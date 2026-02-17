@@ -1,0 +1,10 @@
+[package]
+name = "benchmark-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ranking = { path = "../../pkg/ranking" }
+schema = { path = "../../pkg/schema" }
+store = { path = "../../pkg/store" }
+retrieval = { path = "../../services/retrieval" }

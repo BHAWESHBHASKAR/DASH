@@ -1,0 +1,1710 @@
+use std::{
+    collections::VecDeque,
+    fs::{OpenOptions, create_dir_all},
+    io::{BufRead, BufReader, Write},
+    path::Path,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+use ranking::lexical_overlap_score;
+use retrieval::api::{RetrieveApiRequest, execute_api_query};
+use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
+use store::{AnnTuningConfig, InMemoryStore, StoreIndexStats};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkProfile {
+    Smoke,
+    Standard,
+    Large,
+    Hybrid,
+}
+
+impl BenchmarkProfile {
+    fn from_arg(raw: &str) -> Option<Self> {
+        match raw {
+            "smoke" => Some(Self::Smoke),
+            "standard" | "default" => Some(Self::Standard),
+            "large" => Some(Self::Large),
+            "hybrid" => Some(Self::Hybrid),
+            _ => None,
+        }
+    }
+
+    fn fixture_size(self) -> usize {
+        match self {
+            Self::Smoke => 2_000,
+            Self::Standard => 10_000,
+            Self::Large => 50_000,
+            Self::Hybrid => 20_000,
+        }
+    }
+
+    fn default_iterations(self) -> usize {
+        match self {
+            Self::Smoke => 100,
+            Self::Standard => 300,
+            Self::Large => 120,
+            Self::Hybrid => 180,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Standard => "standard",
+            Self::Large => "large",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkConfig {
+    profile: BenchmarkProfile,
+    iterations: Option<usize>,
+    history_out: Option<String>,
+    guard_history: Option<String>,
+    max_dash_latency_regression_pct: Option<f64>,
+    scorecard_out: Option<String>,
+    ann_tuning: AnnTuningConfig,
+    large_min_candidate_reduction_pct: f64,
+    large_max_dash_latency_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkSummary {
+    run_epoch_secs: u64,
+    profile: BenchmarkProfile,
+    fixture_size: usize,
+    iterations: usize,
+    baseline_top: Option<String>,
+    eme_top: Option<String>,
+    baseline_hit: bool,
+    eme_hit: bool,
+    baseline_latency: f64,
+    eme_latency: f64,
+    baseline_scan_count: usize,
+    dash_candidate_count: usize,
+    metadata_prefilter_count: usize,
+    ann_candidate_count: usize,
+    final_scored_candidate_count: usize,
+    index_stats: StoreIndexStats,
+    ann_tuning: AnnTuningConfig,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryRow {
+    profile: BenchmarkProfile,
+    eme_avg_ms: f64,
+}
+
+#[derive(Debug, Clone)]
+struct QualityProbeSummary {
+    contradiction_support_only_pass: bool,
+    temporal_window_pass: bool,
+    temporal_unknown_excluded_pass: bool,
+    hybrid_filter_with_embedding_pass: bool,
+}
+
+impl QualityProbeSummary {
+    fn passed_count(&self) -> usize {
+        [
+            self.contradiction_support_only_pass,
+            self.temporal_window_pass,
+            self.temporal_unknown_excluded_pass,
+            self.hybrid_filter_with_embedding_pass,
+        ]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+    }
+
+    fn total_count(&self) -> usize {
+        4
+    }
+
+    fn all_passed(&self) -> bool {
+        self.passed_count() == self.total_count()
+    }
+}
+
+fn main() {
+    let config = match parse_args(std::env::args().skip(1)) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let fixture_size = config.profile.fixture_size();
+    let iterations = config
+        .iterations
+        .unwrap_or_else(|| config.profile.default_iterations());
+    let (tenant, query, expected_top) = if config.profile == BenchmarkProfile::Hybrid {
+        (
+            "tenant-benchmark-hybrid",
+            "Did project helios acquire startup nova in 2026?",
+            "claim-hybrid-target",
+        )
+    } else {
+        (
+            "tenant-benchmark",
+            "Did company x acquire company y in 2025?",
+            "claim-target",
+        )
+    };
+    let hybrid_entity_filters = vec!["project helios".to_string()];
+    let hybrid_embedding_filters = vec!["emb://hybrid-target".to_string()];
+    let hybrid_query_embedding = benchmark_query_embedding();
+
+    let mut store = InMemoryStore::new_with_ann_tuning(config.ann_tuning.clone());
+    if config.profile == BenchmarkProfile::Hybrid {
+        seed_hybrid_fixture(&mut store, tenant, fixture_size);
+    } else {
+        seed_fixture(&mut store, tenant, fixture_size);
+    }
+
+    let baseline_top = if config.profile == BenchmarkProfile::Hybrid {
+        baseline_hybrid_retrieve_top1(
+            &store,
+            tenant,
+            query,
+            &hybrid_entity_filters,
+            &hybrid_embedding_filters,
+        )
+    } else {
+        baseline_retrieve_top1(&store, tenant, query)
+    };
+    let baseline_hit = baseline_top.as_deref() == Some(expected_top);
+
+    let eme_top = if config.profile == BenchmarkProfile::Hybrid {
+        eme_hybrid_retrieve_top1(
+            &store,
+            tenant,
+            query,
+            &hybrid_query_embedding,
+            &hybrid_entity_filters,
+            &hybrid_embedding_filters,
+        )
+    } else {
+        eme_retrieve_top1(&store, tenant, query)
+    };
+    let eme_hit = eme_top.as_deref() == Some(expected_top);
+
+    let baseline_scan_count = store.claims_for_tenant(tenant).len();
+    let diagnostics_req = RetrievalRequest {
+        tenant_id: tenant.to_string(),
+        query: query.to_string(),
+        top_k: 1,
+        stance_mode: StanceMode::Balanced,
+    };
+    let metadata_prefilter_claim_ids = if config.profile == BenchmarkProfile::Hybrid {
+        build_metadata_prefilter_claim_ids(
+            &store,
+            tenant,
+            &hybrid_entity_filters,
+            &hybrid_embedding_filters,
+        )
+    } else {
+        None
+    };
+    let metadata_prefilter_count = metadata_prefilter_claim_ids
+        .as_ref()
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+    let ann_candidate_count =
+        store.ann_candidate_count_for_query_vector(tenant, &hybrid_query_embedding, 1);
+    let final_scored_candidate_count = store
+        .candidate_count_with_query_vector_and_allowed_claim_ids(
+            &diagnostics_req,
+            Some(&hybrid_query_embedding),
+            (None, None),
+            metadata_prefilter_claim_ids.as_ref(),
+        );
+    let dash_candidate_count = final_scored_candidate_count;
+    let index_stats = store.index_stats();
+
+    let baseline_latency = if config.profile == BenchmarkProfile::Hybrid {
+        measure_baseline_hybrid_latency_ms(
+            &store,
+            tenant,
+            query,
+            iterations,
+            &hybrid_entity_filters,
+            &hybrid_embedding_filters,
+        )
+    } else {
+        measure_baseline_latency_ms(&store, tenant, query, iterations)
+    };
+    let eme_latency = if config.profile == BenchmarkProfile::Hybrid {
+        measure_eme_hybrid_latency_ms(
+            &store,
+            tenant,
+            query,
+            iterations,
+            &hybrid_query_embedding,
+            &hybrid_entity_filters,
+            &hybrid_embedding_filters,
+        )
+    } else {
+        measure_eme_latency_ms(&store, tenant, query, iterations)
+    };
+
+    let summary = BenchmarkSummary {
+        run_epoch_secs: now_epoch_secs(),
+        profile: config.profile,
+        fixture_size,
+        iterations,
+        baseline_top,
+        eme_top,
+        baseline_hit,
+        eme_hit,
+        baseline_latency,
+        eme_latency,
+        baseline_scan_count,
+        dash_candidate_count,
+        metadata_prefilter_count,
+        ann_candidate_count,
+        final_scored_candidate_count,
+        index_stats,
+        ann_tuning: config.ann_tuning.clone(),
+    };
+    let quality = run_quality_probes();
+
+    print_summary(&summary);
+    print_quality_summary(&quality);
+    print_ann_tuning(&summary.ann_tuning);
+
+    if let Some(history_path) = config.guard_history.as_deref() {
+        let max_regression_pct = config.max_dash_latency_regression_pct.unwrap_or(20.0);
+        if let Err(err) = enforce_history_guard(
+            history_path,
+            summary.profile,
+            summary.eme_latency,
+            max_regression_pct,
+        ) {
+            eprintln!("Benchmark failed: {err}");
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(path) = config.history_out.as_deref() {
+        if let Err(err) = append_history(path, &summary) {
+            eprintln!("Benchmark failed: unable to write history output ({err}).");
+            std::process::exit(1);
+        }
+        println!("Benchmark history output updated: {path}");
+    }
+    if let Some(path) = config.scorecard_out.as_deref() {
+        if let Err(err) = write_scorecard(path, &summary, &quality) {
+            eprintln!("Benchmark failed: unable to write scorecard output ({err}).");
+            std::process::exit(1);
+        }
+        println!("Benchmark scorecard output updated: {path}");
+    }
+
+    if !summary.eme_hit {
+        eprintln!("Benchmark failed: DASH retrieval missed expected top1 result.");
+        std::process::exit(1);
+    }
+    if summary.fixture_size >= 10_000 && summary.dash_candidate_count >= summary.baseline_scan_count
+    {
+        eprintln!(
+            "Benchmark failed: indexed retrieval did not reduce candidate set (baseline_scan_count={}, dash_candidate_count={}).",
+            summary.baseline_scan_count, summary.dash_candidate_count
+        );
+        std::process::exit(1);
+    }
+    if summary.baseline_hit && summary.eme_latency > summary.baseline_latency * 15.0 {
+        eprintln!("Benchmark failed: DASH latency regression too high (>15x baseline).");
+        std::process::exit(1);
+    }
+    if let Err(err) = evaluate_profile_gates(&summary, &config) {
+        eprintln!("Benchmark failed: {err}");
+        std::process::exit(1);
+    }
+    if !quality.all_passed() {
+        eprintln!("Benchmark failed: quality probes did not pass.");
+        std::process::exit(1);
+    }
+}
+
+fn evaluate_profile_gates(
+    summary: &BenchmarkSummary,
+    config: &BenchmarkConfig,
+) -> Result<(), String> {
+    let reduction_pct = if summary.baseline_scan_count == 0 {
+        0.0
+    } else {
+        100.0 * (1.0 - summary.dash_candidate_count as f64 / summary.baseline_scan_count as f64)
+    }
+    .max(0.0);
+
+    if summary.profile == BenchmarkProfile::Large
+        && reduction_pct < config.large_min_candidate_reduction_pct
+    {
+        return Err(format!(
+            "large profile candidate reduction {:.2}% is below gate {:.2}%",
+            reduction_pct, config.large_min_candidate_reduction_pct
+        ));
+    }
+    if summary.profile == BenchmarkProfile::Large
+        && summary.eme_latency > config.large_max_dash_latency_ms
+    {
+        return Err(format!(
+            "large profile DASH avg latency {:.4} ms exceeds gate {:.4} ms",
+            summary.eme_latency, config.large_max_dash_latency_ms
+        ));
+    }
+    Ok(())
+}
+
+fn build_metadata_prefilter_claim_ids(
+    store: &InMemoryStore,
+    tenant_id: &str,
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> Option<std::collections::HashSet<String>> {
+    let entity_candidates = if entity_filters.is_empty() {
+        None
+    } else {
+        let mut ids = std::collections::HashSet::new();
+        for filter in entity_filters {
+            ids.extend(store.claim_ids_for_entity(tenant_id, filter));
+        }
+        Some(ids)
+    };
+    let embedding_candidates = if embedding_filters.is_empty() {
+        None
+    } else {
+        let mut ids = std::collections::HashSet::new();
+        for filter in embedding_filters {
+            ids.extend(store.claim_ids_for_embedding_id(tenant_id, filter));
+        }
+        Some(ids)
+    };
+
+    match (entity_candidates, embedding_candidates) {
+        (None, None) => None,
+        (Some(entity), None) => Some(entity),
+        (None, Some(embedding)) => Some(embedding),
+        (Some(entity), Some(embedding)) => Some(entity.intersection(&embedding).cloned().collect()),
+    }
+}
+
+fn parse_args<I>(args: I) -> Result<BenchmarkConfig, String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut profile = BenchmarkProfile::Standard;
+    let mut iterations = None;
+    let mut history_out = None;
+    let mut guard_history = None;
+    let mut max_dash_latency_regression_pct = None;
+    let mut scorecard_out = None;
+    let defaults = AnnTuningConfig::default();
+    let mut ann_tuning = AnnTuningConfig {
+        max_neighbors_base: env_or_default_usize(
+            "DASH_BENCH_ANN_MAX_NEIGHBORS_BASE",
+            defaults.max_neighbors_base,
+        ),
+        max_neighbors_upper: env_or_default_usize(
+            "DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER",
+            defaults.max_neighbors_upper,
+        ),
+        search_expansion_factor: env_or_default_usize(
+            "DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR",
+            defaults.search_expansion_factor,
+        ),
+        search_expansion_min: env_or_default_usize(
+            "DASH_BENCH_ANN_SEARCH_EXPANSION_MIN",
+            defaults.search_expansion_min,
+        ),
+        search_expansion_max: env_or_default_usize(
+            "DASH_BENCH_ANN_SEARCH_EXPANSION_MAX",
+            defaults.search_expansion_max,
+        ),
+    };
+    let mut large_min_candidate_reduction_pct =
+        env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);
+    let mut large_max_dash_latency_ms =
+        env_or_default_f64("DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS", 120.0);
+
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--smoke" => profile = BenchmarkProfile::Smoke,
+            "--profile" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --profile".to_string())?;
+                profile = BenchmarkProfile::from_arg(&value).ok_or_else(|| {
+                    format!(
+                        "Invalid profile '{value}'. Valid values: smoke, standard, large, hybrid."
+                    )
+                })?;
+            }
+            "--iterations" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --iterations".to_string())?;
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid iterations value '{value}'"))?;
+                if parsed == 0 {
+                    return Err("Iterations must be > 0".to_string());
+                }
+                iterations = Some(parsed);
+            }
+            "--history-out" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --history-out".to_string())?;
+                history_out = Some(value);
+            }
+            "--guard-history" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --guard-history".to_string())?;
+                guard_history = Some(value);
+            }
+            "--max-dash-latency-regression-pct" | "--max-eme-latency-regression-pct" => {
+                let value = args.next().ok_or_else(|| {
+                    "Missing value for --max-dash-latency-regression-pct".to_string()
+                })?;
+                let parsed = value.parse::<f64>().map_err(|_| {
+                    format!("Invalid max-dash-latency-regression-pct value '{value}'")
+                })?;
+                if parsed < 0.0 {
+                    return Err("max-dash-latency-regression-pct must be >= 0".to_string());
+                }
+                max_dash_latency_regression_pct = Some(parsed);
+            }
+            "--scorecard-out" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --scorecard-out".to_string())?;
+                scorecard_out = Some(value);
+            }
+            "--ann-max-neighbors-base" => {
+                ann_tuning.max_neighbors_base =
+                    parse_positive_usize_arg(args.next(), "--ann-max-neighbors-base")?;
+            }
+            "--ann-max-neighbors-upper" => {
+                ann_tuning.max_neighbors_upper =
+                    parse_positive_usize_arg(args.next(), "--ann-max-neighbors-upper")?;
+            }
+            "--ann-search-expansion-factor" => {
+                ann_tuning.search_expansion_factor =
+                    parse_positive_usize_arg(args.next(), "--ann-search-expansion-factor")?;
+            }
+            "--ann-search-expansion-min" => {
+                ann_tuning.search_expansion_min =
+                    parse_positive_usize_arg(args.next(), "--ann-search-expansion-min")?;
+            }
+            "--ann-search-expansion-max" => {
+                ann_tuning.search_expansion_max =
+                    parse_positive_usize_arg(args.next(), "--ann-search-expansion-max")?;
+            }
+            "--large-min-candidate-reduction-pct" => {
+                large_min_candidate_reduction_pct =
+                    parse_non_negative_f64_arg(args.next(), "--large-min-candidate-reduction-pct")?;
+            }
+            "--large-max-dash-latency-ms" => {
+                large_max_dash_latency_ms =
+                    parse_non_negative_f64_arg(args.next(), "--large-max-dash-latency-ms")?;
+            }
+            "--help" | "-h" => return Err(usage_text().to_string()),
+            _ => {
+                return Err(format!("Unknown argument '{arg}'.\n\n{}", usage_text()));
+            }
+        }
+    }
+
+    if ann_tuning.search_expansion_max < ann_tuning.search_expansion_min {
+        return Err("--ann-search-expansion-max must be >= --ann-search-expansion-min".to_string());
+    }
+
+    Ok(BenchmarkConfig {
+        profile,
+        iterations,
+        history_out,
+        guard_history,
+        max_dash_latency_regression_pct,
+        scorecard_out,
+        ann_tuning,
+        large_min_candidate_reduction_pct,
+        large_max_dash_latency_ms,
+    })
+}
+
+fn env_or_default_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_or_default_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value >= 0.0)
+        .unwrap_or(default)
+}
+
+fn parse_positive_usize_arg(value: Option<String>, flag: &str) -> Result<usize, String> {
+    let raw = value.ok_or_else(|| format!("Missing value for {flag}"))?;
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid value '{raw}' for {flag}"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be > 0"));
+    }
+    Ok(parsed)
+}
+
+fn parse_non_negative_f64_arg(value: Option<String>, flag: &str) -> Result<f64, String> {
+    let raw = value.ok_or_else(|| format!("Missing value for {flag}"))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid value '{raw}' for {flag}"))?;
+    if parsed < 0.0 {
+        return Err(format!("{flag} must be >= 0"));
+    }
+    Ok(parsed)
+}
+
+fn usage_text() -> &'static str {
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|hybrid] [--iterations N] [--history-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N]"
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be valid")
+        .as_secs()
+}
+
+fn print_summary(summary: &BenchmarkSummary) {
+    println!("Benchmark profile: {}", summary.profile.as_str());
+    println!("Benchmark fixture size: {}", summary.fixture_size);
+    println!("Iterations: {}", summary.iterations);
+    println!(
+        "Baseline top1: {}",
+        summary.baseline_top.as_deref().unwrap_or("none")
+    );
+    println!(
+        "DASH top1: {}",
+        summary.eme_top.as_deref().unwrap_or("none")
+    );
+    println!("Baseline hit expected: {}", summary.baseline_hit);
+    println!("DASH hit expected: {}", summary.eme_hit);
+    println!("Baseline avg latency (ms): {:.4}", summary.baseline_latency);
+    println!("DASH avg latency (ms): {:.4}", summary.eme_latency);
+    println!("Baseline scan count: {}", summary.baseline_scan_count);
+    println!(
+        "Metadata prefilter candidate count: {}",
+        summary.metadata_prefilter_count
+    );
+    println!("ANN candidate count: {}", summary.ann_candidate_count);
+    println!(
+        "Final scored candidate count: {}",
+        summary.final_scored_candidate_count
+    );
+    println!("DASH candidate count: {}", summary.dash_candidate_count);
+    let reduction_pct = if summary.baseline_scan_count == 0 {
+        0.0
+    } else {
+        100.0 * (1.0 - summary.dash_candidate_count as f64 / summary.baseline_scan_count as f64)
+    };
+    println!("Candidate reduction (%): {:.2}", reduction_pct.max(0.0));
+    println!(
+        "Index stats: tenants={}, claims={}, vectors={}, inverted_terms={}, entity_terms={}, temporal_buckets={}, ann_vector_buckets={}",
+        summary.index_stats.tenant_count,
+        summary.index_stats.claim_count,
+        summary.index_stats.vector_count,
+        summary.index_stats.inverted_terms,
+        summary.index_stats.entity_terms,
+        summary.index_stats.temporal_buckets,
+        summary.index_stats.ann_vector_buckets,
+    );
+}
+
+fn print_quality_summary(summary: &QualityProbeSummary) {
+    println!(
+        "Quality probes passed: {}/{}",
+        summary.passed_count(),
+        summary.total_count()
+    );
+    println!(
+        "Quality probe contradiction_support_only: {}",
+        summary.contradiction_support_only_pass
+    );
+    println!(
+        "Quality probe temporal_window: {}",
+        summary.temporal_window_pass
+    );
+    println!(
+        "Quality probe temporal_unknown_excluded: {}",
+        summary.temporal_unknown_excluded_pass
+    );
+    println!(
+        "Quality probe hybrid_filter_with_embedding: {}",
+        summary.hybrid_filter_with_embedding_pass
+    );
+}
+
+fn print_ann_tuning(ann_tuning: &AnnTuningConfig) {
+    println!(
+        "ANN tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
+        ann_tuning.max_neighbors_base,
+        ann_tuning.max_neighbors_upper,
+        ann_tuning.search_expansion_factor,
+        ann_tuning.search_expansion_min,
+        ann_tuning.search_expansion_max
+    );
+}
+
+fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io::Error> {
+    let history_path = Path::new(path);
+    if let Some(parent) = history_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent)?;
+    }
+
+    let needs_header = !history_path.exists() || std::fs::metadata(history_path)?.len() == 0;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path)?;
+
+    if needs_header {
+        writeln!(file, "# Benchmark History")?;
+        writeln!(file)?;
+        writeln!(
+            file,
+            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count |"
+        )?;
+        writeln!(
+            file,
+            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"
+        )?;
+    }
+
+    writeln!(
+        file,
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} |",
+        summary.run_epoch_secs,
+        summary.profile.as_str(),
+        summary.fixture_size,
+        summary.iterations,
+        summary.baseline_top.as_deref().unwrap_or("none"),
+        summary.eme_top.as_deref().unwrap_or("none"),
+        summary.baseline_hit,
+        summary.eme_hit,
+        summary.baseline_latency,
+        summary.eme_latency,
+        summary.baseline_scan_count,
+        summary.dash_candidate_count,
+        summary.metadata_prefilter_count,
+        summary.ann_candidate_count,
+        summary.final_scored_candidate_count
+    )?;
+    Ok(())
+}
+
+fn write_scorecard(
+    path: &str,
+    summary: &BenchmarkSummary,
+    quality: &QualityProbeSummary,
+) -> Result<(), std::io::Error> {
+    let scorecard_path = Path::new(path);
+    if let Some(parent) = scorecard_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(scorecard_path)?;
+
+    writeln!(file, "# DASH Benchmark Scorecard")?;
+    writeln!(file)?;
+    writeln!(file, "- run_epoch_secs: {}", summary.run_epoch_secs)?;
+    writeln!(file, "- profile: {}", summary.profile.as_str())?;
+    writeln!(file, "- fixture_size: {}", summary.fixture_size)?;
+    writeln!(file, "- iterations: {}", summary.iterations)?;
+    writeln!(
+        file,
+        "- baseline_top1: {}",
+        summary.baseline_top.as_deref().unwrap_or("none")
+    )?;
+    writeln!(
+        file,
+        "- dash_top1: {}",
+        summary.eme_top.as_deref().unwrap_or("none")
+    )?;
+    writeln!(file, "- baseline_avg_ms: {:.4}", summary.baseline_latency)?;
+    writeln!(file, "- dash_avg_ms: {:.4}", summary.eme_latency)?;
+    writeln!(
+        file,
+        "- baseline_scan_count: {}",
+        summary.baseline_scan_count
+    )?;
+    writeln!(
+        file,
+        "- dash_candidate_count: {}",
+        summary.dash_candidate_count
+    )?;
+    writeln!(
+        file,
+        "- metadata_prefilter_count: {}",
+        summary.metadata_prefilter_count
+    )?;
+    writeln!(
+        file,
+        "- ann_candidate_count: {}",
+        summary.ann_candidate_count
+    )?;
+    writeln!(
+        file,
+        "- final_scored_candidate_count: {}",
+        summary.final_scored_candidate_count
+    )?;
+    let reduction_pct = if summary.baseline_scan_count == 0 {
+        0.0
+    } else {
+        100.0 * (1.0 - summary.dash_candidate_count as f64 / summary.baseline_scan_count as f64)
+    };
+    writeln!(
+        file,
+        "- candidate_reduction_pct: {:.2}",
+        reduction_pct.max(0.0)
+    )?;
+    writeln!(
+        file,
+        "- index_tenant_count: {}",
+        summary.index_stats.tenant_count
+    )?;
+    writeln!(
+        file,
+        "- index_claim_count: {}",
+        summary.index_stats.claim_count
+    )?;
+    writeln!(
+        file,
+        "- index_inverted_terms: {}",
+        summary.index_stats.inverted_terms
+    )?;
+    writeln!(
+        file,
+        "- index_entity_terms: {}",
+        summary.index_stats.entity_terms
+    )?;
+    writeln!(
+        file,
+        "- index_temporal_buckets: {}",
+        summary.index_stats.temporal_buckets
+    )?;
+    writeln!(
+        file,
+        "- ann_max_neighbors_base: {}",
+        summary.ann_tuning.max_neighbors_base
+    )?;
+    writeln!(
+        file,
+        "- ann_max_neighbors_upper: {}",
+        summary.ann_tuning.max_neighbors_upper
+    )?;
+    writeln!(
+        file,
+        "- ann_search_expansion_factor: {}",
+        summary.ann_tuning.search_expansion_factor
+    )?;
+    writeln!(
+        file,
+        "- ann_search_expansion_min: {}",
+        summary.ann_tuning.search_expansion_min
+    )?;
+    writeln!(
+        file,
+        "- ann_search_expansion_max: {}",
+        summary.ann_tuning.search_expansion_max
+    )?;
+    writeln!(file)?;
+    writeln!(file, "## Quality Probes")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "- passed: {}/{}",
+        quality.passed_count(),
+        quality.total_count()
+    )?;
+    writeln!(
+        file,
+        "- contradiction_support_only_pass: {}",
+        quality.contradiction_support_only_pass
+    )?;
+    writeln!(
+        file,
+        "- temporal_window_pass: {}",
+        quality.temporal_window_pass
+    )?;
+    writeln!(
+        file,
+        "- temporal_unknown_excluded_pass: {}",
+        quality.temporal_unknown_excluded_pass
+    )?;
+    writeln!(
+        file,
+        "- hybrid_filter_with_embedding_pass: {}",
+        quality.hybrid_filter_with_embedding_pass
+    )?;
+    Ok(())
+}
+
+fn enforce_history_guard(
+    path: &str,
+    profile: BenchmarkProfile,
+    current_eme_avg_ms: f64,
+    max_regression_pct: f64,
+) -> Result<(), String> {
+    let previous = read_latest_history_row(path, profile)?.map(|row| row.eme_avg_ms);
+    match previous {
+        Some(previous_ms) if previous_ms > 0.0 => {
+            let allowed = previous_ms * (1.0 + max_regression_pct / 100.0);
+            if current_eme_avg_ms > allowed {
+                return Err(format!(
+                    "history guard violated for profile '{}': current DASH avg {:.4} ms exceeds allowed {:.4} ms (prev {:.4} ms, max regression {}%)",
+                    profile.as_str(),
+                    current_eme_avg_ms,
+                    allowed,
+                    previous_ms,
+                    max_regression_pct
+                ));
+            }
+            println!(
+                "History guard check passed: profile={}, prev_dash_avg_ms={:.4}, current_dash_avg_ms={:.4}, max_regression_pct={}",
+                profile.as_str(),
+                previous_ms,
+                current_eme_avg_ms,
+                max_regression_pct
+            );
+            Ok(())
+        }
+        _ => {
+            println!(
+                "History guard skipped: no prior row found for profile '{}' in {}",
+                profile.as_str(),
+                path
+            );
+            Ok(())
+        }
+    }
+}
+
+fn read_latest_history_row(
+    path: &str,
+    profile: BenchmarkProfile,
+) -> Result<Option<HistoryRow>, String> {
+    let history_path = Path::new(path);
+    if !history_path.exists() {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::open(history_path).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let mut matching_rows: VecDeque<HistoryRow> = VecDeque::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            continue;
+        }
+        if trimmed.contains("---") || trimmed.contains("run_epoch_secs") {
+            continue;
+        }
+
+        if let Some(row) = parse_history_row(trimmed)?
+            && row.profile == profile
+        {
+            matching_rows.push_back(row);
+        }
+    }
+
+    Ok(matching_rows.pop_back())
+}
+
+fn parse_history_row(line: &str) -> Result<Option<HistoryRow>, String> {
+    let cols: Vec<&str> = line.split('|').map(|c| c.trim()).collect();
+    if cols.len() < 11 {
+        return Ok(None);
+    }
+
+    let profile = match cols[2] {
+        "smoke" => BenchmarkProfile::Smoke,
+        "standard" => BenchmarkProfile::Standard,
+        "large" => BenchmarkProfile::Large,
+        "hybrid" => BenchmarkProfile::Hybrid,
+        _ => return Ok(None),
+    };
+    let eme_avg_ms = cols[10]
+        .parse::<f64>()
+        .map_err(|_| "invalid eme_avg_ms in benchmark history row".to_string())?;
+
+    Ok(Some(HistoryRow {
+        profile,
+        eme_avg_ms,
+    }))
+}
+
+fn run_quality_probes() -> QualityProbeSummary {
+    let tenant = "tenant-quality-probe";
+    let mut store = InMemoryStore::new();
+    seed_quality_probe_fixture(&mut store, tenant);
+
+    let contradiction_top = store
+        .retrieve(&RetrievalRequest {
+            tenant_id: tenant.to_string(),
+            query: "project orion launched".to_string(),
+            top_k: 1,
+            stance_mode: StanceMode::SupportOnly,
+        })
+        .first()
+        .map(|r| r.claim_id.clone());
+    let contradiction_support_only_pass =
+        contradiction_top.as_deref() == Some("probe-contradiction-supported");
+
+    let temporal_results = store.retrieve_with_time_range(
+        &RetrievalRequest {
+            tenant_id: tenant.to_string(),
+            query: "mars mission status update".to_string(),
+            top_k: 10,
+            stance_mode: StanceMode::Balanced,
+        },
+        Some(2_000),
+        Some(3_000),
+    );
+    let temporal_window_pass =
+        temporal_results.first().map(|r| r.claim_id.as_str()) == Some("probe-temporal-new");
+    let temporal_unknown_excluded_pass = !temporal_results
+        .iter()
+        .any(|r| r.claim_id == "probe-temporal-unknown");
+
+    let hybrid_filtered = execute_api_query(
+        &store,
+        RetrieveApiRequest {
+            tenant_id: tenant.to_string(),
+            query: "Did project helios acquire startup nova?".to_string(),
+            query_embedding: Some(benchmark_query_embedding()),
+            entity_filters: vec!["project helios".to_string()],
+            embedding_id_filters: vec!["emb://probe-filter-match".to_string()],
+            top_k: 1,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        },
+    );
+    let hybrid_filter_with_embedding_pass =
+        hybrid_filtered.results.first().map(|r| r.claim_id.as_str()) == Some("probe-filter-match");
+
+    QualityProbeSummary {
+        contradiction_support_only_pass,
+        temporal_window_pass,
+        temporal_unknown_excluded_pass,
+        hybrid_filter_with_embedding_pass,
+    }
+}
+
+fn seed_quality_probe_fixture(store: &mut InMemoryStore, tenant: &str) {
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-contradiction-heavy".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Orion launched in 2024".to_string(),
+                confidence: 0.85,
+                event_time_unix: Some(2_024),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![
+                Evidence {
+                    evidence_id: "probe-contradiction-heavy-s1".to_string(),
+                    claim_id: "probe-contradiction-heavy".to_string(),
+                    source_id: "source://probe/heavy/s1".to_string(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                },
+                Evidence {
+                    evidence_id: "probe-contradiction-heavy-c1".to_string(),
+                    claim_id: "probe-contradiction-heavy".to_string(),
+                    source_id: "source://probe/heavy/c1".to_string(),
+                    stance: Stance::Contradicts,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                },
+                Evidence {
+                    evidence_id: "probe-contradiction-heavy-c2".to_string(),
+                    claim_id: "probe-contradiction-heavy".to_string(),
+                    source_id: "source://probe/heavy/c2".to_string(),
+                    stance: Stance::Contradicts,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                },
+            ],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-contradiction-supported".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Orion launched in 2023".to_string(),
+                confidence: 0.9,
+                event_time_unix: Some(2_023),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![
+                Evidence {
+                    evidence_id: "probe-contradiction-supported-s1".to_string(),
+                    claim_id: "probe-contradiction-supported".to_string(),
+                    source_id: "source://probe/supported/s1".to_string(),
+                    stance: Stance::Supports,
+                    source_quality: 0.92,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                },
+                Evidence {
+                    evidence_id: "probe-contradiction-supported-s2".to_string(),
+                    claim_id: "probe-contradiction-supported".to_string(),
+                    source_id: "source://probe/supported/s2".to_string(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                },
+            ],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-temporal-old".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Mars mission status update".to_string(),
+                confidence: 0.9,
+                event_time_unix: Some(1_500),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-temporal-old-s1".to_string(),
+                claim_id: "probe-temporal-old".to_string(),
+                source_id: "source://probe/temporal/old".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-temporal-new".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Mars mission status update".to_string(),
+                confidence: 0.9,
+                event_time_unix: Some(2_500),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-temporal-new-s1".to_string(),
+                claim_id: "probe-temporal-new".to_string(),
+                source_id: "source://probe/temporal/new".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-temporal-unknown".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Mars mission status update".to_string(),
+                confidence: 0.95,
+                event_time_unix: None,
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-temporal-unknown-s1".to_string(),
+                claim_id: "probe-temporal-unknown".to_string(),
+                source_id: "source://probe/temporal/unknown".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.95,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-filter-match".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Helios acquired Startup Nova".to_string(),
+                confidence: 0.96,
+                event_time_unix: Some(2_026),
+                entities: vec!["Project Helios".to_string(), "Startup Nova".to_string()],
+                embedding_ids: vec!["emb://probe-filter-match".to_string()],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-filter-match-s1".to_string(),
+                claim_id: "probe-filter-match".to_string(),
+                source_id: "source://probe/filter/match".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.95,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+    store
+        .upsert_claim_vector("probe-filter-match", benchmark_query_embedding())
+        .expect("quality probe vector upsert should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-filter-other".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Helios announced startup program".to_string(),
+                confidence: 0.91,
+                event_time_unix: Some(2_026),
+                entities: vec!["Project Helios".to_string()],
+                embedding_ids: vec!["emb://probe-filter-other".to_string()],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-filter-other-s1".to_string(),
+                claim_id: "probe-filter-other".to_string(),
+                source_id: "source://probe/filter/other".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe ingest should succeed");
+    store
+        .upsert_claim_vector("probe-filter-other", fixture_vector_for_index(999_991))
+        .expect("quality probe vector upsert should succeed");
+}
+
+fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
+    for i in 0..count {
+        let claim_id = if i == count / 3 {
+            "claim-target".to_string()
+        } else {
+            format!("claim-{i}")
+        };
+        let claim_text = if i == count / 3 {
+            "Company X acquired Company Y in 2025".to_string()
+        } else if i % 50 == 0 {
+            format!("Company X announced partnership program {i}")
+        } else {
+            format!("Unrelated operational update {i}")
+        };
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: claim_id.clone(),
+                    tenant_id: tenant.to_string(),
+                    canonical_text: claim_text,
+                    confidence: if i == count / 3 { 0.95 } else { 0.7 },
+                    event_time_unix: Some(1735689600 + i as i64),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: format!("evidence-{i}"),
+                    claim_id: claim_id.clone(),
+                    source_id: format!("source://doc-{i}"),
+                    stance: Stance::Supports,
+                    source_quality: if i == count / 3 { 0.95 } else { 0.75 },
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .expect("fixture ingest should succeed");
+
+        let vector = if i == count / 3 {
+            benchmark_query_embedding()
+        } else {
+            fixture_vector_for_index(i)
+        };
+        store
+            .upsert_claim_vector(&claim_id, vector)
+            .expect("fixture vector upsert should succeed");
+    }
+}
+
+fn seed_hybrid_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
+    let target_index = count / 4;
+    for i in 0..count {
+        let is_target = i == target_index;
+        let claim_id = if is_target {
+            "claim-hybrid-target".to_string()
+        } else {
+            format!("claim-hybrid-{i}")
+        };
+
+        let entities = if is_target || i % 19 == 0 {
+            vec!["Project Helios".to_string(), "Startup Nova".to_string()]
+        } else if i % 7 == 0 {
+            vec!["Project Helios".to_string()]
+        } else {
+            vec!["Project Atlas".to_string()]
+        };
+        let embedding_ids = if is_target {
+            vec!["emb://hybrid-target".to_string()]
+        } else if i % 19 == 0 {
+            vec!["emb://hybrid-decoy".to_string()]
+        } else {
+            vec![format!("emb://hybrid/{i}")]
+        };
+        let canonical_text = if is_target {
+            "Project Helios acquired Startup Nova in 2026".to_string()
+        } else if i % 19 == 0 {
+            format!("Project Helios expanded Startup Nova partnership phase {i}")
+        } else if i % 7 == 0 {
+            format!("Project Helios operational update {i}")
+        } else {
+            format!("Unrelated system status report {i}")
+        };
+
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: claim_id.clone(),
+                    tenant_id: tenant.to_string(),
+                    canonical_text,
+                    confidence: if is_target { 0.97 } else { 0.72 },
+                    event_time_unix: Some(1767225600 + i as i64),
+                    entities,
+                    embedding_ids,
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: format!("evidence-hybrid-{i}"),
+                    claim_id: claim_id.clone(),
+                    source_id: format!("source://hybrid/doc-{i}"),
+                    stance: Stance::Supports,
+                    source_quality: if is_target { 0.97 } else { 0.78 },
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .expect("hybrid fixture ingest should succeed");
+
+        let vector = if is_target {
+            benchmark_query_embedding()
+        } else if i % 19 == 0 {
+            fixture_vector_for_index(i + 900_000)
+        } else {
+            fixture_vector_for_index(i + 200_000)
+        };
+        store
+            .upsert_claim_vector(&claim_id, vector)
+            .expect("hybrid fixture vector upsert should succeed");
+    }
+}
+
+fn benchmark_query_embedding() -> Vec<f32> {
+    vec![
+        0.92, 0.11, 0.07, 0.66, 0.13, 0.81, 0.21, 0.35, 0.77, 0.09, 0.58, 0.44, 0.18, 0.72, 0.30,
+        0.63,
+    ]
+}
+
+fn fixture_vector_for_index(i: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(16);
+    let mut state = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+    for _ in 0..16 {
+        state = state
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(3037000493);
+        let value = ((state >> 33) as f32) / (u32::MAX as f32);
+        out.push(value);
+    }
+    out
+}
+
+fn baseline_retrieve_top1(store: &InMemoryStore, tenant: &str, query: &str) -> Option<String> {
+    let claims = store.claims_for_tenant(tenant);
+    claims
+        .iter()
+        .map(|claim| {
+            (
+                claim.claim_id.clone(),
+                lexical_overlap_score(query, &claim.canonical_text),
+            )
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(claim_id, _)| claim_id)
+}
+
+fn baseline_hybrid_retrieve_top1(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> Option<String> {
+    let normalized_entities: Vec<String> = entity_filters
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let embedding_filter_set: std::collections::HashSet<String> = embedding_filters
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    store
+        .claims_for_tenant(tenant)
+        .into_iter()
+        .filter(|claim| {
+            let entity_match = if normalized_entities.is_empty() {
+                true
+            } else {
+                claim
+                    .entities
+                    .iter()
+                    .any(|entity| normalized_entities.contains(&entity.trim().to_ascii_lowercase()))
+            };
+            let embedding_match = if embedding_filter_set.is_empty() {
+                true
+            } else {
+                claim
+                    .embedding_ids
+                    .iter()
+                    .any(|embedding_id| embedding_filter_set.contains(embedding_id.trim()))
+            };
+            entity_match && embedding_match
+        })
+        .map(|claim| {
+            (
+                claim.claim_id,
+                lexical_overlap_score(query, &claim.canonical_text),
+            )
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(claim_id, _)| claim_id)
+}
+
+fn eme_retrieve_top1(store: &InMemoryStore, tenant: &str, query: &str) -> Option<String> {
+    store
+        .retrieve_with_time_range_and_query_vector(
+            &RetrievalRequest {
+                tenant_id: tenant.to_string(),
+                query: query.to_string(),
+                top_k: 1,
+                stance_mode: StanceMode::Balanced,
+            },
+            None,
+            None,
+            Some(&benchmark_query_embedding()),
+        )
+        .first()
+        .map(|r| r.claim_id.clone())
+}
+
+fn eme_hybrid_retrieve_top1(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    query_embedding: &[f32],
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> Option<String> {
+    execute_api_query(
+        store,
+        RetrieveApiRequest {
+            tenant_id: tenant.to_string(),
+            query: query.to_string(),
+            query_embedding: Some(query_embedding.to_vec()),
+            entity_filters: entity_filters.to_vec(),
+            embedding_id_filters: embedding_filters.to_vec(),
+            top_k: 1,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        },
+    )
+    .results
+    .first()
+    .map(|result| result.claim_id.clone())
+}
+
+fn measure_baseline_latency_ms(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    iterations: usize,
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = baseline_retrieve_top1(store, tenant, query);
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    elapsed / iterations as f64
+}
+
+fn measure_baseline_hybrid_latency_ms(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    iterations: usize,
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ =
+            baseline_hybrid_retrieve_top1(store, tenant, query, entity_filters, embedding_filters);
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    elapsed / iterations as f64
+}
+
+fn measure_eme_latency_ms(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    iterations: usize,
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = eme_retrieve_top1(store, tenant, query);
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    elapsed / iterations as f64
+}
+
+fn measure_eme_hybrid_latency_ms(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    iterations: usize,
+    query_embedding: &[f32],
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> f64 {
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = eme_hybrid_retrieve_top1(
+            store,
+            tenant,
+            query,
+            query_embedding,
+            entity_filters,
+            embedding_filters,
+        );
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    elapsed / iterations as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_large_gates(min_reduction: f64, max_latency: f64) -> BenchmarkConfig {
+        BenchmarkConfig {
+            profile: BenchmarkProfile::Large,
+            iterations: Some(1),
+            history_out: None,
+            guard_history: None,
+            max_dash_latency_regression_pct: None,
+            scorecard_out: None,
+            ann_tuning: AnnTuningConfig::default(),
+            large_min_candidate_reduction_pct: min_reduction,
+            large_max_dash_latency_ms: max_latency,
+        }
+    }
+
+    fn summary_large_with(
+        dash_avg_ms: f64,
+        baseline_scan_count: usize,
+        dash_candidates: usize,
+    ) -> BenchmarkSummary {
+        BenchmarkSummary {
+            run_epoch_secs: 0,
+            profile: BenchmarkProfile::Large,
+            fixture_size: 50_000,
+            iterations: 1,
+            baseline_top: Some("claim-target".to_string()),
+            eme_top: Some("claim-target".to_string()),
+            baseline_hit: true,
+            eme_hit: true,
+            baseline_latency: 100.0,
+            eme_latency: dash_avg_ms,
+            baseline_scan_count,
+            dash_candidate_count: dash_candidates,
+            metadata_prefilter_count: 0,
+            ann_candidate_count: dash_candidates,
+            final_scored_candidate_count: dash_candidates,
+            index_stats: StoreIndexStats::default(),
+            ann_tuning: AnnTuningConfig::default(),
+        }
+    }
+
+    #[test]
+    fn large_gate_rejects_low_candidate_reduction() {
+        let config = config_with_large_gates(95.0, 120.0);
+        let summary = summary_large_with(30.0, 50_000, 10_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("candidate reduction"));
+    }
+
+    #[test]
+    fn large_gate_rejects_high_dash_latency() {
+        let config = config_with_large_gates(90.0, 50.0);
+        let summary = summary_large_with(80.0, 50_000, 2_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("avg latency"));
+    }
+
+    #[test]
+    fn large_gate_accepts_good_large_profile_metrics() {
+        let config = config_with_large_gates(90.0, 80.0);
+        let summary = summary_large_with(40.0, 50_000, 2_000);
+        assert!(evaluate_profile_gates(&summary, &config).is_ok());
+    }
+}

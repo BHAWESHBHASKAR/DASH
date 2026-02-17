@@ -1,0 +1,1984 @@
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fs::{OpenOptions, create_dir_all},
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::Path,
+    sync::{Arc, Mutex, mpsc},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use schema::StanceMode;
+use store::InMemoryStore;
+
+use crate::api::{CitationNode, EvidenceNode, RetrieveApiRequest, TimeRange, execute_api_query};
+
+const METRICS_WINDOW_SIZE: usize = 2048;
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const SOCKET_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_HTTP_WORKERS: usize = 4;
+
+#[derive(Debug, Clone)]
+pub(crate) struct TransportMetrics {
+    started_at: Instant,
+    http_requests_total: u64,
+    health_requests_total: u64,
+    metrics_requests_total: u64,
+    retrieve_requests_total: u64,
+    retrieve_success_total: u64,
+    retrieve_client_error_total: u64,
+    retrieve_server_error_total: u64,
+    auth_success_total: u64,
+    auth_failure_total: u64,
+    authz_denied_total: u64,
+    audit_events_total: u64,
+    audit_write_error_total: u64,
+    retrieve_last_result_count: usize,
+    retrieve_latency_ms_window: VecDeque<f64>,
+    ingest_to_visible_lag_ms_window: VecDeque<f64>,
+}
+
+impl Default for TransportMetrics {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            http_requests_total: 0,
+            health_requests_total: 0,
+            metrics_requests_total: 0,
+            retrieve_requests_total: 0,
+            retrieve_success_total: 0,
+            retrieve_client_error_total: 0,
+            retrieve_server_error_total: 0,
+            auth_success_total: 0,
+            auth_failure_total: 0,
+            authz_denied_total: 0,
+            audit_events_total: 0,
+            audit_write_error_total: 0,
+            retrieve_last_result_count: 0,
+            retrieve_latency_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
+            ingest_to_visible_lag_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
+        }
+    }
+}
+
+impl TransportMetrics {
+    fn push_window(window: &mut VecDeque<f64>, value: f64) {
+        if window.len() >= METRICS_WINDOW_SIZE {
+            let _ = window.pop_front();
+        }
+        window.push_back(value);
+    }
+
+    fn observe_http(&mut self, path: &str) {
+        self.http_requests_total += 1;
+        match path {
+            "/health" => self.health_requests_total += 1,
+            "/metrics" => self.metrics_requests_total += 1,
+            _ => {}
+        }
+    }
+
+    fn observe_retrieve(
+        &mut self,
+        status: u16,
+        latency_ms: f64,
+        result_count: usize,
+        ingest_to_visible_lag_ms: Option<f64>,
+    ) {
+        self.retrieve_requests_total += 1;
+        self.retrieve_last_result_count = result_count;
+        Self::push_window(&mut self.retrieve_latency_ms_window, latency_ms);
+        if let Some(value) = ingest_to_visible_lag_ms {
+            Self::push_window(&mut self.ingest_to_visible_lag_ms_window, value);
+        }
+
+        match status {
+            200..=299 => self.retrieve_success_total += 1,
+            400..=499 => self.retrieve_client_error_total += 1,
+            _ => self.retrieve_server_error_total += 1,
+        }
+    }
+
+    fn observe_auth_success(&mut self) {
+        self.auth_success_total += 1;
+    }
+
+    fn observe_auth_failure(&mut self) {
+        self.auth_failure_total += 1;
+    }
+
+    fn observe_authz_denied(&mut self) {
+        self.authz_denied_total += 1;
+    }
+
+    fn observe_audit_event(&mut self, write_error: bool) {
+        self.audit_events_total += 1;
+        if write_error {
+            self.audit_write_error_total += 1;
+        }
+    }
+
+    fn quantile(window: &VecDeque<f64>, quantile: f64) -> f64 {
+        if window.is_empty() {
+            return 0.0;
+        }
+        let mut values: Vec<f64> = window.iter().copied().collect();
+        values.sort_by(|a, b| a.total_cmp(b));
+        let idx = (((values.len() - 1) as f64) * quantile).round() as usize;
+        values[idx]
+    }
+
+    fn render_prometheus(&self) -> String {
+        let retrieve_latency_p50 = Self::quantile(&self.retrieve_latency_ms_window, 0.50);
+        let retrieve_latency_p95 = Self::quantile(&self.retrieve_latency_ms_window, 0.95);
+        let retrieve_latency_p99 = Self::quantile(&self.retrieve_latency_ms_window, 0.99);
+        let visibility_lag_p50 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.50);
+        let visibility_lag_p95 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.95);
+        let uptime_seconds = self.started_at.elapsed().as_secs_f64();
+
+        format!(
+            "# TYPE dash_http_requests_total counter\n\
+dash_http_requests_total {}\n\
+# TYPE dash_health_requests_total counter\n\
+dash_health_requests_total {}\n\
+# TYPE dash_metrics_requests_total counter\n\
+dash_metrics_requests_total {}\n\
+# TYPE dash_retrieve_requests_total counter\n\
+dash_retrieve_requests_total {}\n\
+# TYPE dash_retrieve_success_total counter\n\
+dash_retrieve_success_total {}\n\
+# TYPE dash_retrieve_client_error_total counter\n\
+dash_retrieve_client_error_total {}\n\
+# TYPE dash_retrieve_server_error_total counter\n\
+dash_retrieve_server_error_total {}\n\
+# TYPE dash_transport_auth_success_total counter\n\
+dash_transport_auth_success_total {}\n\
+# TYPE dash_transport_auth_failure_total counter\n\
+dash_transport_auth_failure_total {}\n\
+# TYPE dash_transport_authz_denied_total counter\n\
+dash_transport_authz_denied_total {}\n\
+# TYPE dash_transport_audit_events_total counter\n\
+dash_transport_audit_events_total {}\n\
+# TYPE dash_transport_audit_write_error_total counter\n\
+dash_transport_audit_write_error_total {}\n\
+# TYPE dash_retrieve_last_result_count gauge\n\
+dash_retrieve_last_result_count {}\n\
+# TYPE dash_retrieve_latency_ms_p50 gauge\n\
+dash_retrieve_latency_ms_p50 {:.4}\n\
+# TYPE dash_retrieve_latency_ms_p95 gauge\n\
+dash_retrieve_latency_ms_p95 {:.4}\n\
+# TYPE dash_retrieve_latency_ms_p99 gauge\n\
+dash_retrieve_latency_ms_p99 {:.4}\n\
+# TYPE dash_ingest_to_visible_lag_ms_p50 gauge\n\
+dash_ingest_to_visible_lag_ms_p50 {:.4}\n\
+# TYPE dash_ingest_to_visible_lag_ms_p95 gauge\n\
+dash_ingest_to_visible_lag_ms_p95 {:.4}\n\
+# TYPE dash_transport_uptime_seconds gauge\n\
+dash_transport_uptime_seconds {:.4}\n",
+            self.http_requests_total,
+            self.health_requests_total,
+            self.metrics_requests_total,
+            self.retrieve_requests_total,
+            self.retrieve_success_total,
+            self.retrieve_client_error_total,
+            self.retrieve_server_error_total,
+            self.auth_success_total,
+            self.auth_failure_total,
+            self.authz_denied_total,
+            self.audit_events_total,
+            self.audit_write_error_total,
+            self.retrieve_last_result_count,
+            retrieve_latency_p50,
+            retrieve_latency_p95,
+            retrieve_latency_p99,
+            visibility_lag_p50,
+            visibility_lag_p95,
+            uptime_seconds
+        )
+    }
+}
+
+pub fn serve_http(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+    serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS)
+}
+
+pub fn serve_http_with_workers(
+    store: &InMemoryStore,
+    bind_addr: &str,
+    worker_count: usize,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(bind_addr)?;
+    let worker_count = worker_count.max(1);
+    let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let (tx, rx) = mpsc::channel::<TcpStream>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let metrics = Arc::clone(&metrics);
+            let rx = Arc::clone(&rx);
+            scope.spawn(move || {
+                loop {
+                    let stream = {
+                        let guard = match rx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break,
+                        };
+                        match guard.recv() {
+                            Ok(stream) => stream,
+                            Err(_) => break,
+                        }
+                    };
+                    if let Err(err) = handle_connection(store, stream, &metrics) {
+                        eprintln!("retrieval transport error: {err}");
+                    }
+                }
+            });
+        }
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => {
+                    if tx.send(stream).is_err() {
+                        eprintln!("retrieval transport worker queue closed");
+                        break;
+                    }
+                }
+                Err(err) => eprintln!("retrieval transport accept error: {err}"),
+            }
+        }
+        drop(tx);
+    });
+
+    Ok(())
+}
+
+pub fn serve_http_once(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+    let listener = TcpListener::bind(bind_addr)?;
+    serve_http_once_with_listener(store, listener)
+}
+
+pub fn serve_http_once_with_listener(
+    store: &InMemoryStore,
+    listener: TcpListener,
+) -> std::io::Result<()> {
+    let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let (stream, _) = listener.accept()?;
+    handle_connection(store, stream, &metrics)
+}
+
+pub fn handle_http_request_bytes(
+    store: &InMemoryStore,
+    raw_request: &[u8],
+) -> Result<Vec<u8>, String> {
+    let request_text =
+        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
+    let (header_block, body) = request_text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
+
+    let mut lines = header_block.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing request line".to_string())?;
+    let (method, target) = parse_request_line(request_line)?;
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| "invalid HTTP header".to_string())?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let content_length = match headers.get("content-length") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| "invalid content-length header".to_string())?,
+        None => 0,
+    };
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(format!(
+            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
+        ));
+    }
+    if content_length != body.len() {
+        return Err("content-length does not match body size".to_string());
+    }
+
+    let request = HttpRequest {
+        method,
+        target,
+        headers,
+        body: body.as_bytes().to_vec(),
+    };
+    let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let response = handle_request_with_metrics(store, &request, &metrics);
+    Ok(render_response_text(&response).into_bytes())
+}
+
+fn handle_connection(
+    store: &InMemoryStore,
+    mut stream: TcpStream,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+
+    let request = match read_http_request(&mut stream) {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            return write_response(&mut stream, HttpResponse::bad_request(&err));
+        }
+    };
+
+    let response = handle_request_with_metrics(store, &request, metrics);
+    write_response(&mut stream, response)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
+    let mut reader = BufReader::new(stream);
+
+    let mut request_line = String::new();
+    let bytes = reader
+        .read_line(&mut request_line)
+        .map_err(|e| e.to_string())?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+
+    let (method, target) = parse_request_line(&request_line)?;
+
+    let mut headers = HashMap::new();
+    loop {
+        let mut header_line = String::new();
+        let bytes = reader
+            .read_line(&mut header_line)
+            .map_err(|e| e.to_string())?;
+        if bytes == 0 || header_line == "\r\n" {
+            break;
+        }
+
+        let (name, value) = header_line
+            .split_once(':')
+            .ok_or_else(|| "invalid HTTP header".to_string())?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+
+    let content_length = match headers.get("content-length") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| "invalid content-length header".to_string())?,
+        None => 0,
+    };
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(format!(
+            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
+        ));
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+    }
+
+    Ok(Some(HttpRequest {
+        method,
+        target,
+        headers,
+        body,
+    }))
+}
+
+fn parse_request_line(line: &str) -> Result<(String, String), String> {
+    let line = line.trim();
+    let mut parts = line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing HTTP method".to_string())?;
+    let target = parts
+        .next()
+        .ok_or_else(|| "missing HTTP target".to_string())?;
+    let version = parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+    if !version.starts_with("HTTP/1.") {
+        return Err("unsupported HTTP version".to_string());
+    }
+    Ok((method.to_string(), target.to_string()))
+}
+
+#[cfg(test)]
+fn handle_request(store: &InMemoryStore, request: &HttpRequest) -> HttpResponse {
+    let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    handle_request_with_metrics(store, request, &metrics)
+}
+
+pub(crate) fn handle_request_with_metrics(
+    store: &InMemoryStore,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+) -> HttpResponse {
+    let (path, query) = split_target(&request.target);
+    let auth_policy = AuthPolicy::from_env(
+        env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY"),
+        env_with_fallback(
+            "DASH_RETRIEVAL_ALLOWED_TENANTS",
+            "EME_RETRIEVAL_ALLOWED_TENANTS",
+        ),
+        env_with_fallback(
+            "DASH_RETRIEVAL_API_KEY_SCOPES",
+            "EME_RETRIEVAL_API_KEY_SCOPES",
+        ),
+    );
+    let audit_log_path = env_with_fallback(
+        "DASH_RETRIEVAL_AUDIT_LOG_PATH",
+        "EME_RETRIEVAL_AUDIT_LOG_PATH",
+    );
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_http(&path);
+    }
+
+    match (request.method.as_str(), path.as_str()) {
+        ("GET", "/health") => HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()),
+        ("GET", "/metrics") => {
+            let body = if let Ok(guard) = metrics.lock() {
+                guard.render_prometheus()
+            } else {
+                "dash_transport_metrics_unavailable 1\n".to_string()
+            };
+            HttpResponse::ok_text(body)
+        }
+        ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
+            Ok(req) => {
+                let tenant_id = req.tenant_id.clone();
+                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                    AuthDecision::Unauthorized(reason) => {
+                        observe_auth_failure(metrics);
+                        if let Ok(mut guard) = metrics.lock() {
+                            guard.observe_retrieve(401, 0.0, 0, None);
+                        }
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "retrieve",
+                            Some(&tenant_id),
+                            401,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::unauthorized(reason)
+                    }
+                    AuthDecision::Forbidden(reason) => {
+                        observe_authz_denied(metrics);
+                        if let Ok(mut guard) = metrics.lock() {
+                            guard.observe_retrieve(403, 0.0, 0, None);
+                        }
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "retrieve",
+                            Some(&tenant_id),
+                            403,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::forbidden(reason)
+                    }
+                    AuthDecision::Allowed => {
+                        observe_auth_success(metrics);
+                        let response = execute_retrieve_and_observe(store, req, metrics);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "retrieve",
+                            Some(&tenant_id),
+                            200,
+                            "success",
+                            "retrieve accepted",
+                        );
+                        response
+                    }
+                }
+            }
+            Err(err) => {
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_retrieve(400, 0.0, 0, None);
+                }
+                HttpResponse::bad_request(&err)
+            }
+        },
+        ("POST", "/v1/retrieve") => {
+            if let Some(content_type) = request.headers.get("content-type")
+                && !content_type
+                    .to_ascii_lowercase()
+                    .contains("application/json")
+            {
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_retrieve(400, 0.0, 0, None);
+                }
+                return HttpResponse::bad_request(
+                    "content-type must include application/json for POST /v1/retrieve",
+                );
+            }
+
+            let body = match std::str::from_utf8(&request.body) {
+                Ok(body) => body,
+                Err(_) => {
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.observe_retrieve(400, 0.0, 0, None);
+                    }
+                    return HttpResponse::bad_request("request body must be valid UTF-8");
+                }
+            };
+            match build_retrieve_request_from_json(body) {
+                Ok(req) => {
+                    let tenant_id = req.tenant_id.clone();
+                    match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                        AuthDecision::Unauthorized(reason) => {
+                            observe_auth_failure(metrics);
+                            if let Ok(mut guard) = metrics.lock() {
+                                guard.observe_retrieve(401, 0.0, 0, None);
+                            }
+                            emit_audit_event(
+                                metrics,
+                                audit_log_path.as_deref(),
+                                "retrieve",
+                                Some(&tenant_id),
+                                401,
+                                "denied",
+                                reason,
+                            );
+                            HttpResponse::unauthorized(reason)
+                        }
+                        AuthDecision::Forbidden(reason) => {
+                            observe_authz_denied(metrics);
+                            if let Ok(mut guard) = metrics.lock() {
+                                guard.observe_retrieve(403, 0.0, 0, None);
+                            }
+                            emit_audit_event(
+                                metrics,
+                                audit_log_path.as_deref(),
+                                "retrieve",
+                                Some(&tenant_id),
+                                403,
+                                "denied",
+                                reason,
+                            );
+                            HttpResponse::forbidden(reason)
+                        }
+                        AuthDecision::Allowed => {
+                            observe_auth_success(metrics);
+                            let response = execute_retrieve_and_observe(store, req, metrics);
+                            emit_audit_event(
+                                metrics,
+                                audit_log_path.as_deref(),
+                                "retrieve",
+                                Some(&tenant_id),
+                                200,
+                                "success",
+                                "retrieve accepted",
+                            );
+                            response
+                        }
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.observe_retrieve(400, 0.0, 0, None);
+                    }
+                    HttpResponse::bad_request(&err)
+                }
+            }
+        }
+        (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
+        (_, "/health") | (_, "/metrics") => {
+            HttpResponse::method_not_allowed("only GET is supported")
+        }
+        _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthDecision {
+    Allowed,
+    Unauthorized(&'static str),
+    Forbidden(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthPolicy {
+    required_api_key: Option<String>,
+    allowed_tenants: TenantScope,
+    scoped_api_keys: HashMap<String, TenantScope>,
+}
+
+impl AuthPolicy {
+    fn from_env(
+        required_api_key: Option<String>,
+        allowed_tenants_raw: Option<String>,
+        scoped_api_keys_raw: Option<String>,
+    ) -> Self {
+        Self {
+            required_api_key,
+            allowed_tenants: parse_tenant_scope(allowed_tenants_raw.as_deref(), true),
+            scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TenantScope {
+    Any,
+    Set(HashSet<String>),
+}
+
+impl TenantScope {
+    fn allows(&self, tenant_id: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Set(tenants) => tenants.contains(tenant_id),
+        }
+    }
+}
+
+fn authorize_request_for_tenant(
+    request: &HttpRequest,
+    tenant_id: &str,
+    policy: &AuthPolicy,
+) -> AuthDecision {
+    let presented_api_key = presented_api_key(request);
+    if !policy.scoped_api_keys.is_empty() {
+        let Some(api_key) = presented_api_key else {
+            return AuthDecision::Unauthorized("missing or invalid API key");
+        };
+        let Some(scope) = policy.scoped_api_keys.get(api_key) else {
+            return AuthDecision::Unauthorized("missing or invalid API key");
+        };
+        if !scope.allows(tenant_id) {
+            return AuthDecision::Forbidden("tenant is not allowed for this API key");
+        }
+    } else if let Some(required_api_key) = policy.required_api_key.as_deref()
+        && !required_api_key.trim().is_empty()
+        && presented_api_key != Some(required_api_key)
+    {
+        return AuthDecision::Unauthorized("missing or invalid API key");
+    }
+
+    if !policy.allowed_tenants.allows(tenant_id) {
+        return AuthDecision::Forbidden("tenant is not allowed by service policy");
+    }
+    AuthDecision::Allowed
+}
+
+fn presented_api_key(request: &HttpRequest) -> Option<&str> {
+    if let Some(value) = request.headers.get("x-api-key") {
+        return Some(value.as_str());
+    }
+    let value = request.headers.get("authorization")?;
+    value.strip_prefix("Bearer ").map(str::trim)
+}
+
+fn parse_tenant_scope(raw: Option<&str>, empty_means_any: bool) -> TenantScope {
+    let Some(raw) = raw else {
+        return TenantScope::Any;
+    };
+    let mut tenants = HashSet::new();
+    for value in raw.split(',') {
+        let tenant = value.trim();
+        if tenant.is_empty() {
+            continue;
+        }
+        if tenant == "*" {
+            return TenantScope::Any;
+        }
+        tenants.insert(tenant.to_string());
+    }
+    if tenants.is_empty() && empty_means_any {
+        TenantScope::Any
+    } else {
+        TenantScope::Set(tenants)
+    }
+}
+
+fn parse_scoped_api_keys(raw: Option<&str>) -> HashMap<String, TenantScope> {
+    let mut scoped = HashMap::new();
+    let Some(raw) = raw else {
+        return scoped;
+    };
+
+    for entry in raw.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_scope)) = entry.split_once(':') else {
+            continue;
+        };
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        scoped.insert(
+            key.to_string(),
+            parse_tenant_scope(Some(raw_scope.trim()), false),
+        );
+    }
+    scoped
+}
+
+fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_auth_success();
+    }
+}
+
+fn observe_auth_failure(metrics: &Arc<Mutex<TransportMetrics>>) {
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_auth_failure();
+    }
+}
+
+fn observe_authz_denied(metrics: &Arc<Mutex<TransportMetrics>>) {
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_authz_denied();
+    }
+}
+
+fn emit_audit_event(
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    audit_log_path: Option<&str>,
+    action: &str,
+    tenant_id: Option<&str>,
+    status: u16,
+    outcome: &str,
+    reason: &str,
+) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let payload = format!(
+        "{{\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\"}}",
+        json_escape(action),
+        tenant_id
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
+        status,
+        json_escape(outcome),
+        json_escape(reason),
+    );
+
+    let mut write_error = false;
+    if let Some(path) = audit_log_path
+        && let Err(err) = append_audit_record(path, &payload)
+    {
+        write_error = true;
+        eprintln!("retrieval audit write failed: {err}");
+    }
+
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_audit_event(write_error);
+    }
+}
+
+fn append_audit_record(path: &str, payload: &str) -> Result<(), String> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent).map_err(|e| format!("creating audit directory failed: {e}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("opening audit file failed: {e}"))?;
+    writeln!(file, "{payload}").map_err(|e| format!("appending audit file failed: {e}"))
+}
+
+fn execute_retrieve_and_observe(
+    store: &InMemoryStore,
+    req: RetrieveApiRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+) -> HttpResponse {
+    let started_at = Instant::now();
+    let tenant_id = req.tenant_id.clone();
+    let response = execute_api_query(store, req);
+    let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let result_count = response.results.len();
+    let ingest_to_visible_lag_ms =
+        estimate_ingest_to_visible_lag_ms(store, &tenant_id, &response.results);
+
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_retrieve(200, latency_ms, result_count, ingest_to_visible_lag_ms);
+    }
+
+    HttpResponse::ok_json(render_retrieve_response_json(&response))
+}
+
+fn estimate_ingest_to_visible_lag_ms(
+    store: &InMemoryStore,
+    tenant_id: &str,
+    results: &[EvidenceNode],
+) -> Option<f64> {
+    if results.is_empty() {
+        return None;
+    }
+    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    let claims = store.claims_for_tenant(tenant_id);
+    let event_time_by_claim_id: HashMap<String, i64> = claims
+        .into_iter()
+        .filter_map(|claim| claim.event_time_unix.map(|ts| (claim.claim_id, ts)))
+        .collect();
+
+    let mut lag_values: Vec<f64> = Vec::new();
+    for node in results {
+        if let Some(event_unix) = event_time_by_claim_id.get(&node.claim_id)
+            && now_unix >= *event_unix
+        {
+            lag_values.push((now_unix - *event_unix) as f64 * 1000.0);
+        }
+    }
+    if lag_values.is_empty() {
+        return None;
+    }
+    Some(lag_values.iter().sum::<f64>() / lag_values.len() as f64)
+}
+
+fn split_target(target: &str) -> (String, HashMap<String, String>) {
+    let (path, query_str) = target
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((target, None));
+
+    let mut query = HashMap::new();
+    if let Some(query_str) = query_str {
+        for pair in query_str.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = match url_decode(raw_key) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let value = match url_decode(raw_value) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            query.insert(key, value);
+        }
+    }
+    (path.to_string(), query)
+}
+
+fn url_decode(raw: &str) -> Result<String, String> {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return Err("incomplete percent escape".to_string());
+                }
+                let hi = decode_hex(bytes[i + 1])?;
+                let lo = decode_hex(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).map_err(|_| "invalid UTF-8 in URL field".to_string())
+}
+
+fn decode_hex(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("invalid hex digit".to_string()),
+    }
+}
+
+fn build_retrieve_request_from_query(
+    query: &HashMap<String, String>,
+) -> Result<RetrieveApiRequest, String> {
+    let tenant_id = query
+        .get("tenant_id")
+        .ok_or_else(|| "tenant_id is required".to_string())?
+        .trim()
+        .to_string();
+    if tenant_id.is_empty() {
+        return Err("tenant_id cannot be empty".to_string());
+    }
+
+    let request_query = query
+        .get("query")
+        .ok_or_else(|| "query is required".to_string())?
+        .trim()
+        .to_string();
+    if request_query.is_empty() {
+        return Err("query cannot be empty".to_string());
+    }
+
+    let query_embedding = query
+        .get("query_embedding")
+        .map(|value| parse_query_embedding_csv(value, "query_embedding"))
+        .transpose()?;
+    let entity_filters = query
+        .get("entity_filters")
+        .map(|value| parse_csv_string_list(value, "entity_filters"))
+        .transpose()?
+        .unwrap_or_default();
+    let embedding_id_filters = query
+        .get("embedding_id_filters")
+        .map(|value| parse_csv_string_list(value, "embedding_id_filters"))
+        .transpose()?
+        .unwrap_or_default();
+
+    let top_k = match query.get("top_k") {
+        Some(value) => parse_positive_usize(value, "top_k")?,
+        None => 5,
+    };
+
+    let stance_mode = match query.get("stance_mode").map(|s| s.as_str()) {
+        Some("balanced") | None => StanceMode::Balanced,
+        Some("support_only") => StanceMode::SupportOnly,
+        Some(_) => return Err("stance_mode must be balanced or support_only".to_string()),
+    };
+
+    let return_graph = match query.get("return_graph").map(|s| s.as_str()) {
+        Some("true") => true,
+        Some("false") | None => false,
+        Some(_) => return Err("return_graph must be true or false".to_string()),
+    };
+
+    let from_unix = query
+        .get("from_unix")
+        .map(|value| parse_i64(value, "from_unix"))
+        .transpose()?;
+    let to_unix = query
+        .get("to_unix")
+        .map(|value| parse_i64(value, "to_unix"))
+        .transpose()?;
+    let time_range = if from_unix.is_some() || to_unix.is_some() {
+        Some(TimeRange { from_unix, to_unix })
+    } else {
+        None
+    };
+    if let Some(TimeRange {
+        from_unix: Some(from),
+        to_unix: Some(to),
+    }) = &time_range
+        && from > to
+    {
+        return Err("time range is invalid: from_unix must be <= to_unix".to_string());
+    }
+
+    Ok(RetrieveApiRequest {
+        tenant_id,
+        query: request_query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    })
+}
+
+fn build_retrieve_request_from_json(body: &str) -> Result<RetrieveApiRequest, String> {
+    let value = parse_json(body)?;
+    let object = match value {
+        JsonValue::Object(map) => map,
+        _ => return Err("request body must be a JSON object".to_string()),
+    };
+
+    let tenant_id = require_string(&object, "tenant_id")?;
+    if tenant_id.trim().is_empty() {
+        return Err("tenant_id cannot be empty".to_string());
+    }
+
+    let query = require_string(&object, "query")?;
+    if query.trim().is_empty() {
+        return Err("query cannot be empty".to_string());
+    }
+
+    let query_embedding =
+        parse_optional_f32_array(object.get("query_embedding"), "query_embedding")?;
+    let entity_filters =
+        parse_optional_string_array(object.get("entity_filters"), "entity_filters")?
+            .unwrap_or_default();
+    let embedding_id_filters =
+        parse_optional_string_array(object.get("embedding_id_filters"), "embedding_id_filters")?
+            .unwrap_or_default();
+
+    let top_k = match object.get("top_k") {
+        Some(JsonValue::Number(raw)) => parse_positive_usize(raw, "top_k")?,
+        Some(_) => return Err("top_k must be a positive integer".to_string()),
+        None => 5,
+    };
+
+    let stance_mode = match object.get("stance_mode") {
+        Some(JsonValue::String(mode)) => parse_stance_mode(mode)?,
+        Some(_) => return Err("stance_mode must be a string".to_string()),
+        None => StanceMode::Balanced,
+    };
+
+    let return_graph = match object.get("return_graph") {
+        Some(JsonValue::Bool(flag)) => *flag,
+        Some(_) => return Err("return_graph must be a boolean".to_string()),
+        None => false,
+    };
+
+    let time_range = match object.get("time_range") {
+        Some(JsonValue::Object(range_obj)) => {
+            let from_unix = match range_obj.get("from_unix") {
+                Some(JsonValue::Number(raw)) => Some(parse_i64(raw, "time_range.from_unix")?),
+                Some(JsonValue::Null) | None => None,
+                Some(_) => {
+                    return Err("time_range.from_unix must be an i64 timestamp".to_string());
+                }
+            };
+            let to_unix = match range_obj.get("to_unix") {
+                Some(JsonValue::Number(raw)) => Some(parse_i64(raw, "time_range.to_unix")?),
+                Some(JsonValue::Null) | None => None,
+                Some(_) => {
+                    return Err("time_range.to_unix must be an i64 timestamp".to_string());
+                }
+            };
+
+            if from_unix.is_some() || to_unix.is_some() {
+                Some(TimeRange { from_unix, to_unix })
+            } else {
+                None
+            }
+        }
+        Some(JsonValue::Null) | None => None,
+        Some(_) => return Err("time_range must be an object or null".to_string()),
+    };
+    if let Some(TimeRange {
+        from_unix: Some(from),
+        to_unix: Some(to),
+    }) = &time_range
+        && from > to
+    {
+        return Err("time range is invalid: from_unix must be <= to_unix".to_string());
+    }
+
+    Ok(RetrieveApiRequest {
+        tenant_id,
+        query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    })
+}
+
+fn parse_stance_mode(raw: &str) -> Result<StanceMode, String> {
+    match raw {
+        "balanced" => Ok(StanceMode::Balanced),
+        "support_only" => Ok(StanceMode::SupportOnly),
+        _ => Err("stance_mode must be balanced or support_only".to_string()),
+    }
+}
+
+fn require_string(map: &HashMap<String, JsonValue>, key: &str) -> Result<String, String> {
+    match map.get(key) {
+        Some(JsonValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("{key} is required")),
+    }
+}
+
+fn parse_positive_usize(raw: &str, field_name: &str) -> Result<usize, String> {
+    if raw.contains('.') || raw.contains('e') || raw.contains('E') || raw.starts_with('-') {
+        return Err(format!("{field_name} must be a positive integer"));
+    }
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| format!("{field_name} must be a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{field_name} must be > 0"));
+    }
+    Ok(parsed)
+}
+
+fn parse_i64(raw: &str, field_name: &str) -> Result<i64, String> {
+    if raw.contains('.') || raw.contains('e') || raw.contains('E') {
+        return Err(format!("{field_name} must be an i64 timestamp"));
+    }
+    raw.parse::<i64>()
+        .map_err(|_| format!("{field_name} must be an i64 timestamp"))
+}
+
+fn parse_query_embedding_csv(raw: &str, field_name: &str) -> Result<Vec<f32>, String> {
+    let values: Vec<&str> = raw
+        .split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if values.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for part in values {
+        let parsed = part
+            .parse::<f32>()
+            .map_err(|_| format!("{field_name} must contain only numbers"))?;
+        if !parsed.is_finite() {
+            return Err(format!("{field_name} values must be finite"));
+        }
+        out.push(parsed);
+    }
+    Ok(out)
+}
+
+fn parse_csv_string_list(raw: &str, field_name: &str) -> Result<Vec<String>, String> {
+    let out: Vec<String> = raw
+        .split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if out.is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    Ok(out)
+}
+
+fn parse_optional_f32_array(
+    value: Option<&JsonValue>,
+    field_name: &str,
+) -> Result<Option<Vec<f32>>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let raw = match item {
+                    JsonValue::Number(raw) => raw,
+                    _ => return Err(format!("{field_name} must be an array of numbers")),
+                };
+                let parsed = raw
+                    .parse::<f32>()
+                    .map_err(|_| format!("{field_name} must be an array of numbers"))?;
+                if !parsed.is_finite() {
+                    return Err(format!("{field_name} values must be finite"));
+                }
+                out.push(parsed);
+            }
+            if out.is_empty() {
+                return Err(format!("{field_name} must not be empty when provided"));
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(format!("{field_name} must be an array or null")),
+    }
+}
+
+fn parse_optional_string_array(
+    value: Option<&JsonValue>,
+    field_name: &str,
+) -> Result<Option<Vec<String>>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let value = match item {
+                    JsonValue::String(value) => value,
+                    _ => return Err(format!("{field_name} must be an array of strings")),
+                };
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(format!("{field_name} must not contain empty strings"));
+                }
+                out.push(trimmed.to_string());
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(format!("{field_name} must be an array or null")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum JsonValue {
+    Object(HashMap<String, JsonValue>),
+    Array(Vec<JsonValue>),
+    String(String),
+    Number(String),
+    Bool(bool),
+    Null,
+}
+
+fn parse_json(input: &str) -> Result<JsonValue, String> {
+    let mut parser = JsonParser::new(input);
+    let value = parser.parse_value()?;
+    parser.skip_whitespace();
+    if !parser.is_eof() {
+        return Err("unexpected trailing JSON content".to_string());
+    }
+    Ok(value)
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, String> {
+        self.skip_whitespace();
+        match self.peek_byte() {
+            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_array(),
+            Some(b'"') => self.parse_string().map(JsonValue::String),
+            Some(b't') => {
+                self.expect_literal("true")?;
+                Ok(JsonValue::Bool(true))
+            }
+            Some(b'f') => {
+                self.expect_literal("false")?;
+                Ok(JsonValue::Bool(false))
+            }
+            Some(b'n') => {
+                self.expect_literal("null")?;
+                Ok(JsonValue::Null)
+            }
+            Some(b'-' | b'0'..=b'9') => self.parse_number().map(JsonValue::Number),
+            Some(_) => Err("unsupported JSON token".to_string()),
+            None => Err("empty JSON payload".to_string()),
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<JsonValue, String> {
+        self.expect_byte(b'{')?;
+        self.skip_whitespace();
+
+        let mut map = HashMap::new();
+        if self.peek_byte() == Some(b'}') {
+            self.pos += 1;
+            return Ok(JsonValue::Object(map));
+        }
+
+        loop {
+            self.skip_whitespace();
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            let value = self.parse_value()?;
+            map.insert(key, value);
+            self.skip_whitespace();
+
+            match self.peek_byte() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return Err("invalid JSON object".to_string()),
+            }
+        }
+
+        Ok(JsonValue::Object(map))
+    }
+
+    fn parse_array(&mut self) -> Result<JsonValue, String> {
+        self.expect_byte(b'[')?;
+        self.skip_whitespace();
+
+        let mut items = Vec::new();
+        if self.peek_byte() == Some(b']') {
+            self.pos += 1;
+            return Ok(JsonValue::Array(items));
+        }
+
+        loop {
+            let value = self.parse_value()?;
+            items.push(value);
+            self.skip_whitespace();
+            match self.peek_byte() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return Err("invalid JSON array".to_string()),
+            }
+        }
+
+        Ok(JsonValue::Array(items))
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.expect_byte(b'"')?;
+        let mut out = String::new();
+
+        while let Some(byte) = self.next_byte() {
+            match byte {
+                b'"' => return Ok(out),
+                b'\\' => {
+                    let escaped = self
+                        .next_byte()
+                        .ok_or_else(|| "unterminated JSON escape".to_string())?;
+                    match escaped {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000C}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let code = self.parse_hex4()?;
+                            let ch = char::from_u32(code)
+                                .ok_or_else(|| "invalid unicode escape".to_string())?;
+                            out.push(ch);
+                        }
+                        _ => return Err("invalid JSON escape sequence".to_string()),
+                    }
+                }
+                b if b.is_ascii_control() => {
+                    return Err("unescaped control character in JSON string".to_string());
+                }
+                b => out.push(b as char),
+            }
+        }
+
+        Err("unterminated JSON string".to_string())
+    }
+
+    fn parse_number(&mut self) -> Result<String, String> {
+        let start = self.pos;
+
+        if self.peek_byte() == Some(b'-') {
+            self.pos += 1;
+        }
+
+        match self.peek_byte() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err("invalid JSON number".to_string()),
+        }
+
+        if self.peek_byte() == Some(b'.') {
+            self.pos += 1;
+            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                return Err("invalid JSON number".to_string());
+            }
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+
+        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                return Err("invalid JSON number".to_string());
+            }
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+        }
+
+        let raw = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| "invalid JSON number".to_string())?;
+        Ok(raw.to_string())
+    }
+
+    fn parse_hex4(&mut self) -> Result<u32, String> {
+        let mut value: u32 = 0;
+        for _ in 0..4 {
+            let byte = self
+                .next_byte()
+                .ok_or_else(|| "incomplete unicode escape".to_string())?;
+            value = (value << 4)
+                + match byte {
+                    b'0'..=b'9' => (byte - b'0') as u32,
+                    b'a'..=b'f' => (byte - b'a' + 10) as u32,
+                    b'A'..=b'F' => (byte - b'A' + 10) as u32,
+                    _ => return Err("invalid unicode escape".to_string()),
+                };
+        }
+        Ok(value)
+    }
+
+    fn expect_literal(&mut self, literal: &str) -> Result<(), String> {
+        let bytes = literal.as_bytes();
+        if self.bytes.get(self.pos..self.pos + bytes.len()) == Some(bytes) {
+            self.pos += bytes.len();
+            Ok(())
+        } else {
+            Err("invalid JSON literal".to_string())
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), String> {
+        match self.next_byte() {
+            Some(byte) if byte == expected => Ok(()),
+            _ => Err("invalid JSON syntax".to_string()),
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek_byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.pos += 1;
+        }
+    }
+
+    fn is_eof(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        let out = self.peek_byte()?;
+        self.pos += 1;
+        Some(out)
+    }
+}
+
+fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> String {
+    let mut out = String::new();
+    out.push_str("{\"results\":[");
+    for (idx, node) in resp.results.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        out.push_str("\"claim_id\":\"");
+        out.push_str(&json_escape(&node.claim_id));
+        out.push_str("\",\"canonical_text\":\"");
+        out.push_str(&json_escape(&node.canonical_text));
+        out.push_str("\",\"score\":");
+        out.push_str(&format!("{:.6}", node.score));
+        out.push_str(",\"supports\":");
+        out.push_str(&node.supports.to_string());
+        out.push_str(",\"contradicts\":");
+        out.push_str(&node.contradicts.to_string());
+        out.push_str(",\"citations\":");
+        out.push_str(&render_citations_json(&node.citations));
+        out.push('}');
+    }
+    out.push_str("],\"graph\":");
+
+    if let Some(graph) = &resp.graph {
+        out.push_str("{\"nodes\":[");
+        for (idx, node) in graph.nodes.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push('{');
+            out.push_str("\"claim_id\":\"");
+            out.push_str(&json_escape(&node.claim_id));
+            out.push_str("\",\"canonical_text\":\"");
+            out.push_str(&json_escape(&node.canonical_text));
+            out.push_str("\",\"score\":");
+            out.push_str(&format!("{:.6}", node.score));
+            out.push_str(",\"supports\":");
+            out.push_str(&node.supports.to_string());
+            out.push_str(",\"contradicts\":");
+            out.push_str(&node.contradicts.to_string());
+            out.push_str(",\"citations\":");
+            out.push_str(&render_citations_json(&node.citations));
+            out.push('}');
+        }
+        out.push_str("],\"edges\":[");
+        for (idx, edge) in graph.edges.iter().enumerate() {
+            if idx > 0 {
+                out.push(',');
+            }
+            out.push('{');
+            out.push_str("\"from_claim_id\":\"");
+            out.push_str(&json_escape(&edge.from_claim_id));
+            out.push_str("\",\"to_claim_id\":\"");
+            out.push_str(&json_escape(&edge.to_claim_id));
+            out.push_str("\",\"relation\":\"");
+            out.push_str(&json_escape(&edge.relation));
+            out.push_str("\",\"strength\":");
+            out.push_str(&format!("{:.6}", edge.strength));
+            out.push('}');
+        }
+        out.push_str("]}");
+    } else {
+        out.push_str("null");
+    }
+
+    out.push('}');
+    out
+}
+
+fn render_citations_json(citations: &[CitationNode]) -> String {
+    let mut out = String::new();
+    out.push('[');
+    for (idx, citation) in citations.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        out.push_str("\"evidence_id\":\"");
+        out.push_str(&json_escape(&citation.evidence_id));
+        out.push_str("\",\"source_id\":\"");
+        out.push_str(&json_escape(&citation.source_id));
+        out.push_str("\",\"stance\":\"");
+        out.push_str(&json_escape(&citation.stance));
+        out.push_str("\",\"source_quality\":");
+        out.push_str(&format!("{:.6}", citation.source_quality));
+        out.push_str(",\"chunk_id\":");
+        if let Some(chunk_id) = &citation.chunk_id {
+            out.push('"');
+            out.push_str(&json_escape(chunk_id));
+            out.push('"');
+        } else {
+            out.push_str("null");
+        }
+        out.push_str(",\"span_start\":");
+        if let Some(span_start) = citation.span_start {
+            out.push_str(&span_start.to_string());
+        } else {
+            out.push_str("null");
+        }
+        out.push_str(",\"span_end\":");
+        if let Some(span_end) = citation.span_end {
+            out.push_str(&span_end.to_string());
+        } else {
+            out.push_str("null");
+        }
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+fn json_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn write_response(stream: &mut TcpStream, response: HttpResponse) -> std::io::Result<()> {
+    stream.write_all(render_response_text(&response).as_bytes())?;
+    stream.flush()
+}
+
+fn render_response_text(response: &HttpResponse) -> String {
+    let status_text = match response.status {
+        200 => "200 OK",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        _ => "500 Internal Server Error",
+    };
+    let body_len = response.body.len();
+    format!(
+        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
+        response.content_type, response.body
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpRequest {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: String,
+}
+
+impl HttpResponse {
+    fn ok_json(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json",
+            body,
+        }
+    }
+
+    fn ok_text(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body,
+        }
+    }
+
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: 400,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn unauthorized(message: &str) -> Self {
+        Self {
+            status: 401,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn forbidden(message: &str) -> Self {
+        Self {
+            status: 403,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn method_not_allowed(message: &str) -> Self {
+        Self {
+            status: 405,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn not_found(message: &str) -> Self {
+        Self {
+            status: 404,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schema::{Claim, Evidence, Stance};
+
+    fn sample_store() -> InMemoryStore {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c1".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company X acquired Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: "e1".into(),
+                    claim_id: "c1".into(),
+                    source_id: "source://doc-1".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn build_retrieve_request_from_query_accepts_balanced_defaults() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".into(), "tenant-a".into());
+        params.insert("query".into(), "company x".into());
+
+        let req = build_retrieve_request_from_query(&params).unwrap();
+        assert_eq!(req.top_k, 5);
+        assert_eq!(req.stance_mode, StanceMode::Balanced);
+        assert!(!req.return_graph);
+        assert!(req.query_embedding.is_none());
+        assert!(req.entity_filters.is_empty());
+        assert!(req.embedding_id_filters.is_empty());
+    }
+
+    #[test]
+    fn build_retrieve_request_from_json_accepts_contract_payload() {
+        let body = r#"{
+            "tenant_id": "tenant-a",
+            "query": "company x",
+            "query_embedding": [0.1, 0.2, 0.3],
+            "entity_filters": ["company x"],
+            "embedding_id_filters": ["emb://1"],
+            "top_k": 3,
+            "stance_mode": "support_only",
+            "return_graph": true,
+            "time_range": {"from_unix": 10, "to_unix": 20}
+        }"#;
+
+        let req = build_retrieve_request_from_json(body).unwrap();
+        assert_eq!(req.top_k, 3);
+        assert_eq!(req.stance_mode, StanceMode::SupportOnly);
+        assert!(req.return_graph);
+        assert_eq!(req.time_range.unwrap().from_unix, Some(10));
+        assert_eq!(req.query_embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(req.entity_filters, vec!["company x"]);
+        assert_eq!(req.embedding_id_filters, vec!["emb://1"]);
+    }
+
+    #[test]
+    fn build_retrieve_request_from_query_accepts_embedding_and_filters() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".into(), "tenant-a".into());
+        params.insert("query".into(), "company x".into());
+        params.insert("query_embedding".into(), "0.1,0.2,0.3".into());
+        params.insert("entity_filters".into(), "company x,company y".into());
+        params.insert("embedding_id_filters".into(), "emb://1,emb://2".into());
+
+        let req = build_retrieve_request_from_query(&params).unwrap();
+        assert_eq!(req.query_embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(req.entity_filters, vec!["company x", "company y"]);
+        assert_eq!(req.embedding_id_filters, vec!["emb://1", "emb://2"]);
+    }
+
+    #[test]
+    fn build_retrieve_request_from_query_rejects_invalid_time_range() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".into(), "tenant-a".into());
+        params.insert("query".into(), "company x".into());
+        params.insert("from_unix".into(), "20".into());
+        params.insert("to_unix".into(), "10".into());
+
+        let err = build_retrieve_request_from_query(&params).unwrap_err();
+        assert!(err.contains("from_unix must be <= to_unix"));
+    }
+
+    #[test]
+    fn split_target_decodes_query_parameters() {
+        let (path, query) =
+            split_target("/v1/retrieve?tenant_id=tenant-a&query=company+x&return_graph=true");
+        assert_eq!(path, "/v1/retrieve");
+        assert_eq!(query.get("query").map(String::as_str), Some("company x"));
+        assert_eq!(query.get("return_graph").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn handle_request_get_returns_json_payload() {
+        let store = sample_store();
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(&store, &request);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"results\""));
+        assert!(response.body.contains("\"claim_id\":\"c1\""));
+        assert!(response.body.contains("\"evidence_id\":\"e1\""));
+        assert!(response.body.contains("\"stance\":\"supports\""));
+    }
+
+    #[test]
+    fn handle_request_post_returns_json_payload() {
+        let store = sample_store();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/retrieve".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#.to_vec(),
+        };
+
+        let response = handle_request(&store, &request);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"results\""));
+        assert!(response.body.contains("\"claim_id\":\"c1\""));
+        assert!(response.body.contains("\"evidence_id\":\"e1\""));
+    }
+
+    #[test]
+    fn metrics_endpoint_reports_retrieve_counters() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+
+        let retrieve_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let retrieve_response = handle_request_with_metrics(&store, &retrieve_request, &metrics);
+        assert_eq!(retrieve_response.status, 200);
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics(&store, &metrics_request, &metrics);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .content_type
+                .starts_with("text/plain; version=0.0.4")
+        );
+        assert!(metrics_response.body.contains("dash_http_requests_total"));
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_requests_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_transport_auth_success_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_latency_ms_p95")
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_tracks_retrieve_client_errors() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+
+        let bad_retrieve_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let bad_response = handle_request_with_metrics(&store, &bad_retrieve_request, &metrics);
+        assert_eq!(bad_response.status, 400);
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics(&store, &metrics_request, &metrics);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_client_error_total 1")
+        );
+    }
+
+    #[test]
+    fn auth_policy_scoped_key_allows_configured_tenant() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
+            body: Vec::new(),
+        };
+        let policy =
+            AuthPolicy::from_env(None, None, Some("scope-a:tenant-a,tenant-b".to_string()));
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-b", &policy),
+            AuthDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn auth_policy_scoped_key_rejects_other_tenants() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
+            body: Vec::new(),
+        };
+        let policy = AuthPolicy::from_env(None, None, Some("scope-a:tenant-a".to_string()));
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-z", &policy),
+            AuthDecision::Forbidden("tenant is not allowed for this API key")
+        );
+    }
+
+    #[test]
+    fn auth_policy_required_key_rejects_missing_key() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None);
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            AuthDecision::Unauthorized("missing or invalid API key")
+        );
+    }
+}

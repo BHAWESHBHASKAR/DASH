@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  dash-ingestion:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    command: ["/opt/dash/bin/ingestion", "--serve"]
+    environment:
+      DASH_INGEST_WAL_PATH: /var/lib/dash/claims.wal
+      DASH_INGEST_HTTP_WORKERS: "8"
+      DASH_INGEST_TRANSPORT_RUNTIME: std
+      DASH_INGEST_API_KEY: change-me-ingest-key
+      DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
+      DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
+    volumes:
+      - dash_data:/var/lib/dash
+
+  dash-retrieval:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+    command: ["/opt/dash/bin/retrieval", "--serve"]
+    environment:
+      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/claims.wal
+      DASH_RETRIEVAL_BIND: 0.0.0.0:8080
+      DASH_RETRIEVAL_HTTP_WORKERS: "8"
+      DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
+      DASH_RETRIEVAL_API_KEY: change-me-retrieval-key
+    ports:
+      - "8080:8080"
+    volumes:
+      - dash_data:/var/lib/dash
+    depends_on:
+      - dash-ingestion
+
+volumes:
+  dash_data:

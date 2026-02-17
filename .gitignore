@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Local collaboration / planning artifacts (not part of product)
+/.buddy/
+buddy.md
+progress.md
+/skills/
+/.planning/
+
+# Local release/test artifacts
+/dist/
+/dist-hook-test/
+
+# Local helper scratch files
+fix_structs.py
+
+# Runtime local files
+*.wal
+*.wal.snapshot
+*.log
+
+# Env/editor/system
+.env
+.env.*
+.DS_Store
+.localized

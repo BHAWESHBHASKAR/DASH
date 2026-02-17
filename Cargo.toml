@@ -1,0 +1,14 @@
+[workspace]
+members = [
+  "pkg/schema",
+  "pkg/ranking",
+  "pkg/graph",
+  "pkg/store",
+  "tools/buddy-chat",
+  "services/ingestion",
+  "services/retrieval",
+  "services/indexer",
+  "services/metadata-router",
+  "tests/benchmarks",
+]
+resolver = "2"
