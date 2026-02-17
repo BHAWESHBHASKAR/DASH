@@ -8,3 +8,4 @@ ranking = { path = "../../pkg/ranking" }
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
 retrieval = { path = "../../services/retrieval" }
+indexer = { path = "../../services/indexer" }

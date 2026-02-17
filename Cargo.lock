@@ -78,6 +78,7 @@ dependencies = [
 name = "benchmark-smoke"
 version = "0.1.0"
 dependencies = [
+ "indexer",
  "ranking",
  "retrieval",
  "schema",

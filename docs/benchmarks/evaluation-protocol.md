@@ -170,7 +170,7 @@ Current benchmark binary (`tests/benchmarks/src/main.rs`) exposes:
 - `--profile smoke` -> 2,000 claims (CI smoke path)
 - `--profile standard` -> 10,000 claims (default local baseline)
 - `--profile large` -> 50,000 claims (scale sanity profile)
-- `--profile xlarge` -> 100,000 claims (high-scale stress profile)
+- `--profile xlarge` -> 100,000 claims (high-scale stress profile; benchmark fixture keeps full claim cardinality but samples non-target vector upserts to keep ANN build time bounded)
 - `--profile hybrid` -> 20,000 claims with metadata-rich fixture for end-to-end `query_embedding + entity_filters + embedding_id_filters`
 
 Optional overrides:
@@ -202,6 +202,7 @@ Optional overrides:
   - `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS`
   - `DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT`
   - `DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS`
+  - `DASH_BENCH_WAL_SCALE_CLAIMS` (override claim volume used by WAL checkpoint/replay scale slice)
 
 ## 13. Benchmark History Outputs
 
@@ -211,6 +212,20 @@ Optional overrides:
   - `metadata_prefilter_count`
   - `ann_candidate_count`
   - `final_scored_candidate_count`
+  - segment-cache probe metrics:
+    - `segment_cache_hits`
+    - `segment_refresh_attempts`
+    - `segment_refresh_successes`
+    - `segment_refresh_failures`
+    - `segment_refresh_avg_ms`
+  - WAL scale slice metrics:
+    - `wal_claims_seeded`
+    - `wal_checkpoint_ms`
+    - `wal_replay_ms`
+    - `wal_snapshot_records`
+    - `wal_truncated_wal_records`
+    - `wal_replay_snapshot_records`
+    - `wal_replay_wal_records`
 - Keep this artifact in version control so trend shifts are visible in review.
 
 ## 14. Trend Automation (Release Candidate)
@@ -236,6 +251,15 @@ Optional overrides:
     - ANN candidate count
     - final scored candidate count
   - ANN tuning parameters used in the run
+  - segment prefilter cache observability:
+    - refresh attempts/successes/failures
+    - cache hits
+    - refresh average load time
+  - WAL checkpoint/snapshot scale slice:
+    - profile-scoped claim volume used
+    - checkpoint runtime
+    - replay runtime
+    - snapshot/wal replay record counts
   - contradiction probe (`support_only`) pass/fail
   - temporal-window filtering probe pass/fail
   - exclusion of unknown event-time claims under temporal filters

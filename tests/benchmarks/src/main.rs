@@ -1,15 +1,20 @@
 use std::{
     collections::VecDeque,
+    ffi::{OsStr, OsString},
     fs::{OpenOptions, create_dir_all},
     io::{BufRead, BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use indexer::{Segment, Tier, persist_segments_atomic};
 use ranking::lexical_overlap_score;
-use retrieval::api::{RetrieveApiRequest, execute_api_query};
+use retrieval::api::{
+    RetrieveApiRequest, execute_api_query, reset_segment_prefilter_cache_metrics,
+    segment_prefilter_cache_metrics_snapshot,
+};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
-use store::{AnnTuningConfig, InMemoryStore, StoreIndexStats};
+use store::{AnnTuningConfig, FileWal, InMemoryStore, StoreIndexStats, WalCheckpointStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkProfile {
@@ -97,6 +102,8 @@ struct BenchmarkSummary {
     final_scored_candidate_count: usize,
     index_stats: StoreIndexStats,
     ann_tuning: AnnTuningConfig,
+    segment_cache_probe: SegmentCacheProbeSummary,
+    wal_scale: Option<WalScaleSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +118,25 @@ struct QualityProbeSummary {
     temporal_window_pass: bool,
     temporal_unknown_excluded_pass: bool,
     hybrid_filter_with_embedding_pass: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SegmentCacheProbeSummary {
+    cache_hits: u64,
+    refresh_attempts: u64,
+    refresh_successes: u64,
+    refresh_failures: u64,
+    refresh_load_micros: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WalScaleSummary {
+    claims_seeded: usize,
+    checkpoint_stats: WalCheckpointStats,
+    checkpoint_ms: f64,
+    replay_ms: f64,
+    replay_snapshot_records: usize,
+    replay_wal_records: usize,
 }
 
 impl QualityProbeSummary {
@@ -171,6 +197,34 @@ fn main() {
     } else {
         seed_fixture(&mut store, tenant, fixture_size);
     }
+    let empty_filters: Vec<String> = Vec::new();
+    let (probe_entity_filters, probe_embedding_filters) =
+        if config.profile == BenchmarkProfile::Hybrid {
+            (&hybrid_entity_filters, &hybrid_embedding_filters)
+        } else {
+            (&empty_filters, &empty_filters)
+        };
+    let segment_cache_probe = match run_segment_cache_probe(
+        &store,
+        tenant,
+        query,
+        &hybrid_query_embedding,
+        probe_entity_filters,
+        probe_embedding_filters,
+    ) {
+        Ok(summary) => summary,
+        Err(err) => {
+            eprintln!("Benchmark failed: unable to run segment cache probe ({err}).");
+            std::process::exit(1);
+        }
+    };
+    let wal_scale = match maybe_run_wal_scale_slice(config.profile, fixture_size) {
+        Ok(summary) => summary,
+        Err(err) => {
+            eprintln!("Benchmark failed: unable to run WAL scale slice ({err}).");
+            std::process::exit(1);
+        }
+    };
 
     let baseline_top = if config.profile == BenchmarkProfile::Hybrid {
         baseline_hybrid_retrieve_top1(
@@ -276,6 +330,8 @@ fn main() {
         final_scored_candidate_count,
         index_stats,
         ann_tuning: config.ann_tuning.clone(),
+        segment_cache_probe,
+        wal_scale,
     };
     let quality = run_quality_probes();
 
@@ -620,6 +676,204 @@ fn usage_text() -> &'static str {
     "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N]"
 }
 
+#[allow(unused_unsafe)]
+fn set_env_var(key: &str, value: &OsStr) {
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+#[allow(unused_unsafe)]
+fn restore_env_var(key: &str, value: Option<&OsStr>) {
+    match value {
+        Some(value) => unsafe {
+            std::env::set_var(key, value);
+        },
+        None => unsafe {
+            std::env::remove_var(key);
+        },
+    }
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &OsStr) -> Self {
+        let previous = std::env::var_os(key);
+        set_env_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        restore_env_var(self.key, self.previous.as_deref());
+    }
+}
+
+fn temp_dir_for(tag: &str) -> PathBuf {
+    let mut out = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_nanos();
+    out.push(format!(
+        "dash-bench-{}-{}-{}",
+        tag,
+        std::process::id(),
+        nanos
+    ));
+    out
+}
+
+fn run_segment_cache_probe(
+    store: &InMemoryStore,
+    tenant: &str,
+    query: &str,
+    query_embedding: &[f32],
+    entity_filters: &[String],
+    embedding_filters: &[String],
+) -> Result<SegmentCacheProbeSummary, String> {
+    let root = temp_dir_for("segment-cache");
+    let tenant_segment_root = root.join(tenant);
+    let claim_ids: Vec<String> = store
+        .claims_for_tenant(tenant)
+        .into_iter()
+        .map(|claim| claim.claim_id)
+        .collect();
+    persist_segments_atomic(
+        &tenant_segment_root,
+        &[Segment {
+            segment_id: "bench-segment-hot-0".to_string(),
+            tier: Tier::Hot,
+            claim_ids,
+        }],
+    )
+    .map_err(|err| format!("segment manifest persist failed: {err:?}"))?;
+
+    let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+    let _segment_refresh_env = EnvVarGuard::set(
+        "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+        OsStr::new("600000"),
+    );
+    reset_segment_prefilter_cache_metrics();
+
+    let request = RetrieveApiRequest {
+        tenant_id: tenant.to_string(),
+        query: query.to_string(),
+        query_embedding: Some(query_embedding.to_vec()),
+        entity_filters: entity_filters.to_vec(),
+        embedding_id_filters: embedding_filters.to_vec(),
+        top_k: 1,
+        stance_mode: StanceMode::Balanced,
+        return_graph: false,
+        time_range: None,
+    };
+    let _ = execute_api_query(store, request.clone());
+    let _ = execute_api_query(store, request);
+
+    let metrics = segment_prefilter_cache_metrics_snapshot();
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(SegmentCacheProbeSummary {
+        cache_hits: metrics.cache_hits,
+        refresh_attempts: metrics.refresh_attempts,
+        refresh_successes: metrics.refresh_successes,
+        refresh_failures: metrics.refresh_failures,
+        refresh_load_micros: metrics.refresh_load_micros,
+    })
+}
+
+fn maybe_run_wal_scale_slice(
+    profile: BenchmarkProfile,
+    fixture_size: usize,
+) -> Result<Option<WalScaleSummary>, String> {
+    if !matches!(profile, BenchmarkProfile::Large | BenchmarkProfile::XLarge) {
+        return Ok(None);
+    }
+
+    let root = temp_dir_for("wal-scale");
+    let wal_path = root.join("bench.wal");
+    let mut wal = FileWal::open(&wal_path).map_err(|err| format!("open WAL failed: {err:?}"))?;
+    let mut store = InMemoryStore::new();
+    let default_claims = match profile {
+        BenchmarkProfile::Large => 10_000,
+        BenchmarkProfile::XLarge => 20_000,
+        _ => 5_000,
+    };
+    let claims_seeded = env_or_default_usize("DASH_BENCH_WAL_SCALE_CLAIMS", default_claims)
+        .min(fixture_size)
+        .max(1);
+
+    seed_fixture_persistent(
+        &mut store,
+        &mut wal,
+        "tenant-benchmark-wal-scale",
+        claims_seeded,
+    )?;
+
+    let checkpoint_start = Instant::now();
+    let checkpoint_stats = store
+        .checkpoint_and_compact(&mut wal)
+        .map_err(|err| format!("checkpoint failed: {err:?}"))?;
+    let checkpoint_ms = checkpoint_start.elapsed().as_secs_f64() * 1000.0;
+
+    let delta_claim_id = "claim-wal-delta";
+    store
+        .ingest_bundle_persistent(
+            &mut wal,
+            Claim {
+                claim_id: delta_claim_id.to_string(),
+                tenant_id: "tenant-benchmark-wal-scale".to_string(),
+                canonical_text: "post checkpoint replay delta".to_string(),
+                confidence: 0.9,
+                event_time_unix: Some(1_775_000_000),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "evidence-wal-delta".to_string(),
+                claim_id: delta_claim_id.to_string(),
+                source_id: "source://wal/delta".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .map_err(|err| format!("checkpoint delta ingest failed: {err:?}"))?;
+    store
+        .upsert_claim_vector_persistent(&mut wal, delta_claim_id, benchmark_query_embedding())
+        .map_err(|err| format!("checkpoint delta vector upsert failed: {err:?}"))?;
+
+    let replay_start = Instant::now();
+    let (_, load_stats) = InMemoryStore::load_from_wal_with_stats(&wal)
+        .map_err(|err| format!("replay from WAL failed: {err:?}"))?;
+    let replay_ms = replay_start.elapsed().as_secs_f64() * 1000.0;
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(Some(WalScaleSummary {
+        claims_seeded,
+        checkpoint_stats,
+        checkpoint_ms,
+        replay_ms,
+        replay_snapshot_records: load_stats.replay.snapshot_records,
+        replay_wal_records: load_stats.replay.wal_records,
+    }))
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -670,6 +924,28 @@ fn print_summary(summary: &BenchmarkSummary) {
         summary.index_stats.temporal_buckets,
         summary.index_stats.ann_vector_buckets,
     );
+    println!(
+        "Segment cache probe: hits={}, refresh_attempts={}, refresh_successes={}, refresh_failures={}, refresh_load_micros={}",
+        summary.segment_cache_probe.cache_hits,
+        summary.segment_cache_probe.refresh_attempts,
+        summary.segment_cache_probe.refresh_successes,
+        summary.segment_cache_probe.refresh_failures,
+        summary.segment_cache_probe.refresh_load_micros
+    );
+    if let Some(wal_scale) = summary.wal_scale.as_ref() {
+        println!(
+            "WAL scale slice: claims_seeded={}, checkpoint_ms={:.4}, replay_ms={:.4}, snapshot_records={}, truncated_wal_records={}, replay_snapshot_records={}, replay_wal_records={}",
+            wal_scale.claims_seeded,
+            wal_scale.checkpoint_ms,
+            wal_scale.replay_ms,
+            wal_scale.checkpoint_stats.snapshot_records,
+            wal_scale.checkpoint_stats.truncated_wal_records,
+            wal_scale.replay_snapshot_records,
+            wal_scale.replay_wal_records
+        );
+    } else {
+        println!("WAL scale slice: skipped");
+    }
 }
 
 fn print_quality_summary(summary: &QualityProbeSummary) {
@@ -726,17 +1002,58 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         writeln!(file)?;
         writeln!(
             file,
-            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count |"
+            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records |"
         )?;
         writeln!(
             file,
-            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"
+            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
         )?;
     }
+    let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
+        0.0
+    } else {
+        (summary.segment_cache_probe.refresh_load_micros as f64 / 1000.0)
+            / summary.segment_cache_probe.refresh_attempts as f64
+    };
+    let wal_claims_seeded = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.claims_seeded.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_checkpoint_ms = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| format!("{:.4}", metrics.checkpoint_ms))
+        .unwrap_or_else(|| "n/a".to_string());
+    let wal_replay_ms = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| format!("{:.4}", metrics.replay_ms))
+        .unwrap_or_else(|| "n/a".to_string());
+    let wal_snapshot_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.checkpoint_stats.snapshot_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_truncated_wal_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.checkpoint_stats.truncated_wal_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_replay_snapshot_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_snapshot_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_replay_wal_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_wal_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
 
     writeln!(
         file,
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} |",
         summary.run_epoch_secs,
         summary.profile.as_str(),
         summary.fixture_size,
@@ -751,7 +1068,19 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         summary.dash_candidate_count,
         summary.metadata_prefilter_count,
         summary.ann_candidate_count,
-        summary.final_scored_candidate_count
+        summary.final_scored_candidate_count,
+        summary.segment_cache_probe.cache_hits,
+        summary.segment_cache_probe.refresh_attempts,
+        summary.segment_cache_probe.refresh_successes,
+        summary.segment_cache_probe.refresh_failures,
+        segment_refresh_avg_ms,
+        wal_claims_seeded,
+        wal_checkpoint_ms,
+        wal_replay_ms,
+        wal_snapshot_records,
+        wal_truncated_wal_records,
+        wal_replay_snapshot_records,
+        wal_replay_wal_records
     )?;
     Ok(())
 }
@@ -877,6 +1206,73 @@ fn write_scorecard(
         "- ann_search_expansion_max: {}",
         summary.ann_tuning.search_expansion_max
     )?;
+    let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
+        0.0
+    } else {
+        (summary.segment_cache_probe.refresh_load_micros as f64 / 1000.0)
+            / summary.segment_cache_probe.refresh_attempts as f64
+    };
+    writeln!(file)?;
+    writeln!(file, "## Segment Cache Probe")?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "- segment_cache_hits: {}",
+        summary.segment_cache_probe.cache_hits
+    )?;
+    writeln!(
+        file,
+        "- segment_refresh_attempts: {}",
+        summary.segment_cache_probe.refresh_attempts
+    )?;
+    writeln!(
+        file,
+        "- segment_refresh_successes: {}",
+        summary.segment_cache_probe.refresh_successes
+    )?;
+    writeln!(
+        file,
+        "- segment_refresh_failures: {}",
+        summary.segment_cache_probe.refresh_failures
+    )?;
+    writeln!(
+        file,
+        "- segment_refresh_avg_ms: {:.4}",
+        segment_refresh_avg_ms
+    )?;
+    if let Some(wal_scale) = summary.wal_scale.as_ref() {
+        writeln!(file)?;
+        writeln!(file, "## WAL Scale Slice")?;
+        writeln!(file)?;
+        writeln!(file, "- claims_seeded: {}", wal_scale.claims_seeded)?;
+        writeln!(file, "- checkpoint_ms: {:.4}", wal_scale.checkpoint_ms)?;
+        writeln!(file, "- replay_ms: {:.4}", wal_scale.replay_ms)?;
+        writeln!(
+            file,
+            "- checkpoint_snapshot_records: {}",
+            wal_scale.checkpoint_stats.snapshot_records
+        )?;
+        writeln!(
+            file,
+            "- checkpoint_truncated_wal_records: {}",
+            wal_scale.checkpoint_stats.truncated_wal_records
+        )?;
+        writeln!(
+            file,
+            "- replay_snapshot_records: {}",
+            wal_scale.replay_snapshot_records
+        )?;
+        writeln!(
+            file,
+            "- replay_wal_records: {}",
+            wal_scale.replay_wal_records
+        )?;
+    } else {
+        writeln!(file)?;
+        writeln!(file, "## WAL Scale Slice")?;
+        writeln!(file)?;
+        writeln!(file, "- skipped: true")?;
+    }
     writeln!(file)?;
     writeln!(file, "## Quality Probes")?;
     writeln!(file)?;
@@ -1347,6 +1743,7 @@ fn seed_quality_probe_fixture(store: &mut InMemoryStore, tenant: &str) {
 }
 
 fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
+    let vector_upsert_stride = vector_upsert_stride_for_count(count);
     for i in 0..count {
         let claim_id = if i == count / 3 {
             "claim-target".to_string()
@@ -1393,15 +1790,93 @@ fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
             )
             .expect("fixture ingest should succeed");
 
-        let vector = if i == count / 3 {
-            benchmark_query_embedding()
+        let should_upsert_vector = i == count / 3 || i % vector_upsert_stride == 0;
+        if should_upsert_vector {
+            let vector = if i == count / 3 {
+                benchmark_query_embedding()
+            } else {
+                fixture_vector_for_index(i)
+            };
+            store
+                .upsert_claim_vector(&claim_id, vector)
+                .expect("fixture vector upsert should succeed");
+        }
+    }
+}
+
+fn seed_fixture_persistent(
+    store: &mut InMemoryStore,
+    wal: &mut FileWal,
+    tenant: &str,
+    count: usize,
+) -> Result<(), String> {
+    let vector_upsert_stride = vector_upsert_stride_for_count(count);
+    for i in 0..count {
+        let claim_id = if i == count / 3 {
+            "claim-target".to_string()
         } else {
-            fixture_vector_for_index(i)
+            format!("claim-{i}")
+        };
+        let claim_text = if i == count / 3 {
+            "Company X acquired Company Y in 2025".to_string()
+        } else if i % 50 == 0 {
+            format!("Company X announced partnership program {i}")
+        } else {
+            format!("Unrelated operational update {i}")
         };
         store
-            .upsert_claim_vector(&claim_id, vector)
-            .expect("fixture vector upsert should succeed");
+            .ingest_bundle_persistent(
+                wal,
+                Claim {
+                    claim_id: claim_id.clone(),
+                    tenant_id: tenant.to_string(),
+                    canonical_text: claim_text,
+                    confidence: if i == count / 3 { 0.95 } else { 0.7 },
+                    event_time_unix: Some(1735689600 + i as i64),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: format!("evidence-{i}"),
+                    claim_id: claim_id.clone(),
+                    source_id: format!("source://doc-{i}"),
+                    stance: Stance::Supports,
+                    source_quality: if i == count / 3 { 0.95 } else { 0.75 },
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .map_err(|err| format!("persistent fixture ingest failed at index {i}: {err:?}"))?;
+
+        let should_upsert_vector = i == count / 3 || i % vector_upsert_stride == 0;
+        if should_upsert_vector {
+            let vector = if i == count / 3 {
+                benchmark_query_embedding()
+            } else {
+                fixture_vector_for_index(i)
+            };
+            store
+                .upsert_claim_vector_persistent(wal, &claim_id, vector)
+                .map_err(|err| {
+                    format!("persistent fixture vector upsert failed at index {i}: {err:?}")
+                })?;
+        }
     }
+    Ok(())
+}
+
+fn vector_upsert_stride_for_count(count: usize) -> usize {
+    if count >= 100_000 { 4 } else { 1 }
 }
 
 fn seed_hybrid_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
@@ -1726,6 +2201,8 @@ mod tests {
             final_scored_candidate_count: dash_candidates,
             index_stats: StoreIndexStats::default(),
             ann_tuning: AnnTuningConfig::default(),
+            segment_cache_probe: SegmentCacheProbeSummary::default(),
+            wal_scale: None,
         }
     }
 

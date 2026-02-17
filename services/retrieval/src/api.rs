@@ -4,7 +4,10 @@ use schema::{RetrievalRequest, Stance, StanceMode};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{OnceLock, RwLock},
+    sync::{
+        OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use store::InMemoryStore;
@@ -93,6 +96,26 @@ struct SegmentCacheEntry {
 static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
     OnceLock::new();
 static SEGMENT_PREFILTER_REFRESH_INTERVAL: OnceLock<Duration> = OnceLock::new();
+static SEGMENT_PREFILTER_CACHE_METRICS: OnceLock<SegmentPrefilterCacheMetricAtoms> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SegmentPrefilterCacheMetrics {
+    pub cache_hits: u64,
+    pub refresh_attempts: u64,
+    pub refresh_successes: u64,
+    pub refresh_failures: u64,
+    pub refresh_load_micros: u64,
+}
+
+#[derive(Debug, Default)]
+struct SegmentPrefilterCacheMetricAtoms {
+    cache_hits: AtomicU64,
+    refresh_attempts: AtomicU64,
+    refresh_successes: AtomicU64,
+    refresh_failures: AtomicU64,
+    refresh_load_micros: AtomicU64,
+}
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
     let tenant_id = req.tenant_id.clone();
@@ -324,10 +347,35 @@ fn build_segment_prefilter_claim_ids_from_root(
         && let Some(entry) = cache.get(&cache_key)
         && entry.next_refresh_instant > now
     {
+        segment_prefilter_cache_metric_atoms()
+            .cache_hits
+            .fetch_add(1, Ordering::Relaxed);
         return entry.claim_ids.clone();
     }
 
+    segment_prefilter_cache_metric_atoms()
+        .refresh_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    let refresh_start = std::time::Instant::now();
     let claim_ids = load_segment_prefilter_claim_ids(&segment_tenant_path);
+    let elapsed_micros = refresh_start.elapsed().as_micros();
+    let elapsed_micros_u64 = if elapsed_micros > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        elapsed_micros as u64
+    };
+    segment_prefilter_cache_metric_atoms()
+        .refresh_load_micros
+        .fetch_add(elapsed_micros_u64, Ordering::Relaxed);
+    if claim_ids.is_some() {
+        segment_prefilter_cache_metric_atoms()
+            .refresh_successes
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        segment_prefilter_cache_metric_atoms()
+            .refresh_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let next_refresh_instant = now + segment_prefilter_refresh_interval();
     if let Ok(mut cache) = segment_prefilter_cache().write() {
         cache.insert(
@@ -406,6 +454,30 @@ fn segment_prefilter_cache() -> &'static RwLock<HashMap<SegmentCacheKey, Segment
     SEGMENT_PREFILTER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn segment_prefilter_cache_metric_atoms() -> &'static SegmentPrefilterCacheMetricAtoms {
+    SEGMENT_PREFILTER_CACHE_METRICS.get_or_init(SegmentPrefilterCacheMetricAtoms::default)
+}
+
+pub fn segment_prefilter_cache_metrics_snapshot() -> SegmentPrefilterCacheMetrics {
+    let metrics = segment_prefilter_cache_metric_atoms();
+    SegmentPrefilterCacheMetrics {
+        cache_hits: metrics.cache_hits.load(Ordering::Relaxed),
+        refresh_attempts: metrics.refresh_attempts.load(Ordering::Relaxed),
+        refresh_successes: metrics.refresh_successes.load(Ordering::Relaxed),
+        refresh_failures: metrics.refresh_failures.load(Ordering::Relaxed),
+        refresh_load_micros: metrics.refresh_load_micros.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_segment_prefilter_cache_metrics() {
+    let metrics = segment_prefilter_cache_metric_atoms();
+    metrics.cache_hits.store(0, Ordering::Relaxed);
+    metrics.refresh_attempts.store(0, Ordering::Relaxed);
+    metrics.refresh_successes.store(0, Ordering::Relaxed);
+    metrics.refresh_failures.store(0, Ordering::Relaxed);
+    metrics.refresh_load_micros.store(0, Ordering::Relaxed);
+}
+
 fn stance_to_str(stance: &Stance) -> &'static str {
     match stance {
         Stance::Supports => "supports",
@@ -442,6 +514,7 @@ mod tests {
         {
             guard.clear();
         }
+        reset_segment_prefilter_cache_metrics();
     }
 
     #[test]
@@ -814,6 +887,39 @@ mod tests {
         assert!(!second.contains("claim-old"));
         assert!(second.contains("claim-new"));
         assert!(second.contains("claim-new-2"));
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn segment_prefilter_cache_metrics_track_refreshes_and_hits() {
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-metrics");
+        let tenant_root = root.join("tenant-a");
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-1".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let first = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
+            .expect("first load should work");
+        assert!(first.contains("claim-1"));
+        let second = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
+            .expect("second load should work");
+        assert!(second.contains("claim-1"));
+
+        let metrics = segment_prefilter_cache_metrics_snapshot();
+        assert!(metrics.refresh_attempts >= 1);
+        assert!(metrics.refresh_successes >= 1);
+        assert_eq!(metrics.refresh_failures, 0);
+        assert!(metrics.cache_hits >= 1);
+        assert!(metrics.refresh_load_micros > 0);
 
         let _ = std::fs::remove_dir_all(root);
         clear_segment_cache_for_tests();
