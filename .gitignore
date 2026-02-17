@@ -11,6 +11,9 @@ progress.md
 # Local release/test artifacts
 /dist/
 /dist-hook-test/
+/docs/benchmarks/history/runs/
+/docs/benchmarks/history/concurrency/
+/docs/benchmarks/scorecards/
 
 # Local helper scratch files
 fix_structs.py
@@ -25,3 +28,4 @@ fix_structs.py
 .env.*
 .DS_Store
 .localized
+.gitignore

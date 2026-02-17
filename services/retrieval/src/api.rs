@@ -1,7 +1,12 @@
 use graph::traverse_edges_multi_hop;
 use indexer::{load_manifest, load_segments_from_manifest};
 use schema::{RetrievalRequest, Stance, StanceMode};
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::UNIX_EPOCH,
+};
 use store::InMemoryStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +68,36 @@ pub struct RetrieveApiResponse {
     pub results: Vec<EvidenceNode>,
     pub graph: Option<EvidenceGraph>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SegmentCacheKey {
+    root_dir: String,
+    tenant_id: String,
+}
+
+impl SegmentCacheKey {
+    fn new(root_dir: &Path, tenant_id: &str) -> Self {
+        Self {
+            root_dir: root_dir.to_string_lossy().to_string(),
+            tenant_id: tenant_id.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManifestFingerprint {
+    modified_ns: u128,
+    len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentCacheEntry {
+    manifest_fingerprint: ManifestFingerprint,
+    claim_ids: HashSet<String>,
+}
+
+static SEGMENT_PREFILTER_CACHE: OnceLock<Mutex<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
+    OnceLock::new();
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
     let tenant_id = req.tenant_id.clone();
@@ -287,12 +322,50 @@ fn build_segment_prefilter_claim_ids_from_root(
     tenant_id: &str,
     segment_root: PathBuf,
 ) -> Option<HashSet<String>> {
+    let cache_key = SegmentCacheKey::new(&segment_root, tenant_id);
     let segment_tenant_path = segment_root.join(sanitize_path_component(tenant_id));
-    let manifest = load_manifest(&segment_tenant_path).ok().flatten()?;
-    let segments = load_segments_from_manifest(&segment_tenant_path, &manifest).ok()?;
+    let manifest_path = segment_tenant_path.join("segments.manifest");
+    let manifest_fingerprint = match manifest_fingerprint(&manifest_path) {
+        Some(value) => value,
+        None => {
+            clear_segment_cache_entry(&cache_key);
+            return None;
+        }
+    };
+
+    if let Ok(cache) = segment_prefilter_cache().lock()
+        && let Some(entry) = cache.get(&cache_key)
+        && entry.manifest_fingerprint == manifest_fingerprint
+    {
+        return Some(entry.claim_ids.clone());
+    }
+
+    let manifest = match load_manifest(&segment_tenant_path) {
+        Ok(Some(value)) => value,
+        _ => {
+            clear_segment_cache_entry(&cache_key);
+            return None;
+        }
+    };
+    let segments = match load_segments_from_manifest(&segment_tenant_path, &manifest) {
+        Ok(value) => value,
+        Err(_) => {
+            clear_segment_cache_entry(&cache_key);
+            return None;
+        }
+    };
     let mut ids = HashSet::new();
     for segment in segments {
         ids.extend(segment.claim_ids);
+    }
+    if let Ok(mut cache) = segment_prefilter_cache().lock() {
+        cache.insert(
+            cache_key,
+            SegmentCacheEntry {
+                manifest_fingerprint,
+                claim_ids: ids.clone(),
+            },
+        );
     }
     Some(ids)
 }
@@ -329,6 +402,26 @@ fn sanitize_path_component(raw: &str) -> String {
     out
 }
 
+fn segment_prefilter_cache() -> &'static Mutex<HashMap<SegmentCacheKey, SegmentCacheEntry>> {
+    SEGMENT_PREFILTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clear_segment_cache_entry(key: &SegmentCacheKey) {
+    if let Ok(mut cache) = segment_prefilter_cache().lock() {
+        cache.remove(key);
+    }
+}
+
+fn manifest_fingerprint(path: &Path) -> Option<ManifestFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let modified_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    Some(ManifestFingerprint {
+        modified_ns,
+        len: metadata.len(),
+    })
+}
+
 fn stance_to_str(stance: &Stance) -> &'static str {
     match stance {
         Stance::Supports => "supports",
@@ -357,6 +450,14 @@ mod tests {
             nanos
         ));
         out
+    }
+
+    fn clear_segment_cache_for_tests() {
+        if let Some(cache) = SEGMENT_PREFILTER_CACHE.get()
+            && let Ok(mut guard) = cache.lock()
+        {
+            guard.clear();
+        }
     }
 
     #[test]
@@ -670,6 +771,7 @@ mod tests {
 
     #[test]
     fn build_segment_prefilter_claim_ids_from_root_reads_persisted_segments() {
+        clear_segment_cache_for_tests();
         let root = temp_dir("prefilter");
         let tenant_root = root.join("tenant-a");
         persist_segments_atomic(
@@ -689,5 +791,46 @@ mod tests {
         assert!(ids.contains("claim-2"));
 
         let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn segment_prefilter_cache_refreshes_after_manifest_update() {
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-refresh");
+        let tenant_root = root.join("tenant-a");
+
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-old".into()],
+            }],
+        )
+        .expect("initial segment persist should succeed");
+
+        let first = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
+            .expect("first segment load should succeed");
+        assert!(first.contains("claim-old"));
+
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-new".into(), "claim-new-2".into()],
+            }],
+        )
+        .expect("updated segment persist should succeed");
+
+        let second = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
+            .expect("second segment load should succeed");
+        assert!(!second.contains("claim-old"));
+        assert!(second.contains("claim-new"));
+        assert!(second.contains("claim-new-2"));
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
     }
 }
