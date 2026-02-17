@@ -4,8 +4,8 @@ use schema::{RetrievalRequest, Stance, StanceMode};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
-    time::UNIX_EPOCH,
+    sync::{OnceLock, RwLock},
+    time::Duration,
 };
 use store::InMemoryStore;
 
@@ -84,20 +84,15 @@ impl SegmentCacheKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ManifestFingerprint {
-    modified_ns: u128,
-    len: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentCacheEntry {
-    manifest_fingerprint: ManifestFingerprint,
-    claim_ids: HashSet<String>,
+    claim_ids: Option<HashSet<String>>,
+    next_refresh_instant: std::time::Instant,
 }
 
-static SEGMENT_PREFILTER_CACHE: OnceLock<Mutex<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
+static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
     OnceLock::new();
+static SEGMENT_PREFILTER_REFRESH_INTERVAL: OnceLock<Duration> = OnceLock::new();
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
     let tenant_id = req.tenant_id.clone();
@@ -324,48 +319,40 @@ fn build_segment_prefilter_claim_ids_from_root(
 ) -> Option<HashSet<String>> {
     let cache_key = SegmentCacheKey::new(&segment_root, tenant_id);
     let segment_tenant_path = segment_root.join(sanitize_path_component(tenant_id));
-    let manifest_path = segment_tenant_path.join("segments.manifest");
-    let manifest_fingerprint = match manifest_fingerprint(&manifest_path) {
-        Some(value) => value,
-        None => {
-            clear_segment_cache_entry(&cache_key);
-            return None;
-        }
-    };
-
-    if let Ok(cache) = segment_prefilter_cache().lock()
+    let now = std::time::Instant::now();
+    if let Ok(cache) = segment_prefilter_cache().read()
         && let Some(entry) = cache.get(&cache_key)
-        && entry.manifest_fingerprint == manifest_fingerprint
+        && entry.next_refresh_instant > now
     {
-        return Some(entry.claim_ids.clone());
+        return entry.claim_ids.clone();
     }
 
-    let manifest = match load_manifest(&segment_tenant_path) {
+    let claim_ids = load_segment_prefilter_claim_ids(&segment_tenant_path);
+    let next_refresh_instant = now + segment_prefilter_refresh_interval();
+    if let Ok(mut cache) = segment_prefilter_cache().write() {
+        cache.insert(
+            cache_key,
+            SegmentCacheEntry {
+                claim_ids: claim_ids.clone(),
+                next_refresh_instant,
+            },
+        );
+    }
+    claim_ids
+}
+
+fn load_segment_prefilter_claim_ids(segment_tenant_path: &Path) -> Option<HashSet<String>> {
+    let manifest = match load_manifest(segment_tenant_path) {
         Ok(Some(value)) => value,
-        _ => {
-            clear_segment_cache_entry(&cache_key);
-            return None;
-        }
+        _ => return None,
     };
-    let segments = match load_segments_from_manifest(&segment_tenant_path, &manifest) {
+    let segments = match load_segments_from_manifest(segment_tenant_path, &manifest) {
         Ok(value) => value,
-        Err(_) => {
-            clear_segment_cache_entry(&cache_key);
-            return None;
-        }
+        Err(_) => return None,
     };
     let mut ids = HashSet::new();
     for segment in segments {
         ids.extend(segment.claim_ids);
-    }
-    if let Ok(mut cache) = segment_prefilter_cache().lock() {
-        cache.insert(
-            cache_key,
-            SegmentCacheEntry {
-                manifest_fingerprint,
-                claim_ids: ids.clone(),
-            },
-        );
     }
     Some(ids)
 }
@@ -402,24 +389,21 @@ fn sanitize_path_component(raw: &str) -> String {
     out
 }
 
-fn segment_prefilter_cache() -> &'static Mutex<HashMap<SegmentCacheKey, SegmentCacheEntry>> {
-    SEGMENT_PREFILTER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn clear_segment_cache_entry(key: &SegmentCacheKey) {
-    if let Ok(mut cache) = segment_prefilter_cache().lock() {
-        cache.remove(key);
-    }
-}
-
-fn manifest_fingerprint(path: &Path) -> Option<ManifestFingerprint> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let modified_ns = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
-    Some(ManifestFingerprint {
-        modified_ns,
-        len: metadata.len(),
+fn segment_prefilter_refresh_interval() -> Duration {
+    *SEGMENT_PREFILTER_REFRESH_INTERVAL.get_or_init(|| {
+        let refresh_ms = env_with_fallback(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            "EME_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+        )
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_000);
+        Duration::from_millis(refresh_ms)
     })
+}
+
+fn segment_prefilter_cache() -> &'static RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>> {
+    SEGMENT_PREFILTER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn stance_to_str(stance: &Stance) -> &'static str {
@@ -454,7 +438,7 @@ mod tests {
 
     fn clear_segment_cache_for_tests() {
         if let Some(cache) = SEGMENT_PREFILTER_CACHE.get()
-            && let Ok(mut guard) = cache.lock()
+            && let Ok(mut guard) = cache.write()
         {
             guard.clear();
         }
@@ -824,6 +808,7 @@ mod tests {
         )
         .expect("updated segment persist should succeed");
 
+        std::thread::sleep(segment_prefilter_refresh_interval() + Duration::from_millis(10));
         let second = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
             .expect("second segment load should succeed");
         assert!(!second.contains("claim-old"));

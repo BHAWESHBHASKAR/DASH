@@ -151,8 +151,14 @@ Action items:
   - `DASH_CI_LARGE_MIN_CANDIDATE_REDUCTION_PCT`
   - `DASH_CI_LARGE_MAX_DASH_LATENCY_MS`
   - optional iteration override: `DASH_CI_LARGE_GUARD_ITERATIONS`
+- optionally run xlarge-profile history guard in staged CI (`DASH_CI_INCLUDE_XLARGE_GUARD=true`, `EME_CI_INCLUDE_XLARGE_GUARD` fallback)
+- xlarge CI guard supports ANN preset overrides and hard gates via:
+  - `DASH_CI_XLARGE_ANN_*`
+  - `DASH_CI_XLARGE_MIN_CANDIDATE_REDUCTION_PCT`
+  - `DASH_CI_XLARGE_MAX_DASH_LATENCY_MS`
+  - optional iteration override: `DASH_CI_XLARGE_GUARD_ITERATIONS`
 - optionally run hybrid-profile history guard in staged CI (`DASH_CI_INCLUDE_HYBRID_GUARD=true`, `EME_CI_INCLUDE_HYBRID_GUARD` fallback)
-- optionally run full trend automation in staged CI (`DASH_CI_RUN_BENCH_TREND=true`) with profile scope control via `DASH_CI_BENCH_TREND_INCLUDE_LARGE` and `DASH_CI_BENCH_TREND_INCLUDE_HYBRID`
+- optionally run full trend automation in staged CI (`DASH_CI_RUN_BENCH_TREND=true`) with profile scope control via `DASH_CI_BENCH_TREND_INCLUDE_LARGE`, `DASH_CI_BENCH_TREND_INCLUDE_XLARGE`, and `DASH_CI_BENCH_TREND_INCLUDE_HYBRID`
 - optionally run async transport feature checks and tests in staged CI (`DASH_CI_CHECK_ASYNC_TRANSPORT=true`)
 - run full benchmark nightly
 - block production promotion if any gate fails
@@ -164,6 +170,7 @@ Current benchmark binary (`tests/benchmarks/src/main.rs`) exposes:
 - `--profile smoke` -> 2,000 claims (CI smoke path)
 - `--profile standard` -> 10,000 claims (default local baseline)
 - `--profile large` -> 50,000 claims (scale sanity profile)
+- `--profile xlarge` -> 100,000 claims (high-scale stress profile)
 - `--profile hybrid` -> 20,000 claims with metadata-rich fixture for end-to-end `query_embedding + entity_filters + embedding_id_filters`
 
 Optional overrides:
@@ -182,6 +189,9 @@ Optional overrides:
 - large-profile gates:
   - `--large-min-candidate-reduction-pct <N>` (default `95`)
   - `--large-max-dash-latency-ms <N>` (default `120`)
+- xlarge-profile gates:
+  - `--xlarge-min-candidate-reduction-pct <N>` (default `96`)
+  - `--xlarge-max-dash-latency-ms <N>` (default `250`)
 - env equivalents for benchmark runtime:
   - `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE`
   - `DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER`
@@ -190,6 +200,8 @@ Optional overrides:
   - `DASH_BENCH_ANN_SEARCH_EXPANSION_MAX`
   - `DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT`
   - `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS`
+  - `DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT`
+  - `DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS`
 
 ## 13. Benchmark History Outputs
 
@@ -207,6 +219,8 @@ Optional overrides:
 - Default behavior runs both:
   - `smoke` profile (`2,000` claims)
   - `large` profile (`50,000` claims)
+- Optional scale profile:
+  - `xlarge` profile (`100,000` claims) when `DASH_BENCH_INCLUDE_XLARGE=true` or `--include-xlarge true`
 - Optional profile:
   - `hybrid` profile (`20,000` claims) when `DASH_BENCH_INCLUDE_HYBRID=true` or `--include-hybrid true`
 - For each profile, the script enforces history guard, appends a new history row, and emits a timestamped scorecard under `docs/benchmarks/scorecards/`.

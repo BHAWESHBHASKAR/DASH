@@ -9,10 +9,12 @@ SCORECARD_DIR="${DASH_BENCH_SCORECARD_DIR:-docs/benchmarks/scorecards}"
 SUMMARY_DIR="${DASH_BENCH_SUMMARY_DIR:-docs/benchmarks/history/runs}"
 MAX_REGRESSION_PCT="${DASH_BENCH_GUARD_MAX_REGRESSION_PCT:-${EME_BENCH_GUARD_MAX_REGRESSION_PCT:-50}}"
 INCLUDE_LARGE="${DASH_BENCH_INCLUDE_LARGE:-true}"
+INCLUDE_XLARGE="${DASH_BENCH_INCLUDE_XLARGE:-false}"
 INCLUDE_HYBRID="${DASH_BENCH_INCLUDE_HYBRID:-false}"
 RUN_TAG="${DASH_BENCH_RUN_TAG:-release-candidate}"
 SMOKE_ITERATIONS=""
 LARGE_ITERATIONS=""
+XLARGE_ITERATIONS=""
 HYBRID_ITERATIONS=""
 
 usage() {
@@ -25,10 +27,12 @@ Options:
   --summary-dir DIR             Output directory for run summaries
   --max-regression-pct N        Max allowed DASH avg-latency regression percentage
   --include-large true|false    Include the large (50k) profile run (default: true)
+  --include-xlarge true|false   Include the xlarge (100k) profile run (default: false)
   --include-hybrid true|false   Include the hybrid metadata+embedding profile run (default: false)
   --run-tag TAG                 Suffix tag in generated artifact filenames
   --smoke-iterations N          Override smoke profile iteration count
   --large-iterations N          Override large profile iteration count
+  --xlarge-iterations N         Override xlarge profile iteration count
   --hybrid-iterations N         Override hybrid profile iteration count
   -h, --help                    Show this help
 USAGE
@@ -56,6 +60,10 @@ while [[ $# -gt 0 ]]; do
       INCLUDE_LARGE="$2"
       shift 2
       ;;
+    --include-xlarge)
+      INCLUDE_XLARGE="$2"
+      shift 2
+      ;;
     --include-hybrid)
       INCLUDE_HYBRID="$2"
       shift 2
@@ -70,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --large-iterations)
       LARGE_ITERATIONS="$2"
+      shift 2
+      ;;
+    --xlarge-iterations)
+      XLARGE_ITERATIONS="$2"
       shift 2
       ;;
     --hybrid-iterations)
@@ -92,6 +104,14 @@ case "${INCLUDE_LARGE}" in
   true|false) ;;
   *)
     echo "--include-large must be true or false" >&2
+    exit 2
+    ;;
+esac
+
+case "${INCLUDE_XLARGE}" in
+  true|false) ;;
+  *)
+    echo "--include-xlarge must be true or false" >&2
     exit 2
     ;;
 esac
@@ -209,6 +229,11 @@ if ! run_profile "smoke" "${SMOKE_ITERATIONS}"; then
 fi
 if [[ "${INCLUDE_LARGE}" == "true" ]]; then
   if ! run_profile "large" "${LARGE_ITERATIONS}"; then
+    FAILED=true
+  fi
+fi
+if [[ "${INCLUDE_XLARGE}" == "true" ]]; then
+  if ! run_profile "xlarge" "${XLARGE_ITERATIONS}"; then
     FAILED=true
   fi
 fi

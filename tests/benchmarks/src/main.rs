@@ -16,6 +16,7 @@ enum BenchmarkProfile {
     Smoke,
     Standard,
     Large,
+    XLarge,
     Hybrid,
 }
 
@@ -25,6 +26,7 @@ impl BenchmarkProfile {
             "smoke" => Some(Self::Smoke),
             "standard" | "default" => Some(Self::Standard),
             "large" => Some(Self::Large),
+            "xlarge" => Some(Self::XLarge),
             "hybrid" => Some(Self::Hybrid),
             _ => None,
         }
@@ -35,6 +37,7 @@ impl BenchmarkProfile {
             Self::Smoke => 2_000,
             Self::Standard => 10_000,
             Self::Large => 50_000,
+            Self::XLarge => 100_000,
             Self::Hybrid => 20_000,
         }
     }
@@ -44,6 +47,7 @@ impl BenchmarkProfile {
             Self::Smoke => 100,
             Self::Standard => 300,
             Self::Large => 120,
+            Self::XLarge => 80,
             Self::Hybrid => 180,
         }
     }
@@ -53,6 +57,7 @@ impl BenchmarkProfile {
             Self::Smoke => "smoke",
             Self::Standard => "standard",
             Self::Large => "large",
+            Self::XLarge => "xlarge",
             Self::Hybrid => "hybrid",
         }
     }
@@ -69,6 +74,8 @@ struct BenchmarkConfig {
     ann_tuning: AnnTuningConfig,
     large_min_candidate_reduction_pct: f64,
     large_max_dash_latency_ms: f64,
+    xlarge_min_candidate_reduction_pct: f64,
+    xlarge_max_dash_latency_ms: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +364,22 @@ fn evaluate_profile_gates(
             summary.eme_latency, config.large_max_dash_latency_ms
         ));
     }
+    if summary.profile == BenchmarkProfile::XLarge
+        && reduction_pct < config.xlarge_min_candidate_reduction_pct
+    {
+        return Err(format!(
+            "xlarge profile candidate reduction {:.2}% is below gate {:.2}%",
+            reduction_pct, config.xlarge_min_candidate_reduction_pct
+        ));
+    }
+    if summary.profile == BenchmarkProfile::XLarge
+        && summary.eme_latency > config.xlarge_max_dash_latency_ms
+    {
+        return Err(format!(
+            "xlarge profile DASH avg latency {:.4} ms exceeds gate {:.4} ms",
+            summary.eme_latency, config.xlarge_max_dash_latency_ms
+        ));
+    }
     Ok(())
 }
 
@@ -430,6 +453,10 @@ where
         env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);
     let mut large_max_dash_latency_ms =
         env_or_default_f64("DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS", 120.0);
+    let mut xlarge_min_candidate_reduction_pct =
+        env_or_default_f64("DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT", 96.0);
+    let mut xlarge_max_dash_latency_ms =
+        env_or_default_f64("DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS", 250.0);
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -441,7 +468,7 @@ where
                     .ok_or_else(|| "Missing value for --profile".to_string())?;
                 profile = BenchmarkProfile::from_arg(&value).ok_or_else(|| {
                     format!(
-                        "Invalid profile '{value}'. Valid values: smoke, standard, large, hybrid."
+                        "Invalid profile '{value}'. Valid values: smoke, standard, large, xlarge, hybrid."
                     )
                 })?;
             }
@@ -515,6 +542,16 @@ where
                 large_max_dash_latency_ms =
                     parse_non_negative_f64_arg(args.next(), "--large-max-dash-latency-ms")?;
             }
+            "--xlarge-min-candidate-reduction-pct" => {
+                xlarge_min_candidate_reduction_pct = parse_non_negative_f64_arg(
+                    args.next(),
+                    "--xlarge-min-candidate-reduction-pct",
+                )?;
+            }
+            "--xlarge-max-dash-latency-ms" => {
+                xlarge_max_dash_latency_ms =
+                    parse_non_negative_f64_arg(args.next(), "--xlarge-max-dash-latency-ms")?;
+            }
             "--help" | "-h" => return Err(usage_text().to_string()),
             _ => {
                 return Err(format!("Unknown argument '{arg}'.\n\n{}", usage_text()));
@@ -536,6 +573,8 @@ where
         ann_tuning,
         large_min_candidate_reduction_pct,
         large_max_dash_latency_ms,
+        xlarge_min_candidate_reduction_pct,
+        xlarge_max_dash_latency_ms,
     })
 }
 
@@ -578,7 +617,7 @@ fn parse_non_negative_f64_arg(value: Option<String>, flag: &str) -> Result<f64, 
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|hybrid] [--iterations N] [--history-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N]"
 }
 
 fn now_epoch_secs() -> u64 {
@@ -953,6 +992,7 @@ fn parse_history_row(line: &str) -> Result<Option<HistoryRow>, String> {
         "smoke" => BenchmarkProfile::Smoke,
         "standard" => BenchmarkProfile::Standard,
         "large" => BenchmarkProfile::Large,
+        "xlarge" => BenchmarkProfile::XLarge,
         "hybrid" => BenchmarkProfile::Hybrid,
         _ => return Ok(None),
     };
@@ -1656,18 +1696,22 @@ mod tests {
             ann_tuning: AnnTuningConfig::default(),
             large_min_candidate_reduction_pct: min_reduction,
             large_max_dash_latency_ms: max_latency,
+            xlarge_min_candidate_reduction_pct: 96.0,
+            xlarge_max_dash_latency_ms: 250.0,
         }
     }
 
-    fn summary_large_with(
+    fn summary_with_profile(
+        profile: BenchmarkProfile,
+        fixture_size: usize,
         dash_avg_ms: f64,
         baseline_scan_count: usize,
         dash_candidates: usize,
     ) -> BenchmarkSummary {
         BenchmarkSummary {
             run_epoch_secs: 0,
-            profile: BenchmarkProfile::Large,
-            fixture_size: 50_000,
+            profile,
+            fixture_size,
             iterations: 1,
             baseline_top: Some("claim-target".to_string()),
             eme_top: Some("claim-target".to_string()),
@@ -1688,7 +1732,7 @@ mod tests {
     #[test]
     fn large_gate_rejects_low_candidate_reduction() {
         let config = config_with_large_gates(95.0, 120.0);
-        let summary = summary_large_with(30.0, 50_000, 10_000);
+        let summary = summary_with_profile(BenchmarkProfile::Large, 50_000, 30.0, 50_000, 10_000);
         let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
         assert!(err.contains("candidate reduction"));
     }
@@ -1696,7 +1740,7 @@ mod tests {
     #[test]
     fn large_gate_rejects_high_dash_latency() {
         let config = config_with_large_gates(90.0, 50.0);
-        let summary = summary_large_with(80.0, 50_000, 2_000);
+        let summary = summary_with_profile(BenchmarkProfile::Large, 50_000, 80.0, 50_000, 2_000);
         let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
         assert!(err.contains("avg latency"));
     }
@@ -1704,7 +1748,36 @@ mod tests {
     #[test]
     fn large_gate_accepts_good_large_profile_metrics() {
         let config = config_with_large_gates(90.0, 80.0);
-        let summary = summary_large_with(40.0, 50_000, 2_000);
+        let summary = summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        assert!(evaluate_profile_gates(&summary, &config).is_ok());
+    }
+
+    #[test]
+    fn xlarge_gate_rejects_low_candidate_reduction() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xlarge_min_candidate_reduction_pct = 98.0;
+        let summary = summary_with_profile(BenchmarkProfile::XLarge, 100_000, 90.0, 100_000, 4_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("xlarge profile candidate reduction"));
+    }
+
+    #[test]
+    fn xlarge_gate_rejects_high_dash_latency() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xlarge_max_dash_latency_ms = 120.0;
+        let summary =
+            summary_with_profile(BenchmarkProfile::XLarge, 100_000, 180.0, 100_000, 2_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("xlarge profile DASH avg latency"));
+    }
+
+    #[test]
+    fn xlarge_gate_accepts_good_metrics() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xlarge_min_candidate_reduction_pct = 95.0;
+        config.xlarge_max_dash_latency_ms = 220.0;
+        let summary =
+            summary_with_profile(BenchmarkProfile::XLarge, 100_000, 140.0, 100_000, 2_500);
         assert!(evaluate_profile_gates(&summary, &config).is_ok());
     }
 }
