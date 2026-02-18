@@ -4,7 +4,11 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -53,7 +57,15 @@ pub struct IngestionRuntime {
     wal_flush_success_total: u64,
     wal_flush_failure_total: u64,
     wal_async_flush_tick_total: u64,
+    transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct TransportBackpressureMetrics {
+    queue_depth: AtomicUsize,
+    queue_capacity: usize,
+    queue_full_reject_total: AtomicU64,
 }
 
 impl IngestionRuntime {
@@ -85,6 +97,7 @@ impl IngestionRuntime {
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
             wal_async_flush_tick_total: 0,
+            transport_backpressure: None,
             started_at: Instant::now(),
         }
     }
@@ -122,6 +135,7 @@ impl IngestionRuntime {
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
             wal_async_flush_tick_total: 0,
+            transport_backpressure: None,
             started_at: Instant::now(),
         }
     }
@@ -335,6 +349,10 @@ impl IngestionRuntime {
         self.wal_async_flush_interval
     }
 
+    fn set_transport_backpressure_metrics(&mut self, metrics: Arc<TransportBackpressureMetrics>) {
+        self.transport_backpressure = Some(metrics);
+    }
+
     pub(crate) fn refresh_placement_if_due(&mut self) {
         if let Ok(Some(state)) = self.placement_routing.as_mut() {
             state.maybe_refresh();
@@ -395,6 +413,21 @@ impl IngestionRuntime {
             .as_ref()
             .map(FileWal::background_flush_only)
             .unwrap_or(false) as usize;
+        let transport_queue_capacity = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_capacity)
+            .unwrap_or(0);
+        let transport_queue_depth = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_depth.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let transport_queue_full_reject_total = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
+            .unwrap_or(0);
         format!(
             "# TYPE dash_ingest_success_total counter\n\
 dash_ingest_success_total {}\n\
@@ -470,6 +503,12 @@ dash_ingest_wal_async_flush_interval_ms {}\n\
 dash_ingest_wal_async_flush_tick_total {}\n\
 # TYPE dash_ingest_wal_background_flush_only gauge\n\
 dash_ingest_wal_background_flush_only {}\n\
+# TYPE dash_ingest_transport_queue_capacity gauge\n\
+dash_ingest_transport_queue_capacity {}\n\
+# TYPE dash_ingest_transport_queue_depth gauge\n\
+dash_ingest_transport_queue_depth {}\n\
+# TYPE dash_ingest_transport_queue_full_reject_total counter\n\
+dash_ingest_transport_queue_full_reject_total {}\n\
 # TYPE dash_ingest_claims_total gauge\n\
 dash_ingest_claims_total {}\n\
 # TYPE dash_ingest_uptime_seconds gauge\n\
@@ -511,6 +550,9 @@ dash_ingest_uptime_seconds {:.4}\n",
             wal_async_flush_interval_ms,
             self.wal_async_flush_tick_total,
             wal_background_flush_only,
+            transport_queue_capacity,
+            transport_queue_depth,
+            transport_queue_full_reject_total,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         )
@@ -521,6 +563,7 @@ pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,6 +950,29 @@ fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
     }
 }
 
+fn resolve_http_queue_capacity(worker_count: usize) -> usize {
+    let default_capacity = worker_count
+        .saturating_mul(DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER)
+        .max(worker_count);
+    parse_env_first_usize(&[
+        "DASH_INGEST_HTTP_QUEUE_CAPACITY",
+        "EME_INGEST_HTTP_QUEUE_CAPACITY",
+    ])
+    .filter(|value| *value > 0)
+    .unwrap_or(default_capacity)
+}
+
+fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+    let body = r#"{"error":"service unavailable: ingestion worker queue full"}"#;
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes())
+}
+
 pub fn serve_http(runtime: IngestionRuntime, bind_addr: &str) -> std::io::Result<()> {
     serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS)
 }
@@ -918,9 +984,18 @@ pub fn serve_http_with_workers(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
+    let queue_capacity = resolve_http_queue_capacity(worker_count);
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let runtime = Arc::new(Mutex::new(runtime));
-    let (tx, rx) = mpsc::channel::<TcpStream>();
+    let backpressure_metrics = Arc::new(TransportBackpressureMetrics {
+        queue_depth: AtomicUsize::new(0),
+        queue_capacity,
+        queue_full_reject_total: AtomicU64::new(0),
+    });
+    if let Ok(mut guard) = runtime.lock() {
+        guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
+    }
+    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
     let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
 
@@ -945,6 +1020,7 @@ pub fn serve_http_with_workers(
         for _ in 0..worker_count {
             let runtime = Arc::clone(&runtime);
             let rx = Arc::clone(&rx);
+            let backpressure_metrics = Arc::clone(&backpressure_metrics);
             scope.spawn(move || {
                 loop {
                     let stream = {
@@ -953,7 +1029,12 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         };
                         match guard.recv() {
-                            Ok(stream) => stream,
+                            Ok(stream) => {
+                                backpressure_metrics
+                                    .queue_depth
+                                    .fetch_sub(1, Ordering::Relaxed);
+                                stream
+                            }
                             Err(_) => break,
                         }
                     };
@@ -966,12 +1047,25 @@ pub fn serve_http_with_workers(
 
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => {
-                    if tx.send(stream).is_err() {
+                Ok(stream) => match tx.try_send(stream) {
+                    Ok(()) => {
+                        backpressure_metrics
+                            .queue_depth
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::TrySendError::Full(stream)) => {
+                        backpressure_metrics
+                            .queue_full_reject_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Err(err) = write_backpressure_response(stream) {
+                            eprintln!("ingestion transport backpressure response failed: {err}");
+                        }
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
                         eprintln!("ingestion transport worker queue closed");
                         break;
                     }
-                }
+                },
                 Err(err) => eprintln!("ingestion transport accept error: {err}"),
             }
         }

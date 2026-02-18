@@ -242,6 +242,10 @@ for int_opt in \
     exit 2
   fi
 done
+if [[ "${INGEST_THROUGHPUT_MIN_RPS}" -le 0 ]]; then
+  echo "[release-gate] --ingest-min-rps must be > 0" >&2
+  exit 2
+fi
 if [[ "${INGEST_THROUGHPUT_WORKERS}" -eq 0 || "${INGEST_THROUGHPUT_CLIENTS}" -eq 0 || "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" -eq 0 || "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" -eq 0 || "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}" -eq 0 ]]; then
   echo "[release-gate] ingestion throughput workers/clients/requests/wal thresholds must be > 0" >&2
   exit 2
@@ -256,7 +260,8 @@ case "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}" in
     ;;
 esac
 case "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" in
-  auto|off|none|unset|"") ;;
+  auto) INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="auto" ;;
+  off|none|unset|"") INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="off" ;;
   *)
     if [[ ! "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" =~ ^[0-9]+$ || "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" -eq 0 ]]; then
       echo "[release-gate] --ingest-wal-async-flush-interval-ms must be positive integer, auto, or off" >&2
@@ -264,6 +269,10 @@ case "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" in
     fi
     ;;
 esac
+if [[ "${INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY}" == "true" && "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" == "off" ]]; then
+  echo "[release-gate] --ingest-wal-background-flush-only=true requires async flush worker (set --ingest-wal-async-flush-interval-ms to auto or a positive integer)" >&2
+  exit 2
+fi
 
 mkdir -p "${SUMMARY_DIR}" "$(dirname "${SLO_HISTORY_PATH}")"
 

@@ -19,6 +19,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Retrieval transport exposes runtime metrics at `/metrics` including DASH latency percentiles and visibility-lag estimates.
 - Schema layer includes claim/evidence metadata for citation-grade retrieval (`entities`, `embedding_ids`, `chunk_id`, `span_start`, `span_end`) with backward-compatible WAL replay.
 - Ingestion/retrieval transports support configurable HTTP worker pools for concurrent request handling (`DASH_*_HTTP_WORKERS`).
+- Ingestion std transport now uses a bounded worker queue with backpressure metrics (`DASH_INGEST_HTTP_QUEUE_CAPACITY`, queue depth/full-reject counters).
 - Ingestion/retrieval transports support runtime selection (`std` default, optional `axum`) via `DASH_*_TRANSPORT_RUNTIME` with `EME_*` fallback.
 - Ingestion/retrieval transports include tenant-scoped authz policy controls (`DASH_*_ALLOWED_TENANTS`, `DASH_*_API_KEY_SCOPES`) and optional JSONL audit trails (`DASH_*_AUDIT_LOG_PATH`).
 - Audit trails are now tamper-evident with chained hashes (`seq`, `prev_hash`, `hash`) and verifiable via `scripts/verify_audit_chain.sh`.

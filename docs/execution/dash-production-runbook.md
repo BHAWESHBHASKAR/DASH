@@ -48,6 +48,7 @@ Ingestion:
 DASH_INGEST_WAL_PATH=/var/lib/dash/claims.wal \
 DASH_INGEST_BIND=0.0.0.0:8081 \
 DASH_INGEST_HTTP_WORKERS=8 \
+DASH_INGEST_HTTP_QUEUE_CAPACITY=512 \
 DASH_INGEST_TRANSPORT_RUNTIME=std \
 DASH_INGEST_API_KEY=change-me-ingest-key \
 DASH_INGEST_JWT_HS256_SECRET=change-me-ingest-jwt-secret \
@@ -152,6 +153,7 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `dash_ingest_wal_flush_due_total`, `dash_ingest_wal_flush_success_total`, `dash_ingest_wal_flush_failure_total`
   - `dash_ingest_wal_async_flush_enabled`, `dash_ingest_wal_async_flush_interval_ms`, `dash_ingest_wal_async_flush_tick_total`
   - `dash_ingest_wal_background_flush_only`
+  - `dash_ingest_transport_queue_capacity`, `dash_ingest_transport_queue_depth`, `dash_ingest_transport_queue_full_reject_total`
   - `dash_ingest_auth_success_total`, `dash_ingest_auth_failure_total`, `dash_ingest_authz_denied_total`
   - `dash_ingest_audit_events_total`, `dash_ingest_audit_write_error_total`
   - `dash_ingest_placement_route_reject_total`, `dash_ingest_placement_last_epoch`

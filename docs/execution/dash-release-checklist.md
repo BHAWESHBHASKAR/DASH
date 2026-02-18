@@ -18,6 +18,8 @@ Status: active
 - [ ] optional transport concurrency benchmark: `scripts/benchmark_transport_concurrency.sh --workers-list 1,4 --clients 16 --requests-per-worker 30`
 - [ ] ingestion throughput floor gate passes (included in consolidated release gate):
   - `scripts/release_candidate_gate.sh --run-ingest-throughput-guard true --ingest-min-rps <floor>`
+  - keep `<floor> > 0` (release gate now rejects non-positive floors)
+  - if using `--ingest-wal-background-flush-only true`, keep async flush enabled (`--ingest-wal-async-flush-interval-ms auto|<ms>`)
 
 ## 2. Build and Package
 

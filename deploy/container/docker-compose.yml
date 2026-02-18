@@ -8,6 +8,7 @@ services:
     environment:
       DASH_INGEST_WAL_PATH: /var/lib/dash/claims.wal
       DASH_INGEST_HTTP_WORKERS: "8"
+      DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
       DASH_INGEST_TRANSPORT_RUNTIME: std
       DASH_INGEST_API_KEY: change-me-ingest-key
       DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"

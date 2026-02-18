@@ -9,6 +9,7 @@ Status: active
 | --- | --- | --- | --- | --- |
 | `DASH_INGEST_BIND` | no | `127.0.0.1:8081` | bind address for HTTP ingestion transport (`/v1/ingest`) | `EME_INGEST_BIND` |
 | `DASH_INGEST_HTTP_WORKERS` | no | auto (`min(available_parallelism, 32)`, fallback `4`) | ingestion HTTP worker pool size | `EME_INGEST_HTTP_WORKERS` |
+| `DASH_INGEST_HTTP_QUEUE_CAPACITY` | no | `workers * 64` | bounded ingestion worker-queue capacity; when full, requests are rejected with `503` and backpressure metrics increment | `EME_INGEST_HTTP_QUEUE_CAPACITY` |
 | `DASH_INGEST_TRANSPORT_RUNTIME` | no | `std` | transport runtime selector (`std` or `axum`) | `EME_INGEST_TRANSPORT_RUNTIME` |
 | `DASH_INGEST_API_KEY` | no | unset | optional API key for `POST /v1/ingest` (`X-API-Key` or `Authorization: Bearer`) | `EME_INGEST_API_KEY` |
 | `DASH_INGEST_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_INGEST_API_KEY` | `EME_INGEST_API_KEYS` |
