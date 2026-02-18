@@ -177,6 +177,7 @@ Optional overrides:
 
 - `--iterations <N>` for explicit loop count
 - `--history-out <PATH>` to append run metrics as a markdown row
+- `--history-csv-out <PATH>` to append the same metrics in CSV format
 - `--guard-history <PATH>` to compare current run against last history row for same profile
 - `--max-dash-latency-regression-pct <N>` to cap allowed DASH avg-latency growth vs prior run (`--max-eme-latency-regression-pct` alias is still accepted)
 - `--scorecard-out <PATH>` to emit a markdown benchmark scorecard (latency + quality probes)
@@ -192,6 +193,9 @@ Optional overrides:
 - xlarge-profile gates:
   - `--xlarge-min-candidate-reduction-pct <N>` (default `96`)
   - `--xlarge-max-dash-latency-ms <N>` (default `250`)
+- segment-cache probe strictness gates:
+  - `--min-segment-refresh-successes <N>` (default `0`)
+  - `--min-segment-cache-hits <N>` (default `0`)
 - env equivalents for benchmark runtime:
   - `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE`
   - `DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER`
@@ -202,11 +206,15 @@ Optional overrides:
   - `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS`
   - `DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT`
   - `DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS`
+  - `DASH_BENCH_HISTORY_CSV_OUT`
+  - `DASH_BENCH_MIN_SEGMENT_REFRESH_SUCCESSES`
+  - `DASH_BENCH_MIN_SEGMENT_CACHE_HITS`
   - `DASH_BENCH_WAL_SCALE_CLAIMS` (override claim volume used by WAL checkpoint/replay scale slice)
 
 ## 13. Benchmark History Outputs
 
 - Repository history path: `docs/benchmarks/history/benchmark-history.md`
+- Optional CSV history path: configured via `--history-csv-out` or `DASH_BENCH_HISTORY_CSV_OUT`
 - Each appended row must include profile, fixture size, iteration count, top1 hit status, and average latency metrics.
 - History rows now also include:
   - `metadata_prefilter_count`
@@ -226,6 +234,8 @@ Optional overrides:
     - `wal_truncated_wal_records`
     - `wal_replay_snapshot_records`
     - `wal_replay_wal_records`
+    - `wal_replay_validation_hit`
+    - `wal_replay_validation_top_claim`
 - Keep this artifact in version control so trend shifts are visible in review.
 
 ## 14. Trend Automation (Release Candidate)
@@ -260,6 +270,7 @@ Optional overrides:
     - checkpoint runtime
     - replay runtime
     - snapshot/wal replay record counts
+    - post-checkpoint replay retrieval validation (`hit` + top claim id)
   - contradiction probe (`support_only`) pass/fail
   - temporal-window filtering probe pass/fail
   - exclusion of unknown event-time claims under temporal filters

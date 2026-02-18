@@ -73,6 +73,7 @@ struct BenchmarkConfig {
     profile: BenchmarkProfile,
     iterations: Option<usize>,
     history_out: Option<String>,
+    history_csv_out: Option<String>,
     guard_history: Option<String>,
     max_dash_latency_regression_pct: Option<f64>,
     scorecard_out: Option<String>,
@@ -81,6 +82,8 @@ struct BenchmarkConfig {
     large_max_dash_latency_ms: f64,
     xlarge_min_candidate_reduction_pct: f64,
     xlarge_max_dash_latency_ms: f64,
+    min_segment_refresh_successes: usize,
+    min_segment_cache_hits: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,8 @@ struct WalScaleSummary {
     replay_ms: f64,
     replay_snapshot_records: usize,
     replay_wal_records: usize,
+    replay_validation_hit: bool,
+    replay_validation_top_claim: Option<String>,
 }
 
 impl QualityProbeSummary {
@@ -359,6 +364,13 @@ fn main() {
         }
         println!("Benchmark history output updated: {path}");
     }
+    if let Some(path) = config.history_csv_out.as_deref() {
+        if let Err(err) = append_history_csv(path, &summary) {
+            eprintln!("Benchmark failed: unable to write history CSV output ({err}).");
+            std::process::exit(1);
+        }
+        println!("Benchmark history CSV output updated: {path}");
+    }
     if let Some(path) = config.scorecard_out.as_deref() {
         if let Err(err) = write_scorecard(path, &summary, &quality) {
             eprintln!("Benchmark failed: unable to write scorecard output ({err}).");
@@ -436,6 +448,18 @@ fn evaluate_profile_gates(
             summary.eme_latency, config.xlarge_max_dash_latency_ms
         ));
     }
+    if summary.segment_cache_probe.refresh_successes < config.min_segment_refresh_successes as u64 {
+        return Err(format!(
+            "segment cache refresh successes {} is below gate {}",
+            summary.segment_cache_probe.refresh_successes, config.min_segment_refresh_successes
+        ));
+    }
+    if summary.segment_cache_probe.cache_hits < config.min_segment_cache_hits as u64 {
+        return Err(format!(
+            "segment cache hits {} is below gate {}",
+            summary.segment_cache_probe.cache_hits, config.min_segment_cache_hits
+        ));
+    }
     Ok(())
 }
 
@@ -479,6 +503,7 @@ where
     let mut profile = BenchmarkProfile::Standard;
     let mut iterations = None;
     let mut history_out = None;
+    let mut history_csv_out = std::env::var("DASH_BENCH_HISTORY_CSV_OUT").ok();
     let mut guard_history = None;
     let mut max_dash_latency_regression_pct = None;
     let mut scorecard_out = None;
@@ -513,6 +538,9 @@ where
         env_or_default_f64("DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT", 96.0);
     let mut xlarge_max_dash_latency_ms =
         env_or_default_f64("DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS", 250.0);
+    let mut min_segment_refresh_successes =
+        env_or_default_usize("DASH_BENCH_MIN_SEGMENT_REFRESH_SUCCESSES", 0);
+    let mut min_segment_cache_hits = env_or_default_usize("DASH_BENCH_MIN_SEGMENT_CACHE_HITS", 0);
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -545,6 +573,12 @@ where
                     .next()
                     .ok_or_else(|| "Missing value for --history-out".to_string())?;
                 history_out = Some(value);
+            }
+            "--history-csv-out" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --history-csv-out".to_string())?;
+                history_csv_out = Some(value);
             }
             "--guard-history" => {
                 let value = args
@@ -608,6 +642,14 @@ where
                 xlarge_max_dash_latency_ms =
                     parse_non_negative_f64_arg(args.next(), "--xlarge-max-dash-latency-ms")?;
             }
+            "--min-segment-refresh-successes" => {
+                min_segment_refresh_successes =
+                    parse_non_negative_usize_arg(args.next(), "--min-segment-refresh-successes")?;
+            }
+            "--min-segment-cache-hits" => {
+                min_segment_cache_hits =
+                    parse_non_negative_usize_arg(args.next(), "--min-segment-cache-hits")?;
+            }
             "--help" | "-h" => return Err(usage_text().to_string()),
             _ => {
                 return Err(format!("Unknown argument '{arg}'.\n\n{}", usage_text()));
@@ -623,6 +665,7 @@ where
         profile,
         iterations,
         history_out,
+        history_csv_out,
         guard_history,
         max_dash_latency_regression_pct,
         scorecard_out,
@@ -631,6 +674,8 @@ where
         large_max_dash_latency_ms,
         xlarge_min_candidate_reduction_pct,
         xlarge_max_dash_latency_ms,
+        min_segment_refresh_successes,
+        min_segment_cache_hits,
     })
 }
 
@@ -672,8 +717,14 @@ fn parse_non_negative_f64_arg(value: Option<String>, flag: &str) -> Result<f64, 
     Ok(parsed)
 }
 
+fn parse_non_negative_usize_arg(value: Option<String>, flag: &str) -> Result<usize, String> {
+    let raw = value.ok_or_else(|| format!("Missing value for {flag}"))?;
+    raw.parse::<usize>()
+        .map_err(|_| format!("Invalid value '{raw}' for {flag}"))
+}
+
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N]"
 }
 
 #[allow(unused_unsafe)]
@@ -859,9 +910,19 @@ fn maybe_run_wal_scale_slice(
         .map_err(|err| format!("checkpoint delta vector upsert failed: {err:?}"))?;
 
     let replay_start = Instant::now();
-    let (_, load_stats) = InMemoryStore::load_from_wal_with_stats(&wal)
+    let (replayed, load_stats) = InMemoryStore::load_from_wal_with_stats(&wal)
         .map_err(|err| format!("replay from WAL failed: {err:?}"))?;
     let replay_ms = replay_start.elapsed().as_secs_f64() * 1000.0;
+    let replay_validation_top_claim = replayed
+        .retrieve(&RetrievalRequest {
+            tenant_id: "tenant-benchmark-wal-scale".to_string(),
+            query: "post checkpoint replay delta".to_string(),
+            top_k: 1,
+            stance_mode: StanceMode::Balanced,
+        })
+        .first()
+        .map(|result| result.claim_id.clone());
+    let replay_validation_hit = replay_validation_top_claim.as_deref() == Some(delta_claim_id);
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(Some(WalScaleSummary {
@@ -871,6 +932,8 @@ fn maybe_run_wal_scale_slice(
         replay_ms,
         replay_snapshot_records: load_stats.replay.snapshot_records,
         replay_wal_records: load_stats.replay.wal_records,
+        replay_validation_hit,
+        replay_validation_top_claim,
     }))
 }
 
@@ -934,14 +997,19 @@ fn print_summary(summary: &BenchmarkSummary) {
     );
     if let Some(wal_scale) = summary.wal_scale.as_ref() {
         println!(
-            "WAL scale slice: claims_seeded={}, checkpoint_ms={:.4}, replay_ms={:.4}, snapshot_records={}, truncated_wal_records={}, replay_snapshot_records={}, replay_wal_records={}",
+            "WAL scale slice: claims_seeded={}, checkpoint_ms={:.4}, replay_ms={:.4}, snapshot_records={}, truncated_wal_records={}, replay_snapshot_records={}, replay_wal_records={}, replay_validation_hit={}, replay_validation_top_claim={}",
             wal_scale.claims_seeded,
             wal_scale.checkpoint_ms,
             wal_scale.replay_ms,
             wal_scale.checkpoint_stats.snapshot_records,
             wal_scale.checkpoint_stats.truncated_wal_records,
             wal_scale.replay_snapshot_records,
-            wal_scale.replay_wal_records
+            wal_scale.replay_wal_records,
+            wal_scale.replay_validation_hit,
+            wal_scale
+                .replay_validation_top_claim
+                .as_deref()
+                .unwrap_or("none")
         );
     } else {
         println!("WAL scale slice: skipped");
@@ -1002,11 +1070,11 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         writeln!(file)?;
         writeln!(
             file,
-            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records |"
+            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |"
         )?;
         writeln!(
             file,
-            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
         )?;
     }
     let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
@@ -1050,10 +1118,20 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         .as_ref()
         .map(|metrics| metrics.replay_wal_records.to_string())
         .unwrap_or_else(|| "0".to_string());
+    let wal_replay_validation_hit = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_validation_hit.to_string())
+        .unwrap_or_else(|| "false".to_string());
+    let wal_replay_validation_top_claim = summary
+        .wal_scale
+        .as_ref()
+        .and_then(|metrics| metrics.replay_validation_top_claim.clone())
+        .unwrap_or_else(|| "none".to_string());
 
     writeln!(
         file,
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         summary.run_epoch_secs,
         summary.profile.as_str(),
         summary.fixture_size,
@@ -1080,7 +1158,117 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         wal_snapshot_records,
         wal_truncated_wal_records,
         wal_replay_snapshot_records,
-        wal_replay_wal_records
+        wal_replay_wal_records,
+        wal_replay_validation_hit,
+        wal_replay_validation_top_claim
+    )?;
+    Ok(())
+}
+
+fn append_history_csv(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io::Error> {
+    let csv_path = Path::new(path);
+    if let Some(parent) = csv_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent)?;
+    }
+
+    let needs_header = !csv_path.exists() || std::fs::metadata(csv_path)?.len() == 0;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(csv_path)?;
+    if needs_header {
+        writeln!(
+            file,
+            "run_epoch_secs,profile,fixture_size,iterations,baseline_top1,eme_top1,baseline_hit,eme_hit,baseline_avg_ms,eme_avg_ms,baseline_scan_count,dash_candidate_count,metadata_prefilter_count,ann_candidate_count,final_scored_candidate_count,segment_cache_hits,segment_refresh_attempts,segment_refresh_successes,segment_refresh_failures,segment_refresh_avg_ms,wal_claims_seeded,wal_checkpoint_ms,wal_replay_ms,wal_snapshot_records,wal_truncated_wal_records,wal_replay_snapshot_records,wal_replay_wal_records,wal_replay_validation_hit,wal_replay_validation_top_claim"
+        )?;
+    }
+
+    let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
+        0.0
+    } else {
+        (summary.segment_cache_probe.refresh_load_micros as f64 / 1000.0)
+            / summary.segment_cache_probe.refresh_attempts as f64
+    };
+    let wal_claims_seeded = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.claims_seeded.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_checkpoint_ms = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| format!("{:.4}", metrics.checkpoint_ms))
+        .unwrap_or_else(|| "n/a".to_string());
+    let wal_replay_ms = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| format!("{:.4}", metrics.replay_ms))
+        .unwrap_or_else(|| "n/a".to_string());
+    let wal_snapshot_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.checkpoint_stats.snapshot_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_truncated_wal_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.checkpoint_stats.truncated_wal_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_replay_snapshot_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_snapshot_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_replay_wal_records = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_wal_records.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let wal_replay_validation_hit = summary
+        .wal_scale
+        .as_ref()
+        .map(|metrics| metrics.replay_validation_hit.to_string())
+        .unwrap_or_else(|| "false".to_string());
+    let wal_replay_validation_top_claim = summary
+        .wal_scale
+        .as_ref()
+        .and_then(|metrics| metrics.replay_validation_top_claim.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    writeln!(
+        file,
+        "{},{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{}",
+        summary.run_epoch_secs,
+        summary.profile.as_str(),
+        summary.fixture_size,
+        summary.iterations,
+        summary.baseline_top.as_deref().unwrap_or("none"),
+        summary.eme_top.as_deref().unwrap_or("none"),
+        summary.baseline_hit,
+        summary.eme_hit,
+        summary.baseline_latency,
+        summary.eme_latency,
+        summary.baseline_scan_count,
+        summary.dash_candidate_count,
+        summary.metadata_prefilter_count,
+        summary.ann_candidate_count,
+        summary.final_scored_candidate_count,
+        summary.segment_cache_probe.cache_hits,
+        summary.segment_cache_probe.refresh_attempts,
+        summary.segment_cache_probe.refresh_successes,
+        summary.segment_cache_probe.refresh_failures,
+        segment_refresh_avg_ms,
+        wal_claims_seeded,
+        wal_checkpoint_ms,
+        wal_replay_ms,
+        wal_snapshot_records,
+        wal_truncated_wal_records,
+        wal_replay_snapshot_records,
+        wal_replay_wal_records,
+        wal_replay_validation_hit,
+        wal_replay_validation_top_claim
     )?;
     Ok(())
 }
@@ -1266,6 +1454,19 @@ fn write_scorecard(
             file,
             "- replay_wal_records: {}",
             wal_scale.replay_wal_records
+        )?;
+        writeln!(
+            file,
+            "- replay_validation_hit: {}",
+            wal_scale.replay_validation_hit
+        )?;
+        writeln!(
+            file,
+            "- replay_validation_top_claim: {}",
+            wal_scale
+                .replay_validation_top_claim
+                .as_deref()
+                .unwrap_or("none")
         )?;
     } else {
         writeln!(file)?;
@@ -2165,6 +2366,7 @@ mod tests {
             profile: BenchmarkProfile::Large,
             iterations: Some(1),
             history_out: None,
+            history_csv_out: None,
             guard_history: None,
             max_dash_latency_regression_pct: None,
             scorecard_out: None,
@@ -2173,6 +2375,8 @@ mod tests {
             large_max_dash_latency_ms: max_latency,
             xlarge_min_candidate_reduction_pct: 96.0,
             xlarge_max_dash_latency_ms: 250.0,
+            min_segment_refresh_successes: 0,
+            min_segment_cache_hits: 0,
         }
     }
 
@@ -2255,6 +2459,39 @@ mod tests {
         config.xlarge_max_dash_latency_ms = 220.0;
         let summary =
             summary_with_profile(BenchmarkProfile::XLarge, 100_000, 140.0, 100_000, 2_500);
+        assert!(evaluate_profile_gates(&summary, &config).is_ok());
+    }
+
+    #[test]
+    fn segment_refresh_success_gate_rejects_when_threshold_not_met() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.min_segment_refresh_successes = 1;
+        let summary = summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("segment cache refresh successes"));
+    }
+
+    #[test]
+    fn segment_cache_hit_gate_rejects_when_threshold_not_met() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.min_segment_cache_hits = 2;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.segment_cache_probe.cache_hits = 1;
+        summary.segment_cache_probe.refresh_successes = 1;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("segment cache hits"));
+    }
+
+    #[test]
+    fn segment_probe_gates_accept_when_thresholds_met() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.min_segment_refresh_successes = 1;
+        config.min_segment_cache_hits = 1;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.segment_cache_probe.refresh_successes = 1;
+        summary.segment_cache_probe.cache_hits = 1;
         assert!(evaluate_profile_gates(&summary, &config).is_ok());
     }
 }
