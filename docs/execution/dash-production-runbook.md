@@ -51,6 +51,7 @@ DASH_INGEST_HTTP_WORKERS=8 \
 DASH_INGEST_TRANSPORT_RUNTIME=std \
 DASH_INGEST_API_KEY=change-me-ingest-key \
 DASH_INGEST_JWT_HS256_SECRET=change-me-ingest-jwt-secret \
+DASH_INGEST_JWT_HS256_SECRETS=change-me-ingest-jwt-secret-previous \
 DASH_INGEST_JWT_ISSUER=dash \
 DASH_INGEST_JWT_AUDIENCE=ingestion \
 DASH_INGEST_ALLOWED_TENANTS=tenant-a,tenant-b \
@@ -74,6 +75,7 @@ DASH_RETRIEVAL_HTTP_WORKERS=8 \
 DASH_RETRIEVAL_TRANSPORT_RUNTIME=std \
 DASH_RETRIEVAL_API_KEY=change-me-retrieval-key \
 DASH_RETRIEVAL_JWT_HS256_SECRET=change-me-retrieval-jwt-secret \
+DASH_RETRIEVAL_JWT_HS256_SECRETS=change-me-retrieval-jwt-secret-previous \
 DASH_RETRIEVAL_JWT_ISSUER=dash \
 DASH_RETRIEVAL_JWT_AUDIENCE=retrieval \
 DASH_RETRIEVAL_ALLOWED_TENANTS=tenant-a,tenant-b \
@@ -87,7 +89,7 @@ Compatibility note: legacy `EME_*` env vars are still accepted as fallback.
 Compatibility note: `DASH_*_TRANSPORT_RUNTIME=axum` requires binaries built with `async-transport` feature.
 Policy note: if `DASH_*_API_KEY_SCOPES` is set, key scope checks are enforced before tenant allowlist checks.
 Policy note: `DASH_*_API_KEYS` enables rotation overlap (multiple active keys); `DASH_*_REVOKED_API_KEYS` hard-denies compromised keys.
-Policy note: if `DASH_*_JWT_HS256_SECRET` is set and a bearer token is a JWT, HS256 signature + claim checks are enforced (`exp` required by default, optional `iss`/`aud` checks, tenant claim enforcement via `tenant_id`/`tenants`/`tenant_ids`).
+Policy note: if `DASH_*_JWT_HS256_SECRET` is set and a bearer token is a JWT, HS256 signature + claim checks are enforced (`exp` required by default, optional `iss`/`aud` checks, tenant claim enforcement via `tenant_id`/`tenants`/`tenant_ids`). Rotation is supported with `DASH_*_JWT_HS256_SECRETS` and deterministic `kid` selection via `DASH_*_JWT_HS256_SECRETS_BY_KID`.
 
 ## 6. Smoke Checks
 
@@ -176,6 +178,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 
 - configure JWT verification:
   - `DASH_INGEST_JWT_HS256_SECRET` / `DASH_RETRIEVAL_JWT_HS256_SECRET`
+  - optional rotation overlap: `DASH_*_JWT_HS256_SECRETS`
+  - optional `kid` map: `DASH_*_JWT_HS256_SECRETS_BY_KID` (`kid-a:secret-a;kid-b:secret-b`)
   - optional `DASH_*_JWT_ISSUER`, `DASH_*_JWT_AUDIENCE`
   - optional `DASH_*_JWT_LEEWAY_SECS`
   - `DASH_*_JWT_REQUIRE_EXP=true` is the secure default

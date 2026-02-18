@@ -14,6 +14,8 @@ Status: active
 | `DASH_INGEST_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_INGEST_API_KEY` | `EME_INGEST_API_KEYS` |
 | `DASH_INGEST_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_INGEST_REVOKED_API_KEYS` |
 | `DASH_INGEST_JWT_HS256_SECRET` | no | unset | optional HS256 JWT secret for bearer-token auth (`Authorization: Bearer <jwt>`) | `EME_INGEST_JWT_HS256_SECRET` |
+| `DASH_INGEST_JWT_HS256_SECRETS` | no | unset | optional comma-separated fallback HS256 JWT secrets for rotation overlap (used when JWT header has no `kid`) | `EME_INGEST_JWT_HS256_SECRETS` |
+| `DASH_INGEST_JWT_HS256_SECRETS_BY_KID` | no | unset | optional JWT `kid` secret map (`kid-a:secret-a;kid-b:secret-b`) for deterministic key selection | `EME_INGEST_JWT_HS256_SECRETS_BY_KID` |
 | `DASH_INGEST_JWT_ISSUER` | no | unset | optional required JWT `iss` claim value | `EME_INGEST_JWT_ISSUER` |
 | `DASH_INGEST_JWT_AUDIENCE` | no | unset | optional required JWT `aud` claim value | `EME_INGEST_JWT_AUDIENCE` |
 | `DASH_INGEST_JWT_LEEWAY_SECS` | no | `0` | optional JWT time-claim leeway seconds (`exp`, `nbf`) | `EME_INGEST_JWT_LEEWAY_SECS` |
@@ -56,6 +58,8 @@ Status: active
 | `DASH_RETRIEVAL_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_RETRIEVAL_API_KEY` | `EME_RETRIEVAL_API_KEYS` |
 | `DASH_RETRIEVAL_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_RETRIEVAL_REVOKED_API_KEYS` |
 | `DASH_RETRIEVAL_JWT_HS256_SECRET` | no | unset | optional HS256 JWT secret for bearer-token auth (`Authorization: Bearer <jwt>`) | `EME_RETRIEVAL_JWT_HS256_SECRET` |
+| `DASH_RETRIEVAL_JWT_HS256_SECRETS` | no | unset | optional comma-separated fallback HS256 JWT secrets for rotation overlap (used when JWT header has no `kid`) | `EME_RETRIEVAL_JWT_HS256_SECRETS` |
+| `DASH_RETRIEVAL_JWT_HS256_SECRETS_BY_KID` | no | unset | optional JWT `kid` secret map (`kid-a:secret-a;kid-b:secret-b`) for deterministic key selection | `EME_RETRIEVAL_JWT_HS256_SECRETS_BY_KID` |
 | `DASH_RETRIEVAL_JWT_ISSUER` | no | unset | optional required JWT `iss` claim value | `EME_RETRIEVAL_JWT_ISSUER` |
 | `DASH_RETRIEVAL_JWT_AUDIENCE` | no | unset | optional required JWT `aud` claim value | `EME_RETRIEVAL_JWT_AUDIENCE` |
 | `DASH_RETRIEVAL_JWT_LEEWAY_SECS` | no | `0` | optional JWT time-claim leeway seconds (`exp`, `nbf`) | `EME_RETRIEVAL_JWT_LEEWAY_SECS` |

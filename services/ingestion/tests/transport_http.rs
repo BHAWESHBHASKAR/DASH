@@ -9,7 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use auth::encode_hs256_token;
+use auth::{encode_hs256_token, encode_hs256_token_with_kid};
 use ingestion::transport::{IngestionRuntime, handle_http_request_bytes};
 use store::InMemoryStore;
 
@@ -395,4 +395,73 @@ fn transport_denies_expired_ingest_jwt() {
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 401"));
     assert!(response.contains("JWT expired"));
+}
+
+#[test]
+fn transport_allows_ingest_jwt_signed_with_rotation_fallback_secret() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_INGEST_JWT_HS256_SECRET", OsStr::new("active-secret"));
+    let _jwt_secrets = EnvVarGuard::set(
+        "DASH_INGEST_JWT_HS256_SECRETS",
+        OsStr::new("previous-secret"),
+    );
+    let _jwt_issuer = EnvVarGuard::set("DASH_INGEST_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_INGEST_JWT_AUDIENCE", OsStr::new("ingestion"));
+    let exp = now_unix_secs() + 300;
+    let token = encode_hs256_token(
+        &format!(
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+        ),
+        "previous-secret",
+    )
+    .expect("token should encode");
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-jwt-rotation-fallback","tenant_id":"tenant-http","canonical_text":"JWT rotation fallback check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        token,
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+}
+
+#[test]
+fn transport_allows_ingest_jwt_signed_with_kid_secret() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_INGEST_JWT_HS256_SECRET", OsStr::new("active-secret"));
+    let _jwt_secrets_by_kid = EnvVarGuard::set(
+        "DASH_INGEST_JWT_HS256_SECRETS_BY_KID",
+        OsStr::new("next:next-secret;current:current-secret"),
+    );
+    let _jwt_issuer = EnvVarGuard::set("DASH_INGEST_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_INGEST_JWT_AUDIENCE", OsStr::new("ingestion"));
+    let exp = now_unix_secs() + 300;
+    let token = encode_hs256_token_with_kid(
+        &format!(
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+        ),
+        "next-secret",
+        Some("next"),
+    )
+    .expect("token should encode");
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-jwt-kid-ok","tenant_id":"tenant-http","canonical_text":"JWT kid check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        token,
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
 }

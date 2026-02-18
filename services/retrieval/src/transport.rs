@@ -1136,6 +1136,14 @@ impl AuthPolicy {
                     "DASH_RETRIEVAL_JWT_HS256_SECRET",
                     "EME_RETRIEVAL_JWT_HS256_SECRET",
                 ),
+                env_with_fallback(
+                    "DASH_RETRIEVAL_JWT_HS256_SECRETS",
+                    "EME_RETRIEVAL_JWT_HS256_SECRETS",
+                ),
+                env_with_fallback(
+                    "DASH_RETRIEVAL_JWT_HS256_SECRETS_BY_KID",
+                    "EME_RETRIEVAL_JWT_HS256_SECRETS_BY_KID",
+                ),
                 env_with_fallback("DASH_RETRIEVAL_JWT_ISSUER", "EME_RETRIEVAL_JWT_ISSUER"),
                 env_with_fallback("DASH_RETRIEVAL_JWT_AUDIENCE", "EME_RETRIEVAL_JWT_AUDIENCE"),
                 env_with_fallback(
@@ -1320,6 +1328,8 @@ fn parse_api_key_set(single_key: Option<&str>, raw: Option<&str>) -> HashSet<Str
 
 fn parse_jwt_validation_config(
     secret_raw: Option<String>,
+    secret_set_raw: Option<String>,
+    secrets_by_kid_raw: Option<String>,
     issuer_raw: Option<String>,
     audience_raw: Option<String>,
     leeway_secs_raw: Option<String>,
@@ -1334,8 +1344,14 @@ fn parse_jwt_validation_config(
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0);
     let require_exp = parse_bool_env_default(require_exp_raw.as_deref(), true);
+    let mut fallback_secrets = parse_secret_list(secret_set_raw.as_deref());
+    fallback_secrets.retain(|value| value != &secret);
+    let mut seen = HashSet::new();
+    fallback_secrets.retain(|value| seen.insert(value.clone()));
     Some(JwtValidationConfig {
         hs256_secret: secret,
+        hs256_fallback_secrets: fallback_secrets,
+        hs256_secrets_by_kid: parse_jwt_secrets_by_kid(secrets_by_kid_raw.as_deref()),
         issuer: issuer_raw.and_then(|value| {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -1366,6 +1382,40 @@ fn parse_bool_env_default(raw: Option<&str>, default: bool) -> bool {
         "0" | "false" | "no" | "off" => false,
         _ => default,
     }
+}
+
+fn parse_secret_list(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_jwt_secrets_by_kid(raw: Option<&str>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(raw) = raw else {
+        return out;
+    };
+    for entry in raw.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((kid_raw, secret_raw)) = entry.split_once(':') else {
+            continue;
+        };
+        let kid = kid_raw.trim();
+        let secret = secret_raw.trim();
+        if kid.is_empty() || secret.is_empty() {
+            continue;
+        }
+        out.insert(kid.to_string(), secret.to_string());
+    }
+    out
 }
 
 fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {

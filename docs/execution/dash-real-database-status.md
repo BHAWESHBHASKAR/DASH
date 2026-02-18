@@ -39,6 +39,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Runtime policy controls for auth, worker pools, and transport mode selection.
 - Startup replay and replay-stat logging for persistent mode.
 - JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
+- JWT key rotation support (`active + fallback` secrets and optional `kid` secret maps).
 
 ### 3.4 Index and scale path primitives
 

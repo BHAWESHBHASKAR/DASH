@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtValidationConfig {
     pub hs256_secret: String,
+    pub hs256_fallback_secrets: Vec<String>,
+    pub hs256_secrets_by_kid: HashMap<String, String>,
     pub issuer: Option<String>,
     pub audience: Option<String>,
     pub leeway_secs: u64,
@@ -19,6 +21,7 @@ pub enum JwtValidationError {
     InvalidSignature,
     MissingClaim(&'static str),
     InvalidClaimType(&'static str),
+    UnknownKeyId,
     Expired,
     NotYetValid,
     IssuerMismatch,
@@ -37,24 +40,33 @@ pub fn verify_hs256_token_for_tenant(
     let signing_input = format!("{header_b64}.{payload_b64}");
 
     let header_raw = decode_base64url(header_b64)?;
-    let payload_raw = decode_base64url(payload_b64)?;
     let signature = decode_base64url(signature_b64)?;
-    let expected_signature = hmac_sha256(config.hs256_secret.as_bytes(), signing_input.as_bytes());
-    if !constant_time_eq(signature.as_slice(), &expected_signature) {
-        return Err(JwtValidationError::InvalidSignature);
-    }
-
     let header_text =
         std::str::from_utf8(&header_raw).map_err(|_| JwtValidationError::InvalidUtf8)?;
-    let payload_text =
-        std::str::from_utf8(&payload_raw).map_err(|_| JwtValidationError::InvalidUtf8)?;
     let header = parse_json_object(header_text)?;
-    let claims = parse_json_object(payload_text)?;
 
     let alg = object_get_string(&header, "alg").ok_or(JwtValidationError::MissingClaim("alg"))?;
     if alg != "HS256" {
         return Err(JwtValidationError::UnsupportedAlgorithm);
     }
+
+    let candidate_secrets = select_hs256_secrets_for_header(&header, config)?;
+    let mut signature_matches = false;
+    for secret in candidate_secrets {
+        let expected_signature = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
+        if constant_time_eq(signature.as_slice(), &expected_signature) {
+            signature_matches = true;
+            break;
+        }
+    }
+    if !signature_matches {
+        return Err(JwtValidationError::InvalidSignature);
+    }
+
+    let payload_raw = decode_base64url(payload_b64)?;
+    let payload_text =
+        std::str::from_utf8(&payload_raw).map_err(|_| JwtValidationError::InvalidUtf8)?;
+    let claims = parse_json_object(payload_text)?;
 
     if let Some(issuer) = config.issuer.as_deref() {
         let claim_issuer =
@@ -97,9 +109,53 @@ pub fn verify_hs256_token_for_tenant(
     Ok(())
 }
 
+fn select_hs256_secrets_for_header<'a>(
+    header: &HashMap<String, JsonValue>,
+    config: &'a JwtValidationConfig,
+) -> Result<Vec<&'a str>, JwtValidationError> {
+    if let Some(kid) = object_get_optional_string(header, "kid")? {
+        let kid = kid.trim();
+        if kid.is_empty() {
+            return Err(JwtValidationError::InvalidClaimType("kid"));
+        }
+        let secret = config
+            .hs256_secrets_by_kid
+            .get(kid)
+            .ok_or(JwtValidationError::UnknownKeyId)?;
+        return Ok(vec![secret.as_str()]);
+    }
+
+    let mut out = Vec::with_capacity(1 + config.hs256_fallback_secrets.len());
+    out.push(config.hs256_secret.as_str());
+    for secret in &config.hs256_fallback_secrets {
+        if !secret.is_empty() && !out.contains(&secret.as_str()) {
+            out.push(secret.as_str());
+        }
+    }
+    Ok(out)
+}
+
 pub fn encode_hs256_token(claims_json: &str, secret: &str) -> Result<String, JwtValidationError> {
+    encode_hs256_token_with_kid(claims_json, secret, None)
+}
+
+pub fn encode_hs256_token_with_kid(
+    claims_json: &str,
+    secret: &str,
+    kid: Option<&str>,
+) -> Result<String, JwtValidationError> {
     parse_json_object(claims_json)?;
-    let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let mut header_json = String::from(r#"{"alg":"HS256","typ":"JWT""#);
+    if let Some(kid) = kid {
+        let kid = kid.trim();
+        if kid.is_empty() {
+            return Err(JwtValidationError::InvalidClaimType("kid"));
+        }
+        header_json.push_str(",\"kid\":\"");
+        header_json.push_str(&json_escape(kid));
+        header_json.push('"');
+    }
+    header_json.push('}');
     let header = encode_base64url(header_json.as_bytes());
     let payload = encode_base64url(claims_json.as_bytes());
     let signing_input = format!("{header}.{payload}");
@@ -260,6 +316,19 @@ fn object_get_string<'a>(map: &'a HashMap<String, JsonValue>, key: &str) -> Opti
     }
 }
 
+fn object_get_optional_string<'a>(
+    map: &'a HashMap<String, JsonValue>,
+    key: &'static str,
+) -> Result<Option<&'a str>, JwtValidationError> {
+    let Some(value) = map.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::String(value) => Ok(Some(value.as_str())),
+        _ => Err(JwtValidationError::InvalidClaimType(key)),
+    }
+}
+
 fn object_get_u64(
     map: &HashMap<String, JsonValue>,
     key: &'static str,
@@ -297,6 +366,21 @@ fn object_get_string_or_string_array(
         }
         _ => Err(JwtValidationError::InvalidClaimType(key)),
     }
+}
+
+fn json_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -654,6 +738,8 @@ mod tests {
     fn sample_config() -> JwtValidationConfig {
         JwtValidationConfig {
             hs256_secret: "secret".to_string(),
+            hs256_fallback_secrets: Vec::new(),
+            hs256_secrets_by_kid: HashMap::new(),
             issuer: Some("dash".to_string()),
             audience: Some("ingestion".to_string()),
             leeway_secs: 0,
@@ -716,5 +802,53 @@ mod tests {
         let bad_result =
             verify_hs256_token_for_tenant(&bad, "tenant-a", &sample_config(), 1_000_000_000);
         assert_eq!(bad_result, Err(JwtValidationError::InvalidSignature));
+    }
+
+    #[test]
+    fn verify_hs256_token_for_tenant_accepts_fallback_rotation_secret() {
+        let mut config = sample_config();
+        config.hs256_secret = "active-secret".to_string();
+        config.hs256_fallback_secrets = vec!["previous-secret".to_string()];
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "previous-secret",
+        )
+        .unwrap();
+        let result = verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_hs256_token_for_tenant_uses_kid_secret_map() {
+        let mut config = sample_config();
+        config.hs256_secret = "fallback-only".to_string();
+        config.hs256_fallback_secrets = vec!["unused".to_string()];
+        config
+            .hs256_secrets_by_kid
+            .insert("next".to_string(), "next-secret".to_string());
+        let token = encode_hs256_token_with_kid(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "next-secret",
+            Some("next"),
+        )
+        .unwrap();
+        let result = verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_hs256_token_for_tenant_rejects_unknown_kid() {
+        let mut config = sample_config();
+        config
+            .hs256_secrets_by_kid
+            .insert("current".to_string(), "current-secret".to_string());
+        let token = encode_hs256_token_with_kid(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "current-secret",
+            Some("next"),
+        )
+        .unwrap();
+        let result = verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000);
+        assert_eq!(result, Err(JwtValidationError::UnknownKeyId));
     }
 }
