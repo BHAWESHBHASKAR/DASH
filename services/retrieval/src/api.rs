@@ -154,13 +154,19 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         .collect();
     let metadata_allowed_claim_ids =
         build_metadata_prefilter_claim_ids(store, &tenant_id, &entity_filters, &embedding_filters);
-    let segment_allowed_claim_ids = build_segment_prefilter_claim_ids(&tenant_id);
+    let segment_base_claim_ids = build_segment_prefilter_claim_ids(&tenant_id);
+    let wal_delta_claim_ids =
+        build_wal_delta_claim_ids(store, &tenant_id, segment_base_claim_ids.as_ref());
+    let storage_visible_claim_ids = merge_segment_base_with_wal_delta_claim_ids(
+        segment_base_claim_ids.as_ref(),
+        wal_delta_claim_ids.as_ref(),
+    );
     let has_filtering = !entity_filters.is_empty()
         || !embedding_filters.is_empty()
-        || segment_allowed_claim_ids.is_some();
+        || storage_visible_claim_ids.is_some();
     let allowed_claim_ids = merge_allowed_claim_ids(
         metadata_allowed_claim_ids.as_ref(),
-        segment_allowed_claim_ids.as_ref(),
+        storage_visible_claim_ids.as_ref(),
     );
 
     if has_filtering
@@ -405,6 +411,37 @@ fn load_segment_prefilter_claim_ids(segment_tenant_path: &Path) -> Option<HashSe
     Some(ids)
 }
 
+fn build_wal_delta_claim_ids(
+    store: &InMemoryStore,
+    tenant_id: &str,
+    segment_base_claim_ids: Option<&HashSet<String>>,
+) -> Option<HashSet<String>> {
+    let segment_base_claim_ids = segment_base_claim_ids?;
+    let tenant_claim_ids = store.claim_ids_for_tenant(tenant_id);
+    Some(
+        tenant_claim_ids
+            .difference(segment_base_claim_ids)
+            .cloned()
+            .collect(),
+    )
+}
+
+fn merge_segment_base_with_wal_delta_claim_ids(
+    segment_base: Option<&HashSet<String>>,
+    wal_delta: Option<&HashSet<String>>,
+) -> Option<HashSet<String>> {
+    match (segment_base, wal_delta) {
+        (None, None) => None,
+        (Some(segment_base), None) => Some(segment_base.clone()),
+        (None, Some(wal_delta)) => Some(wal_delta.clone()),
+        (Some(segment_base), Some(wal_delta)) => {
+            let mut merged = segment_base.clone();
+            merged.extend(wal_delta.iter().cloned());
+            Some(merged)
+        }
+    }
+}
+
 fn merge_allowed_claim_ids(
     metadata: Option<&HashSet<String>>,
     segment: Option<&HashSet<String>>,
@@ -491,6 +528,8 @@ mod tests {
     use super::*;
     use indexer::{Segment, Tier, persist_segments_atomic};
     use schema::{Claim, ClaimEdge, Evidence, Relation, Stance};
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -515,6 +554,49 @@ mod tests {
             guard.clear();
         }
         reset_segment_prefilter_cache_metrics();
+    }
+
+    fn segment_cache_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[allow(unused_unsafe)]
+    fn set_env_var_for_tests(key: &str, value: &OsStr) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    fn restore_env_var_for_tests(key: &str, value: Option<&OsStr>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(key);
+            },
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            set_env_var_for_tests(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var_for_tests(self.key, self.previous.as_deref());
+        }
     }
 
     #[test]
@@ -827,7 +909,116 @@ mod tests {
     }
 
     #[test]
+    fn merge_segment_base_with_wal_delta_claim_ids_unions_sets() {
+        let segment_base: HashSet<String> = ["c-segment".to_string(), "c-shared".to_string()]
+            .into_iter()
+            .collect();
+        let wal_delta: HashSet<String> = ["c-delta".to_string(), "c-shared".to_string()]
+            .into_iter()
+            .collect();
+        let merged =
+            merge_segment_base_with_wal_delta_claim_ids(Some(&segment_base), Some(&wal_delta))
+                .expect("merged set should exist");
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains("c-segment"));
+        assert!(merged.contains("c-shared"));
+        assert!(merged.contains("c-delta"));
+    }
+
+    #[test]
+    fn execute_api_query_includes_wal_delta_when_segment_manifest_is_stale() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("wal-delta-visibility");
+        let tenant = "tenant-a";
+        let tenant_root = root.join(tenant);
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-segment".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-segment".into(),
+                    tenant_id: tenant.into(),
+                    canonical_text: "Company X acquired Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://segment".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("segment base ingest should succeed");
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-wal-delta".into(),
+                    tenant_id: tenant.into(),
+                    canonical_text: "Company X acquired Startup Nova in 2026".into(),
+                    confidence: 0.95,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://wal-delta".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("wal delta ingest should succeed");
+
+        let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+        let _segment_refresh_env = EnvVarGuard::set(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            OsStr::new("600000"),
+        );
+
+        let response = execute_api_query(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: tenant.into(),
+                query: "startup nova acquisition 2026".into(),
+                query_embedding: None,
+                entity_filters: vec!["company x".into()],
+                embedding_id_filters: vec!["emb://wal-delta".into()],
+                top_k: 3,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].claim_id, "claim-wal-delta");
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
     fn build_segment_prefilter_claim_ids_from_root_reads_persisted_segments() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
         clear_segment_cache_for_tests();
         let root = temp_dir("prefilter");
         let tenant_root = root.join("tenant-a");
@@ -853,6 +1044,9 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_refreshes_after_manifest_update() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
         clear_segment_cache_for_tests();
         let root = temp_dir("prefilter-refresh");
         let tenant_root = root.join("tenant-a");
@@ -894,6 +1088,9 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_metrics_track_refreshes_and_hits() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
         clear_segment_cache_for_tests();
         let root = temp_dir("prefilter-metrics");
         let tenant_root = root.join("tenant-a");

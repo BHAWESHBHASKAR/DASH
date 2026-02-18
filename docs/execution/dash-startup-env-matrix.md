@@ -18,7 +18,16 @@ Status: active
 | `DASH_INGEST_SEGMENT_MAX_SEGMENT_SIZE` | no | `10000` | max claim IDs per segment before per-tier chunking | `EME_INGEST_SEGMENT_MAX_SEGMENT_SIZE` |
 | `DASH_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER` | no | `8` | compaction planning threshold per tier | `EME_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER` |
 | `DASH_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS` | no | `4` | max input segments consumed per compaction plan | `EME_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS` |
+| `DASH_ROUTER_PLACEMENT_FILE` | no | unset | optional shard placement CSV file path (enables placement-aware write routing) | `EME_ROUTER_PLACEMENT_FILE` |
+| `DASH_ROUTER_LOCAL_NODE_ID` | conditional (required when `DASH_ROUTER_PLACEMENT_FILE` is set) | unset | local node identity used to verify this ingestion instance is the routed write leader | `EME_ROUTER_LOCAL_NODE_ID` |
+| `DASH_NODE_ID` | conditional alias | unset | fallback alias for local node identity if `DASH_ROUTER_LOCAL_NODE_ID` is unset | `EME_NODE_ID` |
+| `DASH_ROUTER_SHARD_IDS` | no | inferred from placement file | optional shard ring override (comma-separated u32 IDs) | `EME_ROUTER_SHARD_IDS` |
+| `DASH_ROUTER_VIRTUAL_NODES_PER_SHARD` | no | `64` | optional virtual-node count for consistent-hash shard ring | `EME_ROUTER_VIRTUAL_NODES_PER_SHARD` |
+| `DASH_ROUTER_REPLICA_COUNT` | no | inferred from placement file | optional replica count override for routing plan | `EME_ROUTER_REPLICA_COUNT` |
 | `DASH_INGEST_WAL_PATH` | yes (for persistence) | none | WAL path for durable claim/evidence/edge writes | `EME_INGEST_WAL_PATH` |
+| `DASH_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | WAL durability batch interval (`1` = fsync every append; `N>1` = group-commit style sync every N records) | `EME_INGEST_WAL_SYNC_EVERY_RECORDS` |
+| `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS` | no | `1` | in-process WAL append buffer threshold before flushing batched lines to disk | `EME_INGEST_WAL_APPEND_BUFFER_RECORDS` |
+| `DASH_INGEST_WAL_SYNC_INTERVAL_MS` | no | unset | optional max interval before pending WAL records are synced (checked on ingest/metrics runtime hooks) | `EME_INGEST_WAL_SYNC_INTERVAL_MS` |
 | `DASH_CHECKPOINT_MAX_WAL_RECORDS` | no | unset | checkpoint trigger by WAL record count | `EME_CHECKPOINT_MAX_WAL_RECORDS` |
 | `DASH_CHECKPOINT_MAX_WAL_BYTES` | no | unset | checkpoint trigger by WAL file bytes | `EME_CHECKPOINT_MAX_WAL_BYTES` |
 | `DASH_INGEST_ANN_MAX_NEIGHBORS_BASE` | no | `12` | ANN base-layer max neighbors for ingestion-side index build | `EME_INGEST_ANN_MAX_NEIGHBORS_BASE` |
@@ -39,6 +48,13 @@ Status: active
 | `DASH_RETRIEVAL_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_RETRIEVAL_API_KEY_SCOPES` |
 | `DASH_RETRIEVAL_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for retrieval events (success/denied/error) | `EME_RETRIEVAL_AUDIT_LOG_PATH` |
 | `DASH_RETRIEVAL_SEGMENT_DIR` | no | unset | optional segment read root directory used as additional retrieval allow-list prefilter | `EME_RETRIEVAL_SEGMENT_DIR` |
+| `DASH_ROUTER_PLACEMENT_FILE` | no | unset | optional shard placement CSV file path (enables placement-aware read routing) | `EME_ROUTER_PLACEMENT_FILE` |
+| `DASH_ROUTER_LOCAL_NODE_ID` | conditional (required when `DASH_ROUTER_PLACEMENT_FILE` is set) | unset | local node identity used to verify this retrieval instance is the routed read replica | `EME_ROUTER_LOCAL_NODE_ID` |
+| `DASH_NODE_ID` | conditional alias | unset | fallback alias for local node identity if `DASH_ROUTER_LOCAL_NODE_ID` is unset | `EME_NODE_ID` |
+| `DASH_ROUTER_READ_PREFERENCE` | no | `any_healthy` | read replica selection policy (`any_healthy`, `leader_only`, `prefer_follower`) | `EME_ROUTER_READ_PREFERENCE` |
+| `DASH_ROUTER_SHARD_IDS` | no | inferred from placement file | optional shard ring override (comma-separated u32 IDs) | `EME_ROUTER_SHARD_IDS` |
+| `DASH_ROUTER_VIRTUAL_NODES_PER_SHARD` | no | `64` | optional virtual-node count for consistent-hash shard ring | `EME_ROUTER_VIRTUAL_NODES_PER_SHARD` |
+| `DASH_ROUTER_REPLICA_COUNT` | no | inferred from placement file | optional replica count override for routing plan | `EME_ROUTER_REPLICA_COUNT` |
 | `DASH_RETRIEVAL_WAL_PATH` | no | unset | WAL path for startup replay mode | `EME_RETRIEVAL_WAL_PATH` |
 | `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` | no | `12` | ANN base-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` |
 | `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` | no | `6` | ANN upper-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` |
@@ -62,6 +78,9 @@ Runtime note:
 | `DASH_BENCH_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | benchmark run-time ANN search maximum expansion clamp | none |
 | `DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT` | no | `95` | large profile minimum candidate reduction gate (%) | none |
 | `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS` | no | `120` | large profile max DASH avg latency gate (ms) | none |
+| `DASH_CONCURRENCY_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | ingestion transport concurrency benchmark WAL sync threshold override | none |
+| `DASH_CONCURRENCY_INGEST_WAL_APPEND_BUFFER_RECORDS` | no | `1` | ingestion transport concurrency benchmark WAL append-buffer threshold override | none |
+| `DASH_CONCURRENCY_INGEST_WAL_SYNC_INTERVAL_MS` | no | unset | ingestion transport concurrency benchmark WAL sync-interval override | none |
 | `DASH_CI_INCLUDE_LARGE_GUARD` | no | `false` | when `true`, runs large profile history guard in CI | `EME_CI_INCLUDE_LARGE_GUARD` |
 | `DASH_CI_LARGE_GUARD_ITERATIONS` | no | unset (benchmark default) | override iterations for large CI guard run | none |
 | `DASH_CI_LARGE_ANN_MAX_NEIGHBORS_BASE` | no | benchmark/default fallback (`12`) | large CI guard ANN base neighbor override | none |

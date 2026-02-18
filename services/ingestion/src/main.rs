@@ -3,7 +3,7 @@ use ingestion::{
     transport::IngestionRuntime, transport::serve_http_with_workers,
 };
 use schema::{Claim, Evidence, Stance};
-use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore};
+use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWritePolicy};
 
 fn main() {
     let serve_mode = std::env::args().any(|arg| arg == "--serve");
@@ -13,6 +13,23 @@ fn main() {
     let transport_runtime = parse_transport_runtime();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_INGEST_SEGMENT_DIR", "EME_INGEST_SEGMENT_DIR");
+    let wal_sync_every_records = parse_env_with_fallback::<usize>(
+        "DASH_INGEST_WAL_SYNC_EVERY_RECORDS",
+        "EME_INGEST_WAL_SYNC_EVERY_RECORDS",
+    )
+    .filter(|value| *value > 0)
+    .unwrap_or(1);
+    let wal_append_buffer_records = parse_env_with_fallback::<usize>(
+        "DASH_INGEST_WAL_APPEND_BUFFER_RECORDS",
+        "EME_INGEST_WAL_APPEND_BUFFER_RECORDS",
+    )
+    .filter(|value| *value > 0)
+    .unwrap_or(1);
+    let wal_sync_interval_ms = parse_env_with_fallback::<u64>(
+        "DASH_INGEST_WAL_SYNC_INTERVAL_MS",
+        "EME_INGEST_WAL_SYNC_INTERVAL_MS",
+    )
+    .filter(|value| *value > 0);
 
     let input = IngestInput {
         claim: Claim {
@@ -47,7 +64,14 @@ fn main() {
     };
 
     if let Some(wal_path) = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH") {
-        let mut wal = match FileWal::open(&wal_path) {
+        let mut wal = match FileWal::open_with_policy(
+            &wal_path,
+            WalWritePolicy {
+                sync_every_records: wal_sync_every_records,
+                append_buffer_max_records: wal_append_buffer_records,
+                sync_interval: wal_sync_interval_ms.map(std::time::Duration::from_millis),
+            },
+        ) {
             Ok(wal) => wal,
             Err(err) => {
                 eprintln!("ingestion failed opening WAL '{wal_path}': {err:?}");
@@ -72,6 +96,14 @@ fn main() {
             load_stats.vectors_loaded,
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
+        );
+        println!(
+            "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}",
+            wal.sync_every_records(),
+            wal.append_buffer_max_records(),
+            wal.sync_interval()
+                .map(|value| value.as_millis())
+                .unwrap_or(0)
         );
         let policy = CheckpointPolicy {
             max_wal_records: parse_env_with_fallback::<usize>(
@@ -101,11 +133,19 @@ fn main() {
             );
             println!("ingestion health endpoint: http://{bind_addr}/health");
             println!("ingestion metrics endpoint: http://{bind_addr}/metrics");
+            println!("ingestion placement debug endpoint: http://{bind_addr}/debug/placement");
             println!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
             if let Some(segment_dir) = segment_dir.as_deref() {
                 println!("ingestion segment publish dir: {segment_dir}");
             }
             let runtime = IngestionRuntime::persistent(store, wal, policy);
+            if let Some(reason) = runtime.placement_routing_error() {
+                eprintln!("ingestion placement routing configuration error: {reason}");
+                std::process::exit(2);
+            }
+            if let Some(summary) = runtime.placement_routing_summary() {
+                println!("ingestion placement routing: {summary}");
+            }
             match transport_runtime {
                 TransportRuntime::Std => {
                     if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
@@ -171,11 +211,19 @@ fn main() {
             );
             println!("ingestion health endpoint: http://{bind_addr}/health");
             println!("ingestion metrics endpoint: http://{bind_addr}/metrics");
+            println!("ingestion placement debug endpoint: http://{bind_addr}/debug/placement");
             println!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
             if let Some(segment_dir) = segment_dir.as_deref() {
                 println!("ingestion segment publish dir: {segment_dir}");
             }
             let runtime = IngestionRuntime::in_memory(store);
+            if let Some(reason) = runtime.placement_routing_error() {
+                eprintln!("ingestion placement routing configuration error: {reason}");
+                std::process::exit(2);
+            }
+            if let Some(summary) = runtime.placement_routing_summary() {
+                println!("ingestion placement routing: {summary}");
+            }
             match transport_runtime {
                 TransportRuntime::Std => {
                     if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {

@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardAssignment {
@@ -271,6 +275,110 @@ pub fn promote_replica_to_leader(
     Ok(placement.epoch)
 }
 
+pub fn load_shard_placements_csv(path: &Path) -> Result<Vec<ShardPlacement>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read placement file '{}': {err}", path.display()))?;
+    parse_shard_placements_csv(&raw)
+}
+
+pub fn parse_shard_placements_csv(input: &str) -> Result<Vec<ShardPlacement>, String> {
+    let mut grouped: BTreeMap<(String, u32), ShardPlacement> = BTreeMap::new();
+    for (line_index, line) in input.lines().enumerate() {
+        let line_no = line_index + 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let columns: Vec<&str> = line.split(',').map(str::trim).collect();
+        if columns.len() != 6 {
+            return Err(format!(
+                "invalid placement CSV line {line_no}: expected 6 columns (tenant_id,shard_id,epoch,node_id,role,health)"
+            ));
+        }
+        let tenant_id = columns[0];
+        if tenant_id.is_empty() {
+            return Err(format!(
+                "invalid placement CSV line {line_no}: tenant_id must not be empty"
+            ));
+        }
+        let shard_id = columns[1]
+            .parse::<u32>()
+            .map_err(|_| format!("invalid placement CSV line {line_no}: shard_id must be a u32"))?;
+        let epoch = columns[2]
+            .parse::<u64>()
+            .map_err(|_| format!("invalid placement CSV line {line_no}: epoch must be a u64"))?;
+        let node_id = columns[3];
+        if node_id.is_empty() {
+            return Err(format!(
+                "invalid placement CSV line {line_no}: node_id must not be empty"
+            ));
+        }
+        let role = parse_replica_role(columns[4])
+            .map_err(|reason| format!("invalid placement CSV line {line_no}: role {reason}"))?;
+        let health = parse_replica_health(columns[5])
+            .map_err(|reason| format!("invalid placement CSV line {line_no}: health {reason}"))?;
+        let key = (tenant_id.to_string(), shard_id);
+        let entry = grouped.entry(key).or_insert_with(|| ShardPlacement {
+            tenant_id: tenant_id.to_string(),
+            shard_id,
+            epoch,
+            replicas: Vec::new(),
+        });
+        if entry.epoch != epoch {
+            return Err(format!(
+                "invalid placement CSV line {line_no}: epoch mismatch for tenant '{tenant_id}' shard {shard_id}"
+            ));
+        }
+        if entry
+            .replicas
+            .iter()
+            .any(|replica| replica.node_id == node_id)
+        {
+            return Err(format!(
+                "invalid placement CSV line {line_no}: duplicate node_id '{node_id}' for tenant '{tenant_id}' shard {shard_id}"
+            ));
+        }
+        entry.replicas.push(ReplicaPlacement {
+            node_id: node_id.to_string(),
+            role,
+            health,
+        });
+    }
+
+    let mut placements: Vec<ShardPlacement> = grouped.into_values().collect();
+    placements.sort_by(|a, b| {
+        a.tenant_id
+            .cmp(&b.tenant_id)
+            .then(a.shard_id.cmp(&b.shard_id))
+    });
+    Ok(placements)
+}
+
+pub fn shard_ids_from_placements(placements: &[ShardPlacement]) -> Vec<u32> {
+    let mut shard_ids = BTreeSet::new();
+    for placement in placements {
+        shard_ids.insert(placement.shard_id);
+    }
+    shard_ids.into_iter().collect()
+}
+
+fn parse_replica_role(raw: &str) -> Result<ReplicaRole, &'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "leader" => Ok(ReplicaRole::Leader),
+        "follower" => Ok(ReplicaRole::Follower),
+        _ => Err("must be one of: leader, follower"),
+    }
+}
+
+fn parse_replica_health(raw: &str) -> Result<ReplicaHealth, &'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "healthy" => Ok(ReplicaHealth::Healthy),
+        "degraded" => Ok(ReplicaHealth::Degraded),
+        "unavailable" => Ok(ReplicaHealth::Unavailable),
+        _ => Err("must be one of: healthy, degraded, unavailable"),
+    }
+}
+
 fn find_placement<'a>(
     placements: &'a [ShardPlacement],
     tenant_id: &str,
@@ -444,5 +552,58 @@ mod tests {
         )
         .expect_err("read route should fail");
         assert!(matches!(err, PlacementRouteError::NoReadableReplica { .. }));
+    }
+
+    #[test]
+    fn parse_shard_placements_csv_loads_replicas_per_shard() {
+        let csv = r#"
+            # tenant_id,shard_id,epoch,node_id,role,health
+            tenant-a,0,7,node-a,leader,healthy
+            tenant-a,0,7,node-b,follower,degraded
+            tenant-a,1,2,node-c,leader,healthy
+        "#;
+        let placements = parse_shard_placements_csv(csv).expect("csv should parse");
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].tenant_id, "tenant-a");
+        assert_eq!(placements[0].shard_id, 0);
+        assert_eq!(placements[0].epoch, 7);
+        assert_eq!(placements[0].replicas.len(), 2);
+        assert_eq!(placements[1].shard_id, 1);
+        assert_eq!(placements[1].replicas.len(), 1);
+    }
+
+    #[test]
+    fn parse_shard_placements_csv_rejects_epoch_conflicts() {
+        let csv = r#"
+            tenant-a,0,7,node-a,leader,healthy
+            tenant-a,0,8,node-b,follower,healthy
+        "#;
+        let err = parse_shard_placements_csv(csv).expect_err("csv should reject epoch conflicts");
+        assert!(err.contains("epoch mismatch"));
+    }
+
+    #[test]
+    fn shard_ids_from_placements_deduplicates_and_sorts() {
+        let placements = vec![
+            ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 5,
+                epoch: 1,
+                replicas: vec![],
+            },
+            ShardPlacement {
+                tenant_id: "tenant-b".to_string(),
+                shard_id: 2,
+                epoch: 1,
+                replicas: vec![],
+            },
+            ShardPlacement {
+                tenant_id: "tenant-c".to_string(),
+                shard_id: 5,
+                epoch: 1,
+                replicas: vec![],
+            },
+        ];
+        assert_eq!(shard_ids_from_placements(&placements), vec![2, 5]);
     }
 }

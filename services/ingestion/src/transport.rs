@@ -12,6 +12,10 @@ use indexer::{
     CompactionSchedulerConfig, SegmentStoreError, apply_compaction_plan, build_segments,
     persist_segments_atomic, plan_compaction_round,
 };
+use metadata_router::{
+    PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig, ShardPlacement,
+    load_shard_placements_csv, route_write_with_placement, shard_ids_from_placements,
+};
 use schema::{Claim, ClaimEdge, Evidence, Relation, Stance};
 use store::{CheckpointPolicy, FileWal, InMemoryStore, StoreError};
 
@@ -26,6 +30,7 @@ pub struct IngestionRuntime {
     wal: Option<FileWal>,
     checkpoint_policy: CheckpointPolicy,
     segment_runtime: Option<SegmentRuntime>,
+    placement_routing: Result<Option<PlacementRoutingRuntime>, String>,
     successful_ingests: u64,
     failed_ingests: u64,
     segment_publish_success_total: u64,
@@ -38,6 +43,13 @@ pub struct IngestionRuntime {
     authz_denied_total: u64,
     audit_events_total: u64,
     audit_write_error_total: u64,
+    placement_route_reject_total: u64,
+    placement_last_shard_id: Option<u32>,
+    placement_last_epoch: Option<u64>,
+    placement_last_role: Option<ReplicaRole>,
+    wal_flush_due_total: u64,
+    wal_flush_success_total: u64,
+    wal_flush_failure_total: u64,
     started_at: Instant,
 }
 
@@ -48,6 +60,7 @@ impl IngestionRuntime {
             wal: None,
             checkpoint_policy: CheckpointPolicy::default(),
             segment_runtime: SegmentRuntime::from_env(),
+            placement_routing: PlacementRoutingRuntime::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
             segment_publish_success_total: 0,
@@ -60,6 +73,13 @@ impl IngestionRuntime {
             authz_denied_total: 0,
             audit_events_total: 0,
             audit_write_error_total: 0,
+            placement_route_reject_total: 0,
+            placement_last_shard_id: None,
+            placement_last_epoch: None,
+            placement_last_role: None,
+            wal_flush_due_total: 0,
+            wal_flush_success_total: 0,
+            wal_flush_failure_total: 0,
             started_at: Instant::now(),
         }
     }
@@ -74,6 +94,7 @@ impl IngestionRuntime {
             wal: Some(wal),
             checkpoint_policy,
             segment_runtime: SegmentRuntime::from_env(),
+            placement_routing: PlacementRoutingRuntime::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
             segment_publish_success_total: 0,
@@ -86,6 +107,13 @@ impl IngestionRuntime {
             authz_denied_total: 0,
             audit_events_total: 0,
             audit_write_error_total: 0,
+            placement_route_reject_total: 0,
+            placement_last_shard_id: None,
+            placement_last_epoch: None,
+            placement_last_role: None,
+            wal_flush_due_total: 0,
+            wal_flush_success_total: 0,
+            wal_flush_failure_total: 0,
             started_at: Instant::now(),
         }
     }
@@ -94,10 +122,64 @@ impl IngestionRuntime {
         self.store.claims_len()
     }
 
+    pub fn placement_routing_error(&self) -> Option<&str> {
+        self.placement_routing.as_ref().err().map(String::as_str)
+    }
+
+    pub fn placement_routing_summary(&self) -> Option<String> {
+        let routing = self.placement_routing.as_ref().ok()?.as_ref()?;
+        Some(format!(
+            "local_node_id={}, shards={}, replicas_per_shard={}",
+            routing.local_node_id,
+            routing.router_config.shard_ids.len(),
+            routing.router_config.replica_count
+        ))
+    }
+
     #[cfg(test)]
     fn with_segment_runtime_for_tests(mut self, runtime: Option<SegmentRuntime>) -> Self {
         self.segment_runtime = runtime;
         self
+    }
+
+    #[cfg(test)]
+    fn with_placement_runtime_for_tests(
+        mut self,
+        runtime: Result<Option<PlacementRoutingRuntime>, String>,
+    ) -> Self {
+        self.placement_routing = runtime;
+        self
+    }
+
+    fn ensure_local_write_route_for_claim(&mut self, claim: &Claim) -> Result<(), WriteRouteError> {
+        let Some(routing) = self
+            .placement_routing
+            .as_ref()
+            .map_err(|reason| WriteRouteError::Config(reason.clone()))?
+            .as_ref()
+        else {
+            return Ok(());
+        };
+        let entity_key = write_entity_key_for_claim(claim);
+        let routed = route_write_with_placement(
+            &claim.tenant_id,
+            entity_key,
+            &routing.router_config,
+            &routing.placements,
+        )
+        .map_err(WriteRouteError::Placement)?;
+        let local_node_id = routing.local_node_id.clone();
+        self.observe_write_route_resolution(&routed);
+        if routed.node_id != local_node_id {
+            return Err(WriteRouteError::WrongNode {
+                local_node_id,
+                target_node_id: routed.node_id,
+                shard_id: routed.shard_id,
+                epoch: routed.epoch,
+                role: routed.role,
+            });
+        }
+        Ok(())
     }
 
     fn ingest(&mut self, request: IngestApiRequest) -> Result<IngestApiResponse, StoreError> {
@@ -175,7 +257,85 @@ impl IngestionRuntime {
         self.audit_write_error_total += 1;
     }
 
+    fn observe_write_route_resolution(&mut self, routed: &RoutedReplica) {
+        self.placement_last_shard_id = Some(routed.shard_id);
+        self.placement_last_epoch = Some(routed.epoch);
+        self.placement_last_role = Some(routed.role);
+    }
+
+    fn observe_write_route_rejection(&mut self, error: &WriteRouteError) {
+        self.placement_route_reject_total += 1;
+        if let WriteRouteError::WrongNode {
+            shard_id,
+            epoch,
+            role,
+            ..
+        } = error
+        {
+            self.placement_last_shard_id = Some(*shard_id);
+            self.placement_last_epoch = Some(*epoch);
+            self.placement_last_role = Some(*role);
+        }
+    }
+
+    fn flush_wal_if_due(&mut self) {
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        match wal.flush_pending_sync_if_interval_elapsed() {
+            Ok(true) => {
+                self.wal_flush_due_total += 1;
+                self.wal_flush_success_total += 1;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.wal_flush_due_total += 1;
+                self.wal_flush_failure_total += 1;
+                eprintln!("ingestion WAL interval flush failed: {err:?}");
+            }
+        }
+    }
+
     fn metrics_text(&self) -> String {
+        let placement_enabled = self
+            .placement_routing
+            .as_ref()
+            .ok()
+            .and_then(|runtime| runtime.as_ref())
+            .map(|_| 1)
+            .unwrap_or(0);
+        let placement_config_error = if self.placement_routing.is_err() {
+            1
+        } else {
+            0
+        };
+        let placement_snapshot = self
+            .placement_routing
+            .as_ref()
+            .ok()
+            .and_then(|runtime| runtime.as_ref())
+            .map(PlacementRoutingRuntime::observability_snapshot)
+            .unwrap_or_default();
+        let placement_last_shard_id = self
+            .placement_last_shard_id
+            .map(|value| value as i64)
+            .unwrap_or(-1);
+        let placement_last_epoch = self.placement_last_epoch.unwrap_or(0);
+        let placement_last_role = match self.placement_last_role {
+            Some(ReplicaRole::Leader) => 1,
+            Some(ReplicaRole::Follower) => 2,
+            None => 0,
+        };
+        let wal_unsynced_records = self
+            .wal
+            .as_ref()
+            .map(FileWal::unsynced_record_count)
+            .unwrap_or(0);
+        let wal_buffered_records = self
+            .wal
+            .as_ref()
+            .map(FileWal::buffered_record_count)
+            .unwrap_or(0);
         format!(
             "# TYPE dash_ingest_success_total counter\n\
 dash_ingest_success_total {}\n\
@@ -201,6 +361,38 @@ dash_ingest_authz_denied_total {}\n\
 dash_ingest_audit_events_total {}\n\
 # TYPE dash_ingest_audit_write_error_total counter\n\
 dash_ingest_audit_write_error_total {}\n\
+# TYPE dash_ingest_placement_enabled gauge\n\
+dash_ingest_placement_enabled {}\n\
+# TYPE dash_ingest_placement_config_error gauge\n\
+dash_ingest_placement_config_error {}\n\
+# TYPE dash_ingest_placement_route_reject_total counter\n\
+dash_ingest_placement_route_reject_total {}\n\
+# TYPE dash_ingest_placement_last_shard_id gauge\n\
+dash_ingest_placement_last_shard_id {}\n\
+# TYPE dash_ingest_placement_last_epoch gauge\n\
+dash_ingest_placement_last_epoch {}\n\
+# TYPE dash_ingest_placement_last_role gauge\n\
+dash_ingest_placement_last_role {}\n\
+# TYPE dash_ingest_placement_leaders_total gauge\n\
+dash_ingest_placement_leaders_total {}\n\
+# TYPE dash_ingest_placement_followers_total gauge\n\
+dash_ingest_placement_followers_total {}\n\
+# TYPE dash_ingest_placement_replicas_healthy gauge\n\
+dash_ingest_placement_replicas_healthy {}\n\
+# TYPE dash_ingest_placement_replicas_degraded gauge\n\
+dash_ingest_placement_replicas_degraded {}\n\
+# TYPE dash_ingest_placement_replicas_unavailable gauge\n\
+dash_ingest_placement_replicas_unavailable {}\n\
+# TYPE dash_ingest_wal_unsynced_records gauge\n\
+dash_ingest_wal_unsynced_records {}\n\
+# TYPE dash_ingest_wal_buffered_records gauge\n\
+dash_ingest_wal_buffered_records {}\n\
+# TYPE dash_ingest_wal_flush_due_total counter\n\
+dash_ingest_wal_flush_due_total {}\n\
+# TYPE dash_ingest_wal_flush_success_total counter\n\
+dash_ingest_wal_flush_success_total {}\n\
+# TYPE dash_ingest_wal_flush_failure_total counter\n\
+dash_ingest_wal_flush_failure_total {}\n\
 # TYPE dash_ingest_claims_total gauge\n\
 dash_ingest_claims_total {}\n\
 # TYPE dash_ingest_uptime_seconds gauge\n\
@@ -217,6 +409,22 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.authz_denied_total,
             self.audit_events_total,
             self.audit_write_error_total,
+            placement_enabled,
+            placement_config_error,
+            self.placement_route_reject_total,
+            placement_last_shard_id,
+            placement_last_epoch,
+            placement_last_role,
+            placement_snapshot.leaders_total,
+            placement_snapshot.followers_total,
+            placement_snapshot.replicas_healthy,
+            placement_snapshot.replicas_degraded,
+            placement_snapshot.replicas_unavailable,
+            wal_unsynced_records,
+            wal_buffered_records,
+            self.wal_flush_due_total,
+            self.wal_flush_success_total,
+            self.wal_flush_failure_total,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         )
@@ -240,6 +448,55 @@ struct SegmentPublishStats {
     claim_count: usize,
     segment_count: usize,
     compaction_plan_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementRoutingRuntime {
+    local_node_id: String,
+    router_config: RouterConfig,
+    placements: Vec<ShardPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlacementObservabilitySnapshot {
+    leaders_total: usize,
+    followers_total: usize,
+    replicas_healthy: usize,
+    replicas_degraded: usize,
+    replicas_unavailable: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriteRouteError {
+    Config(String),
+    Placement(PlacementRouteError),
+    WrongNode {
+        local_node_id: String,
+        target_node_id: String,
+        shard_id: u32,
+        epoch: u64,
+        role: ReplicaRole,
+    },
+}
+
+impl PlacementRoutingRuntime {
+    fn observability_snapshot(&self) -> PlacementObservabilitySnapshot {
+        let mut snapshot = PlacementObservabilitySnapshot::default();
+        for placement in &self.placements {
+            for replica in &placement.replicas {
+                match replica.role {
+                    ReplicaRole::Leader => snapshot.leaders_total += 1,
+                    ReplicaRole::Follower => snapshot.followers_total += 1,
+                }
+                match replica.health {
+                    ReplicaHealth::Healthy => snapshot.replicas_healthy += 1,
+                    ReplicaHealth::Degraded => snapshot.replicas_degraded += 1,
+                    ReplicaHealth::Unavailable => snapshot.replicas_unavailable += 1,
+                }
+            }
+        }
+        snapshot
+    }
 }
 
 impl SegmentRuntime {
@@ -302,6 +559,126 @@ impl SegmentRuntime {
 
     fn tenant_segment_dir(&self, tenant_id: &str) -> PathBuf {
         self.root_dir.join(sanitize_path_component(tenant_id))
+    }
+}
+
+impl PlacementRoutingRuntime {
+    fn from_env() -> Result<Option<Self>, String> {
+        let Some(placement_file) =
+            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
+        else {
+            return Ok(None);
+        };
+        let local_node_id = env_with_fallback(
+            "DASH_ROUTER_LOCAL_NODE_ID",
+            "EME_ROUTER_LOCAL_NODE_ID",
+        )
+        .or_else(|| env_with_fallback("DASH_NODE_ID", "EME_NODE_ID"))
+        .ok_or_else(|| {
+            "placement routing enabled, but DASH_ROUTER_LOCAL_NODE_ID (or DASH_NODE_ID) is unset"
+                .to_string()
+        })?;
+        let local_node_id = local_node_id.trim();
+        if local_node_id.is_empty() {
+            return Err(
+                "placement routing enabled, but local node id is empty after trimming".to_string(),
+            );
+        }
+
+        let placements = load_shard_placements_csv(Path::new(&placement_file))?;
+        if placements.is_empty() {
+            return Err(format!(
+                "placement file '{}' has no placement records",
+                placement_file
+            ));
+        }
+
+        let shard_ids = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS")
+            .unwrap_or_else(|| shard_ids_from_placements(&placements));
+        if shard_ids.is_empty() {
+            return Err("placement routing requires at least one shard id".to_string());
+        }
+        let replica_count =
+            parse_env_first_usize(&["DASH_ROUTER_REPLICA_COUNT", "EME_ROUTER_REPLICA_COUNT"])
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    placements
+                        .iter()
+                        .map(|placement| placement.replicas.len())
+                        .max()
+                        .unwrap_or(1)
+                });
+        let virtual_nodes_per_shard = parse_env_first_usize(&[
+            "DASH_ROUTER_VIRTUAL_NODES_PER_SHARD",
+            "EME_ROUTER_VIRTUAL_NODES_PER_SHARD",
+        ])
+        .filter(|value| *value > 0)
+        .unwrap_or(64) as u32;
+
+        Ok(Some(Self {
+            local_node_id: local_node_id.to_string(),
+            router_config: RouterConfig {
+                shard_ids,
+                virtual_nodes_per_shard,
+                replica_count,
+            },
+            placements,
+        }))
+    }
+}
+
+fn write_entity_key_for_claim(claim: &Claim) -> &str {
+    claim
+        .entities
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or(claim.claim_id.as_str())
+}
+
+fn parse_csv_u32_env(primary: &str, fallback: &str) -> Option<Vec<u32>> {
+    let raw = env_with_fallback(primary, fallback)?;
+    let mut values = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = item.parse::<u32>() {
+            values.push(parsed);
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
+    match error {
+        WriteRouteError::Config(reason) => (
+            500,
+            format!("placement routing configuration error: {reason}"),
+        ),
+        WriteRouteError::Placement(reason) => (
+            503,
+            format!("placement route rejected write request: {reason:?}"),
+        ),
+        WriteRouteError::WrongNode {
+            local_node_id,
+            target_node_id,
+            shard_id,
+            epoch,
+            role: _,
+        } => (
+            503,
+            format!(
+                "placement route rejected write request: local node '{local_node_id}' is not leader for shard {shard_id} at epoch {epoch} (target leader: '{target_node_id}')"
+            ),
+        ),
     }
 }
 
@@ -497,7 +874,7 @@ fn parse_request_line(line: &str) -> Result<(String, String), String> {
 }
 
 pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> HttpResponse {
-    let (path, _) = split_target(&request.target);
+    let (path, query) = split_target(&request.target);
     let auth_policy = AuthPolicy::from_env(
         env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY"),
         env_with_fallback("DASH_INGEST_ALLOWED_TENANTS", "EME_INGEST_ALLOWED_TENANTS"),
@@ -509,11 +886,20 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
         ("GET", "/health") => HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()),
         ("GET", "/metrics") => {
             let body = match runtime.lock() {
-                Ok(rt) => rt.metrics_text(),
+                Ok(mut rt) => {
+                    rt.flush_wal_if_due();
+                    rt.metrics_text()
+                }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
             };
             HttpResponse::ok_text(body)
         }
+        ("GET", "/debug/placement") => match runtime.lock() {
+            Ok(rt) => HttpResponse::ok_json(render_placement_debug_json(&rt, &query)),
+            Err(_) => {
+                HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+            }
+        },
         ("POST", "/v1/ingest") => {
             if let Some(content_type) = request.headers.get("content-type")
                 && !content_type
@@ -593,16 +979,28 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
                             );
                         }
                     };
-                    let response = match guard.ingest(api_req) {
-                        Ok(resp) => {
-                            audit_status = 200;
-                            audit_outcome = "success";
-                            audit_reason = "ingest accepted".to_string();
-                            HttpResponse::ok_json(render_ingest_response_json(&resp))
-                        }
-                        Err(err) => {
+                    guard.flush_wal_if_due();
+                    let response = match guard.ensure_local_write_route_for_claim(&api_req.claim) {
+                        Ok(()) => match guard.ingest(api_req) {
+                            Ok(resp) => {
+                                audit_status = 200;
+                                audit_outcome = "success";
+                                audit_reason = "ingest accepted".to_string();
+                                HttpResponse::ok_json(render_ingest_response_json(&resp))
+                            }
+                            Err(err) => {
+                                guard.observe_failure();
+                                let (status, message) = map_store_error(&err);
+                                audit_status = status;
+                                audit_reason = message.clone();
+                                HttpResponse::error_with_status(status, &message)
+                            }
+                        },
+                        Err(route_err) => {
                             guard.observe_failure();
-                            let (status, message) = map_store_error(&err);
+                            guard.observe_write_route_rejection(&route_err);
+                            audit_outcome = "denied";
+                            let (status, message) = map_write_route_error(&route_err);
                             audit_status = status;
                             audit_reason = message.clone();
                             HttpResponse::error_with_status(status, &message)
@@ -627,10 +1025,161 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
             }
         }
         (_, "/v1/ingest") => HttpResponse::method_not_allowed("only POST is supported"),
-        (_, "/health") | (_, "/metrics") => {
+        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+fn render_placement_debug_json(
+    runtime: &IngestionRuntime,
+    query: &HashMap<String, String>,
+) -> String {
+    let (enabled, config_error, local_node_id, shard_count, placements, route_probe) =
+        match runtime.placement_routing.as_ref() {
+            Ok(Some(routing)) => (
+                true,
+                None,
+                Some(routing.local_node_id.clone()),
+                routing.router_config.shard_ids.len(),
+                routing.placements.as_slice(),
+                build_write_route_probe_json(Some(routing), query),
+            ),
+            Ok(None) => (false, None, None, 0, &[][..], "null".to_string()),
+            Err(reason) => (
+                false,
+                Some(reason.as_str()),
+                None,
+                0,
+                &[][..],
+                "null".to_string(),
+            ),
+        };
+
+    format!(
+        "{{\"enabled\":{},\"config_error\":{},\"local_node_id\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{}}}",
+        enabled,
+        config_error
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
+        local_node_id
+            .as_ref()
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
+        shard_count,
+        render_placements_json(placements),
+        route_probe
+    )
+}
+
+fn build_write_route_probe_json(
+    routing: Option<&PlacementRoutingRuntime>,
+    query: &HashMap<String, String>,
+) -> String {
+    let Some(tenant_id) = query.get("tenant_id").map(String::as_str) else {
+        return "null".to_string();
+    };
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() {
+        return "{\"status\":\"invalid\",\"reason\":\"tenant_id must not be empty\"}".to_string();
+    }
+    let entity_key = query
+        .get("entity_key")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if entity_key.is_empty() {
+        return "{\"status\":\"invalid\",\"reason\":\"entity_key is required for route probe\"}"
+            .to_string();
+    }
+    let Some(routing) = routing else {
+        return "{\"status\":\"unconfigured\",\"reason\":\"placement routing is disabled\"}"
+            .to_string();
+    };
+
+    match route_write_with_placement(
+        tenant_id,
+        entity_key,
+        &routing.router_config,
+        &routing.placements,
+    ) {
+        Ok(routed) => {
+            let local_admission = routed.node_id == routing.local_node_id;
+            let reason = if local_admission {
+                "local node is write leader"
+            } else {
+                "request would be rejected: local node is not write leader"
+            };
+            format!(
+                "{{\"status\":\"{}\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"local_node_id\":\"{}\",\"target_node_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"role\":\"{}\",\"local_admission\":{},\"reason\":\"{}\"}}",
+                if local_admission {
+                    "routable"
+                } else {
+                    "rejected"
+                },
+                json_escape(tenant_id),
+                json_escape(entity_key),
+                json_escape(&routing.local_node_id),
+                json_escape(&routed.node_id),
+                routed.shard_id,
+                routed.epoch,
+                replica_role_str(routed.role),
+                local_admission,
+                json_escape(reason),
+            )
+        }
+        Err(err) => format!(
+            "{{\"status\":\"rejected\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"reason\":\"{}\"}}",
+            json_escape(tenant_id),
+            json_escape(entity_key),
+            json_escape(&format!("placement route error: {err:?}"))
+        ),
+    }
+}
+
+fn render_placements_json(placements: &[ShardPlacement]) -> String {
+    let body = placements
+        .iter()
+        .map(|placement| {
+            let replicas = placement
+                .replicas
+                .iter()
+                .map(|replica| {
+                    format!(
+                        "{{\"node_id\":\"{}\",\"role\":\"{}\",\"health\":\"{}\"}}",
+                        json_escape(&replica.node_id),
+                        replica_role_str(replica.role),
+                        replica_health_str(replica.health),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"tenant_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"replicas\":[{}]}}",
+                json_escape(&placement.tenant_id),
+                placement.shard_id,
+                placement.epoch,
+                replicas
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn replica_role_str(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Leader => "leader",
+        ReplicaRole::Follower => "follower",
+    }
+}
+
+fn replica_health_str(health: ReplicaHealth) -> &'static str {
+    match health {
+        ReplicaHealth::Healthy => "healthy",
+        ReplicaHealth::Degraded => "degraded",
+        ReplicaHealth::Unavailable => "unavailable",
     }
 }
 
@@ -1441,6 +1990,7 @@ fn render_response_text(response: &HttpResponse) -> String {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        503 => "503 Service Unavailable",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
     };
@@ -1531,6 +2081,14 @@ impl HttpResponse {
         }
     }
 
+    fn service_unavailable(message: &str) -> Self {
+        Self {
+            status: 503,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
     fn error_with_status(status: u16, message: &str) -> Self {
         match status {
             400 => Self::bad_request(message),
@@ -1538,6 +2096,7 @@ impl HttpResponse {
             403 => Self::forbidden(message),
             404 => Self::not_found(message),
             405 => Self::method_not_allowed(message),
+            503 => Self::service_unavailable(message),
             _ => Self::internal_server_error(message),
         }
     }
@@ -1546,6 +2105,9 @@ impl HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metadata_router::{
+        ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_runtime() -> SharedRuntime {
@@ -1760,6 +2322,223 @@ mod tests {
                 .body
                 .contains("dash_ingest_auth_success_total 1")
         );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_enabled 0")
+        );
+    }
+
+    #[test]
+    fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
+        let placement = ShardPlacement {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: 0,
+            epoch: 9,
+            replicas: vec![
+                ReplicaPlacement {
+                    node_id: "node-a".to_string(),
+                    role: ReplicaRole::Leader,
+                    health: ReplicaHealth::Healthy,
+                },
+                ReplicaPlacement {
+                    node_id: "node-b".to_string(),
+                    role: ReplicaRole::Follower,
+                    health: ReplicaHealth::Healthy,
+                },
+            ],
+        };
+        let runtime = Arc::new(Mutex::new(
+            IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+                Some(PlacementRoutingRuntime {
+                    local_node_id: "node-b".to_string(),
+                    router_config: RouterConfig {
+                        shard_ids: vec![0],
+                        virtual_nodes_per_shard: 16,
+                        replica_count: 2,
+                    },
+                    placements: vec![placement],
+                }),
+            )),
+        ));
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"claim":{"claim_id":"c-route","tenant_id":"tenant-a","canonical_text":"placement route test","confidence":0.9}}"#.to_vec(),
+        };
+        let response = handle_request(&runtime, &request);
+        assert_eq!(
+            response.status, 503,
+            "unexpected response body: {}",
+            response.body
+        );
+        assert!(response.body.contains("local node 'node-b'"));
+
+        let claims_len = runtime
+            .lock()
+            .expect("runtime lock should hold")
+            .claims_len();
+        assert_eq!(claims_len, 0);
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_route_reject_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_last_epoch 9")
+        );
+    }
+
+    #[test]
+    fn handle_request_write_route_reresolves_after_leader_promotion() {
+        let placement = ShardPlacement {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: 0,
+            epoch: 9,
+            replicas: vec![
+                ReplicaPlacement {
+                    node_id: "node-a".to_string(),
+                    role: ReplicaRole::Leader,
+                    health: ReplicaHealth::Healthy,
+                },
+                ReplicaPlacement {
+                    node_id: "node-b".to_string(),
+                    role: ReplicaRole::Follower,
+                    health: ReplicaHealth::Healthy,
+                },
+            ],
+        };
+        let runtime = Arc::new(Mutex::new(
+            IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+                Some(PlacementRoutingRuntime {
+                    local_node_id: "node-b".to_string(),
+                    router_config: RouterConfig {
+                        shard_ids: vec![0],
+                        virtual_nodes_per_shard: 16,
+                        replica_count: 2,
+                    },
+                    placements: vec![placement],
+                }),
+            )),
+        ));
+        let denied_request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"claim":{"claim_id":"c-failover-a","tenant_id":"tenant-a","canonical_text":"placement route failover test","confidence":0.9}}"#.to_vec(),
+        };
+        let denied_response = handle_request(&runtime, &denied_request);
+        assert_eq!(denied_response.status, 503);
+
+        {
+            let mut guard = runtime.lock().expect("runtime lock should hold");
+            let routing = guard
+                .placement_routing
+                .as_mut()
+                .expect("placement config should be present")
+                .as_mut()
+                .expect("placement routing should be enabled");
+            let epoch = promote_replica_to_leader(&mut routing.placements[0], "node-b")
+                .expect("promotion should succeed");
+            assert_eq!(epoch, 10);
+        }
+
+        let accepted_request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"claim":{"claim_id":"c-failover-b","tenant_id":"tenant-a","canonical_text":"placement route failover test","confidence":0.9}}"#.to_vec(),
+        };
+        let accepted_response = handle_request(&runtime, &accepted_request);
+        assert_eq!(accepted_response.status, 200);
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_route_reject_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_last_epoch 10")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_last_role 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_placement_replicas_healthy 2")
+        );
+    }
+
+    #[test]
+    fn debug_placement_endpoint_returns_structured_route_probe() {
+        let placement = ShardPlacement {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: 0,
+            epoch: 4,
+            replicas: vec![
+                ReplicaPlacement {
+                    node_id: "node-a".to_string(),
+                    role: ReplicaRole::Leader,
+                    health: ReplicaHealth::Healthy,
+                },
+                ReplicaPlacement {
+                    node_id: "node-b".to_string(),
+                    role: ReplicaRole::Follower,
+                    health: ReplicaHealth::Degraded,
+                },
+            ],
+        };
+        let runtime = Arc::new(Mutex::new(
+            IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+                Some(PlacementRoutingRuntime {
+                    local_node_id: "node-b".to_string(),
+                    router_config: RouterConfig {
+                        shard_ids: vec![0],
+                        virtual_nodes_per_shard: 16,
+                        replica_count: 2,
+                    },
+                    placements: vec![placement],
+                }),
+            )),
+        ));
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/placement?tenant_id=tenant-a&entity_key=company-x".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response = handle_request(&runtime, &request);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"enabled\":true"));
+        assert!(response.body.contains("\"placements\""));
+        assert!(response.body.contains("\"route_probe\""));
+        assert!(response.body.contains("\"status\":\"rejected\""));
+        assert!(response.body.contains("\"local_node_id\":\"node-b\""));
+        assert!(response.body.contains("\"target_node_id\":\"node-a\""));
     }
 
     #[test]

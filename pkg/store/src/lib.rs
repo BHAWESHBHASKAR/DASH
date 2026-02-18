@@ -4,6 +4,7 @@ use std::{
     fs::{OpenOptions, create_dir_all, rename},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use graph::summarize_edges;
@@ -180,10 +181,53 @@ impl Ord for ScoredNode {
 pub struct FileWal {
     path: PathBuf,
     wal_records: usize,
+    sync_every_records: usize,
+    append_buffer_max_records: usize,
+    sync_interval: Option<Duration>,
+    append_buffer: Vec<String>,
+    unsynced_records: usize,
+    last_sync_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalWritePolicy {
+    pub sync_every_records: usize,
+    pub append_buffer_max_records: usize,
+    pub sync_interval: Option<Duration>,
+}
+
+impl Default for WalWritePolicy {
+    fn default() -> Self {
+        Self {
+            sync_every_records: 1,
+            append_buffer_max_records: 1,
+            sync_interval: None,
+        }
+    }
 }
 
 impl FileWal {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_with_sync_every_records(path, 1)
+    }
+
+    pub fn open_with_sync_every_records(
+        path: impl AsRef<Path>,
+        sync_every_records: usize,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_policy(
+            path,
+            WalWritePolicy {
+                sync_every_records,
+                ..WalWritePolicy::default()
+            },
+        )
+    }
+
+    pub fn open_with_policy(
+        path: impl AsRef<Path>,
+        policy: WalWritePolicy,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -192,11 +236,40 @@ impl FileWal {
         }
         OpenOptions::new().create(true).append(true).open(&path)?;
         let wal_records = count_non_empty_lines(&path)?;
-        Ok(Self { path, wal_records })
+        Ok(Self {
+            path,
+            wal_records,
+            sync_every_records: policy.sync_every_records.max(1),
+            append_buffer_max_records: policy.append_buffer_max_records.max(1),
+            sync_interval: policy.sync_interval,
+            append_buffer: Vec::new(),
+            unsynced_records: 0,
+            last_sync_at: Instant::now(),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn sync_every_records(&self) -> usize {
+        self.sync_every_records
+    }
+
+    pub fn append_buffer_max_records(&self) -> usize {
+        self.append_buffer_max_records
+    }
+
+    pub fn sync_interval(&self) -> Option<Duration> {
+        self.sync_interval
+    }
+
+    pub fn unsynced_record_count(&self) -> usize {
+        self.unsynced_records
+    }
+
+    pub fn buffered_record_count(&self) -> usize {
+        self.append_buffer.len()
     }
 
     pub fn snapshot_path(&self) -> PathBuf {
@@ -237,14 +310,58 @@ impl FileWal {
     }
 
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
+        self.append_buffer.push(record_to_line(record));
+        self.wal_records += 1;
+        self.unsynced_records += 1;
+        if self.append_buffer.len() >= self.append_buffer_max_records {
+            self.flush_append_buffer()?;
+        }
+        let interval_elapsed = self
+            .sync_interval
+            .is_some_and(|interval| self.last_sync_at.elapsed() >= interval);
+        if self.unsynced_records >= self.sync_every_records || interval_elapsed {
+            self.flush_pending_sync()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_pending_sync_if_interval_elapsed(&mut self) -> Result<bool, StoreError> {
+        let Some(interval) = self.sync_interval else {
+            return Ok(false);
+        };
+        if self.unsynced_records == 0 || self.last_sync_at.elapsed() < interval {
+            return Ok(false);
+        }
+        self.flush_pending_sync()?;
+        Ok(true)
+    }
+
+    fn flush_append_buffer(&mut self) -> Result<(), StoreError> {
+        if self.append_buffer.is_empty() {
+            return Ok(());
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(file, "{}", record_to_line(record))?;
-        // Force WAL durability for each record append.
+        for line in self.append_buffer.drain(..) {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    }
+
+    pub fn flush_pending_sync(&mut self) -> Result<(), StoreError> {
+        self.flush_append_buffer()?;
+        if self.unsynced_records == 0 {
+            return Ok(());
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         file.sync_data()?;
-        self.wal_records += 1;
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
         Ok(())
     }
 
@@ -252,7 +369,12 @@ impl FileWal {
         &self,
     ) -> Result<(Vec<PersistedRecord>, WalReplayStats), StoreError> {
         let snapshot_records = self.replay_snapshot_records()?;
-        let wal_records = self.replay_wal_records()?;
+        let mut wal_records = self.replay_wal_records()?;
+        if !self.append_buffer.is_empty() {
+            for line in &self.append_buffer {
+                wal_records.push(line_to_record(line)?);
+            }
+        }
         let stats = WalReplayStats {
             snapshot_records: snapshot_records.len(),
             wal_records: wal_records.len(),
@@ -343,12 +465,15 @@ impl FileWal {
     }
 
     fn truncate_wal(&mut self) -> Result<(), StoreError> {
+        self.append_buffer.clear();
         OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
         self.wal_records = 0;
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
         Ok(())
     }
 
@@ -357,12 +482,19 @@ impl FileWal {
         snapshot_records: &[PersistedRecord],
     ) -> Result<WalCheckpointStats, StoreError> {
         let truncated_wal_records = self.wal_records;
+        self.flush_pending_sync()?;
         self.write_snapshot_records(snapshot_records)?;
         self.truncate_wal()?;
         Ok(WalCheckpointStats {
             snapshot_records: snapshot_records.len(),
             truncated_wal_records,
         })
+    }
+}
+
+impl Drop for FileWal {
+    fn drop(&mut self) {
+        let _ = self.flush_pending_sync();
     }
 }
 
@@ -693,6 +825,13 @@ impl InMemoryStore {
             .collect()
     }
 
+    pub fn claim_ids_for_tenant(&self, tenant_id: &str) -> HashSet<String> {
+        self.tenant_claim_ids
+            .get(tenant_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn claim_by_id(&self, claim_id: &str) -> Option<&Claim> {
         self.claims.get(claim_id)
     }
@@ -835,6 +974,48 @@ impl InMemoryStore {
         let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
         self.vector_candidates(tenant_id, query_vector, vector_top_n)
             .len()
+    }
+
+    pub fn ann_vector_top_candidates(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+        top_n: usize,
+    ) -> Vec<String> {
+        if query_vector.is_empty() || top_n == 0 {
+            return Vec::new();
+        }
+        self.vector_candidates(tenant_id, query_vector, top_n)
+    }
+
+    pub fn exact_vector_top_candidates(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+        top_n: usize,
+    ) -> Vec<String> {
+        if query_vector.is_empty() || top_n == 0 {
+            return Vec::new();
+        }
+
+        let mut scored: Vec<(String, f32)> = self
+            .claim_vectors
+            .iter()
+            .filter_map(|(claim_id, vector)| {
+                let claim = self.claims.get(claim_id)?;
+                if claim.tenant_id != tenant_id {
+                    return None;
+                }
+                let score = cosine_similarity(query_vector, vector)?;
+                Some((claim_id.clone(), score))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored
+            .into_iter()
+            .take(top_n)
+            .map(|(claim_id, _)| claim_id)
+            .collect()
     }
 
     pub fn wal_len(&self) -> usize {
@@ -2492,6 +2673,106 @@ mod tests {
     }
 
     #[test]
+    fn wal_open_with_sync_every_records_clamps_to_minimum_one() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open_with_sync_every_records(&wal_path, 0).unwrap();
+        assert_eq!(wal.sync_every_records(), 1);
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_batch_sync_triggers_on_configured_interval() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open_with_sync_every_records(&wal_path, 2).unwrap();
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-batch-1", "Batch sync one"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(wal.unsynced_records, 1);
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-batch-2", "Batch sync two"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(wal.unsynced_records, 0);
+        assert_eq!(wal.wal_record_count().unwrap(), 2);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_append_buffer_batches_disk_writes_until_threshold() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open_with_policy(
+            &wal_path,
+            WalWritePolicy {
+                sync_every_records: 10,
+                append_buffer_max_records: 3,
+                sync_interval: None,
+            },
+        )
+        .unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(&mut wal, claim("c-buf-1", "Buffer one"), vec![], vec![])
+            .unwrap();
+        store
+            .ingest_bundle_persistent(&mut wal, claim("c-buf-2", "Buffer two"), vec![], vec![])
+            .unwrap();
+        assert_eq!(wal.buffered_record_count(), 2);
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 0);
+
+        store
+            .ingest_bundle_persistent(&mut wal, claim("c-buf-3", "Buffer three"), vec![], vec![])
+            .unwrap();
+        assert_eq!(wal.buffered_record_count(), 0);
+        assert!(std::fs::metadata(wal.path()).unwrap().len() > 0);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_interval_flush_hook_syncs_pending_records() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open_with_policy(
+            &wal_path,
+            WalWritePolicy {
+                sync_every_records: 100,
+                append_buffer_max_records: 100,
+                sync_interval: Some(Duration::from_millis(1)),
+            },
+        )
+        .unwrap();
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-interval", "Interval flush"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(wal.unsynced_record_count(), 1);
+        std::thread::sleep(Duration::from_millis(2));
+        let flushed = wal.flush_pending_sync_if_interval_elapsed().unwrap();
+        assert!(flushed);
+        assert_eq!(wal.unsynced_record_count(), 0);
+        assert_eq!(wal.buffered_record_count(), 0);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
     fn wal_round_trip_preserves_claim_and_evidence_metadata() {
         let wal_path = temp_wal_path();
         let mut wal = FileWal::open(&wal_path).unwrap();
@@ -3003,6 +3284,30 @@ mod tests {
         let stats = store.index_stats();
         assert_eq!(stats.vector_count, 2);
         assert!(stats.ann_vector_buckets >= 1);
+    }
+
+    #[test]
+    fn ann_and_exact_vector_top_candidates_rank_expected_claim() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(claim("c-near", "Semantic nearby claim"), vec![], vec![])
+            .unwrap();
+        store
+            .ingest_bundle(claim("c-far", "Semantic distant claim"), vec![], vec![])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-near", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-far", vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+
+        let query = [0.99, 0.01, 0.0, 0.0];
+        let ann = store.ann_vector_top_candidates("tenant-a", &query, 1);
+        let exact = store.exact_vector_top_candidates("tenant-a", &query, 1);
+
+        assert_eq!(ann.first().map(String::as_str), Some("c-near"));
+        assert_eq!(exact.first().map(String::as_str), Some("c-near"));
     }
 
     #[test]

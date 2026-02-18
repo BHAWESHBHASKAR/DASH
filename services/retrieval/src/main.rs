@@ -108,8 +108,24 @@ fn main() {
         if let Some(segment_dir) = segment_dir.as_deref() {
             println!("retrieval segment read dir: {segment_dir}");
         }
+        if let Some(placement_file) =
+            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
+        {
+            let local_node =
+                env_with_fallback("DASH_ROUTER_LOCAL_NODE_ID", "EME_ROUTER_LOCAL_NODE_ID")
+                    .or_else(|| env_with_fallback("DASH_NODE_ID", "EME_NODE_ID"))
+                    .unwrap_or_else(|| "<unset>".to_string());
+            let read_preference =
+                env_with_fallback("DASH_ROUTER_READ_PREFERENCE", "EME_ROUTER_READ_PREFERENCE")
+                    .unwrap_or_else(|| "any_healthy".to_string());
+            println!(
+                "retrieval placement routing: file={}, local_node_id={}, read_preference={}",
+                placement_file, local_node, read_preference
+            );
+        }
         println!("retrieval health endpoint: http://{bind_addr}/health");
         println!("retrieval metrics endpoint: http://{bind_addr}/metrics");
+        println!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
         match transport_runtime {
             TransportRuntime::Std => {
                 if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers) {

@@ -12,5 +12,6 @@ schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
 graph = { path = "../../pkg/graph" }
 indexer = { path = "../indexer" }
+metadata-router = { path = "../metadata-router" }
 axum = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }

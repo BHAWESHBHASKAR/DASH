@@ -220,6 +220,10 @@ Optional overrides:
   - `metadata_prefilter_count`
   - `ann_candidate_count`
   - `final_scored_candidate_count`
+  - ANN recall metrics:
+    - `ann_recall_at_10`
+    - `ann_recall_at_100`
+    - `ann_recall_curve` (`budget:recall` points)
   - segment-cache probe metrics:
     - `segment_cache_hits`
     - `segment_refresh_attempts`
@@ -260,6 +264,10 @@ Optional overrides:
     - metadata prefilter candidate count
     - ANN candidate count
     - final scored candidate count
+  - ANN recall observability fields:
+    - `ann_recall_at_10`
+    - `ann_recall_at_100`
+    - `ann_recall_curve`
   - ANN tuning parameters used in the run
   - segment prefilter cache observability:
     - refresh attempts/successes/failures
@@ -292,6 +300,25 @@ Optional overrides:
   - `docs/benchmarks/history/concurrency/*.md`
 - Ingestion WAL mode:
   - `--ingest-wal-path <PATH>` to control WAL location
+  - `--ingest-wal-sync-every-records <N>` to configure WAL fsync batch threshold
+  - `--ingest-wal-append-buffer-records <N>` to configure in-process append buffering
+  - `--ingest-wal-sync-interval-ms <N|off>` to cap max unsynced duration when batching
   - default WAL path is a temporary `/tmp/dash-ingest-concurrency-<run_id>.wal`
 - Baseline recommendation:
   - compare at least `workers=1` vs `workers=4` with fixed client/request settings for each target.
+
+## 17. Ingestion WAL Durability Benchmark
+
+- Orchestration script:
+  - `scripts/benchmark_ingest_wal_durability.sh`
+- Purpose:
+  - compare ingestion throughput/latency tradeoffs across WAL durability policies under a fixed load profile
+- Default modes:
+  - `strict_per_record`: `sync_every=1`, `append_buffer=1`, `sync_interval=off`
+  - `grouped_sync`: `sync_every=32`, `append_buffer=1`, `sync_interval=off`
+  - `buffered_interval`: `sync_every=64`, `append_buffer=32`, `sync_interval=250ms`
+- Output artifact paths:
+  - summary: `docs/benchmarks/history/concurrency/wal-durability/*.md`
+  - per-mode raw runs: `docs/benchmarks/history/concurrency/*.md`
+- Baseline recommendation:
+  - run with fixed `workers`, `clients`, and request profile, then compare `throughput_vs_strict` deltas only across mode rows from the same run artifact.

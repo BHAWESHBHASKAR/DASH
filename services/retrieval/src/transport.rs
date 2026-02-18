@@ -8,6 +8,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use metadata_router::{
+    PlacementRouteError, ReadPreference, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig,
+    ShardPlacement, load_shard_placements_csv, route_read_with_placement,
+    shard_ids_from_placements,
+};
 use schema::StanceMode;
 use store::InMemoryStore;
 
@@ -17,6 +22,35 @@ const METRICS_WINDOW_SIZE: usize = 2048;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementRoutingRuntime {
+    local_node_id: String,
+    router_config: RouterConfig,
+    placements: Vec<ShardPlacement>,
+    read_preference: ReadPreference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadRouteError {
+    Placement(PlacementRouteError),
+    WrongNode {
+        local_node_id: String,
+        target_node_id: String,
+        shard_id: u32,
+        epoch: u64,
+        role: ReplicaRole,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PlacementObservabilitySnapshot {
+    leaders_total: usize,
+    followers_total: usize,
+    replicas_healthy: usize,
+    replicas_degraded: usize,
+    replicas_unavailable: usize,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TransportMetrics {
@@ -33,6 +67,10 @@ pub(crate) struct TransportMetrics {
     authz_denied_total: u64,
     audit_events_total: u64,
     audit_write_error_total: u64,
+    placement_route_reject_total: u64,
+    placement_last_shard_id: Option<u32>,
+    placement_last_epoch: Option<u64>,
+    placement_last_role: Option<ReplicaRole>,
     retrieve_last_result_count: usize,
     retrieve_latency_ms_window: VecDeque<f64>,
     ingest_to_visible_lag_ms_window: VecDeque<f64>,
@@ -54,6 +92,10 @@ impl Default for TransportMetrics {
             authz_denied_total: 0,
             audit_events_total: 0,
             audit_write_error_total: 0,
+            placement_route_reject_total: 0,
+            placement_last_shard_id: None,
+            placement_last_epoch: None,
+            placement_last_role: None,
             retrieve_last_result_count: 0,
             retrieve_latency_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
             ingest_to_visible_lag_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
@@ -118,6 +160,27 @@ impl TransportMetrics {
         }
     }
 
+    fn observe_read_route_resolution(&mut self, routed: &RoutedReplica) {
+        self.placement_last_shard_id = Some(routed.shard_id);
+        self.placement_last_epoch = Some(routed.epoch);
+        self.placement_last_role = Some(routed.role);
+    }
+
+    fn observe_read_route_rejection(&mut self, error: &ReadRouteError) {
+        self.placement_route_reject_total += 1;
+        if let ReadRouteError::WrongNode {
+            shard_id,
+            epoch,
+            role,
+            ..
+        } = error
+        {
+            self.placement_last_shard_id = Some(*shard_id);
+            self.placement_last_epoch = Some(*epoch);
+            self.placement_last_role = Some(*role);
+        }
+    }
+
     fn quantile(window: &VecDeque<f64>, quantile: f64) -> f64 {
         if window.is_empty() {
             return 0.0;
@@ -128,13 +191,27 @@ impl TransportMetrics {
         values[idx]
     }
 
-    fn render_prometheus(&self) -> String {
+    fn render_prometheus(&self, placement_routing: Option<&PlacementRoutingRuntime>) -> String {
         let retrieve_latency_p50 = Self::quantile(&self.retrieve_latency_ms_window, 0.50);
         let retrieve_latency_p95 = Self::quantile(&self.retrieve_latency_ms_window, 0.95);
         let retrieve_latency_p99 = Self::quantile(&self.retrieve_latency_ms_window, 0.99);
         let visibility_lag_p50 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.50);
         let visibility_lag_p95 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.95);
         let uptime_seconds = self.started_at.elapsed().as_secs_f64();
+        let placement_enabled = placement_routing.map(|_| 1).unwrap_or(0);
+        let placement_snapshot = placement_routing
+            .map(PlacementRoutingRuntime::observability_snapshot)
+            .unwrap_or_default();
+        let placement_last_shard_id = self
+            .placement_last_shard_id
+            .map(|value| value as i64)
+            .unwrap_or(-1);
+        let placement_last_epoch = self.placement_last_epoch.unwrap_or(0);
+        let placement_last_role = match self.placement_last_role {
+            Some(ReplicaRole::Leader) => 1,
+            Some(ReplicaRole::Follower) => 2,
+            None => 0,
+        };
 
         format!(
             "# TYPE dash_http_requests_total counter\n\
@@ -161,6 +238,26 @@ dash_transport_authz_denied_total {}\n\
 dash_transport_audit_events_total {}\n\
 # TYPE dash_transport_audit_write_error_total counter\n\
 dash_transport_audit_write_error_total {}\n\
+# TYPE dash_retrieve_placement_enabled gauge\n\
+dash_retrieve_placement_enabled {}\n\
+# TYPE dash_retrieve_placement_route_reject_total counter\n\
+dash_retrieve_placement_route_reject_total {}\n\
+# TYPE dash_retrieve_placement_last_shard_id gauge\n\
+dash_retrieve_placement_last_shard_id {}\n\
+# TYPE dash_retrieve_placement_last_epoch gauge\n\
+dash_retrieve_placement_last_epoch {}\n\
+# TYPE dash_retrieve_placement_last_role gauge\n\
+dash_retrieve_placement_last_role {}\n\
+# TYPE dash_retrieve_placement_leaders_total gauge\n\
+dash_retrieve_placement_leaders_total {}\n\
+# TYPE dash_retrieve_placement_followers_total gauge\n\
+dash_retrieve_placement_followers_total {}\n\
+# TYPE dash_retrieve_placement_replicas_healthy gauge\n\
+dash_retrieve_placement_replicas_healthy {}\n\
+# TYPE dash_retrieve_placement_replicas_degraded gauge\n\
+dash_retrieve_placement_replicas_degraded {}\n\
+# TYPE dash_retrieve_placement_replicas_unavailable gauge\n\
+dash_retrieve_placement_replicas_unavailable {}\n\
 # TYPE dash_retrieve_last_result_count gauge\n\
 dash_retrieve_last_result_count {}\n\
 # TYPE dash_retrieve_latency_ms_p50 gauge\n\
@@ -187,6 +284,16 @@ dash_transport_uptime_seconds {:.4}\n",
             self.authz_denied_total,
             self.audit_events_total,
             self.audit_write_error_total,
+            placement_enabled,
+            self.placement_route_reject_total,
+            placement_last_shard_id,
+            placement_last_epoch,
+            placement_last_role,
+            placement_snapshot.leaders_total,
+            placement_snapshot.followers_total,
+            placement_snapshot.replicas_healthy,
+            placement_snapshot.replicas_degraded,
+            placement_snapshot.replicas_unavailable,
             self.retrieve_last_result_count,
             retrieve_latency_p50,
             retrieve_latency_p95,
@@ -210,6 +317,12 @@ pub fn serve_http_with_workers(
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let placement_routing = Arc::new(PlacementRoutingRuntime::from_env().map_err(|reason| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid placement routing configuration: {reason}"),
+        )
+    })?);
     let (tx, rx) = mpsc::channel::<TcpStream>();
     let rx = Arc::new(Mutex::new(rx));
 
@@ -217,6 +330,7 @@ pub fn serve_http_with_workers(
         for _ in 0..worker_count {
             let metrics = Arc::clone(&metrics);
             let rx = Arc::clone(&rx);
+            let placement_routing = Arc::clone(&placement_routing);
             scope.spawn(move || {
                 loop {
                     let stream = {
@@ -229,7 +343,12 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) = handle_connection(store, stream, &metrics) {
+                    if let Err(err) = handle_connection(
+                        store,
+                        stream,
+                        &metrics,
+                        placement_routing.as_ref().as_ref(),
+                    ) {
                         eprintln!("retrieval transport error: {err}");
                     }
                 }
@@ -263,8 +382,14 @@ pub fn serve_http_once_with_listener(
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let placement_routing = PlacementRoutingRuntime::from_env().map_err(|reason| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid placement routing configuration: {reason}"),
+        )
+    })?;
     let (stream, _) = listener.accept()?;
-    handle_connection(store, stream, &metrics)
+    handle_connection(store, stream, &metrics, placement_routing.as_ref())
 }
 
 pub fn handle_http_request_bytes(
@@ -316,7 +441,13 @@ pub fn handle_http_request_bytes(
         body: body.as_bytes().to_vec(),
     };
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let response = handle_request_with_metrics(store, &request, &metrics);
+    let placement_routing = PlacementRoutingRuntime::from_env()?;
+    let response = handle_request_with_metrics_and_routing(
+        store,
+        &request,
+        &metrics,
+        placement_routing.as_ref(),
+    );
     Ok(render_response_text(&response).into_bytes())
 }
 
@@ -324,6 +455,7 @@ fn handle_connection(
     store: &InMemoryStore,
     mut stream: TcpStream,
     metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
@@ -336,7 +468,8 @@ fn handle_connection(
         }
     };
 
-    let response = handle_request_with_metrics(store, &request, metrics);
+    let response =
+        handle_request_with_metrics_and_routing(store, &request, metrics, placement_routing);
     write_response(&mut stream, response)
 }
 
@@ -418,10 +551,28 @@ fn handle_request(store: &InMemoryStore, request: &HttpRequest) -> HttpResponse 
     handle_request_with_metrics(store, request, &metrics)
 }
 
+#[cfg(test)]
 pub(crate) fn handle_request_with_metrics(
     store: &InMemoryStore,
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
+) -> HttpResponse {
+    let placement_routing = match PlacementRoutingRuntime::from_env() {
+        Ok(runtime) => runtime,
+        Err(reason) => {
+            return HttpResponse::internal_server_error(&format!(
+                "placement routing configuration error: {reason}"
+            ));
+        }
+    };
+    handle_request_with_metrics_and_routing(store, request, metrics, placement_routing.as_ref())
+}
+
+fn handle_request_with_metrics_and_routing(
+    store: &InMemoryStore,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
     let auth_policy = AuthPolicy::from_env(
@@ -447,11 +598,14 @@ pub(crate) fn handle_request_with_metrics(
         ("GET", "/health") => HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()),
         ("GET", "/metrics") => {
             let body = if let Ok(guard) = metrics.lock() {
-                guard.render_prometheus()
+                guard.render_prometheus(placement_routing)
             } else {
                 "dash_transport_metrics_unavailable 1\n".to_string()
             };
             HttpResponse::ok_text(body)
+        }
+        ("GET", "/debug/placement") => {
+            HttpResponse::ok_json(render_placement_debug_json(placement_routing, &query))
         }
         ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
@@ -491,15 +645,21 @@ pub(crate) fn handle_request_with_metrics(
                     }
                     AuthDecision::Allowed => {
                         observe_auth_success(metrics);
-                        let response = execute_retrieve_and_observe(store, req, metrics);
+                        let response =
+                            execute_retrieve_and_observe(store, req, metrics, placement_routing);
+                        let (outcome, reason) = if response.status < 400 {
+                            ("success", "retrieve accepted")
+                        } else {
+                            ("error", "retrieve rejected")
+                        };
                         emit_audit_event(
                             metrics,
                             audit_log_path.as_deref(),
                             "retrieve",
                             Some(&tenant_id),
-                            200,
-                            "success",
-                            "retrieve accepted",
+                            response.status,
+                            outcome,
+                            reason,
                         );
                         response
                     }
@@ -573,15 +733,25 @@ pub(crate) fn handle_request_with_metrics(
                         }
                         AuthDecision::Allowed => {
                             observe_auth_success(metrics);
-                            let response = execute_retrieve_and_observe(store, req, metrics);
+                            let response = execute_retrieve_and_observe(
+                                store,
+                                req,
+                                metrics,
+                                placement_routing,
+                            );
+                            let (outcome, reason) = if response.status < 400 {
+                                ("success", "retrieve accepted")
+                            } else {
+                                ("error", "retrieve rejected")
+                            };
                             emit_audit_event(
                                 metrics,
                                 audit_log_path.as_deref(),
                                 "retrieve",
                                 Some(&tenant_id),
-                                200,
-                                "success",
-                                "retrieve accepted",
+                                response.status,
+                                outcome,
+                                reason,
                             );
                             response
                         }
@@ -596,10 +766,162 @@ pub(crate) fn handle_request_with_metrics(
             }
         }
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
-        (_, "/health") | (_, "/metrics") => {
+        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+fn render_placement_debug_json(
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    query: &HashMap<String, String>,
+) -> String {
+    let route_probe = build_read_route_probe_json(placement_routing, query);
+    let (enabled, local_node_id, read_preference, shard_count, placements) =
+        if let Some(routing) = placement_routing {
+            (
+                true,
+                Some(routing.local_node_id.as_str()),
+                Some(read_preference_str(routing.read_preference)),
+                routing.router_config.shard_ids.len(),
+                routing.placements.as_slice(),
+            )
+        } else {
+            (false, None, None, 0, &[][..])
+        };
+    format!(
+        "{{\"enabled\":{},\"local_node_id\":{},\"read_preference\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{}}}",
+        enabled,
+        local_node_id
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
+        read_preference
+            .map(|value| format!("\"{}\"", value))
+            .unwrap_or_else(|| "null".to_string()),
+        shard_count,
+        render_placements_json(placements),
+        route_probe
+    )
+}
+
+fn build_read_route_probe_json(
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    query: &HashMap<String, String>,
+) -> String {
+    let Some(tenant_id) = query.get("tenant_id").map(String::as_str) else {
+        return "null".to_string();
+    };
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() {
+        return "{\"status\":\"invalid\",\"reason\":\"tenant_id must not be empty\"}".to_string();
+    }
+    let entity_key = query
+        .get("entity_key")
+        .or_else(|| query.get("query"))
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if entity_key.is_empty() {
+        return "{\"status\":\"invalid\",\"reason\":\"entity_key (or query) is required for route probe\"}".to_string();
+    }
+    let Some(routing) = placement_routing else {
+        return "{\"status\":\"unconfigured\",\"reason\":\"placement routing is disabled\"}"
+            .to_string();
+    };
+
+    match route_read_with_placement(
+        tenant_id,
+        entity_key,
+        &routing.router_config,
+        &routing.placements,
+        routing.read_preference,
+    ) {
+        Ok(routed) => {
+            let local_admission = routed.node_id == routing.local_node_id;
+            let reason = if local_admission {
+                "local node is selected replica"
+            } else {
+                "request would be rejected: local node is not selected replica"
+            };
+            format!(
+                "{{\"status\":\"{}\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"local_node_id\":\"{}\",\"target_node_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"role\":\"{}\",\"read_preference\":\"{}\",\"local_admission\":{},\"reason\":\"{}\"}}",
+                if local_admission {
+                    "routable"
+                } else {
+                    "rejected"
+                },
+                json_escape(tenant_id),
+                json_escape(entity_key),
+                json_escape(&routing.local_node_id),
+                json_escape(&routed.node_id),
+                routed.shard_id,
+                routed.epoch,
+                replica_role_str(routed.role),
+                read_preference_str(routing.read_preference),
+                local_admission,
+                json_escape(reason),
+            )
+        }
+        Err(err) => format!(
+            "{{\"status\":\"rejected\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"reason\":\"{}\"}}",
+            json_escape(tenant_id),
+            json_escape(entity_key),
+            json_escape(&format!("placement route error: {err:?}"))
+        ),
+    }
+}
+
+fn render_placements_json(placements: &[ShardPlacement]) -> String {
+    let body = placements
+        .iter()
+        .map(|placement| {
+            let replicas = placement
+                .replicas
+                .iter()
+                .map(|replica| {
+                    format!(
+                        "{{\"node_id\":\"{}\",\"role\":\"{}\",\"health\":\"{}\"}}",
+                        json_escape(&replica.node_id),
+                        replica_role_str(replica.role),
+                        replica_health_str(replica.health),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"tenant_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"replicas\":[{}]}}",
+                json_escape(&placement.tenant_id),
+                placement.shard_id,
+                placement.epoch,
+                replicas
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn replica_role_str(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Leader => "leader",
+        ReplicaRole::Follower => "follower",
+    }
+}
+
+fn replica_health_str(health: ReplicaHealth) -> &'static str {
+    match health {
+        ReplicaHealth::Healthy => "healthy",
+        ReplicaHealth::Degraded => "degraded",
+        ReplicaHealth::Unavailable => "unavailable",
+    }
+}
+
+fn read_preference_str(value: ReadPreference) -> &'static str {
+    match value {
+        ReadPreference::LeaderOnly => "leader_only",
+        ReadPreference::PreferFollower => "prefer_follower",
+        ReadPreference::AnyHealthy => "any_healthy",
     }
 }
 
@@ -810,7 +1132,26 @@ fn execute_retrieve_and_observe(
     store: &InMemoryStore,
     req: RetrieveApiRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
 ) -> HttpResponse {
+    if let Some(routing) = placement_routing {
+        match ensure_local_read_route(routing, &req) {
+            Ok(routed) => {
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_read_route_resolution(&routed);
+                }
+            }
+            Err(route_error) => {
+                let (status, message) = map_read_route_error(&route_error);
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_retrieve(status, 0.0, 0, None);
+                    guard.observe_read_route_rejection(&route_error);
+                }
+                return HttpResponse::error_with_status(status, &message);
+            }
+        }
+    }
+
     let started_at = Instant::now();
     let tenant_id = req.tenant_id.clone();
     let response = execute_api_query(store, req);
@@ -824,6 +1165,192 @@ fn execute_retrieve_and_observe(
     }
 
     HttpResponse::ok_json(render_retrieve_response_json(&response))
+}
+
+impl PlacementRoutingRuntime {
+    fn observability_snapshot(&self) -> PlacementObservabilitySnapshot {
+        let mut snapshot = PlacementObservabilitySnapshot::default();
+        for placement in &self.placements {
+            for replica in &placement.replicas {
+                match replica.role {
+                    ReplicaRole::Leader => snapshot.leaders_total += 1,
+                    ReplicaRole::Follower => snapshot.followers_total += 1,
+                }
+                match replica.health {
+                    ReplicaHealth::Healthy => snapshot.replicas_healthy += 1,
+                    ReplicaHealth::Degraded => snapshot.replicas_degraded += 1,
+                    ReplicaHealth::Unavailable => snapshot.replicas_unavailable += 1,
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn from_env() -> Result<Option<Self>, String> {
+        let Some(placement_file) =
+            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
+        else {
+            return Ok(None);
+        };
+        let local_node_id = env_with_fallback(
+            "DASH_ROUTER_LOCAL_NODE_ID",
+            "EME_ROUTER_LOCAL_NODE_ID",
+        )
+        .or_else(|| env_with_fallback("DASH_NODE_ID", "EME_NODE_ID"))
+        .ok_or_else(|| {
+            "placement routing enabled, but DASH_ROUTER_LOCAL_NODE_ID (or DASH_NODE_ID) is unset"
+                .to_string()
+        })?;
+        let local_node_id = local_node_id.trim();
+        if local_node_id.is_empty() {
+            return Err(
+                "placement routing enabled, but local node id is empty after trimming".to_string(),
+            );
+        }
+
+        let placements = load_shard_placements_csv(Path::new(&placement_file))?;
+        if placements.is_empty() {
+            return Err(format!(
+                "placement file '{}' has no placement records",
+                placement_file
+            ));
+        }
+
+        let shard_ids = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS")
+            .unwrap_or_else(|| shard_ids_from_placements(&placements));
+        if shard_ids.is_empty() {
+            return Err("placement routing requires at least one shard id".to_string());
+        }
+        let replica_count =
+            parse_env_first_usize(&["DASH_ROUTER_REPLICA_COUNT", "EME_ROUTER_REPLICA_COUNT"])
+                .filter(|value| *value > 0)
+                .unwrap_or_else(|| {
+                    placements
+                        .iter()
+                        .map(|placement| placement.replicas.len())
+                        .max()
+                        .unwrap_or(1)
+                });
+        let virtual_nodes_per_shard = parse_env_first_usize(&[
+            "DASH_ROUTER_VIRTUAL_NODES_PER_SHARD",
+            "EME_ROUTER_VIRTUAL_NODES_PER_SHARD",
+        ])
+        .filter(|value| *value > 0)
+        .unwrap_or(64) as u32;
+        let read_preference =
+            parse_read_preference_env("DASH_ROUTER_READ_PREFERENCE", "EME_ROUTER_READ_PREFERENCE")?;
+
+        Ok(Some(Self {
+            local_node_id: local_node_id.to_string(),
+            router_config: RouterConfig {
+                shard_ids,
+                virtual_nodes_per_shard,
+                replica_count,
+            },
+            placements,
+            read_preference,
+        }))
+    }
+}
+
+fn parse_read_preference_env(primary: &str, fallback: &str) -> Result<ReadPreference, String> {
+    let Some(raw) = env_with_fallback(primary, fallback) else {
+        return Ok(ReadPreference::AnyHealthy);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "any_healthy" => Ok(ReadPreference::AnyHealthy),
+        "leader_only" => Ok(ReadPreference::LeaderOnly),
+        "prefer_follower" => Ok(ReadPreference::PreferFollower),
+        _ => Err(format!(
+            "{primary} must be one of: any_healthy, leader_only, prefer_follower"
+        )),
+    }
+}
+
+fn parse_csv_u32_env(primary: &str, fallback: &str) -> Option<Vec<u32>> {
+    let raw = env_with_fallback(primary, fallback)?;
+    let mut values = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = item.parse::<u32>() {
+            values.push(parsed);
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn parse_env_first_usize(keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key)
+            && let Ok(parsed) = value.parse::<usize>()
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn read_entity_key_for_request(req: &RetrieveApiRequest) -> &str {
+    req.entity_filters
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or(req.query.as_str())
+}
+
+fn ensure_local_read_route(
+    routing: &PlacementRoutingRuntime,
+    req: &RetrieveApiRequest,
+) -> Result<RoutedReplica, ReadRouteError> {
+    let entity_key = read_entity_key_for_request(req);
+    let routed = route_read_with_placement(
+        &req.tenant_id,
+        entity_key,
+        &routing.router_config,
+        &routing.placements,
+        routing.read_preference,
+    )
+    .map_err(ReadRouteError::Placement)?;
+    if routed.node_id != routing.local_node_id {
+        return Err(ReadRouteError::WrongNode {
+            local_node_id: routing.local_node_id.clone(),
+            target_node_id: routed.node_id,
+            shard_id: routed.shard_id,
+            epoch: routed.epoch,
+            role: routed.role,
+        });
+    }
+    Ok(routed)
+}
+
+fn map_read_route_error(error: &ReadRouteError) -> (u16, String) {
+    match error {
+        ReadRouteError::Placement(reason) => (
+            503,
+            format!("placement route rejected read request: {reason:?}"),
+        ),
+        ReadRouteError::WrongNode {
+            local_node_id,
+            target_node_id,
+            shard_id,
+            epoch,
+            role: _,
+        } => (
+            503,
+            format!(
+                "placement route rejected read request: local node '{local_node_id}' is not selected for shard {shard_id} at epoch {epoch} (target replica: '{target_node_id}')"
+            ),
+        ),
+    }
 }
 
 fn estimate_ingest_to_visible_lag_ms(
@@ -1629,6 +2156,7 @@ fn render_response_text(response: &HttpResponse) -> String {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
     let body_len = response.body.len();
@@ -1709,11 +2237,42 @@ impl HttpResponse {
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
         }
     }
+
+    fn internal_server_error(message: &str) -> Self {
+        Self {
+            status: 500,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn service_unavailable(message: &str) -> Self {
+        Self {
+            status: 503,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
+    fn error_with_status(status: u16, message: &str) -> Self {
+        match status {
+            400 => Self::bad_request(message),
+            401 => Self::unauthorized(message),
+            403 => Self::forbidden(message),
+            404 => Self::not_found(message),
+            405 => Self::method_not_allowed(message),
+            503 => Self::service_unavailable(message),
+            _ => Self::internal_server_error(message),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metadata_router::{
+        ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
+    };
     use schema::{Claim, Evidence, Stance};
 
     fn sample_store() -> InMemoryStore {
@@ -1864,6 +2423,222 @@ mod tests {
     }
 
     #[test]
+    fn handle_request_rejects_when_local_node_is_not_selected_replica() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let routing = PlacementRoutingRuntime {
+            local_node_id: "node-b".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 2,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Healthy,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response =
+            handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("local node 'node-b'"));
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics_and_routing(
+            &store,
+            &metrics_request,
+            &metrics,
+            Some(&routing),
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_server_error_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_route_reject_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_last_epoch 11")
+        );
+    }
+
+    #[test]
+    fn handle_request_read_route_reresolves_after_leader_promotion() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let mut routing = PlacementRoutingRuntime {
+            local_node_id: "node-b".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 2,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Healthy,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let retrieve_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let denied_response = handle_request_with_metrics_and_routing(
+            &store,
+            &retrieve_request,
+            &metrics,
+            Some(&routing),
+        );
+        assert_eq!(denied_response.status, 503);
+
+        let new_epoch = promote_replica_to_leader(&mut routing.placements[0], "node-b")
+            .expect("promotion should succeed");
+        assert_eq!(new_epoch, 12);
+
+        let accepted_response = handle_request_with_metrics_and_routing(
+            &store,
+            &retrieve_request,
+            &metrics,
+            Some(&routing),
+        );
+        assert_eq!(accepted_response.status, 200);
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics_and_routing(
+            &store,
+            &metrics_request,
+            &metrics,
+            Some(&routing),
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_enabled 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_route_reject_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_last_epoch 12")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_last_role 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_replicas_healthy 2")
+        );
+    }
+
+    #[test]
+    fn debug_placement_endpoint_returns_structured_route_probe() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let routing = PlacementRoutingRuntime {
+            local_node_id: "node-b".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 2,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Degraded,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/placement?tenant_id=tenant-a&entity_key=company-x".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response =
+            handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"enabled\":true"));
+        assert!(response.body.contains("\"placements\""));
+        assert!(response.body.contains("\"route_probe\""));
+        assert!(response.body.contains("\"status\":\"rejected\""));
+        assert!(
+            response
+                .body
+                .contains("\"read_preference\":\"leader_only\"")
+        );
+        assert!(response.body.contains("\"target_node_id\":\"node-a\""));
+    }
+
+    #[test]
     fn metrics_endpoint_reports_retrieve_counters() {
         let store = sample_store();
         let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -1900,6 +2675,11 @@ mod tests {
             metrics_response
                 .body
                 .contains("dash_transport_auth_success_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_enabled 0")
         );
         assert!(
             metrics_response

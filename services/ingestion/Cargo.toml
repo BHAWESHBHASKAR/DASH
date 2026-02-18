@@ -11,5 +11,6 @@ async-transport = ["dep:axum", "dep:tokio"]
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
 indexer = { path = "../indexer" }
+metadata-router = { path = "../metadata-router" }
 axum = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }

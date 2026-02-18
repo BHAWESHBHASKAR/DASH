@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
     fs::{OpenOptions, create_dir_all},
     io::{BufRead, BufReader, Write},
@@ -103,6 +103,7 @@ struct BenchmarkSummary {
     metadata_prefilter_count: usize,
     ann_candidate_count: usize,
     final_scored_candidate_count: usize,
+    ann_recall: AnnRecallSummary,
     index_stats: StoreIndexStats,
     ann_tuning: AnnTuningConfig,
     segment_cache_probe: SegmentCacheProbeSummary,
@@ -142,6 +143,19 @@ struct WalScaleSummary {
     replay_wal_records: usize,
     replay_validation_hit: bool,
     replay_validation_top_claim: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnnRecallSummary {
+    recall_at_10: f64,
+    recall_at_100: f64,
+    curve: Vec<AnnRecallPoint>,
+}
+
+#[derive(Debug, Clone)]
+struct AnnRecallPoint {
+    budget: usize,
+    recall: f64,
 }
 
 impl QualityProbeSummary {
@@ -289,6 +303,7 @@ fn main() {
             metadata_prefilter_claim_ids.as_ref(),
         );
     let dash_candidate_count = final_scored_candidate_count;
+    let ann_recall = measure_ann_recall(&store, tenant, &hybrid_query_embedding);
     let index_stats = store.index_stats();
 
     let baseline_latency = if config.profile == BenchmarkProfile::Hybrid {
@@ -333,6 +348,7 @@ fn main() {
         metadata_prefilter_count,
         ann_candidate_count,
         final_scored_candidate_count,
+        ann_recall,
         index_stats,
         ann_tuning: config.ann_tuning.clone(),
         segment_cache_probe,
@@ -944,6 +960,62 @@ fn now_epoch_secs() -> u64 {
         .as_secs()
 }
 
+fn measure_ann_recall(
+    store: &InMemoryStore,
+    tenant: &str,
+    query_embedding: &[f32],
+) -> AnnRecallSummary {
+    let budgets = [10usize, 25, 50, 100, 200];
+    let curve: Vec<AnnRecallPoint> = budgets
+        .into_iter()
+        .map(|budget| AnnRecallPoint {
+            budget,
+            recall: compute_ann_recall_at_budget(store, tenant, query_embedding, budget),
+        })
+        .collect();
+
+    AnnRecallSummary {
+        recall_at_10: compute_ann_recall_at_budget(store, tenant, query_embedding, 10),
+        recall_at_100: compute_ann_recall_at_budget(store, tenant, query_embedding, 100),
+        curve,
+    }
+}
+
+fn compute_ann_recall_at_budget(
+    store: &InMemoryStore,
+    tenant: &str,
+    query_embedding: &[f32],
+    budget: usize,
+) -> f64 {
+    if budget == 0 {
+        return 1.0;
+    }
+
+    let ann = store.ann_vector_top_candidates(tenant, query_embedding, budget);
+    let exact = store.exact_vector_top_candidates(tenant, query_embedding, budget);
+    if exact.is_empty() {
+        return 1.0;
+    }
+
+    let exact_set: HashSet<&str> = exact.iter().map(String::as_str).collect();
+    let hits = ann
+        .iter()
+        .filter(|claim_id| exact_set.contains(claim_id.as_str()))
+        .count();
+    hits as f64 / exact_set.len() as f64
+}
+
+fn format_ann_recall_curve(curve: &[AnnRecallPoint]) -> String {
+    if curve.is_empty() {
+        return "none".to_string();
+    }
+    curve
+        .iter()
+        .map(|point| format!("{}:{:.4}", point.budget, point.recall))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn print_summary(summary: &BenchmarkSummary) {
     println!("Benchmark profile: {}", summary.profile.as_str());
     println!("Benchmark fixture size: {}", summary.fixture_size);
@@ -969,6 +1041,12 @@ fn print_summary(summary: &BenchmarkSummary) {
     println!(
         "Final scored candidate count: {}",
         summary.final_scored_candidate_count
+    );
+    println!("ANN recall@10: {:.4}", summary.ann_recall.recall_at_10);
+    println!("ANN recall@100: {:.4}", summary.ann_recall.recall_at_100);
+    println!(
+        "ANN recall curve (budget:recall): {}",
+        format_ann_recall_curve(&summary.ann_recall.curve)
     );
     println!("DASH candidate count: {}", summary.dash_candidate_count);
     let reduction_pct = if summary.baseline_scan_count == 0 {
@@ -1070,11 +1148,11 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         writeln!(file)?;
         writeln!(
             file,
-            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |"
+            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | ann_recall_at_10 | ann_recall_at_100 | ann_recall_curve | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |"
         )?;
         writeln!(
             file,
-            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"
+            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
         )?;
     }
     let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
@@ -1128,10 +1206,11 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         .as_ref()
         .and_then(|metrics| metrics.replay_validation_top_claim.clone())
         .unwrap_or_else(|| "none".to_string());
+    let ann_recall_curve = format_ann_recall_curve(&summary.ann_recall.curve);
 
     writeln!(
         file,
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         summary.run_epoch_secs,
         summary.profile.as_str(),
         summary.fixture_size,
@@ -1147,6 +1226,9 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         summary.metadata_prefilter_count,
         summary.ann_candidate_count,
         summary.final_scored_candidate_count,
+        summary.ann_recall.recall_at_10,
+        summary.ann_recall.recall_at_100,
+        ann_recall_curve,
         summary.segment_cache_probe.cache_hits,
         summary.segment_cache_probe.refresh_attempts,
         summary.segment_cache_probe.refresh_successes,
@@ -1181,7 +1263,7 @@ fn append_history_csv(path: &str, summary: &BenchmarkSummary) -> Result<(), std:
     if needs_header {
         writeln!(
             file,
-            "run_epoch_secs,profile,fixture_size,iterations,baseline_top1,eme_top1,baseline_hit,eme_hit,baseline_avg_ms,eme_avg_ms,baseline_scan_count,dash_candidate_count,metadata_prefilter_count,ann_candidate_count,final_scored_candidate_count,segment_cache_hits,segment_refresh_attempts,segment_refresh_successes,segment_refresh_failures,segment_refresh_avg_ms,wal_claims_seeded,wal_checkpoint_ms,wal_replay_ms,wal_snapshot_records,wal_truncated_wal_records,wal_replay_snapshot_records,wal_replay_wal_records,wal_replay_validation_hit,wal_replay_validation_top_claim"
+            "run_epoch_secs,profile,fixture_size,iterations,baseline_top1,eme_top1,baseline_hit,eme_hit,baseline_avg_ms,eme_avg_ms,baseline_scan_count,dash_candidate_count,metadata_prefilter_count,ann_candidate_count,final_scored_candidate_count,ann_recall_at_10,ann_recall_at_100,ann_recall_curve,segment_cache_hits,segment_refresh_attempts,segment_refresh_successes,segment_refresh_failures,segment_refresh_avg_ms,wal_claims_seeded,wal_checkpoint_ms,wal_replay_ms,wal_snapshot_records,wal_truncated_wal_records,wal_replay_snapshot_records,wal_replay_wal_records,wal_replay_validation_hit,wal_replay_validation_top_claim"
         )?;
     }
 
@@ -1236,30 +1318,36 @@ fn append_history_csv(path: &str, summary: &BenchmarkSummary) -> Result<(), std:
         .as_ref()
         .and_then(|metrics| metrics.replay_validation_top_claim.clone())
         .unwrap_or_else(|| "none".to_string());
+    let ann_recall_curve = format_ann_recall_curve(&summary.ann_recall.curve);
 
-    writeln!(
-        file,
-        "{},{},{},{},{},{},{},{},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{:.4},{},{},{},{},{},{},{},{},{}",
-        summary.run_epoch_secs,
-        summary.profile.as_str(),
-        summary.fixture_size,
-        summary.iterations,
-        summary.baseline_top.as_deref().unwrap_or("none"),
-        summary.eme_top.as_deref().unwrap_or("none"),
-        summary.baseline_hit,
-        summary.eme_hit,
-        summary.baseline_latency,
-        summary.eme_latency,
-        summary.baseline_scan_count,
-        summary.dash_candidate_count,
-        summary.metadata_prefilter_count,
-        summary.ann_candidate_count,
-        summary.final_scored_candidate_count,
-        summary.segment_cache_probe.cache_hits,
-        summary.segment_cache_probe.refresh_attempts,
-        summary.segment_cache_probe.refresh_successes,
-        summary.segment_cache_probe.refresh_failures,
-        segment_refresh_avg_ms,
+    let row = vec![
+        summary.run_epoch_secs.to_string(),
+        summary.profile.as_str().to_string(),
+        summary.fixture_size.to_string(),
+        summary.iterations.to_string(),
+        summary
+            .baseline_top
+            .as_deref()
+            .unwrap_or("none")
+            .to_string(),
+        summary.eme_top.as_deref().unwrap_or("none").to_string(),
+        summary.baseline_hit.to_string(),
+        summary.eme_hit.to_string(),
+        format!("{:.4}", summary.baseline_latency),
+        format!("{:.4}", summary.eme_latency),
+        summary.baseline_scan_count.to_string(),
+        summary.dash_candidate_count.to_string(),
+        summary.metadata_prefilter_count.to_string(),
+        summary.ann_candidate_count.to_string(),
+        summary.final_scored_candidate_count.to_string(),
+        format!("{:.4}", summary.ann_recall.recall_at_10),
+        format!("{:.4}", summary.ann_recall.recall_at_100),
+        ann_recall_curve,
+        summary.segment_cache_probe.cache_hits.to_string(),
+        summary.segment_cache_probe.refresh_attempts.to_string(),
+        summary.segment_cache_probe.refresh_successes.to_string(),
+        summary.segment_cache_probe.refresh_failures.to_string(),
+        format!("{:.4}", segment_refresh_avg_ms),
         wal_claims_seeded,
         wal_checkpoint_ms,
         wal_replay_ms,
@@ -1268,8 +1356,9 @@ fn append_history_csv(path: &str, summary: &BenchmarkSummary) -> Result<(), std:
         wal_replay_snapshot_records,
         wal_replay_wal_records,
         wal_replay_validation_hit,
-        wal_replay_validation_top_claim
-    )?;
+        wal_replay_validation_top_claim,
+    ];
+    writeln!(file, "{}", row.join(","))?;
     Ok(())
 }
 
@@ -1333,6 +1422,21 @@ fn write_scorecard(
         file,
         "- final_scored_candidate_count: {}",
         summary.final_scored_candidate_count
+    )?;
+    writeln!(
+        file,
+        "- ann_recall_at_10: {:.4}",
+        summary.ann_recall.recall_at_10
+    )?;
+    writeln!(
+        file,
+        "- ann_recall_at_100: {:.4}",
+        summary.ann_recall.recall_at_100
+    )?;
+    writeln!(
+        file,
+        "- ann_recall_curve: {}",
+        format_ann_recall_curve(&summary.ann_recall.curve)
     )?;
     let reduction_pct = if summary.baseline_scan_count == 0 {
         0.0
@@ -2403,6 +2507,7 @@ mod tests {
             metadata_prefilter_count: 0,
             ann_candidate_count: dash_candidates,
             final_scored_candidate_count: dash_candidates,
+            ann_recall: AnnRecallSummary::default(),
             index_stats: StoreIndexStats::default(),
             ann_tuning: AnnTuningConfig::default(),
             segment_cache_probe: SegmentCacheProbeSummary::default(),

@@ -54,6 +54,8 @@ DASH_INGEST_ALLOWED_TENANTS=tenant-a,tenant-b \
 DASH_INGEST_API_KEY_SCOPES="change-me-ingest-key:tenant-a,tenant-b" \
 DASH_INGEST_AUDIT_LOG_PATH=/var/log/dash/ingestion-audit.jsonl \
 DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
+DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1 \
+DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=1 \
 DASH_CHECKPOINT_MAX_WAL_RECORDS=50000 \
 DASH_CHECKPOINT_MAX_WAL_BYTES=52428800 \
 target/release/ingestion --serve
@@ -110,12 +112,20 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 ## 7. Operational Guardrails
 
 - set checkpoint limits to avoid unbounded WAL growth
+- keep `DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1` for strict per-record durability; increase only when explicitly trading crash-window durability for ingestion throughput
+- keep `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=1` for no in-process batching; increase only for controlled throughput experiments
+- optionally set `DASH_INGEST_WAL_SYNC_INTERVAL_MS` to cap maximum durability lag window when batching is enabled
+- before changing WAL durability defaults, run:
+  - `scripts/benchmark_ingest_wal_durability.sh --workers 4 --clients 16 --requests-per-worker 25 --warmup-requests 5`
+  - archive the generated markdown under `docs/benchmarks/history/concurrency/wal-durability/`
 - monitor replay startup logs (`snapshot_records`, `wal_delta_records`)
 - monitor ingestion `/metrics` for:
   - `dash_ingest_success_total`
   - `dash_ingest_failed_total`
   - `dash_ingest_segment_publish_success_total`, `dash_ingest_segment_publish_failure_total`
   - `dash_ingest_segment_last_claim_count`, `dash_ingest_segment_last_segment_count`
+  - `dash_ingest_wal_unsynced_records`, `dash_ingest_wal_buffered_records`
+  - `dash_ingest_wal_flush_due_total`, `dash_ingest_wal_flush_success_total`, `dash_ingest_wal_flush_failure_total`
   - `dash_ingest_auth_success_total`, `dash_ingest_auth_failure_total`, `dash_ingest_authz_denied_total`
   - `dash_ingest_audit_events_total`, `dash_ingest_audit_write_error_total`
   - `dash_ingest_claims_total`
@@ -127,6 +137,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 - keep benchmark history guard active in CI before production promotion
 - run benchmark trend automation for release candidates:
   - `scripts/benchmark_trend.sh --run-tag release-candidate`
+- run placement failover drill before release candidates:
+  - `scripts/failover_drill.sh --keep-artifacts true`
 
 ## 8. Incident Response (Minimal)
 

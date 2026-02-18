@@ -15,6 +15,9 @@ READ_TIMEOUT_MS="${DASH_CONCURRENCY_READ_TIMEOUT_MS:-5000}"
 OUTPUT_DIR="${DASH_CONCURRENCY_OUTPUT_DIR:-docs/benchmarks/history/concurrency}"
 RUN_TAG="${DASH_CONCURRENCY_RUN_TAG:-transport-worker-pool}"
 INGEST_WAL_PATH="${DASH_CONCURRENCY_INGEST_WAL_PATH:-}"
+INGEST_WAL_SYNC_EVERY_RECORDS="${DASH_CONCURRENCY_INGEST_WAL_SYNC_EVERY_RECORDS:-1}"
+INGEST_WAL_APPEND_BUFFER_RECORDS="${DASH_CONCURRENCY_INGEST_WAL_APPEND_BUFFER_RECORDS:-1}"
+INGEST_WAL_SYNC_INTERVAL_MS="${DASH_CONCURRENCY_INGEST_WAL_SYNC_INTERVAL_MS:-}"
 INGEST_BODY_TEMPLATE='{"claim":{"claim_id":"bench-claim-%WORKER%-%REQUEST%-%EPOCH_MS%","tenant_id":"bench-tenant","canonical_text":"Load benchmark claim","confidence":0.9},"evidence":[{"evidence_id":"bench-evidence-%WORKER%-%REQUEST%-%EPOCH_MS%","claim_id":"bench-claim-%WORKER%-%REQUEST%-%EPOCH_MS%","source_id":"bench://source-%WORKER%-%REQUEST%","stance":"supports","source_quality":0.8}]}'
 
 usage() {
@@ -31,6 +34,12 @@ Options:
   --connect-timeout-ms N        socket connect timeout
   --read-timeout-ms N           socket read/write timeout
   --ingest-wal-path PATH        WAL path used for ingestion target (persistent mode)
+  --ingest-wal-sync-every-records N
+                                ingest WAL sync batch threshold (1=strict)
+  --ingest-wal-append-buffer-records N
+                                ingest WAL append-buffer threshold
+  --ingest-wal-sync-interval-ms N|off
+                                ingest WAL max sync interval; use off to disable
   --output-dir DIR              markdown output directory
   --run-tag TAG                 suffix for output filename
   -h, --help                    show help
@@ -75,6 +84,25 @@ while [[ $# -gt 0 ]]; do
       INGEST_WAL_PATH="$2"
       shift 2
       ;;
+    --ingest-wal-sync-every-records)
+      INGEST_WAL_SYNC_EVERY_RECORDS="$2"
+      shift 2
+      ;;
+    --ingest-wal-append-buffer-records)
+      INGEST_WAL_APPEND_BUFFER_RECORDS="$2"
+      shift 2
+      ;;
+    --ingest-wal-sync-interval-ms)
+      case "$2" in
+        off|none|unset)
+          INGEST_WAL_SYNC_INTERVAL_MS=""
+          ;;
+        *)
+          INGEST_WAL_SYNC_INTERVAL_MS="$2"
+          ;;
+      esac
+      shift 2
+      ;;
     --output-dir)
       OUTPUT_DIR="$2"
       shift 2
@@ -114,6 +142,26 @@ if [[ "${TARGET}" != "retrieval" && "${TARGET}" != "ingestion" ]]; then
   exit 2
 fi
 
+is_positive_integer() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+$ ]] && [[ "${value}" -gt 0 ]]
+}
+
+if ! is_positive_integer "${INGEST_WAL_SYNC_EVERY_RECORDS}"; then
+  echo "invalid --ingest-wal-sync-every-records: ${INGEST_WAL_SYNC_EVERY_RECORDS}" >&2
+  exit 2
+fi
+
+if ! is_positive_integer "${INGEST_WAL_APPEND_BUFFER_RECORDS}"; then
+  echo "invalid --ingest-wal-append-buffer-records: ${INGEST_WAL_APPEND_BUFFER_RECORDS}" >&2
+  exit 2
+fi
+
+if [[ -n "${INGEST_WAL_SYNC_INTERVAL_MS}" ]] && ! is_positive_integer "${INGEST_WAL_SYNC_INTERVAL_MS}"; then
+  echo "invalid --ingest-wal-sync-interval-ms: ${INGEST_WAL_SYNC_INTERVAL_MS}" >&2
+  exit 2
+fi
+
 stop_server() {
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
     kill "${SERVER_PID}" >/dev/null 2>&1 || true
@@ -146,10 +194,22 @@ start_server() {
       cargo run -p retrieval -- --serve >"${SERVER_LOG}" 2>&1 &
   else
     rm -f "${INGEST_WAL_PATH}" "${INGEST_WAL_PATH}.snapshot"
-    DASH_INGEST_BIND="${BIND_ADDR}" \
-      DASH_INGEST_HTTP_WORKERS="${workers}" \
-      DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
-      cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+    if [[ -n "${INGEST_WAL_SYNC_INTERVAL_MS}" ]]; then
+      DASH_INGEST_BIND="${BIND_ADDR}" \
+        DASH_INGEST_HTTP_WORKERS="${workers}" \
+        DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+        DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+        DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+        DASH_INGEST_WAL_SYNC_INTERVAL_MS="${INGEST_WAL_SYNC_INTERVAL_MS}" \
+        cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+    else
+      DASH_INGEST_BIND="${BIND_ADDR}" \
+        DASH_INGEST_HTTP_WORKERS="${workers}" \
+        DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+        DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+        DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+        cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+    fi
   fi
   SERVER_PID=$!
 
@@ -185,6 +245,9 @@ cat > "${OUT_PATH}" <<EOF_MD
 - warmup_requests: ${WARMUP_REQUESTS}
 - workers_list: ${WORKERS_LIST}
 $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_path: ${INGEST_WAL_PATH}"; fi)
+$(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_sync_every_records: ${INGEST_WAL_SYNC_EVERY_RECORDS}"; fi)
+$(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_append_buffer_records: ${INGEST_WAL_APPEND_BUFFER_RECORDS}"; fi)
+$(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_sync_interval_ms: ${INGEST_WAL_SYNC_INTERVAL_MS:-off}"; fi)
 
 | transport_workers | total_requests | throughput_rps | latency_avg_ms | latency_p95_ms | latency_p99_ms | success_rate_pct |
 |---:|---:|---:|---:|---:|---:|---:|

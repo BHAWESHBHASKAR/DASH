@@ -239,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "indexer",
+ "metadata-router",
  "schema",
  "store",
  "tokio",
@@ -351,6 +352,7 @@ dependencies = [
  "axum",
  "graph",
  "indexer",
+ "metadata-router",
  "schema",
  "store",
  "tokio",

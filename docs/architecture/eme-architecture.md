@@ -489,12 +489,13 @@ If you keep this as a single-file proposal first, this document can be split int
 - retrieval-and-ranking.md
 - benchmark-and-rollout.md
 
-Current implementation notes (2026-02-17):
+Current implementation notes (2026-02-18):
 
 - `pkg/store` now supports snapshot checkpoints at `<wal_path>.snapshot`.
 - Recovery path replays `snapshot + WAL delta` instead of full WAL history.
 - Compaction API (`checkpoint_and_compact`) writes a snapshot and truncates WAL for faster restart.
 - Ingest path can apply configurable automatic checkpoint thresholds (WAL record count and/or WAL bytes).
+- Ingestion WAL path now supports bounded append buffering + sync scheduling hooks (`sync_every_records`, append-buffer threshold, optional sync interval) with strict defaults preserved for crash safety.
 - `services/retrieval` includes a dependency-light HTTP transport (`GET /health`, `GET /v1/retrieve?...`, `POST /v1/retrieve` JSON) layered directly on retrieval API contracts.
 - Retrieval now enforces request `time_range` semantics on claim `event_time_unix` and rejects invalid ranges where `from_unix > to_unix`.
 - WAL checkpoint policy checks use cached record counts in-memory (avoids O(N) WAL scans on each ingest decision).
@@ -510,6 +511,8 @@ Current implementation notes (2026-02-17):
   - compaction scheduler planning hook and compaction-plan application helper
 - ingestion runtime can publish tenant-scoped immutable segment snapshots to disk (`DASH_INGEST_SEGMENT_DIR`).
 - retrieval API can apply segment-backed claim prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`) as a bounded read-path prototype.
+- retrieval read source-of-truth is now explicit: `immutable segment base + mutable WAL delta`, then optional metadata prefilter intersection.
+- ingestion and retrieval transports expose placement-debug snapshots via `GET /debug/placement` (per-shard replicas, epoch, role, health, and optional route probe context).
 
 ## 21. Implementation Reality Check (What we have discussed)
 
@@ -527,7 +530,7 @@ Current implementation notes (2026-02-17):
 - ingestion/retrieval transports are functional (std runtime default; optional axum feature path)
 - tenant-scoped authz and audit hooks are implemented in ingestion/retrieval transport
 - indexer immutable segment prototype is implemented (writer/reader/checksum + scheduler hooks), and ingestion/retrieval now have basic segment publish/read wiring
-- indexer and metadata-router evolved beyond scaffold
+- indexer and metadata-router evolved beyond scaffold; placement-aware routing is now enforced in ingestion/retrieval request admission paths
 - benchmark tooling now reports baseline scan vs candidate-reduction metrics
 - benchmark profile matrix includes smoke/standard/large plus a hybrid metadata+embedding profile
 - full workspace tests are green (`cargo test --workspace`)
@@ -537,7 +540,7 @@ Current implementation notes (2026-02-17):
 - ANN recall/latency tuning toward production-grade HNSW-style behavior
 - metadata-filter planning over larger ANN candidate pools (to avoid filter drop-off on strict constraints)
 - full segment runtime integration (delta->segment promotion in live serving path + object-store tier)
-- distributed sharding + replica failover runtime (router is still planning-oriented)
+- distributed shard ownership + failover orchestration runtime (routing primitives are wired, but epoch-health observability and failover automation are still pending)
 - full authn federation (OIDC/JWT), hard tenant isolation audits, encryption controls
 - production observability + formal SLO enforcement loops
 
@@ -551,7 +554,7 @@ Current implementation notes (2026-02-17):
 1. tune leveled ANN backend (neighbor budgets, search budget, recall guardrails)
 2. add richer hybrid planner controls (ANN + sparse + graph + metadata filters)
 3. integrate segment writer/reader into serving pipeline + compaction service
-4. wire router to active shard map + replicas
+4. add placement epoch/health observability + failover simulation across ingestion/retrieval services
 5. harden auth policy (OIDC/JWT + key rotation + stricter tenant-isolation tests)
 
 ## 22. Immediate Build Batch (Post-ANN Hardening)

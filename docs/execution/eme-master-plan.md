@@ -23,10 +23,19 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transports include tenant-scoped authz policy controls (`DASH_*_ALLOWED_TENANTS`, `DASH_*_API_KEY_SCOPES`) and optional JSONL audit trails (`DASH_*_AUDIT_LOG_PATH`).
 - Indexer includes immutable segment lifecycle primitives (atomic segment+manifest persistence, checksum-verified load, compaction scheduler hook).
 - Metadata router now includes placement-aware routing primitives (leader/follower health policies, read preferences, and failover promotion with epoch bump).
+- Ingestion/retrieval transports now support placement-aware request admission gates (write-leader enforcement on ingest and read-replica preference enforcement on retrieve) using shared placement CSV metadata.
+- Ingestion/retrieval transports now expose placement-debug snapshots and route probe context at `GET /debug/placement`.
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
+- Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters.
+- Ingestion WAL durability now supports configurable batching controls with strict defaults:
+  - sync batch threshold: `DASH_INGEST_WAL_SYNC_EVERY_RECORDS`
+  - append buffer threshold: `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS`
+  - optional interval-triggered flush policy: `DASH_INGEST_WAL_SYNC_INTERVAL_MS`
 - Benchmark harness supports smoke, standard, and large fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).
+- Placement failover validation script is available via `scripts/failover_drill.sh`.
 - Transport concurrency benchmark tooling is available via `scripts/benchmark_transport_concurrency.sh` and `concurrent_load`.
+- Ingestion WAL durability benchmark comparison tooling is available via `scripts/benchmark_ingest_wal_durability.sh` with history artifacts under `docs/benchmarks/history/concurrency/wal-durability/`.
 - CI supports optional staged trend execution via `DASH_CI_RUN_BENCH_TREND=true`.
 - CI pipeline (`scripts/ci.sh`) runs fmt, clippy, workspace tests, and smoke benchmark.
 - Production packaging and operations artifacts are available:
