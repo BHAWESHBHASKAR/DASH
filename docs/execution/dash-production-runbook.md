@@ -167,6 +167,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true`
 - run SLO/error-budget guard before release candidates:
   - `scripts/slo_guard.sh --profile smoke --run-tag release-candidate --include-recovery-drill true`
+- run ingestion throughput floor gate before release candidates:
+  - `scripts/release_candidate_gate.sh --run-ingest-throughput-guard true --ingest-min-rps 100 --run-benchmark-trend false --slo-include-recovery-drill false`
 - run audit-chain integrity checks on JSONL audit files:
   - `scripts/verify_audit_chain.sh --path /var/log/dash/ingestion-audit.jsonl --service ingestion`
   - `scripts/verify_audit_chain.sh --path /var/log/dash/retrieval-audit.jsonl --service retrieval`
@@ -275,6 +277,7 @@ scripts/release_candidate_gate.sh \
   --run-tag release-candidate \
   --run-benchmark-trend true \
   --slo-include-recovery-drill true \
+  --ingest-min-rps 100 \
   --verify-ingestion-audit /var/log/dash/ingestion-audit.jsonl \
   --verify-retrieval-audit /var/log/dash/retrieval-audit.jsonl
 ```

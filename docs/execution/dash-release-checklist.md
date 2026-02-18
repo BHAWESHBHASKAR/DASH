@@ -6,7 +6,7 @@ Status: active
 ## 1. Pre-Release Validation
 
 - [ ] preferred: run consolidated gate with release settings:
-  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --verify-ingestion-audit <ingestion-audit.jsonl> --verify-retrieval-audit <retrieval-audit.jsonl>`
+  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --verify-ingestion-audit <ingestion-audit.jsonl> --verify-retrieval-audit <retrieval-audit.jsonl> --ingest-min-rps <floor>`
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
@@ -16,6 +16,8 @@ Status: active
 - [ ] `scripts/slo_guard.sh --profile smoke --run-tag release-candidate --include-recovery-drill true`
 - [ ] `scripts/verify_audit_chain.sh --path <ingestion-audit.jsonl> --service ingestion` and `scripts/verify_audit_chain.sh --path <retrieval-audit.jsonl> --service retrieval`
 - [ ] optional transport concurrency benchmark: `scripts/benchmark_transport_concurrency.sh --workers-list 1,4 --clients 16 --requests-per-worker 30`
+- [ ] ingestion throughput floor gate passes (included in consolidated release gate):
+  - `scripts/release_candidate_gate.sh --run-ingest-throughput-guard true --ingest-min-rps <floor>`
 
 ## 2. Build and Package
 

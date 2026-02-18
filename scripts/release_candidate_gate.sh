@@ -18,6 +18,18 @@ BENCH_INCLUDE_HYBRID="${DASH_RELEASE_GATE_BENCH_INCLUDE_HYBRID:-false}"
 BENCH_HISTORY_PATH="${DASH_RELEASE_GATE_BENCH_HISTORY_PATH:-docs/benchmarks/history/benchmark-history.md}"
 VERIFY_INGESTION_AUDIT_PATH="${DASH_RELEASE_GATE_VERIFY_INGESTION_AUDIT_PATH:-}"
 VERIFY_RETRIEVAL_AUDIT_PATH="${DASH_RELEASE_GATE_VERIFY_RETRIEVAL_AUDIT_PATH:-}"
+RUN_INGEST_THROUGHPUT_GUARD="${DASH_RELEASE_GATE_RUN_INGEST_THROUGHPUT_GUARD:-true}"
+INGEST_THROUGHPUT_MIN_RPS="${DASH_RELEASE_GATE_INGEST_MIN_RPS:-100}"
+INGEST_THROUGHPUT_BIND_ADDR="${DASH_RELEASE_GATE_INGEST_BIND_ADDR:-127.0.0.1:18080}"
+INGEST_THROUGHPUT_WORKERS="${DASH_RELEASE_GATE_INGEST_WORKERS:-4}"
+INGEST_THROUGHPUT_CLIENTS="${DASH_RELEASE_GATE_INGEST_CLIENTS:-16}"
+INGEST_THROUGHPUT_REQUESTS_PER_WORKER="${DASH_RELEASE_GATE_INGEST_REQUESTS_PER_WORKER:-30}"
+INGEST_THROUGHPUT_WARMUP_REQUESTS="${DASH_RELEASE_GATE_INGEST_WARMUP_REQUESTS:-5}"
+INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS="${DASH_RELEASE_GATE_INGEST_WAL_SYNC_EVERY_RECORDS:-1}"
+INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS="${DASH_RELEASE_GATE_INGEST_WAL_APPEND_BUFFER_RECORDS:-1}"
+INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_SYNC_INTERVAL_MS:-off}"
+INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS:-auto}"
+INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="${DASH_RELEASE_GATE_INGEST_ALLOW_UNSAFE_WAL_DURABILITY:-false}"
 
 usage() {
   cat <<'USAGE'
@@ -41,6 +53,21 @@ Options:
   --bench-history-path PATH            Benchmark history markdown path
   --verify-ingestion-audit PATH        Run audit chain verify for ingestion log
   --verify-retrieval-audit PATH        Run audit chain verify for retrieval log
+  --run-ingest-throughput-guard true|false
+                                       Enable/disable ingestion throughput release gate
+  --ingest-min-rps N                   Minimum ingestion throughput (requests/second)
+  --ingest-bind-addr HOST:PORT         Ingestion benchmark bind address
+  --ingest-workers N                   Ingestion benchmark transport worker count
+  --ingest-clients N                   Ingestion benchmark concurrent client count
+  --ingest-requests-per-worker N       Ingestion benchmark requests per worker
+  --ingest-warmup-requests N           Ingestion benchmark warmup requests
+  --ingest-wal-sync-every-records N    Ingestion benchmark WAL sync threshold
+  --ingest-wal-append-buffer-records N Ingestion benchmark WAL append-buffer threshold
+  --ingest-wal-sync-interval-ms N|off  Ingestion benchmark WAL interval sync policy
+  --ingest-wal-async-flush-interval-ms N|off|auto
+                                       Ingestion benchmark async flush worker interval
+  --ingest-allow-unsafe-wal-durability true|false
+                                       Ingestion benchmark unsafe WAL durability override
   -h, --help                           Show help
 
 Environment:
@@ -106,6 +133,54 @@ while [[ $# -gt 0 ]]; do
       VERIFY_RETRIEVAL_AUDIT_PATH="$2"
       shift 2
       ;;
+    --run-ingest-throughput-guard)
+      RUN_INGEST_THROUGHPUT_GUARD="$2"
+      shift 2
+      ;;
+    --ingest-min-rps)
+      INGEST_THROUGHPUT_MIN_RPS="$2"
+      shift 2
+      ;;
+    --ingest-bind-addr)
+      INGEST_THROUGHPUT_BIND_ADDR="$2"
+      shift 2
+      ;;
+    --ingest-workers)
+      INGEST_THROUGHPUT_WORKERS="$2"
+      shift 2
+      ;;
+    --ingest-clients)
+      INGEST_THROUGHPUT_CLIENTS="$2"
+      shift 2
+      ;;
+    --ingest-requests-per-worker)
+      INGEST_THROUGHPUT_REQUESTS_PER_WORKER="$2"
+      shift 2
+      ;;
+    --ingest-warmup-requests)
+      INGEST_THROUGHPUT_WARMUP_REQUESTS="$2"
+      shift 2
+      ;;
+    --ingest-wal-sync-every-records)
+      INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS="$2"
+      shift 2
+      ;;
+    --ingest-wal-append-buffer-records)
+      INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS="$2"
+      shift 2
+      ;;
+    --ingest-wal-sync-interval-ms)
+      INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS="$2"
+      shift 2
+      ;;
+    --ingest-wal-async-flush-interval-ms)
+      INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="$2"
+      shift 2
+      ;;
+    --ingest-allow-unsafe-wal-durability)
+      INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -135,6 +210,8 @@ validate_bool "--run-benchmark-trend" "${RUN_BENCH_TREND}"
 validate_bool "--bench-include-large" "${BENCH_INCLUDE_LARGE}"
 validate_bool "--bench-include-xlarge" "${BENCH_INCLUDE_XLARGE}"
 validate_bool "--bench-include-hybrid" "${BENCH_INCLUDE_HYBRID}"
+validate_bool "--run-ingest-throughput-guard" "${RUN_INGEST_THROUGHPUT_GUARD}"
+validate_bool "--ingest-allow-unsafe-wal-durability" "${INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY}"
 
 if [[ -n "${SLO_ITERATIONS}" && ! "${SLO_ITERATIONS}" =~ ^[0-9]+$ ]]; then
   echo "[release-gate] --slo-iterations must be a non-negative integer" >&2
@@ -144,6 +221,41 @@ if [[ ! "${RECOVERY_MAX_RTO_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "[release-gate] --recovery-max-rto-seconds must be a non-negative integer" >&2
   exit 2
 fi
+for int_opt in \
+  "${INGEST_THROUGHPUT_MIN_RPS}" \
+  "${INGEST_THROUGHPUT_WORKERS}" \
+  "${INGEST_THROUGHPUT_CLIENTS}" \
+  "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" \
+  "${INGEST_THROUGHPUT_WARMUP_REQUESTS}" \
+  "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" \
+  "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}"; do
+  if [[ ! "${int_opt}" =~ ^[0-9]+$ ]]; then
+    echo "[release-gate] ingestion throughput options must be non-negative integers" >&2
+    exit 2
+  fi
+done
+if [[ "${INGEST_THROUGHPUT_WORKERS}" -eq 0 || "${INGEST_THROUGHPUT_CLIENTS}" -eq 0 || "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" -eq 0 || "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" -eq 0 || "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}" -eq 0 ]]; then
+  echo "[release-gate] ingestion throughput workers/clients/requests/wal thresholds must be > 0" >&2
+  exit 2
+fi
+case "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}" in
+  off|none|unset|"") INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS="off" ;;
+  *)
+    if [[ ! "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}" =~ ^[0-9]+$ || "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}" -eq 0 ]]; then
+      echo "[release-gate] --ingest-wal-sync-interval-ms must be positive integer or off" >&2
+      exit 2
+    fi
+    ;;
+esac
+case "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" in
+  auto|off|none|unset|"") ;;
+  *)
+    if [[ ! "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" =~ ^[0-9]+$ || "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" -eq 0 ]]; then
+      echo "[release-gate] --ingest-wal-async-flush-interval-ms must be positive integer, auto, or off" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 mkdir -p "${SUMMARY_DIR}" "$(dirname "${SLO_HISTORY_PATH}")"
 
@@ -271,6 +383,76 @@ run_step "slo guard" "${SLO_CMD[*]}" "${SLO_CMD[@]}"
 
 run_step "recovery drill" "scripts/recovery_drill.sh --max-rto-seconds ${RECOVERY_MAX_RTO_SECONDS}" \
   scripts/recovery_drill.sh --max-rto-seconds "${RECOVERY_MAX_RTO_SECONDS}"
+
+if [[ "${RUN_INGEST_THROUGHPUT_GUARD}" == "true" ]]; then
+  THROUGHPUT_CMD=(
+    scripts/benchmark_transport_concurrency.sh
+    --target ingestion
+    --bind-addr "${INGEST_THROUGHPUT_BIND_ADDR}"
+    --workers-list "${INGEST_THROUGHPUT_WORKERS}"
+    --clients "${INGEST_THROUGHPUT_CLIENTS}"
+    --requests-per-worker "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}"
+    --warmup-requests "${INGEST_THROUGHPUT_WARMUP_REQUESTS}"
+    --run-tag "${RUN_TAG}-ingest-throughput-gate"
+    --ingest-wal-sync-every-records "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}"
+    --ingest-wal-append-buffer-records "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}"
+    --ingest-wal-sync-interval-ms "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}"
+    --ingest-allow-unsafe-wal-durability "${INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY}"
+  )
+  if [[ "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" != "auto" && "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" != "" ]]; then
+    THROUGHPUT_CMD+=(--ingest-wal-async-flush-interval-ms "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}")
+  fi
+  step="ingest throughput guard"
+  safe_step="${step// /-}"
+  log_path="${LOG_DIR}/${safe_step}.log"
+  started="$(date -u +%s)"
+  echo "[release-gate] ${step}"
+  echo "[release-gate] command: ${THROUGHPUT_CMD[*]} (min_rps=${INGEST_THROUGHPUT_MIN_RPS})"
+
+  output=""
+  if output="$("${THROUGHPUT_CMD[@]}" 2>&1)"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  printf '%s\n' "${output}" | tee "${log_path}"
+
+  summary_path=""
+  throughput_rps=""
+  if [[ ${exit_code} -eq 0 ]]; then
+    summary_path="$(printf '%s\n' "${output}" | sed -n 's/^\[concurrency\] output: //p' | tail -n 1)"
+    if [[ -z "${summary_path}" || ! -f "${summary_path}" ]]; then
+      printf '%s\n' "[release-gate] ingestion throughput guard failed: missing benchmark summary path" | tee -a "${log_path}" >&2
+      exit_code=1
+    else
+      throughput_rps="$(awk -F'|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ { gsub(/[[:space:]]/, "", $0); print $4; exit }' "${summary_path}")"
+      if [[ -z "${throughput_rps}" ]]; then
+        printf '%s\n' "[release-gate] ingestion throughput guard failed: unable to parse throughput_rps from ${summary_path}" | tee -a "${log_path}" >&2
+        exit_code=1
+      elif ! awk -v v="${throughput_rps}" -v min="${INGEST_THROUGHPUT_MIN_RPS}" 'BEGIN { exit (v >= min ? 0 : 1) }'; then
+        printf '%s\n' "[release-gate] ingestion throughput guard failed: throughput_rps=${throughput_rps} < min_rps=${INGEST_THROUGHPUT_MIN_RPS}" | tee -a "${log_path}" >&2
+        exit_code=1
+      else
+        printf '%s\n' "[release-gate] ingestion throughput guard passed: throughput_rps=${throughput_rps} >= min_rps=${INGEST_THROUGHPUT_MIN_RPS}" | tee -a "${log_path}"
+      fi
+    fi
+  fi
+
+  finished="$(date -u +%s)"
+  duration=$((finished - started))
+  if [[ ${exit_code} -eq 0 ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    printf '| %s | PASS | %s | `%s` |\n' "${step}" "${duration}" "${THROUGHPUT_CMD[*]} (min_rps=${INGEST_THROUGHPUT_MIN_RPS})" >> "${ROWS_TMP}"
+    append_detail "${step}" "PASS" "${THROUGHPUT_CMD[*]} (min_rps=${INGEST_THROUGHPUT_MIN_RPS})" "${duration}" "${log_path}"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    FAILED=true
+    printf '| %s | FAIL | %s | `%s` |\n' "${step}" "${duration}" "${THROUGHPUT_CMD[*]} (min_rps=${INGEST_THROUGHPUT_MIN_RPS})" >> "${ROWS_TMP}"
+    append_detail "${step}" "FAIL (exit ${exit_code})" "${THROUGHPUT_CMD[*]} (min_rps=${INGEST_THROUGHPUT_MIN_RPS})" "${duration}" "${log_path}"
+  fi
+else
+  skip_step "ingest throughput guard" "scripts/benchmark_transport_concurrency.sh --target ingestion ..." "disabled"
+fi
 
 if [[ -n "${VERIFY_INGESTION_AUDIT_PATH}" ]]; then
   run_step "audit verify ingestion" "scripts/verify_audit_chain.sh --path ${VERIFY_INGESTION_AUDIT_PATH} --service ingestion" \
