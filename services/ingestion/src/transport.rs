@@ -2890,7 +2890,10 @@ mod tests {
     use metadata_router::{
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_runtime() -> SharedRuntime {
@@ -2911,6 +2914,30 @@ mod tests {
             nanos
         ));
         wal_path
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[allow(unused_unsafe)]
+    fn set_env_var_for_tests(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    fn restore_env_var_for_tests(key: &str, value: Option<&std::ffi::OsStr>) {
+        match value {
+            Some(value) => unsafe {
+                std::env::set_var(key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(key);
+            },
+        }
     }
 
     #[test]
@@ -3182,6 +3209,102 @@ mod tests {
                 .body
                 .contains("dash_ingest_wal_background_flush_only 0")
         );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_capacity 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_depth 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_full_reject_total 0")
+        );
+    }
+
+    #[test]
+    fn metrics_endpoint_reports_backpressure_queue_values() {
+        let runtime = sample_runtime();
+        let queue_metrics = Arc::new(TransportBackpressureMetrics {
+            queue_depth: AtomicUsize::new(3),
+            queue_capacity: 8,
+            queue_full_reject_total: AtomicU64::new(11),
+        });
+        {
+            let mut guard = runtime.lock().expect("runtime lock should be available");
+            guard.set_transport_backpressure_metrics(queue_metrics);
+        }
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_capacity 8")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_depth 3")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_transport_queue_full_reject_total 11")
+        );
+    }
+
+    #[test]
+    fn resolve_http_queue_capacity_defaults_to_workers_times_constant() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let key = "DASH_INGEST_HTTP_QUEUE_CAPACITY";
+        let previous = std::env::var_os(key);
+        restore_env_var_for_tests(key, None);
+        let capacity = resolve_http_queue_capacity(3);
+        assert_eq!(capacity, 3 * DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER);
+        restore_env_var_for_tests(key, previous.as_deref());
+    }
+
+    #[test]
+    fn resolve_http_queue_capacity_prefers_env_override() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let key = "DASH_INGEST_HTTP_QUEUE_CAPACITY";
+        let previous = std::env::var_os(key);
+        set_env_var_for_tests(key, "7");
+        let capacity = resolve_http_queue_capacity(3);
+        assert_eq!(capacity, 7);
+        restore_env_var_for_tests(key, previous.as_deref());
+    }
+
+    #[test]
+    fn write_backpressure_response_returns_http_503_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).expect("client connect should succeed");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("client should read response");
+            response
+        });
+
+        let (server_stream, _) = listener.accept().expect("accept should succeed");
+        write_backpressure_response(server_stream).expect("response write should succeed");
+        let response = client.join().expect("client thread should join");
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(response.contains("content-type: application/json"));
+        assert!(response.contains("ingestion worker queue full"));
     }
 
     #[test]
