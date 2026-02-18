@@ -8,6 +8,7 @@ default = []
 async-transport = ["dep:axum", "dep:tokio"]
 
 [dependencies]
+auth = { path = "../../pkg/auth" }
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
 graph = { path = "../../pkg/graph" }

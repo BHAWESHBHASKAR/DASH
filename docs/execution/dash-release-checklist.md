@@ -25,6 +25,7 @@ Status: active
 
 - [ ] production WAL path capacity and permissions verified
 - [ ] `DASH_*` runtime envs configured (or explicit `EME_*` fallback plan documented)
+- [ ] if JWT auth mode is enabled, `DASH_*_JWT_*` envs validated (secret, issuer/audience policy, exp requirement)
 - [ ] health endpoint, ingest endpoint, and retrieve endpoint probes prepared
 - [ ] metrics endpoint probe prepared (`/metrics`)
 - [ ] rollback operator and fallback data restore path documented

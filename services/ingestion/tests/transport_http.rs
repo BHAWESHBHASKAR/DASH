@@ -9,6 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use auth::encode_hs256_token;
 use ingestion::transport::{IngestionRuntime, handle_http_request_bytes};
 use store::InMemoryStore;
 
@@ -87,6 +88,13 @@ fn overwrite_placement_csv(path: &PathBuf, contents: &str) {
     file.write_all(contents.as_bytes())
         .expect("placement file should be writable");
     file.flush().expect("placement file should flush");
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_secs()
 }
 
 #[test]
@@ -280,4 +288,66 @@ fn transport_denies_revoked_ingest_key() {
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 401"));
     assert!(response.contains("API key revoked"));
+}
+
+#[test]
+fn transport_denies_cross_tenant_ingest_for_jwt_claim_scope() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_INGEST_JWT_HS256_SECRET", OsStr::new("jwt-secret"));
+    let _jwt_issuer = EnvVarGuard::set("DASH_INGEST_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_INGEST_JWT_AUDIENCE", OsStr::new("ingestion"));
+    let exp = now_unix_secs() + 300;
+    let token = encode_hs256_token(
+        &format!(
+            "{{\"tenant_id\":\"tenant-allowed\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+        ),
+        "jwt-secret",
+    )
+    .expect("token should encode");
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-jwt-scope-deny","tenant_id":"tenant-blocked","canonical_text":"JWT scope deny check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        token,
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 403"));
+    assert!(response.contains("tenant is not allowed for this JWT"));
+}
+
+#[test]
+fn transport_denies_expired_ingest_jwt() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_INGEST_JWT_HS256_SECRET", OsStr::new("jwt-secret"));
+    let _jwt_issuer = EnvVarGuard::set("DASH_INGEST_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_INGEST_JWT_AUDIENCE", OsStr::new("ingestion"));
+    let exp = now_unix_secs().saturating_sub(10);
+    let token = encode_hs256_token(
+        &format!(
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+        ),
+        "jwt-secret",
+    )
+    .expect("token should encode");
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-jwt-expired","tenant_id":"tenant-http","canonical_text":"JWT expiry check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        token,
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 401"));
+    assert!(response.contains("JWT expired"));
 }

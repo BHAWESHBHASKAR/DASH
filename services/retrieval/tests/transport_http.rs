@@ -7,6 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use auth::encode_hs256_token;
 use schema::{Claim, Evidence, Stance};
 use store::InMemoryStore;
 
@@ -105,6 +106,13 @@ fn temp_placement_csv(contents: &str) -> PathBuf {
     file.write_all(contents.as_bytes())
         .expect("placement file should be writable");
     out
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_secs()
 }
 
 #[test]
@@ -230,4 +238,58 @@ fn transport_denies_revoked_retrieval_key() {
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 401"));
     assert!(response.contains("API key revoked"));
+}
+
+#[test]
+fn transport_denies_cross_tenant_retrieval_for_jwt_claim_scope() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_RETRIEVAL_JWT_HS256_SECRET", OsStr::new("jwt-secret"));
+    let _jwt_issuer = EnvVarGuard::set("DASH_RETRIEVAL_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_RETRIEVAL_JWT_AUDIENCE", OsStr::new("retrieval"));
+    let exp = now_unix_secs() + 300;
+    let token = encode_hs256_token(
+        &format!(
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+        ),
+        "jwt-secret",
+    )
+    .expect("token should encode");
+
+    let store = sample_store();
+    let request = format!(
+        "GET /v1/retrieve?tenant_id=tenant-blocked&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        token
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 403"));
+    assert!(response.contains("tenant is not allowed for this JWT"));
+}
+
+#[test]
+fn transport_denies_expired_retrieval_jwt() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set("DASH_RETRIEVAL_JWT_HS256_SECRET", OsStr::new("jwt-secret"));
+    let _jwt_issuer = EnvVarGuard::set("DASH_RETRIEVAL_JWT_ISSUER", OsStr::new("dash"));
+    let _jwt_audience = EnvVarGuard::set("DASH_RETRIEVAL_JWT_AUDIENCE", OsStr::new("retrieval"));
+    let exp = now_unix_secs().saturating_sub(10);
+    let token = encode_hs256_token(
+        &format!(
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+        ),
+        "jwt-secret",
+    )
+    .expect("token should encode");
+
+    let store = sample_store();
+    let request = format!(
+        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        token
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 401"));
+    assert!(response.contains("JWT expired"));
 }

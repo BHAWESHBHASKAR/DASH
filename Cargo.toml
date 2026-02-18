@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "pkg/auth",
   "pkg/schema",
   "pkg/ranking",
   "pkg/graph",

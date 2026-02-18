@@ -36,6 +36,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Ingestion and retrieval HTTP transports with health and metrics endpoints.
 - Runtime policy controls for auth, worker pools, and transport mode selection.
 - Startup replay and replay-stat logging for persistent mode.
+- JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
 
 ### 3.4 Index and scale path primitives
 

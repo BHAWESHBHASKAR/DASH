@@ -13,6 +13,11 @@ Status: active
 | `DASH_INGEST_API_KEY` | no | unset | optional API key for `POST /v1/ingest` (`X-API-Key` or `Authorization: Bearer`) | `EME_INGEST_API_KEY` |
 | `DASH_INGEST_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_INGEST_API_KEY` | `EME_INGEST_API_KEYS` |
 | `DASH_INGEST_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_INGEST_REVOKED_API_KEYS` |
+| `DASH_INGEST_JWT_HS256_SECRET` | no | unset | optional HS256 JWT secret for bearer-token auth (`Authorization: Bearer <jwt>`) | `EME_INGEST_JWT_HS256_SECRET` |
+| `DASH_INGEST_JWT_ISSUER` | no | unset | optional required JWT `iss` claim value | `EME_INGEST_JWT_ISSUER` |
+| `DASH_INGEST_JWT_AUDIENCE` | no | unset | optional required JWT `aud` claim value | `EME_INGEST_JWT_AUDIENCE` |
+| `DASH_INGEST_JWT_LEEWAY_SECS` | no | `0` | optional JWT time-claim leeway seconds (`exp`, `nbf`) | `EME_INGEST_JWT_LEEWAY_SECS` |
+| `DASH_INGEST_JWT_REQUIRE_EXP` | no | `true` | when `true`, JWT auth requires `exp` claim | `EME_INGEST_JWT_REQUIRE_EXP` |
 | `DASH_INGEST_ALLOWED_TENANTS` | no | unset (`*`) | optional tenant allowlist (comma-separated tenant IDs or `*`) for ingest writes | `EME_INGEST_ALLOWED_TENANTS` |
 | `DASH_INGEST_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_INGEST_API_KEY_SCOPES` |
 | `DASH_INGEST_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for ingest events (success/denied/error) | `EME_INGEST_AUDIT_LOG_PATH` |
@@ -50,6 +55,11 @@ Status: active
 | `DASH_RETRIEVAL_API_KEY` | no | unset | optional API key for `GET/POST /v1/retrieve` (`X-API-Key` or `Authorization: Bearer`) | `EME_RETRIEVAL_API_KEY` |
 | `DASH_RETRIEVAL_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_RETRIEVAL_API_KEY` | `EME_RETRIEVAL_API_KEYS` |
 | `DASH_RETRIEVAL_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_RETRIEVAL_REVOKED_API_KEYS` |
+| `DASH_RETRIEVAL_JWT_HS256_SECRET` | no | unset | optional HS256 JWT secret for bearer-token auth (`Authorization: Bearer <jwt>`) | `EME_RETRIEVAL_JWT_HS256_SECRET` |
+| `DASH_RETRIEVAL_JWT_ISSUER` | no | unset | optional required JWT `iss` claim value | `EME_RETRIEVAL_JWT_ISSUER` |
+| `DASH_RETRIEVAL_JWT_AUDIENCE` | no | unset | optional required JWT `aud` claim value | `EME_RETRIEVAL_JWT_AUDIENCE` |
+| `DASH_RETRIEVAL_JWT_LEEWAY_SECS` | no | `0` | optional JWT time-claim leeway seconds (`exp`, `nbf`) | `EME_RETRIEVAL_JWT_LEEWAY_SECS` |
+| `DASH_RETRIEVAL_JWT_REQUIRE_EXP` | no | `true` | when `true`, JWT auth requires `exp` claim | `EME_RETRIEVAL_JWT_REQUIRE_EXP` |
 | `DASH_RETRIEVAL_ALLOWED_TENANTS` | no | unset (`*`) | optional tenant allowlist (comma-separated tenant IDs or `*`) for retrieval requests | `EME_RETRIEVAL_ALLOWED_TENANTS` |
 | `DASH_RETRIEVAL_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_RETRIEVAL_API_KEY_SCOPES` |
 | `DASH_RETRIEVAL_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for retrieval events (success/denied/error) | `EME_RETRIEVAL_AUDIT_LOG_PATH` |

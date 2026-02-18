@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use auth::{JwtValidationConfig, JwtValidationError, verify_hs256_token_for_tenant};
 use metadata_router::{
     PlacementRouteError, ReadPreference, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig,
     ShardPlacement, load_shard_placements_csv, route_read_with_placement,
@@ -1111,6 +1112,7 @@ struct AuthPolicy {
     revoked_api_keys: HashSet<String>,
     allowed_tenants: TenantScope,
     scoped_api_keys: HashMap<String, TenantScope>,
+    jwt_validation: Option<JwtValidationConfig>,
 }
 
 impl AuthPolicy {
@@ -1129,6 +1131,22 @@ impl AuthPolicy {
             revoked_api_keys: parse_api_key_set(None, revoked_api_keys_raw.as_deref()),
             allowed_tenants: parse_tenant_scope(allowed_tenants_raw.as_deref(), true),
             scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref()),
+            jwt_validation: parse_jwt_validation_config(
+                env_with_fallback(
+                    "DASH_RETRIEVAL_JWT_HS256_SECRET",
+                    "EME_RETRIEVAL_JWT_HS256_SECRET",
+                ),
+                env_with_fallback("DASH_RETRIEVAL_JWT_ISSUER", "EME_RETRIEVAL_JWT_ISSUER"),
+                env_with_fallback("DASH_RETRIEVAL_JWT_AUDIENCE", "EME_RETRIEVAL_JWT_AUDIENCE"),
+                env_with_fallback(
+                    "DASH_RETRIEVAL_JWT_LEEWAY_SECS",
+                    "EME_RETRIEVAL_JWT_LEEWAY_SECS",
+                ),
+                env_with_fallback(
+                    "DASH_RETRIEVAL_JWT_REQUIRE_EXP",
+                    "EME_RETRIEVAL_JWT_REQUIRE_EXP",
+                ),
+            ),
         }
     }
 }
@@ -1153,6 +1171,26 @@ fn authorize_request_for_tenant(
     tenant_id: &str,
     policy: &AuthPolicy,
 ) -> AuthDecision {
+    if let Some(jwt_config) = policy.jwt_validation.as_ref()
+        && let Some(token) = presented_bearer_token(request)
+        && bearer_looks_like_jwt(token)
+    {
+        return match verify_hs256_token_for_tenant(token, tenant_id, jwt_config, unix_now_secs()) {
+            Ok(()) => {
+                if !policy.allowed_tenants.allows(tenant_id) {
+                    AuthDecision::Forbidden("tenant is not allowed by service policy")
+                } else {
+                    AuthDecision::Allowed
+                }
+            }
+            Err(JwtValidationError::TenantNotAllowed) => {
+                AuthDecision::Forbidden("tenant is not allowed for this JWT")
+            }
+            Err(JwtValidationError::Expired) => AuthDecision::Unauthorized("JWT expired"),
+            Err(_) => AuthDecision::Unauthorized("invalid JWT"),
+        };
+    }
+
     let maybe_api_key = presented_api_key(request);
     if let Some(api_key) = maybe_api_key
         && policy.revoked_api_keys.contains(api_key)
@@ -1189,8 +1227,27 @@ fn presented_api_key(request: &HttpRequest) -> Option<&str> {
     if let Some(value) = request.headers.get("x-api-key") {
         return Some(value.as_str());
     }
+    presented_bearer_token(request)
+}
+
+fn presented_bearer_token(request: &HttpRequest) -> Option<&str> {
     let value = request.headers.get("authorization")?;
     value.strip_prefix("Bearer ").map(str::trim)
+}
+
+fn bearer_looks_like_jwt(token: &str) -> bool {
+    let mut parts = token.split('.');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next().unwrap_or_default();
+    let third = parts.next().unwrap_or_default();
+    parts.next().is_none() && !first.is_empty() && !second.is_empty() && !third.is_empty()
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 fn parse_tenant_scope(raw: Option<&str>, empty_means_any: bool) -> TenantScope {
@@ -1259,6 +1316,56 @@ fn parse_api_key_set(single_key: Option<&str>, raw: Option<&str>) -> HashSet<Str
         }
     }
     keys
+}
+
+fn parse_jwt_validation_config(
+    secret_raw: Option<String>,
+    issuer_raw: Option<String>,
+    audience_raw: Option<String>,
+    leeway_secs_raw: Option<String>,
+    require_exp_raw: Option<String>,
+) -> Option<JwtValidationConfig> {
+    let secret = secret_raw?.trim().to_string();
+    if secret.is_empty() {
+        return None;
+    }
+    let leeway_secs = leeway_secs_raw
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let require_exp = parse_bool_env_default(require_exp_raw.as_deref(), true);
+    Some(JwtValidationConfig {
+        hs256_secret: secret,
+        issuer: issuer_raw.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }),
+        audience: audience_raw.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }),
+        leeway_secs,
+        require_exp,
+    })
+}
+
+fn parse_bool_env_default(raw: Option<&str>, default: bool) -> bool {
+    let Some(raw) = raw else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
 }
 
 fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {

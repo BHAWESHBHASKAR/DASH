@@ -77,6 +77,7 @@ Key env groups:
 - transport/runtime: `DASH_*_BIND`, `DASH_*_HTTP_WORKERS`, `DASH_*_TRANSPORT_RUNTIME`
 - durability: `DASH_INGEST_WAL_PATH`, checkpoint limits
 - security: API keys, tenant allowlists, scoped keys, audit log paths
+- JWT auth (HS256): `DASH_*_JWT_HS256_SECRET` + optional `DASH_*_JWT_ISSUER` / `DASH_*_JWT_AUDIENCE`
 - ANN tuning: `DASH_*_ANN_*`
 - segment lifecycle:
   - ingestion publish: `DASH_INGEST_SEGMENT_DIR` (+ sizing/compaction knobs)
