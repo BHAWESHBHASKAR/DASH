@@ -1012,6 +1012,139 @@ mod tests {
     }
 
     #[test]
+    fn execute_api_query_ignores_foreign_claim_ids_in_segment_allowlist() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("tenant-allowlist-isolation");
+        let tenant_a_root = root.join("tenant-a");
+        persist_segments_atomic(
+            &tenant_a_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-tenant-a".into(), "claim-tenant-b".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-tenant-a".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Tenant A project update".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Project Alpha".into()],
+                    embedding_ids: vec!["emb://tenant-a".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("tenant-a ingest should succeed");
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-tenant-b".into(),
+                    tenant_id: "tenant-b".into(),
+                    canonical_text: "Tenant B project update".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Project Beta".into()],
+                    embedding_ids: vec!["emb://tenant-b".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("tenant-b ingest should succeed");
+
+        let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+        let _segment_refresh_env = EnvVarGuard::set(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            OsStr::new("600000"),
+        );
+
+        let response = execute_api_query(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "project update".into(),
+                query_embedding: None,
+                entity_filters: vec![],
+                embedding_id_filters: vec![],
+                top_k: 5,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].claim_id, "claim-tenant-a");
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn build_segment_prefilter_claim_ids_from_root_is_tenant_scoped() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-tenant-scope");
+        let tenant_a_root = root.join("tenant-a");
+        let tenant_b_root = root.join("tenant-b");
+        persist_segments_atomic(
+            &tenant_a_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-a-1".into(), "claim-a-2".into()],
+            }],
+        )
+        .expect("tenant-a segment persist should succeed");
+        persist_segments_atomic(
+            &tenant_b_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-b-1".into()],
+            }],
+        )
+        .expect("tenant-b segment persist should succeed");
+
+        let tenant_a_ids = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone())
+            .expect("tenant-a segment ids should be loaded");
+        let tenant_b_ids = build_segment_prefilter_claim_ids_from_root("tenant-b", root.clone())
+            .expect("tenant-b segment ids should be loaded");
+
+        assert_eq!(tenant_a_ids.len(), 2);
+        assert!(tenant_a_ids.contains("claim-a-1"));
+        assert!(tenant_a_ids.contains("claim-a-2"));
+        assert!(!tenant_a_ids.contains("claim-b-1"));
+        assert_eq!(tenant_b_ids.len(), 1);
+        assert!(tenant_b_ids.contains("claim-b-1"));
+        assert!(!tenant_b_ids.contains("claim-a-1"));
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
     fn build_segment_prefilter_claim_ids_from_root_reads_persisted_segments() {
         let _lock = segment_cache_test_lock()
             .lock()

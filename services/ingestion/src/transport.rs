@@ -1398,6 +1398,7 @@ fn map_store_error(error: &StoreError) -> (u16, String) {
     match error {
         StoreError::Validation(err) => (400, format!("validation error: {err:?}")),
         StoreError::MissingClaim(claim_id) => (400, format!("missing claim: {claim_id}")),
+        StoreError::Conflict(message) => (409, format!("state conflict: {message}")),
         StoreError::InvalidVector(message) => (400, format!("invalid vector: {message}")),
         StoreError::Io(message) | StoreError::Parse(message) => {
             (500, format!("internal persistence error: {message}"))
@@ -2345,6 +2346,7 @@ fn render_response_text(response: &HttpResponse) -> String {
         400 => "400 Bad Request",
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
+        409 => "409 Conflict",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
         503 => "503 Service Unavailable",
@@ -2414,6 +2416,14 @@ impl HttpResponse {
         }
     }
 
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: 409,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+        }
+    }
+
     fn method_not_allowed(message: &str) -> Self {
         Self {
             status: 405,
@@ -2451,6 +2461,7 @@ impl HttpResponse {
             400 => Self::bad_request(message),
             401 => Self::unauthorized(message),
             403 => Self::forbidden(message),
+            409 => Self::conflict(message),
             404 => Self::not_found(message),
             405 => Self::method_not_allowed(message),
             503 => Self::service_unavailable(message),

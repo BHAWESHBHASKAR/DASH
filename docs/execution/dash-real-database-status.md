@@ -23,6 +23,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - WAL append + replay durability path.
 - Snapshot checkpoint compaction and snapshot+delta recovery path.
 - Backward-compatible WAL record evolution for metadata and vectors.
+- Fail-closed tenant safety guard for cross-tenant `claim_id` collisions.
 
 ### 3.2 Retrieval engine
 
@@ -30,6 +31,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Stance modes (`balanced`, `support_only`) and citation-grade outputs.
 - Optional graph payload in retrieval contracts.
 - Segment prefilter cache with runtime refresh controls and observability metrics.
+- Tenant-isolation coverage for retrieval segment prefilter/cache paths.
 
 ### 3.3 Services and transport
 

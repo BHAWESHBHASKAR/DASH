@@ -133,6 +133,51 @@ fn transport_post_ingest_parses_json_and_returns_response() {
 }
 
 #[test]
+fn transport_rejects_cross_tenant_claim_id_collision_with_conflict_status() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let first_body = r#"{
+      "claim": {
+        "claim_id": "claim-collision",
+        "tenant_id": "tenant-a",
+        "canonical_text": "Tenant A claim",
+        "confidence": 0.95
+      }
+    }"#;
+    let first_request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        first_body.len(),
+        first_body
+    );
+    let first_response = handle_http_request_bytes(&runtime, first_request.as_bytes())
+        .expect("first request should parse and return response");
+    let first_response = String::from_utf8(first_response).expect("response should be UTF-8");
+    assert!(first_response.starts_with("HTTP/1.1 200 OK"));
+
+    let second_body = r#"{
+      "claim": {
+        "claim_id": "claim-collision",
+        "tenant_id": "tenant-b",
+        "canonical_text": "Tenant B claim",
+        "confidence": 0.95
+      }
+    }"#;
+    let second_request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        second_body.len(),
+        second_body
+    );
+    let second_response = handle_http_request_bytes(&runtime, second_request.as_bytes())
+        .expect("second request should parse and return response");
+    let second_response = String::from_utf8(second_response).expect("response should be UTF-8");
+    assert!(
+        second_response.starts_with("HTTP/1.1 409"),
+        "response was: {second_response}"
+    );
+    assert!(second_response.contains("state conflict"));
+}
+
+#[test]
 fn transport_metrics_endpoint_returns_prometheus_payload() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let runtime = sample_runtime();

@@ -25,6 +25,8 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transport integration tests now include scoped cross-tenant deny and revoked-key deny coverage.
 - Ingestion/retrieval now support JWT bearer auth mode (HS256) with issuer/audience/time-claim checks and tenant claim enforcement.
 - Ingestion/retrieval transport integration tests now include JWT cross-tenant deny and JWT expiry deny coverage.
+- Store now fails closed on cross-tenant `claim_id` collisions to prevent tenant overwrite and replay divergence.
+- Retrieval API tests now validate tenant isolation in segment-prefilter allowlists and cache scoping.
 - Indexer includes immutable segment lifecycle primitives (atomic segment+manifest persistence, checksum-verified load, compaction scheduler hook).
 - Metadata router now includes placement-aware routing primitives (leader/follower health policies, read preferences, and failover promotion with epoch bump).
 - Ingestion/retrieval transports now support placement-aware request admission gates (write-leader enforcement on ingest and read-replica preference enforcement on retrieve) using shared placement CSV metadata.

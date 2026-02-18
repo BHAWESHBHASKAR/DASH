@@ -26,6 +26,7 @@ pub enum WalEvent {
 pub enum StoreError {
     Validation(ValidationError),
     MissingClaim(String),
+    Conflict(String),
     InvalidVector(String),
     Io(String),
     Parse(String),
@@ -1360,6 +1361,14 @@ impl InMemoryStore {
         edges: &[ClaimEdge],
     ) -> Result<(), StoreError> {
         validate_claim(claim)?;
+        if let Some(existing) = self.claims.get(&claim.claim_id)
+            && existing.tenant_id != claim.tenant_id
+        {
+            return Err(StoreError::Conflict(format!(
+                "claim_id '{}' already exists for tenant '{}'",
+                claim.claim_id, existing.tenant_id
+            )));
+        }
         for evd in evidence {
             validate_evidence(evd)?;
             if evd.claim_id != claim.claim_id {
@@ -1395,6 +1404,12 @@ impl InMemoryStore {
         validate_claim(&claim)?;
         let claim_id = claim.claim_id.clone();
         if let Some(previous) = self.claims.get(&claim_id).cloned() {
+            if previous.tenant_id != claim.tenant_id {
+                return Err(StoreError::Conflict(format!(
+                    "claim_id '{}' already exists for tenant '{}'",
+                    claim_id, previous.tenant_id
+                )));
+            }
             self.remove_claim_indexes(&previous);
         }
         self.add_claim_indexes(&claim);
@@ -2253,10 +2268,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    fn claim(id: &str, text: &str) -> Claim {
+    fn claim_for_tenant(id: &str, text: &str, tenant_id: &str) -> Claim {
         Claim {
             claim_id: id.to_string(),
-            tenant_id: "tenant-a".to_string(),
+            tenant_id: tenant_id.to_string(),
             canonical_text: text.to_string(),
             confidence: 0.9,
             event_time_unix: None,
@@ -2268,6 +2283,10 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    fn claim(id: &str, text: &str) -> Claim {
+        claim_for_tenant(id, text, "tenant-a")
     }
 
     fn temp_wal_path() -> PathBuf {
@@ -3384,5 +3403,96 @@ mod tests {
             }
             other => panic!("expected InvalidVector, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claim_id_reuse_across_tenants_is_rejected() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                claim_for_tenant("c-tenant-collision", "tenant-a claim", "tenant-a"),
+                vec![],
+                vec![],
+            )
+            .expect("initial ingest should succeed");
+
+        let err = store
+            .ingest_bundle(
+                claim_for_tenant("c-tenant-collision", "tenant-b claim", "tenant-b"),
+                vec![],
+                vec![],
+            )
+            .expect_err("cross-tenant claim_id reuse should be rejected");
+        match err {
+            StoreError::Conflict(message) => {
+                assert!(message.contains("c-tenant-collision"));
+                assert!(message.contains("tenant-a"));
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        assert_eq!(store.claims_for_tenant("tenant-a").len(), 1);
+        assert_eq!(store.claims_for_tenant("tenant-b").len(), 0);
+    }
+
+    #[test]
+    fn ingest_bundle_persistent_rejects_cross_tenant_claim_id_before_wal_append() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open(&wal_path).expect("wal should open");
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim_for_tenant("c-tenant-collision", "tenant-a claim", "tenant-a"),
+                vec![],
+                vec![],
+            )
+            .expect("initial persistent ingest should succeed");
+        let before = wal
+            .wal_record_count()
+            .expect("wal record count should be readable");
+
+        let err = store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim_for_tenant("c-tenant-collision", "tenant-b claim", "tenant-b"),
+                vec![],
+                vec![],
+            )
+            .expect_err("cross-tenant claim_id reuse should be rejected");
+        assert!(matches!(err, StoreError::Conflict(_)));
+        let after = wal
+            .wal_record_count()
+            .expect("wal record count should be readable");
+        assert_eq!(after, before);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn load_from_wal_rejects_cross_tenant_claim_id_collision() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open(&wal_path).expect("wal should open");
+
+        wal.append_claim(&claim_for_tenant(
+            "c-tenant-collision",
+            "tenant-a claim",
+            "tenant-a",
+        ))
+        .expect("tenant-a claim append should succeed");
+        wal.append_claim(&claim_for_tenant(
+            "c-tenant-collision",
+            "tenant-b claim",
+            "tenant-b",
+        ))
+        .expect("tenant-b claim append should succeed");
+
+        let err = InMemoryStore::load_from_wal(&wal)
+            .err()
+            .expect("cross-tenant claim_id collision should fail replay");
+        assert!(matches!(err, StoreError::Conflict(_)));
+
+        cleanup_persistence_files(&wal);
     }
 }
