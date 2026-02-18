@@ -11,6 +11,8 @@ Status: active
 | `DASH_INGEST_HTTP_WORKERS` | no | auto (`min(available_parallelism, 32)`, fallback `4`) | ingestion HTTP worker pool size | `EME_INGEST_HTTP_WORKERS` |
 | `DASH_INGEST_TRANSPORT_RUNTIME` | no | `std` | transport runtime selector (`std` or `axum`) | `EME_INGEST_TRANSPORT_RUNTIME` |
 | `DASH_INGEST_API_KEY` | no | unset | optional API key for `POST /v1/ingest` (`X-API-Key` or `Authorization: Bearer`) | `EME_INGEST_API_KEY` |
+| `DASH_INGEST_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_INGEST_API_KEY` | `EME_INGEST_API_KEYS` |
+| `DASH_INGEST_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_INGEST_REVOKED_API_KEYS` |
 | `DASH_INGEST_ALLOWED_TENANTS` | no | unset (`*`) | optional tenant allowlist (comma-separated tenant IDs or `*`) for ingest writes | `EME_INGEST_ALLOWED_TENANTS` |
 | `DASH_INGEST_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_INGEST_API_KEY_SCOPES` |
 | `DASH_INGEST_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for ingest events (success/denied/error) | `EME_INGEST_AUDIT_LOG_PATH` |
@@ -46,6 +48,8 @@ Status: active
 | `DASH_RETRIEVAL_HTTP_WORKERS` | no | auto (`min(available_parallelism, 32)`, fallback `4`) | retrieval HTTP worker pool size | `EME_RETRIEVAL_HTTP_WORKERS` |
 | `DASH_RETRIEVAL_TRANSPORT_RUNTIME` | no | `std` | transport runtime selector (`std` or `axum`) | `EME_RETRIEVAL_TRANSPORT_RUNTIME` |
 | `DASH_RETRIEVAL_API_KEY` | no | unset | optional API key for `GET/POST /v1/retrieve` (`X-API-Key` or `Authorization: Bearer`) | `EME_RETRIEVAL_API_KEY` |
+| `DASH_RETRIEVAL_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_RETRIEVAL_API_KEY` | `EME_RETRIEVAL_API_KEYS` |
+| `DASH_RETRIEVAL_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_RETRIEVAL_REVOKED_API_KEYS` |
 | `DASH_RETRIEVAL_ALLOWED_TENANTS` | no | unset (`*`) | optional tenant allowlist (comma-separated tenant IDs or `*`) for retrieval requests | `EME_RETRIEVAL_ALLOWED_TENANTS` |
 | `DASH_RETRIEVAL_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_RETRIEVAL_API_KEY_SCOPES` |
 | `DASH_RETRIEVAL_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for retrieval events (success/denied/error) | `EME_RETRIEVAL_AUDIT_LOG_PATH` |

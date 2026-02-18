@@ -80,6 +80,7 @@ target/release/retrieval --serve
 Compatibility note: legacy `EME_*` env vars are still accepted as fallback.
 Compatibility note: `DASH_*_TRANSPORT_RUNTIME=axum` requires binaries built with `async-transport` feature.
 Policy note: if `DASH_*_API_KEY_SCOPES` is set, key scope checks are enforced before tenant allowlist checks.
+Policy note: `DASH_*_API_KEYS` enables rotation overlap (multiple active keys); `DASH_*_REVOKED_API_KEYS` hard-denies compromised keys.
 
 ## 6. Smoke Checks
 
@@ -148,6 +149,17 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/benchmark_trend.sh --run-tag release-candidate`
 - run placement failover drill before release candidates:
   - `scripts/failover_drill.sh --mode both --placement-reload-interval-ms 200 --keep-artifacts true`
+
+### 7.1 API key rotation and revocation
+
+- rotation overlap (old + new key accepted during rollout):
+  - set both keys in `DASH_INGEST_API_KEYS` / `DASH_RETRIEVAL_API_KEYS` (comma-separated)
+  - keep scoped mappings in `DASH_*_API_KEY_SCOPES` for tenant-level allow rules
+- revocation:
+  - add compromised key to `DASH_INGEST_REVOKED_API_KEYS` and `DASH_RETRIEVAL_REVOKED_API_KEYS`
+  - revoked keys are denied even if present in `DASH_*_API_KEYS` or `DASH_*_API_KEY_SCOPES`
+- completion:
+  - remove old key from `DASH_*_API_KEYS` once clients finish migration
 
 ## 8. Incident Response (Minimal)
 

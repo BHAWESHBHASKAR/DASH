@@ -715,6 +715,11 @@ fn handle_request_with_metrics_and_reload(
     let (path, query) = split_target(&request.target);
     let auth_policy = AuthPolicy::from_env(
         env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY"),
+        env_with_fallback("DASH_RETRIEVAL_API_KEYS", "EME_RETRIEVAL_API_KEYS"),
+        env_with_fallback(
+            "DASH_RETRIEVAL_REVOKED_API_KEYS",
+            "EME_RETRIEVAL_REVOKED_API_KEYS",
+        ),
         env_with_fallback(
             "DASH_RETRIEVAL_ALLOWED_TENANTS",
             "EME_RETRIEVAL_ALLOWED_TENANTS",
@@ -1102,7 +1107,8 @@ enum AuthDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuthPolicy {
-    required_api_key: Option<String>,
+    required_api_keys: HashSet<String>,
+    revoked_api_keys: HashSet<String>,
     allowed_tenants: TenantScope,
     scoped_api_keys: HashMap<String, TenantScope>,
 }
@@ -1110,11 +1116,17 @@ struct AuthPolicy {
 impl AuthPolicy {
     fn from_env(
         required_api_key: Option<String>,
+        required_api_keys_raw: Option<String>,
+        revoked_api_keys_raw: Option<String>,
         allowed_tenants_raw: Option<String>,
         scoped_api_keys_raw: Option<String>,
     ) -> Self {
         Self {
-            required_api_key,
+            required_api_keys: parse_api_key_set(
+                required_api_key.as_deref(),
+                required_api_keys_raw.as_deref(),
+            ),
+            revoked_api_keys: parse_api_key_set(None, revoked_api_keys_raw.as_deref()),
             allowed_tenants: parse_tenant_scope(allowed_tenants_raw.as_deref(), true),
             scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref()),
         }
@@ -1141,20 +1153,28 @@ fn authorize_request_for_tenant(
     tenant_id: &str,
     policy: &AuthPolicy,
 ) -> AuthDecision {
-    let presented_api_key = presented_api_key(request);
+    let maybe_api_key = presented_api_key(request);
+    if let Some(api_key) = maybe_api_key
+        && policy.revoked_api_keys.contains(api_key)
+    {
+        return AuthDecision::Unauthorized("API key revoked");
+    }
+
     if !policy.scoped_api_keys.is_empty() {
-        let Some(api_key) = presented_api_key else {
+        let Some(api_key) = maybe_api_key else {
             return AuthDecision::Unauthorized("missing or invalid API key");
         };
-        let Some(scope) = policy.scoped_api_keys.get(api_key) else {
+        if let Some(scope) = policy.scoped_api_keys.get(api_key) {
+            if !scope.allows(tenant_id) {
+                return AuthDecision::Forbidden("tenant is not allowed for this API key");
+            }
+        } else if !policy.required_api_keys.is_empty()
+            && !policy.required_api_keys.contains(api_key)
+        {
             return AuthDecision::Unauthorized("missing or invalid API key");
-        };
-        if !scope.allows(tenant_id) {
-            return AuthDecision::Forbidden("tenant is not allowed for this API key");
         }
-    } else if let Some(required_api_key) = policy.required_api_key.as_deref()
-        && !required_api_key.trim().is_empty()
-        && presented_api_key != Some(required_api_key)
+    } else if !policy.required_api_keys.is_empty()
+        && !matches!(maybe_api_key, Some(key) if policy.required_api_keys.contains(key))
     {
         return AuthDecision::Unauthorized("missing or invalid API key");
     }
@@ -1219,6 +1239,26 @@ fn parse_scoped_api_keys(raw: Option<&str>) -> HashMap<String, TenantScope> {
         );
     }
     scoped
+}
+
+fn parse_api_key_set(single_key: Option<&str>, raw: Option<&str>) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    if let Some(single_key) = single_key {
+        let key = single_key.trim();
+        if !key.is_empty() {
+            keys.insert(key.to_string());
+        }
+    }
+    if let Some(raw) = raw {
+        for key in raw.split(',') {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            keys.insert(key.to_string());
+        }
+    }
+    keys
 }
 
 fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {
@@ -3106,8 +3146,13 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy =
-            AuthPolicy::from_env(None, None, Some("scope-a:tenant-a,tenant-b".to_string()));
+        let policy = AuthPolicy::from_env(
+            None,
+            None,
+            None,
+            None,
+            Some("scope-a:tenant-a,tenant-b".to_string()),
+        );
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-b", &policy),
             AuthDecision::Allowed
@@ -3122,7 +3167,8 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(None, None, Some("scope-a:tenant-a".to_string()));
+        let policy =
+            AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-z", &policy),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
@@ -3137,10 +3183,52 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::new(),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None);
+        let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-a", &policy),
             AuthDecision::Unauthorized("missing or invalid API key")
+        );
+    }
+
+    #[test]
+    fn auth_policy_required_key_set_supports_rotation() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::from([("x-api-key".to_string(), "new-key".to_string())]),
+            body: Vec::new(),
+        };
+        let policy = AuthPolicy::from_env(
+            Some("old-key".to_string()),
+            Some("new-key,old-key-2".to_string()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            AuthDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn auth_policy_revoked_key_is_denied() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
+            body: Vec::new(),
+        };
+        let policy = AuthPolicy::from_env(
+            None,
+            None,
+            Some("scope-a".to_string()),
+            None,
+            Some("scope-a:tenant-a".to_string()),
+        );
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            AuthDecision::Unauthorized("API key revoked")
         );
     }
 }
