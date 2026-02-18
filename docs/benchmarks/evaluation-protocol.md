@@ -280,6 +280,10 @@ Optional overrides:
     - snapshot/wal replay record counts
     - post-checkpoint replay retrieval validation (`hit` + top claim id)
   - contradiction probe (`support_only`) pass/fail
+  - contradiction-detection F1 probe on adversarial fixture:
+    - `contradiction_detection_f1`
+    - enforced gate: `>= 0.80`
+    - `contradiction_detection_f1_pass`
   - temporal-window filtering probe pass/fail
   - exclusion of unknown event-time claims under temporal filters
   - hybrid retrieval probe for `query_embedding + entity_filters + embedding_id_filters`

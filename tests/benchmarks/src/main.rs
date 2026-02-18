@@ -16,6 +16,8 @@ use retrieval::api::{
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore, StoreIndexStats, WalCheckpointStats};
 
+const CONTRADICTION_DETECTION_F1_GATE: f64 = 0.80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkProfile {
     Smoke,
@@ -119,6 +121,8 @@ struct HistoryRow {
 #[derive(Debug, Clone)]
 struct QualityProbeSummary {
     contradiction_support_only_pass: bool,
+    contradiction_detection_f1: f64,
+    contradiction_detection_f1_pass: bool,
     temporal_window_pass: bool,
     temporal_unknown_excluded_pass: bool,
     hybrid_filter_with_embedding_pass: bool,
@@ -162,6 +166,7 @@ impl QualityProbeSummary {
     fn passed_count(&self) -> usize {
         [
             self.contradiction_support_only_pass,
+            self.contradiction_detection_f1_pass,
             self.temporal_window_pass,
             self.temporal_unknown_excluded_pass,
             self.hybrid_filter_with_embedding_pass,
@@ -172,7 +177,7 @@ impl QualityProbeSummary {
     }
 
     fn total_count(&self) -> usize {
-        4
+        5
     }
 
     fn all_passed(&self) -> bool {
@@ -740,7 +745,7 @@ fn parse_non_negative_usize_arg(value: Option<String>, flag: &str) -> Result<usi
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [quality probe enforces contradiction_detection_f1 >= 0.80]"
 }
 
 #[allow(unused_unsafe)]
@@ -1103,6 +1108,14 @@ fn print_quality_summary(summary: &QualityProbeSummary) {
     println!(
         "Quality probe contradiction_support_only: {}",
         summary.contradiction_support_only_pass
+    );
+    println!(
+        "Quality probe contradiction_detection_f1: {:.4} (gate >= {:.2})",
+        summary.contradiction_detection_f1, CONTRADICTION_DETECTION_F1_GATE
+    );
+    println!(
+        "Quality probe contradiction_detection_f1_pass: {}",
+        summary.contradiction_detection_f1_pass
     );
     println!(
         "Quality probe temporal_window: {}",
@@ -1594,6 +1607,21 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
+        "- contradiction_detection_f1: {:.4}",
+        quality.contradiction_detection_f1
+    )?;
+    writeln!(
+        file,
+        "- contradiction_detection_f1_gate: {:.2}",
+        CONTRADICTION_DETECTION_F1_GATE
+    )?;
+    writeln!(
+        file,
+        "- contradiction_detection_f1_pass: {}",
+        quality.contradiction_detection_f1_pass
+    )?;
+    writeln!(
+        file,
         "- temporal_window_pass: {}",
         quality.temporal_window_pass
     )?;
@@ -1723,6 +1751,9 @@ fn run_quality_probes() -> QualityProbeSummary {
         .map(|r| r.claim_id.clone());
     let contradiction_support_only_pass =
         contradiction_top.as_deref() == Some("probe-contradiction-supported");
+    let contradiction_detection_f1 = measure_contradiction_detection_f1(&store, tenant);
+    let contradiction_detection_f1_pass =
+        contradiction_detection_f1 >= CONTRADICTION_DETECTION_F1_GATE;
 
     let temporal_results = store.retrieve_with_time_range(
         &RetrievalRequest {
@@ -1759,6 +1790,8 @@ fn run_quality_probes() -> QualityProbeSummary {
 
     QualityProbeSummary {
         contradiction_support_only_pass,
+        contradiction_detection_f1,
+        contradiction_detection_f1_pass,
         temporal_window_pass,
         temporal_unknown_excluded_pass,
         hybrid_filter_with_embedding_pass,
@@ -2045,6 +2078,118 @@ fn seed_quality_probe_fixture(store: &mut InMemoryStore, tenant: &str) {
     store
         .upsert_claim_vector("probe-filter-other", fixture_vector_for_index(999_991))
         .expect("quality probe vector upsert should succeed");
+
+    seed_contradiction_f1_fixture(store, tenant);
+}
+
+fn seed_contradiction_f1_fixture(store: &mut InMemoryStore, tenant: &str) {
+    let mut seed_case = |claim_id: &str, supports: usize, contradicts: usize| {
+        let mut evidence = Vec::with_capacity(supports + contradicts);
+        for idx in 0..supports {
+            evidence.push(Evidence {
+                evidence_id: format!("{claim_id}-s{}", idx + 1),
+                claim_id: claim_id.to_string(),
+                source_id: format!("source://probe/f1/{claim_id}/supports/{}", idx + 1),
+                stance: Stance::Supports,
+                source_quality: 0.91,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            });
+        }
+        for idx in 0..contradicts {
+            evidence.push(Evidence {
+                evidence_id: format!("{claim_id}-c{}", idx + 1),
+                claim_id: claim_id.to_string(),
+                source_id: format!("source://probe/f1/{claim_id}/contradicts/{}", idx + 1),
+                stance: Stance::Contradicts,
+                source_quality: 0.91,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            });
+        }
+
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: claim_id.to_string(),
+                    tenant_id: tenant.to_string(),
+                    canonical_text: format!(
+                        "Adversarial contradiction probe statement for {claim_id}"
+                    ),
+                    confidence: 0.9,
+                    event_time_unix: Some(2_026),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                evidence,
+                vec![],
+            )
+            .expect("contradiction F1 probe ingest should succeed");
+    };
+
+    for idx in 1..=5 {
+        seed_case(&format!("probe-f1-support-{idx}"), 2, 0);
+    }
+    for idx in 1..=5 {
+        seed_case(&format!("probe-f1-contradict-{idx}"), 1, 2);
+    }
+}
+
+fn measure_contradiction_detection_f1(store: &InMemoryStore, tenant: &str) -> f64 {
+    let results = store.retrieve(&RetrievalRequest {
+        tenant_id: tenant.to_string(),
+        query: "adversarial contradiction probe".to_string(),
+        top_k: 32,
+        stance_mode: StanceMode::Balanced,
+    });
+
+    let expected_contradiction_ids: HashSet<String> = (1..=5)
+        .map(|idx| format!("probe-f1-contradict-{idx}"))
+        .collect();
+    let predicted_contradiction_ids: HashSet<String> = results
+        .into_iter()
+        .filter(|result| result.claim_id.starts_with("probe-f1-"))
+        .filter(|result| result.contradicts > result.supports)
+        .map(|result| result.claim_id)
+        .collect();
+
+    let true_positive = predicted_contradiction_ids
+        .intersection(&expected_contradiction_ids)
+        .count();
+    let false_positive = predicted_contradiction_ids
+        .difference(&expected_contradiction_ids)
+        .count();
+    let false_negative = expected_contradiction_ids
+        .difference(&predicted_contradiction_ids)
+        .count();
+
+    f1_score(true_positive, false_positive, false_negative)
+}
+
+fn f1_score(true_positive: usize, false_positive: usize, false_negative: usize) -> f64 {
+    if true_positive == 0 {
+        return 0.0;
+    }
+    let precision = true_positive as f64 / (true_positive + false_positive) as f64;
+    let recall = true_positive as f64 / (true_positive + false_negative) as f64;
+    if (precision + recall).abs() <= f64::EPSILON {
+        0.0
+    } else {
+        (2.0 * precision * recall) / (precision + recall)
+    }
 }
 
 fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
@@ -2598,5 +2743,11 @@ mod tests {
         summary.segment_cache_probe.refresh_successes = 1;
         summary.segment_cache_probe.cache_hits = 1;
         assert!(evaluate_profile_gates(&summary, &config).is_ok());
+    }
+
+    #[test]
+    fn f1_score_returns_expected_value() {
+        let score = f1_score(4, 1, 1);
+        assert!((score - 0.8).abs() < 0.0001);
     }
 }
