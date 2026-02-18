@@ -10,6 +10,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 ## 2. Current State
 
 - Consolidated architecture-and-goals execution spec is available at `docs/execution/dash-full-architecture-and-goals.md`.
+- Detailed 10-phase execution blueprint is available at `docs/execution/dash-10-phase-build-blueprint.md`.
 - `docs/architecture/eme-architecture.md` exists and defines target architecture.
 - Repository scaffolding exists for core services and shared packages.
 - Rust workspace implementation is active across schema, ranking, graph, store, ingestion, retrieval, indexer, and metadata-router crates.
