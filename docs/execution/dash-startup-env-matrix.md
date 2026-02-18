@@ -110,6 +110,9 @@ Runtime note:
 
 SLO guard runtime envs (`scripts/slo_guard.sh`):
 
+- `DASH_SLO_HISTORY_PATH` (default `docs/benchmarks/history/runs/slo-history.csv`)
+- `DASH_SLO_SUMMARY_DIR` (default `docs/benchmarks/history/runs`)
+- `DASH_SLO_RUN_TAG` (default `manual`)
 - `DASH_SLO_PROFILE` (default `smoke`)
 - `DASH_SLO_ITERATIONS` (optional)
 - `DASH_SLO_MAX_DASH_LATENCY_MS` (default `120`)

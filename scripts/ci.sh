@@ -93,6 +93,25 @@ echo "[ci] backup/restore script functional smoke"
   cmp "${SRC_DIR}/segments/tenant-a/.marker" "${DST_DIR}/segments/tenant-a/.marker"
 )
 
+echo "[ci] slo guard functional smoke"
+(
+  set -euo pipefail
+  TMP_HISTORY="$(mktemp "${TMPDIR:-/tmp}/dash-slo-history-XXXXXX.csv")"
+  TMP_SUMMARY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dash-slo-summary-XXXXXX")"
+  trap 'rm -f "${TMP_HISTORY}"; rm -rf "${TMP_SUMMARY_DIR}"' EXIT
+
+  scripts/slo_guard.sh \
+    --profile smoke \
+    --iterations 5 \
+    --run-tag ci-smoke \
+    --slo-history-path "${TMP_HISTORY}" \
+    --summary-dir "${TMP_SUMMARY_DIR}" \
+    --max-dash-latency-ms 200 \
+    --window-runs 3 \
+    --max-failed-run-pct 100 \
+    --include-recovery-drill false >/dev/null
+)
+
 echo "[ci] benchmark history guard"
 cargo run -p benchmark-smoke --bin benchmark-smoke -- \
   --profile smoke \

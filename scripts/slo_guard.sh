@@ -7,7 +7,7 @@ cd "${ROOT_DIR}"
 PROFILE="${DASH_SLO_PROFILE:-smoke}"
 ITERATIONS="${DASH_SLO_ITERATIONS:-}"
 RUN_TAG="${DASH_SLO_RUN_TAG:-manual}"
-SLO_HISTORY_PATH="${DASH_SLO_HISTORY_PATH:-docs/benchmarks/history/slo-history.csv}"
+SLO_HISTORY_PATH="${DASH_SLO_HISTORY_PATH:-docs/benchmarks/history/runs/slo-history.csv}"
 SUMMARY_DIR="${DASH_SLO_SUMMARY_DIR:-docs/benchmarks/history/runs}"
 
 MAX_DASH_LATENCY_MS="${DASH_SLO_MAX_DASH_LATENCY_MS:-120}"
