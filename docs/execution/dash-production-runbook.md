@@ -56,6 +56,7 @@ DASH_INGEST_AUDIT_LOG_PATH=/var/log/dash/ingestion-audit.jsonl \
 DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
 DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1 \
 DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=1 \
+DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=false \
 DASH_CHECKPOINT_MAX_WAL_RECORDS=50000 \
 DASH_CHECKPOINT_MAX_WAL_BYTES=52428800 \
 target/release/ingestion --serve
@@ -115,6 +116,10 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 - keep `DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1` for strict per-record durability; increase only when explicitly trading crash-window durability for ingestion throughput
 - keep `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=1` for no in-process batching; increase only for controlled throughput experiments
 - optionally set `DASH_INGEST_WAL_SYNC_INTERVAL_MS` to cap maximum durability lag window when batching is enabled
+- ingestion startup enforces WAL durability guardrails by default:
+  - batched durability (`sync_every>1` or `append_buffer>1`) requires `DASH_INGEST_WAL_SYNC_INTERVAL_MS`
+  - excessive durability windows are rejected unless explicit override is set
+- only set `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true` for controlled stress/benchmark runs (not production default)
 - before changing WAL durability defaults, run:
   - `scripts/benchmark_ingest_wal_durability.sh --workers 4 --clients 16 --requests-per-worker 25 --warmup-requests 5`
   - archive the generated markdown under `docs/benchmarks/history/concurrency/wal-durability/`

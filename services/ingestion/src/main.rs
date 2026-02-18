@@ -5,6 +5,18 @@ use ingestion::{
 use schema::{Claim, Evidence, Stance};
 use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWritePolicy};
 
+const SAFE_WAL_SYNC_EVERY_RECORDS_MAX: usize = 256;
+const SAFE_WAL_APPEND_BUFFER_RECORDS_MAX: usize = 256;
+const SAFE_WAL_SYNC_INTERVAL_MS_MAX: u64 = 5_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalDurabilityConfig {
+    sync_every_records: usize,
+    append_buffer_records: usize,
+    sync_interval_ms: Option<u64>,
+    allow_unsafe_override: bool,
+}
+
 fn main() {
     let serve_mode = std::env::args().any(|arg| arg == "--serve");
     let bind_addr = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
@@ -30,6 +42,16 @@ fn main() {
         "EME_INGEST_WAL_SYNC_INTERVAL_MS",
     )
     .filter(|value| *value > 0);
+    let allow_unsafe_wal_durability = match parse_bool_env_with_fallback(
+        "DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY",
+        "EME_INGEST_ALLOW_UNSAFE_WAL_DURABILITY",
+    ) {
+        Ok(value) => value.unwrap_or(false),
+        Err(reason) => {
+            eprintln!("ingestion invalid WAL durability override env: {reason}");
+            std::process::exit(2);
+        }
+    };
 
     let input = IngestInput {
         claim: Claim {
@@ -64,6 +86,28 @@ fn main() {
     };
 
     if let Some(wal_path) = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH") {
+        let wal_durability_config = WalDurabilityConfig {
+            sync_every_records: wal_sync_every_records,
+            append_buffer_records: wal_append_buffer_records,
+            sync_interval_ms: wal_sync_interval_ms,
+            allow_unsafe_override: allow_unsafe_wal_durability,
+        };
+        if let Err(reason) = validate_wal_durability_guardrails(&wal_durability_config) {
+            eprintln!("ingestion WAL durability config rejected: {reason}");
+            std::process::exit(2);
+        }
+        let guardrail_violations = wal_durability_guardrail_violations(
+            wal_durability_config.sync_every_records,
+            wal_durability_config.append_buffer_records,
+            wal_durability_config.sync_interval_ms,
+        );
+        if allow_unsafe_wal_durability && !guardrail_violations.is_empty() {
+            eprintln!(
+                "ingestion WAL durability guardrails overridden via DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true: {}",
+                guardrail_violations.join("; ")
+            );
+        }
+
         let mut wal = match FileWal::open_with_policy(
             &wal_path,
             WalWritePolicy {
@@ -98,12 +142,13 @@ fn main() {
             load_stats.replay.wal_records
         );
         println!(
-            "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}",
+            "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, unsafe_override={}",
             wal.sync_every_records(),
             wal.append_buffer_max_records(),
             wal.sync_interval()
                 .map(|value| value.as_millis())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            allow_unsafe_wal_durability
         );
         let policy = CheckpointPolicy {
             max_wal_records: parse_env_with_fallback::<usize>(
@@ -278,6 +323,71 @@ where
     env_with_fallback(primary, fallback).and_then(|value| value.parse::<T>().ok())
 }
 
+fn parse_bool_env_with_fallback(primary: &str, fallback: &str) -> Result<Option<bool>, String> {
+    let Some(raw) = env_with_fallback(primary, fallback) else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(format!(
+            "{primary}/{fallback} must be one of: true,false,1,0,yes,no,on,off (got '{raw}')"
+        )),
+    }
+}
+
+fn wal_durability_guardrail_violations(
+    sync_every_records: usize,
+    append_buffer_records: usize,
+    sync_interval_ms: Option<u64>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if sync_every_records > SAFE_WAL_SYNC_EVERY_RECORDS_MAX {
+        violations.push(format!(
+            "DASH_INGEST_WAL_SYNC_EVERY_RECORDS={} exceeds safe max {}",
+            sync_every_records, SAFE_WAL_SYNC_EVERY_RECORDS_MAX
+        ));
+    }
+    if append_buffer_records > SAFE_WAL_APPEND_BUFFER_RECORDS_MAX {
+        violations.push(format!(
+            "DASH_INGEST_WAL_APPEND_BUFFER_RECORDS={} exceeds safe max {}",
+            append_buffer_records, SAFE_WAL_APPEND_BUFFER_RECORDS_MAX
+        ));
+    }
+    if let Some(interval_ms) = sync_interval_ms
+        && interval_ms > SAFE_WAL_SYNC_INTERVAL_MS_MAX
+    {
+        violations.push(format!(
+            "DASH_INGEST_WAL_SYNC_INTERVAL_MS={} exceeds safe max {}",
+            interval_ms, SAFE_WAL_SYNC_INTERVAL_MS_MAX
+        ));
+    }
+    let batching_enabled = sync_every_records > 1 || append_buffer_records > 1;
+    if batching_enabled && sync_interval_ms.is_none() {
+        violations.push(
+            "batched WAL durability requires DASH_INGEST_WAL_SYNC_INTERVAL_MS to cap unsynced window"
+                .to_string(),
+        );
+    }
+    violations
+}
+
+fn validate_wal_durability_guardrails(config: &WalDurabilityConfig) -> Result<(), String> {
+    let violations = wal_durability_guardrail_violations(
+        config.sync_every_records,
+        config.append_buffer_records,
+        config.sync_interval_ms,
+    );
+    if config.allow_unsafe_override || violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} (set DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true only for controlled stress testing)",
+            violations.join("; ")
+        ))
+    }
+}
+
 fn parse_ann_tuning_config() -> AnnTuningConfig {
     let defaults = AnnTuningConfig::default();
     AnnTuningConfig {
@@ -373,5 +483,56 @@ fn parse_transport_runtime() -> TransportRuntime {
     match runtime_raw.as_deref() {
         Some("axum") => TransportRuntime::Axum,
         _ => TransportRuntime::Std,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wal_durability_guardrails_accept_strict_defaults() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 1,
+            append_buffer_records: 1,
+            sync_interval_ms: None,
+            allow_unsafe_override: false,
+        };
+        assert!(validate_wal_durability_guardrails(&config).is_ok());
+    }
+
+    #[test]
+    fn wal_durability_guardrails_reject_batching_without_interval() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 32,
+            append_buffer_records: 1,
+            sync_interval_ms: None,
+            allow_unsafe_override: false,
+        };
+        let err = validate_wal_durability_guardrails(&config).expect_err("must reject");
+        assert!(err.contains("batched WAL durability requires"));
+    }
+
+    #[test]
+    fn wal_durability_guardrails_allow_unsafe_override() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 512,
+            append_buffer_records: 512,
+            sync_interval_ms: None,
+            allow_unsafe_override: true,
+        };
+        assert!(validate_wal_durability_guardrails(&config).is_ok());
+    }
+
+    #[test]
+    fn wal_durability_guardrails_reject_interval_above_safe_max() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 2,
+            append_buffer_records: 2,
+            sync_interval_ms: Some(SAFE_WAL_SYNC_INTERVAL_MS_MAX + 1),
+            allow_unsafe_override: false,
+        };
+        let err = validate_wal_durability_guardrails(&config).expect_err("must reject");
+        assert!(err.contains("DASH_INGEST_WAL_SYNC_INTERVAL_MS"));
     }
 }

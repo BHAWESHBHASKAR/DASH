@@ -307,6 +307,7 @@ Optional overrides:
   - `--ingest-wal-sync-every-records <N>` to configure WAL fsync batch threshold
   - `--ingest-wal-append-buffer-records <N>` to configure in-process append buffering
   - `--ingest-wal-sync-interval-ms <N|off>` to cap max unsynced duration when batching
+  - `--ingest-allow-unsafe-wal-durability true|false` to explicitly bypass ingestion startup guardrails for stress runs
   - default WAL path is a temporary `/tmp/dash-ingest-concurrency-<run_id>.wal`
 - Baseline recommendation:
   - compare at least `workers=1` vs `workers=4` with fixed client/request settings for each target.
@@ -321,6 +322,9 @@ Optional overrides:
   - `strict_per_record`: `sync_every=1`, `append_buffer=1`, `sync_interval=off`
   - `grouped_sync`: `sync_every=32`, `append_buffer=1`, `sync_interval=off`
   - `buffered_interval`: `sync_every=64`, `append_buffer=32`, `sync_interval=250ms`
+- Guardrail behavior:
+  - ingestion startup enforces safe WAL durability defaults
+  - script defaults to `allow_unsafe_wal_durability=true` to run intentional stress profiles
 - Output artifact paths:
   - summary: `docs/benchmarks/history/concurrency/wal-durability/*.md`
   - per-mode raw runs: `docs/benchmarks/history/concurrency/*.md`

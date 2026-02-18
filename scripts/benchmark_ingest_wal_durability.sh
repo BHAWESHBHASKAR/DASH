@@ -14,6 +14,7 @@ READ_TIMEOUT_MS="${DASH_WAL_DURABILITY_READ_TIMEOUT_MS:-5000}"
 OUTPUT_DIR="${DASH_WAL_DURABILITY_OUTPUT_DIR:-docs/benchmarks/history/concurrency/wal-durability}"
 RAW_OUTPUT_DIR="${DASH_WAL_DURABILITY_RAW_OUTPUT_DIR:-docs/benchmarks/history/concurrency}"
 RUN_TAG="${DASH_WAL_DURABILITY_RUN_TAG:-ingest-wal-durability}"
+ALLOW_UNSAFE_WAL_DURABILITY="${DASH_WAL_DURABILITY_ALLOW_UNSAFE_WAL_DURABILITY:-true}"
 
 STRICT_SYNC_EVERY="${DASH_WAL_DURABILITY_STRICT_SYNC_EVERY:-1}"
 STRICT_APPEND_BUFFER="${DASH_WAL_DURABILITY_STRICT_APPEND_BUFFER:-1}"
@@ -42,6 +43,8 @@ Options:
   --output-dir DIR                  WAL-durability summary output directory
   --raw-output-dir DIR              per-mode transport output directory
   --run-tag TAG                     suffix for output filename
+  --allow-unsafe-wal-durability true|false
+                                  set ingestion unsafe WAL durability override for stress modes
   --strict-sync-every N             strict mode sync threshold
   --strict-append-buffer N          strict mode append buffer threshold
   --strict-interval-ms N|off        strict mode sync interval
@@ -95,6 +98,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --run-tag)
       RUN_TAG="$2"
+      shift 2
+      ;;
+    --allow-unsafe-wal-durability)
+      ALLOW_UNSAFE_WAL_DURABILITY="$2"
       shift 2
       ;;
     --strict-sync-every)
@@ -198,6 +205,10 @@ if ! is_positive_integer "${READ_TIMEOUT_MS}"; then
   echo "invalid --read-timeout-ms: ${READ_TIMEOUT_MS}" >&2
   exit 2
 fi
+if [[ "${ALLOW_UNSAFE_WAL_DURABILITY}" != "true" && "${ALLOW_UNSAFE_WAL_DURABILITY}" != "false" ]]; then
+  echo "invalid --allow-unsafe-wal-durability: ${ALLOW_UNSAFE_WAL_DURABILITY}" >&2
+  exit 2
+fi
 
 STRICT_INTERVAL_MS="$(normalize_interval "${STRICT_INTERVAL_MS}")"
 GROUPED_INTERVAL_MS="$(normalize_interval "${GROUPED_INTERVAL_MS}")"
@@ -273,6 +284,7 @@ for idx in "${!mode_names[@]}"; do
       --ingest-wal-sync-every-records "${sync_every}" \
       --ingest-wal-append-buffer-records "${append_buffer}" \
       --ingest-wal-sync-interval-ms "${interval_ms}" \
+      --ingest-allow-unsafe-wal-durability "${ALLOW_UNSAFE_WAL_DURABILITY}" \
       --output-dir "${RAW_OUTPUT_DIR}" \
       --run-tag "${mode_tag}" 2>&1
   )"
@@ -367,6 +379,7 @@ cat > "${OUT_PATH}" <<EOF_MD
 - requests_per_worker: ${REQUESTS_PER_WORKER}
 - warmup_requests: ${WARMUP_REQUESTS}
 - raw_output_dir: ${RAW_OUTPUT_DIR}
+- allow_unsafe_wal_durability: ${ALLOW_UNSAFE_WAL_DURABILITY}
 
 | mode | sync_every_records | append_buffer_records | sync_interval_ms | throughput_rps | latency_avg_ms | latency_p95_ms | latency_p99_ms | success_rate_pct | throughput_vs_strict |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
