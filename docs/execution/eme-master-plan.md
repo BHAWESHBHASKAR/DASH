@@ -47,6 +47,15 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/deploy_systemd.sh`
   - `scripts/deploy_container.sh`
 
+### 2.1 Milestone Status (2026-02-18)
+
+- Phase 0 (Vertical Slice): complete
+- Phase 1 (Evidence Graph): complete
+  - contradiction-aware retrieval behavior is enforced
+  - graph expansion is bounded in retrieval graph payload assembly
+  - contradiction detection F1 probe gate is enforced in benchmark quality probes (`>= 0.80`)
+- Phase 2 (Scale Path): in progress
+
 ## 3. Success Targets (v1)
 
 - retrieval API returns claim-level results with machine-readable citations.
