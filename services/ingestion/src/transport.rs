@@ -29,6 +29,7 @@ use crate::{
 pub struct IngestionRuntime {
     store: InMemoryStore,
     wal: Option<FileWal>,
+    wal_async_flush_interval: Option<Duration>,
     checkpoint_policy: CheckpointPolicy,
     segment_runtime: Option<SegmentRuntime>,
     placement_routing: Result<Option<PlacementRoutingState>, String>,
@@ -51,6 +52,7 @@ pub struct IngestionRuntime {
     wal_flush_due_total: u64,
     wal_flush_success_total: u64,
     wal_flush_failure_total: u64,
+    wal_async_flush_tick_total: u64,
     started_at: Instant,
 }
 
@@ -59,6 +61,7 @@ impl IngestionRuntime {
         Self {
             store,
             wal: None,
+            wal_async_flush_interval: None,
             checkpoint_policy: CheckpointPolicy::default(),
             segment_runtime: SegmentRuntime::from_env(),
             placement_routing: PlacementRoutingState::from_env(),
@@ -81,6 +84,7 @@ impl IngestionRuntime {
             wal_flush_due_total: 0,
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
+            wal_async_flush_tick_total: 0,
             started_at: Instant::now(),
         }
     }
@@ -90,9 +94,11 @@ impl IngestionRuntime {
         wal: FileWal,
         checkpoint_policy: CheckpointPolicy,
     ) -> Self {
+        let wal_async_flush_interval = resolve_wal_async_flush_interval(Some(&wal));
         Self {
             store,
             wal: Some(wal),
+            wal_async_flush_interval,
             checkpoint_policy,
             segment_runtime: SegmentRuntime::from_env(),
             placement_routing: PlacementRoutingState::from_env(),
@@ -115,6 +121,7 @@ impl IngestionRuntime {
             wal_flush_due_total: 0,
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
+            wal_async_flush_tick_total: 0,
             started_at: Instant::now(),
         }
     }
@@ -302,7 +309,30 @@ impl IngestionRuntime {
         }
     }
 
-    fn refresh_placement_if_due(&mut self) {
+    pub(crate) fn flush_wal_for_async_tick(&mut self) {
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        self.wal_async_flush_tick_total += 1;
+        match wal.flush_pending_sync_if_unsynced() {
+            Ok(true) => {
+                self.wal_flush_due_total += 1;
+                self.wal_flush_success_total += 1;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.wal_flush_due_total += 1;
+                self.wal_flush_failure_total += 1;
+                eprintln!("ingestion WAL async flush failed: {err:?}");
+            }
+        }
+    }
+
+    pub(crate) fn wal_async_flush_interval(&self) -> Option<Duration> {
+        self.wal_async_flush_interval
+    }
+
+    pub(crate) fn refresh_placement_if_due(&mut self) {
         if let Ok(Some(state)) = self.placement_routing.as_mut() {
             state.maybe_refresh();
         }
@@ -351,6 +381,11 @@ impl IngestionRuntime {
             .wal
             .as_ref()
             .map(FileWal::buffered_record_count)
+            .unwrap_or(0);
+        let wal_async_flush_enabled = self.wal_async_flush_interval.is_some() as usize;
+        let wal_async_flush_interval_ms = self
+            .wal_async_flush_interval
+            .map(|value| value.as_millis() as u64)
             .unwrap_or(0);
         format!(
             "# TYPE dash_ingest_success_total counter\n\
@@ -419,6 +454,12 @@ dash_ingest_wal_flush_due_total {}\n\
 dash_ingest_wal_flush_success_total {}\n\
 # TYPE dash_ingest_wal_flush_failure_total counter\n\
 dash_ingest_wal_flush_failure_total {}\n\
+# TYPE dash_ingest_wal_async_flush_enabled gauge\n\
+dash_ingest_wal_async_flush_enabled {}\n\
+# TYPE dash_ingest_wal_async_flush_interval_ms gauge\n\
+dash_ingest_wal_async_flush_interval_ms {}\n\
+# TYPE dash_ingest_wal_async_flush_tick_total counter\n\
+dash_ingest_wal_async_flush_tick_total {}\n\
 # TYPE dash_ingest_claims_total gauge\n\
 dash_ingest_claims_total {}\n\
 # TYPE dash_ingest_uptime_seconds gauge\n\
@@ -456,6 +497,9 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.wal_flush_due_total,
             self.wal_flush_success_total,
             self.wal_flush_failure_total,
+            wal_async_flush_enabled,
+            wal_async_flush_interval_ms,
+            self.wal_async_flush_tick_total,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         )
@@ -466,6 +510,7 @@ pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentRuntime {
@@ -862,11 +907,30 @@ pub fn serve_http_with_workers(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
+    let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let runtime = Arc::new(Mutex::new(runtime));
     let (tx, rx) = mpsc::channel::<TcpStream>();
     let rx = Arc::new(Mutex::new(rx));
+    let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
 
     std::thread::scope(|scope| {
+        if let Some(async_interval) = wal_async_flush_interval {
+            let runtime = Arc::clone(&runtime);
+            scope.spawn(move || {
+                loop {
+                    match flush_shutdown_rx.recv_timeout(async_interval) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let Ok(mut guard) = runtime.lock() else {
+                        break;
+                    };
+                    guard.flush_wal_for_async_tick();
+                    guard.refresh_placement_if_due();
+                }
+            });
+        }
+
         for _ in 0..worker_count {
             let runtime = Arc::clone(&runtime);
             let rx = Arc::clone(&rx);
@@ -900,6 +964,7 @@ pub fn serve_http_with_workers(
                 Err(err) => eprintln!("ingestion transport accept error: {err}"),
             }
         }
+        let _ = flush_shutdown_tx.send(());
         drop(tx);
     });
 
@@ -1432,6 +1497,61 @@ fn parse_env_first_u64(keys: &[&str]) -> Option<u64> {
         }
     }
     None
+}
+
+fn parse_wal_async_flush_interval_override() -> Option<Option<Duration>> {
+    for key in [
+        "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS",
+        "EME_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS",
+    ] {
+        let Ok(raw) = std::env::var(key) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Some(None);
+        }
+        let normalized = trimmed.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "off" | "none" | "false" | "disabled" | "0"
+        ) {
+            return Some(None);
+        }
+        match trimmed.parse::<u64>() {
+            Ok(value) if value > 0 => return Some(Some(Duration::from_millis(value))),
+            Ok(_) => return Some(None),
+            Err(_) => {
+                eprintln!(
+                    "ingestion ignoring invalid {}='{}' (expected positive integer ms or off)",
+                    key, trimmed
+                );
+                return Some(None);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_wal_async_flush_interval(wal: Option<&FileWal>) -> Option<Duration> {
+    let wal = wal?;
+    if let Some(override_value) = parse_wal_async_flush_interval_override() {
+        return override_value;
+    }
+
+    let batching_enabled = wal.sync_every_records() > 1
+        || wal.append_buffer_max_records() > 1
+        || wal.sync_interval().is_some();
+    if !batching_enabled {
+        return None;
+    }
+
+    let default_interval = Duration::from_millis(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS);
+    Some(
+        wal.sync_interval()
+            .map(|value| value.min(default_interval))
+            .unwrap_or(default_interval),
+    )
 }
 
 fn sanitize_path_component(raw: &str) -> String {
@@ -2664,12 +2784,27 @@ mod tests {
     use metadata_router::{
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sample_runtime() -> SharedRuntime {
         Arc::new(Mutex::new(
             IngestionRuntime::in_memory(InMemoryStore::new()),
         ))
+    }
+
+    fn temp_wal_path() -> PathBuf {
+        let mut wal_path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        wal_path.push(format!(
+            "dash-ingest-runtime-wal-{}-{}.log",
+            std::process::id(),
+            nanos
+        ));
+        wal_path
     }
 
     #[test]
@@ -2931,6 +3066,72 @@ mod tests {
                 .body
                 .contains("dash_ingest_placement_enabled 0")
         );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_wal_async_flush_enabled 0")
+        );
+    }
+
+    #[test]
+    fn persistent_runtime_enables_async_flush_for_batched_wal_by_default() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open_with_policy(
+            &wal_path,
+            store::WalWritePolicy {
+                sync_every_records: 64,
+                append_buffer_max_records: 64,
+                sync_interval: None,
+            },
+        )
+        .expect("wal should open");
+        let runtime =
+            IngestionRuntime::persistent(InMemoryStore::new(), wal, CheckpointPolicy::default());
+        assert_eq!(
+            runtime.wal_async_flush_interval(),
+            Some(Duration::from_millis(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS))
+        );
+        drop(runtime);
+        let _ = std::fs::remove_file(&wal_path);
+        let mut snapshot = wal_path.into_os_string();
+        snapshot.push(".snapshot");
+        let _ = std::fs::remove_file(PathBuf::from(snapshot));
+    }
+
+    #[test]
+    fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open_with_policy(
+            &wal_path,
+            store::WalWritePolicy {
+                sync_every_records: 64,
+                append_buffer_max_records: 64,
+                sync_interval: None,
+            },
+        )
+        .expect("wal should open");
+        let mut runtime =
+            IngestionRuntime::persistent(InMemoryStore::new(), wal, CheckpointPolicy::default());
+        let request = build_ingest_request_from_json(
+            r#"{"claim":{"claim_id":"c1","tenant_id":"tenant-a","canonical_text":"Company X acquired Company Y","confidence":0.9}}"#,
+        )
+        .expect("request should parse");
+        runtime.ingest(request).expect("ingest should succeed");
+        let before = runtime.metrics_text();
+        assert!(before.contains("dash_ingest_wal_unsynced_records 1"));
+        assert!(before.contains("dash_ingest_wal_buffered_records 1"));
+
+        runtime.flush_wal_for_async_tick();
+        let after = runtime.metrics_text();
+        assert!(after.contains("dash_ingest_wal_unsynced_records 0"));
+        assert!(after.contains("dash_ingest_wal_buffered_records 0"));
+        assert!(after.contains("dash_ingest_wal_async_flush_tick_total 1"));
+
+        drop(runtime);
+        let _ = std::fs::remove_file(&wal_path);
+        let mut snapshot = wal_path.into_os_string();
+        snapshot.push(".snapshot");
+        let _ = std::fs::remove_file(PathBuf::from(snapshot));
     }
 
     #[test]

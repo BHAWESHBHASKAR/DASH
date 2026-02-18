@@ -15,6 +15,7 @@ OUTPUT_DIR="${DASH_WAL_DURABILITY_OUTPUT_DIR:-docs/benchmarks/history/concurrenc
 RAW_OUTPUT_DIR="${DASH_WAL_DURABILITY_RAW_OUTPUT_DIR:-docs/benchmarks/history/concurrency}"
 RUN_TAG="${DASH_WAL_DURABILITY_RUN_TAG:-ingest-wal-durability}"
 ALLOW_UNSAFE_WAL_DURABILITY="${DASH_WAL_DURABILITY_ALLOW_UNSAFE_WAL_DURABILITY:-true}"
+ASYNC_FLUSH_INTERVAL_MS="${DASH_WAL_DURABILITY_ASYNC_FLUSH_INTERVAL_MS:-auto}"
 
 STRICT_SYNC_EVERY="${DASH_WAL_DURABILITY_STRICT_SYNC_EVERY:-1}"
 STRICT_APPEND_BUFFER="${DASH_WAL_DURABILITY_STRICT_APPEND_BUFFER:-1}"
@@ -45,6 +46,8 @@ Options:
   --run-tag TAG                     suffix for output filename
   --allow-unsafe-wal-durability true|false
                                   set ingestion unsafe WAL durability override for stress modes
+  --async-flush-interval-ms N|off|auto
+                                  ingestion async WAL flush worker interval for benchmark runs
   --strict-sync-every N             strict mode sync threshold
   --strict-append-buffer N          strict mode append buffer threshold
   --strict-interval-ms N|off        strict mode sync interval
@@ -102,6 +105,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --allow-unsafe-wal-durability)
       ALLOW_UNSAFE_WAL_DURABILITY="$2"
+      shift 2
+      ;;
+    --async-flush-interval-ms)
+      ASYNC_FLUSH_INTERVAL_MS="$2"
       shift 2
       ;;
     --strict-sync-every)
@@ -213,6 +220,19 @@ fi
 STRICT_INTERVAL_MS="$(normalize_interval "${STRICT_INTERVAL_MS}")"
 GROUPED_INTERVAL_MS="$(normalize_interval "${GROUPED_INTERVAL_MS}")"
 BUFFERED_INTERVAL_MS="$(normalize_interval "${BUFFERED_INTERVAL_MS}")"
+ASYNC_FLUSH_INTERVAL_MS="$(trim "${ASYNC_FLUSH_INTERVAL_MS}")"
+if [[ -z "${ASYNC_FLUSH_INTERVAL_MS}" ]]; then
+  ASYNC_FLUSH_INTERVAL_MS="auto"
+fi
+case "${ASYNC_FLUSH_INTERVAL_MS}" in
+  auto|off|none|unset) ;;
+  *)
+    if ! is_positive_integer "${ASYNC_FLUSH_INTERVAL_MS}"; then
+      echo "invalid --async-flush-interval-ms: ${ASYNC_FLUSH_INTERVAL_MS}" >&2
+      exit 2
+    fi
+    ;;
+esac
 
 mode_sync_values=("${STRICT_SYNC_EVERY}" "${GROUPED_SYNC_EVERY}" "${BUFFERED_SYNC_EVERY}")
 mode_append_values=("${STRICT_APPEND_BUFFER}" "${GROUPED_APPEND_BUFFER}" "${BUFFERED_APPEND_BUFFER}")
@@ -270,6 +290,10 @@ for idx in "${!mode_names[@]}"; do
   echo "[wal-durability] running mode=${mode} sync_every=${sync_every} append_buffer=${append_buffer} interval_ms=${interval_ms}"
 
   set +e
+  async_flush_args=()
+  if [[ "${ASYNC_FLUSH_INTERVAL_MS}" != "auto" ]]; then
+    async_flush_args+=(--ingest-wal-async-flush-interval-ms "${ASYNC_FLUSH_INTERVAL_MS}")
+  fi
   cmd_output="$(
     scripts/benchmark_transport_concurrency.sh \
       --target ingestion \
@@ -284,6 +308,7 @@ for idx in "${!mode_names[@]}"; do
       --ingest-wal-sync-every-records "${sync_every}" \
       --ingest-wal-append-buffer-records "${append_buffer}" \
       --ingest-wal-sync-interval-ms "${interval_ms}" \
+      "${async_flush_args[@]}" \
       --ingest-allow-unsafe-wal-durability "${ALLOW_UNSAFE_WAL_DURABILITY}" \
       --output-dir "${RAW_OUTPUT_DIR}" \
       --run-tag "${mode_tag}" 2>&1
@@ -380,6 +405,7 @@ cat > "${OUT_PATH}" <<EOF_MD
 - warmup_requests: ${WARMUP_REQUESTS}
 - raw_output_dir: ${RAW_OUTPUT_DIR}
 - allow_unsafe_wal_durability: ${ALLOW_UNSAFE_WAL_DURABILITY}
+- async_flush_interval_ms: ${ASYNC_FLUSH_INTERVAL_MS}
 
 | mode | sync_every_records | append_buffer_records | sync_interval_ms | throughput_rps | latency_avg_ms | latency_p95_ms | latency_p99_ms | success_rate_pct | throughput_vs_strict |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|

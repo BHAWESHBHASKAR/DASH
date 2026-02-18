@@ -337,6 +337,14 @@ impl FileWal {
         Ok(true)
     }
 
+    pub fn flush_pending_sync_if_unsynced(&mut self) -> Result<bool, StoreError> {
+        if self.unsynced_records == 0 {
+            return Ok(false);
+        }
+        self.flush_pending_sync()?;
+        Ok(true)
+    }
+
     fn flush_append_buffer(&mut self) -> Result<(), StoreError> {
         if self.append_buffer.is_empty() {
             return Ok(());
@@ -2784,6 +2792,38 @@ mod tests {
         assert_eq!(wal.unsynced_record_count(), 1);
         std::thread::sleep(Duration::from_millis(2));
         let flushed = wal.flush_pending_sync_if_interval_elapsed().unwrap();
+        assert!(flushed);
+        assert_eq!(wal.unsynced_record_count(), 0);
+        assert_eq!(wal.buffered_record_count(), 0);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_unsynced_flush_hook_syncs_without_interval_policy() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open_with_policy(
+            &wal_path,
+            WalWritePolicy {
+                sync_every_records: 100,
+                append_buffer_max_records: 100,
+                sync_interval: None,
+            },
+        )
+        .unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-unsynced", "Unsynced flush"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(wal.unsynced_record_count(), 1);
+
+        let flushed = wal.flush_pending_sync_if_unsynced().unwrap();
         assert!(flushed);
         assert_eq!(wal.unsynced_record_count(), 0);
         assert_eq!(wal.buffered_record_count(), 0);

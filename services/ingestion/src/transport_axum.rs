@@ -41,18 +41,51 @@ pub fn serve_http_with_axum(
             .await
             .map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
 
-        let state = AppState {
-            runtime: Arc::new(Mutex::new(ingestion_runtime)),
-        };
+        let runtime = Arc::new(Mutex::new(ingestion_runtime));
+        let wal_async_flush_interval = runtime
+            .lock()
+            .ok()
+            .and_then(|guard| guard.wal_async_flush_interval());
+        let (flush_shutdown_tx, mut flush_shutdown_rx) = tokio::sync::watch::channel(false);
+        let flush_handle = wal_async_flush_interval.map(|interval| {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            let Ok(mut guard) = runtime.lock() else {
+                                break;
+                            };
+                            guard.flush_wal_for_async_tick();
+                            guard.refresh_placement_if_due();
+                        }
+                        changed = flush_shutdown_rx.changed() => {
+                            if changed.is_err() || *flush_shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
+        let state = AppState { runtime };
 
         let app = Router::new()
             .fallback(any(dispatch))
             .with_state(state)
             .layer(axum::extract::DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES));
 
-        axum::serve(listener, app)
+        let serve_result = axum::serve(listener, app)
             .await
-            .map_err(|e| format!("axum server failed: {e}"))
+            .map_err(|e| format!("axum server failed: {e}"));
+
+        let _ = flush_shutdown_tx.send(true);
+        if let Some(handle) = flush_handle {
+            let _ = handle.await;
+        }
+        serve_result
     })
 }
 

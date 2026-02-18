@@ -37,7 +37,8 @@ Status: active
 | `DASH_INGEST_WAL_PATH` | yes (for persistence) | none | WAL path for durable claim/evidence/edge writes | `EME_INGEST_WAL_PATH` |
 | `DASH_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | WAL durability batch interval (`1` = fsync every append; `N>1` = group-commit style sync every N records) | `EME_INGEST_WAL_SYNC_EVERY_RECORDS` |
 | `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS` | no | `1` | in-process WAL append buffer threshold before flushing batched lines to disk | `EME_INGEST_WAL_APPEND_BUFFER_RECORDS` |
-| `DASH_INGEST_WAL_SYNC_INTERVAL_MS` | no | unset | optional max interval before pending WAL records are synced (checked on ingest/metrics runtime hooks) | `EME_INGEST_WAL_SYNC_INTERVAL_MS` |
+| `DASH_INGEST_WAL_SYNC_INTERVAL_MS` | no | unset | optional max interval before pending WAL records are synced | `EME_INGEST_WAL_SYNC_INTERVAL_MS` |
+| `DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS` | no | auto when WAL batching is enabled | optional async WAL flush worker interval (`off`/`0` disables); worker bounds unsynced window during idle traffic | `EME_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS` |
 | `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` | no | `false` | when `true`, bypasses ingestion startup WAL durability guardrails; use only for controlled stress benchmarks | `EME_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` |
 | `DASH_CHECKPOINT_MAX_WAL_RECORDS` | no | unset | checkpoint trigger by WAL record count | `EME_CHECKPOINT_MAX_WAL_RECORDS` |
 | `DASH_CHECKPOINT_MAX_WAL_BYTES` | no | unset | checkpoint trigger by WAL file bytes | `EME_CHECKPOINT_MAX_WAL_BYTES` |
@@ -103,6 +104,7 @@ Runtime note:
 | `DASH_CONCURRENCY_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | ingestion transport concurrency benchmark WAL sync threshold override | none |
 | `DASH_CONCURRENCY_INGEST_WAL_APPEND_BUFFER_RECORDS` | no | `1` | ingestion transport concurrency benchmark WAL append-buffer threshold override | none |
 | `DASH_CONCURRENCY_INGEST_WAL_SYNC_INTERVAL_MS` | no | unset | ingestion transport concurrency benchmark WAL sync-interval override | none |
+| `DASH_CONCURRENCY_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS` | no | unset (`auto`) | ingestion transport concurrency benchmark async WAL flush worker interval override | none |
 | `DASH_CONCURRENCY_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` | no | `false` | ingestion transport concurrency benchmark unsafe WAL durability override (`true` for stress modes) | none |
 | `DASH_CI_INCLUDE_LARGE_GUARD` | no | `false` | when `true`, runs large profile history guard in CI | `EME_CI_INCLUDE_LARGE_GUARD` |
 | `DASH_CI_LARGE_GUARD_ITERATIONS` | no | unset (benchmark default) | override iterations for large CI guard run | none |

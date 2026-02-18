@@ -40,6 +40,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - sync batch threshold: `DASH_INGEST_WAL_SYNC_EVERY_RECORDS`
   - append buffer threshold: `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS`
   - optional interval-triggered flush policy: `DASH_INGEST_WAL_SYNC_INTERVAL_MS`
+  - async flush worker: `DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS` (auto-enabled when batching is active)
   - startup safety guardrails reject unsafe durability windows unless explicitly overridden via `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true`
 - Benchmark harness supports smoke, standard, and large fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).

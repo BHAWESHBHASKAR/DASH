@@ -18,6 +18,7 @@ INGEST_WAL_PATH="${DASH_CONCURRENCY_INGEST_WAL_PATH:-}"
 INGEST_WAL_SYNC_EVERY_RECORDS="${DASH_CONCURRENCY_INGEST_WAL_SYNC_EVERY_RECORDS:-1}"
 INGEST_WAL_APPEND_BUFFER_RECORDS="${DASH_CONCURRENCY_INGEST_WAL_APPEND_BUFFER_RECORDS:-1}"
 INGEST_WAL_SYNC_INTERVAL_MS="${DASH_CONCURRENCY_INGEST_WAL_SYNC_INTERVAL_MS:-}"
+INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS="${DASH_CONCURRENCY_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS:-}"
 INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${DASH_CONCURRENCY_INGEST_ALLOW_UNSAFE_WAL_DURABILITY:-false}"
 INGEST_BODY_TEMPLATE='{"claim":{"claim_id":"bench-claim-%WORKER%-%REQUEST%-%EPOCH_MS%","tenant_id":"bench-tenant","canonical_text":"Load benchmark claim","confidence":0.9},"evidence":[{"evidence_id":"bench-evidence-%WORKER%-%REQUEST%-%EPOCH_MS%","claim_id":"bench-claim-%WORKER%-%REQUEST%-%EPOCH_MS%","source_id":"bench://source-%WORKER%-%REQUEST%","stance":"supports","source_quality":0.8}]}'
 
@@ -41,6 +42,8 @@ Options:
                                 ingest WAL append-buffer threshold
   --ingest-wal-sync-interval-ms N|off
                                 ingest WAL max sync interval; use off to disable
+  --ingest-wal-async-flush-interval-ms N|off
+                                async WAL flush worker interval; use off to disable
   --ingest-allow-unsafe-wal-durability true|false
                                 set unsafe WAL durability override for ingestion service benchmark runs
   --output-dir DIR              markdown output directory
@@ -102,6 +105,17 @@ while [[ $# -gt 0 ]]; do
           ;;
         *)
           INGEST_WAL_SYNC_INTERVAL_MS="$2"
+          ;;
+      esac
+      shift 2
+      ;;
+    --ingest-wal-async-flush-interval-ms)
+      case "$2" in
+        off|none|unset)
+          INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS=""
+          ;;
+        *)
+          INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS="$2"
           ;;
       esac
       shift 2
@@ -168,6 +182,10 @@ if [[ -n "${INGEST_WAL_SYNC_INTERVAL_MS}" ]] && ! is_positive_integer "${INGEST_
   echo "invalid --ingest-wal-sync-interval-ms: ${INGEST_WAL_SYNC_INTERVAL_MS}" >&2
   exit 2
 fi
+if [[ -n "${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" ]] && ! is_positive_integer "${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}"; then
+  echo "invalid --ingest-wal-async-flush-interval-ms: ${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" >&2
+  exit 2
+fi
 
 if [[ "${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" != "true" && "${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" != "false" ]]; then
   echo "invalid --ingest-allow-unsafe-wal-durability: ${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" >&2
@@ -207,22 +225,45 @@ start_server() {
   else
     rm -f "${INGEST_WAL_PATH}" "${INGEST_WAL_PATH}.snapshot"
     if [[ -n "${INGEST_WAL_SYNC_INTERVAL_MS}" ]]; then
-      DASH_INGEST_BIND="${BIND_ADDR}" \
-        DASH_INGEST_HTTP_WORKERS="${workers}" \
-        DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
-        DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
-        DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
-        DASH_INGEST_WAL_SYNC_INTERVAL_MS="${INGEST_WAL_SYNC_INTERVAL_MS}" \
-        DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
-        cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      if [[ -n "${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" ]]; then
+        DASH_INGEST_BIND="${BIND_ADDR}" \
+          DASH_INGEST_HTTP_WORKERS="${workers}" \
+          DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+          DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+          DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+          DASH_INGEST_WAL_SYNC_INTERVAL_MS="${INGEST_WAL_SYNC_INTERVAL_MS}" \
+          DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS="${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" \
+          DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
+          cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      else
+        DASH_INGEST_BIND="${BIND_ADDR}" \
+          DASH_INGEST_HTTP_WORKERS="${workers}" \
+          DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+          DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+          DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+          DASH_INGEST_WAL_SYNC_INTERVAL_MS="${INGEST_WAL_SYNC_INTERVAL_MS}" \
+          DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
+          cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      fi
     else
-      DASH_INGEST_BIND="${BIND_ADDR}" \
-        DASH_INGEST_HTTP_WORKERS="${workers}" \
-        DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
-        DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
-        DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
-        DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
-        cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      if [[ -n "${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" ]]; then
+        DASH_INGEST_BIND="${BIND_ADDR}" \
+          DASH_INGEST_HTTP_WORKERS="${workers}" \
+          DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+          DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+          DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+          DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS="${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS}" \
+          DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
+          cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      else
+        DASH_INGEST_BIND="${BIND_ADDR}" \
+          DASH_INGEST_HTTP_WORKERS="${workers}" \
+          DASH_INGEST_WAL_PATH="${INGEST_WAL_PATH}" \
+          DASH_INGEST_WAL_SYNC_EVERY_RECORDS="${INGEST_WAL_SYNC_EVERY_RECORDS}" \
+          DASH_INGEST_WAL_APPEND_BUFFER_RECORDS="${INGEST_WAL_APPEND_BUFFER_RECORDS}" \
+          DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY="${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}" \
+          cargo run -p ingestion -- --serve >"${SERVER_LOG}" 2>&1 &
+      fi
     fi
   fi
   SERVER_PID=$!
@@ -262,6 +303,7 @@ $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_path: ${INGEST_WA
 $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_sync_every_records: ${INGEST_WAL_SYNC_EVERY_RECORDS}"; fi)
 $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_append_buffer_records: ${INGEST_WAL_APPEND_BUFFER_RECORDS}"; fi)
 $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_sync_interval_ms: ${INGEST_WAL_SYNC_INTERVAL_MS:-off}"; fi)
+$(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_wal_async_flush_interval_ms: ${INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS:-auto}"; fi)
 $(if [[ "${TARGET}" == "ingestion" ]]; then echo "- ingest_allow_unsafe_wal_durability: ${INGEST_ALLOW_UNSAFE_WAL_DURABILITY}"; fi)
 
 | transport_workers | total_requests | throughput_rps | latency_avg_ms | latency_p95_ms | latency_p99_ms | success_rate_pct |
