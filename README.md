@@ -90,6 +90,7 @@ Operational scripts:
 - failover drill: `scripts/failover_drill.sh`
 - slo/error-budget guard: `scripts/slo_guard.sh`
 - audit chain verifier: `scripts/verify_audit_chain.sh`
+- release-candidate gate runner: `scripts/release_candidate_gate.sh`
 
 ## Benchmarks
 

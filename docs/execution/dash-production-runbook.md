@@ -165,6 +165,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 - run audit-chain integrity checks on JSONL audit files:
   - `scripts/verify_audit_chain.sh --path /var/log/dash/ingestion-audit.jsonl --service ingestion`
   - `scripts/verify_audit_chain.sh --path /var/log/dash/retrieval-audit.jsonl --service retrieval`
+- run consolidated release-candidate gate (recommended):
+  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --verify-ingestion-audit /var/log/dash/ingestion-audit.jsonl --verify-retrieval-audit /var/log/dash/retrieval-audit.jsonl`
 
 ### 7.1 API key rotation and revocation
 
@@ -259,6 +261,17 @@ scripts/slo_guard.sh \
   --max-dash-latency-ms 120 \
   --window-runs 20 \
   --max-failed-run-pct 10
+```
+
+Run consolidated release-candidate gate and archive summary/checksum:
+
+```bash
+scripts/release_candidate_gate.sh \
+  --run-tag release-candidate \
+  --run-benchmark-trend true \
+  --slo-include-recovery-drill true \
+  --verify-ingestion-audit /var/log/dash/ingestion-audit.jsonl \
+  --verify-retrieval-audit /var/log/dash/retrieval-audit.jsonl
 ```
 
 ## 10. Deployment Assets

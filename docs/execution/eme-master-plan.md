@@ -48,6 +48,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion WAL durability benchmark comparison tooling is available via `scripts/benchmark_ingest_wal_durability.sh` with history artifacts under `docs/benchmarks/history/concurrency/wal-durability/`.
 - CI supports optional staged trend execution via `DASH_CI_RUN_BENCH_TREND=true`.
 - SLO/error-budget gate automation is available via `scripts/slo_guard.sh` (benchmark SLI checks + rolling failed-run budget + optional recovery drill signal).
+- Consolidated release-candidate gate automation is available via `scripts/release_candidate_gate.sh` (fmt/clippy/tests/ci + SLO + recovery + optional audit-chain and benchmark trend gates).
 - CI pipeline (`scripts/ci.sh`) runs fmt, clippy, workspace tests, and smoke benchmark.
 - Production packaging and operations artifacts are available:
   - `docs/execution/dash-production-runbook.md`
@@ -62,6 +63,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/recovery_drill.sh`
   - `scripts/slo_guard.sh`
   - `scripts/verify_audit_chain.sh`
+  - `scripts/release_candidate_gate.sh`
 
 ### 2.1 Milestone Status (2026-02-18)
 

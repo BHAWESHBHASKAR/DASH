@@ -5,6 +5,8 @@ Status: active
 
 ## 1. Pre-Release Validation
 
+- [ ] preferred: run consolidated gate with release settings:
+  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --verify-ingestion-audit <ingestion-audit.jsonl> --verify-retrieval-audit <retrieval-audit.jsonl>`
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`

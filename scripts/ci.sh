@@ -57,6 +57,7 @@ scripts/restore_state_bundle.sh --help >/dev/null
 scripts/recovery_drill.sh --help >/dev/null
 scripts/slo_guard.sh --help >/dev/null
 scripts/verify_audit_chain.sh --help >/dev/null
+scripts/release_candidate_gate.sh --help >/dev/null
 
 echo "[ci] backup/restore script functional smoke"
 (
