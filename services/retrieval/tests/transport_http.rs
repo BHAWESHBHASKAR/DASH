@@ -198,3 +198,36 @@ tenant-http,0,9,node-b,follower,healthy\n",
 
     let _ = std::fs::remove_file(placement_file);
 }
+
+#[test]
+fn transport_denies_cross_tenant_retrieval_for_scoped_key() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _scope_env = EnvVarGuard::set(
+        "DASH_RETRIEVAL_API_KEY_SCOPES",
+        OsStr::new("scope-a:tenant-http"),
+    );
+    let store = sample_store();
+    let request = b"GET /v1/retrieve?tenant_id=tenant-blocked&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nX-API-Key: scope-a\r\nConnection: close\r\n\r\n";
+    let response = retrieval::transport::handle_http_request_bytes(&store, request)
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 403"));
+    assert!(response.contains("tenant is not allowed for this API key"));
+}
+
+#[test]
+fn transport_denies_revoked_retrieval_key() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _scope_env = EnvVarGuard::set(
+        "DASH_RETRIEVAL_API_KEY_SCOPES",
+        OsStr::new("scope-a:tenant-http"),
+    );
+    let _revoked_env = EnvVarGuard::set("DASH_RETRIEVAL_REVOKED_API_KEYS", OsStr::new("scope-a"));
+    let store = sample_store();
+    let request = b"GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer scope-a\r\nConnection: close\r\n\r\n";
+    let response = retrieval::transport::handle_http_request_bytes(&store, request)
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 401"));
+    assert!(response.contains("API key revoked"));
+}

@@ -234,3 +234,50 @@ tenant-http,0,8,node-a,follower,healthy\n",
 
     let _ = std::fs::remove_file(placement_file);
 }
+
+#[test]
+fn transport_denies_cross_tenant_ingest_for_scoped_key() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _scope_env = EnvVarGuard::set(
+        "DASH_INGEST_API_KEY_SCOPES",
+        OsStr::new("scope-a:tenant-allowed"),
+    );
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-scope-deny","tenant_id":"tenant-blocked","canonical_text":"Scope deny check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nX-API-Key: scope-a\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 403"));
+    assert!(response.contains("tenant is not allowed for this API key"));
+}
+
+#[test]
+fn transport_denies_revoked_ingest_key() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _scope_env = EnvVarGuard::set(
+        "DASH_INGEST_API_KEY_SCOPES",
+        OsStr::new("scope-a:tenant-http"),
+    );
+    let _revoked_env = EnvVarGuard::set("DASH_INGEST_REVOKED_API_KEYS", OsStr::new("scope-a"));
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-revoked","tenant_id":"tenant-http","canonical_text":"Revoked key check","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer scope-a\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 401"));
+    assert!(response.contains("API key revoked"));
+}
