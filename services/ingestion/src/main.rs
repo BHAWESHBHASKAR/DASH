@@ -8,12 +8,22 @@ use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWriteP
 const SAFE_WAL_SYNC_EVERY_RECORDS_MAX: usize = 256;
 const SAFE_WAL_APPEND_BUFFER_RECORDS_MAX: usize = 256;
 const SAFE_WAL_SYNC_INTERVAL_MS_MAX: u64 = 5_000;
+const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncWalFlushSetting {
+    Auto,
+    Disabled,
+    IntervalMs(u64),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalDurabilityConfig {
     sync_every_records: usize,
     append_buffer_records: usize,
     sync_interval_ms: Option<u64>,
+    async_flush_interval_ms: Option<u64>,
+    background_flush_only: bool,
     allow_unsafe_override: bool,
 }
 
@@ -52,6 +62,23 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let wal_background_flush_only = match parse_bool_env_with_fallback(
+        "DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY",
+        "EME_INGEST_WAL_BACKGROUND_FLUSH_ONLY",
+    ) {
+        Ok(value) => value.unwrap_or(false),
+        Err(reason) => {
+            eprintln!("ingestion invalid WAL background flush env: {reason}");
+            std::process::exit(2);
+        }
+    };
+    let wal_async_flush_setting = match parse_wal_async_flush_setting() {
+        Ok(value) => value,
+        Err(reason) => {
+            eprintln!("ingestion invalid WAL async flush env: {reason}");
+            std::process::exit(2);
+        }
+    };
 
     let input = IngestInput {
         claim: Claim {
@@ -86,10 +113,19 @@ fn main() {
     };
 
     if let Some(wal_path) = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH") {
+        let wal_async_flush_interval_ms = resolve_wal_async_flush_interval_ms(
+            wal_sync_every_records,
+            wal_append_buffer_records,
+            wal_sync_interval_ms,
+            wal_background_flush_only,
+            wal_async_flush_setting,
+        );
         let wal_durability_config = WalDurabilityConfig {
             sync_every_records: wal_sync_every_records,
             append_buffer_records: wal_append_buffer_records,
             sync_interval_ms: wal_sync_interval_ms,
+            async_flush_interval_ms: wal_async_flush_interval_ms,
+            background_flush_only: wal_background_flush_only,
             allow_unsafe_override: allow_unsafe_wal_durability,
         };
         if let Err(reason) = validate_wal_durability_guardrails(&wal_durability_config) {
@@ -100,6 +136,8 @@ fn main() {
             wal_durability_config.sync_every_records,
             wal_durability_config.append_buffer_records,
             wal_durability_config.sync_interval_ms,
+            wal_durability_config.async_flush_interval_ms,
+            wal_durability_config.background_flush_only,
         );
         if allow_unsafe_wal_durability && !guardrail_violations.is_empty() {
             eprintln!(
@@ -114,6 +152,7 @@ fn main() {
                 sync_every_records: wal_sync_every_records,
                 append_buffer_max_records: wal_append_buffer_records,
                 sync_interval: wal_sync_interval_ms.map(std::time::Duration::from_millis),
+                background_flush_only: wal_background_flush_only,
             },
         ) {
             Ok(wal) => wal,
@@ -142,12 +181,14 @@ fn main() {
             load_stats.replay.wal_records
         );
         println!(
-            "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, unsafe_override={}",
+            "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, async_flush_interval_ms={}, background_flush_only={}, unsafe_override={}",
             wal.sync_every_records(),
             wal.append_buffer_max_records(),
             wal.sync_interval()
                 .map(|value| value.as_millis())
                 .unwrap_or(0),
+            wal_async_flush_interval_ms.unwrap_or(0),
+            wal.background_flush_only(),
             allow_unsafe_wal_durability
         );
         let policy = CheckpointPolicy {
@@ -336,10 +377,68 @@ fn parse_bool_env_with_fallback(primary: &str, fallback: &str) -> Result<Option<
     }
 }
 
+fn parse_wal_async_flush_setting() -> Result<AsyncWalFlushSetting, String> {
+    let Some(raw) = env_with_fallback(
+        "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS",
+        "EME_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS",
+    ) else {
+        return Ok(AsyncWalFlushSetting::Auto);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(AsyncWalFlushSetting::Disabled);
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    if normalized == "auto" {
+        return Ok(AsyncWalFlushSetting::Auto);
+    }
+    if matches!(
+        normalized.as_str(),
+        "off" | "none" | "false" | "disabled" | "0"
+    ) {
+        return Ok(AsyncWalFlushSetting::Disabled);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(value) if value > 0 => Ok(AsyncWalFlushSetting::IntervalMs(value)),
+        _ => Err(format!(
+            "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS/EME_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS must be positive integer milliseconds, auto, or off (got '{raw}')"
+        )),
+    }
+}
+
+fn resolve_wal_async_flush_interval_ms(
+    sync_every_records: usize,
+    append_buffer_records: usize,
+    sync_interval_ms: Option<u64>,
+    background_flush_only: bool,
+    setting: AsyncWalFlushSetting,
+) -> Option<u64> {
+    match setting {
+        AsyncWalFlushSetting::Disabled => None,
+        AsyncWalFlushSetting::IntervalMs(value) => Some(value),
+        AsyncWalFlushSetting::Auto => {
+            let batching_enabled = background_flush_only
+                || sync_every_records > 1
+                || append_buffer_records > 1
+                || sync_interval_ms.is_some();
+            if !batching_enabled {
+                return None;
+            }
+            Some(
+                sync_interval_ms
+                    .map(|value| value.min(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS))
+                    .unwrap_or(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS),
+            )
+        }
+    }
+}
+
 fn wal_durability_guardrail_violations(
     sync_every_records: usize,
     append_buffer_records: usize,
     sync_interval_ms: Option<u64>,
+    async_flush_interval_ms: Option<u64>,
+    background_flush_only: bool,
 ) -> Vec<String> {
     let mut violations = Vec::new();
     if sync_every_records > SAFE_WAL_SYNC_EVERY_RECORDS_MAX {
@@ -362,10 +461,25 @@ fn wal_durability_guardrail_violations(
             interval_ms, SAFE_WAL_SYNC_INTERVAL_MS_MAX
         ));
     }
-    let batching_enabled = sync_every_records > 1 || append_buffer_records > 1;
-    if batching_enabled && sync_interval_ms.is_none() {
+    if let Some(interval_ms) = async_flush_interval_ms
+        && interval_ms > SAFE_WAL_SYNC_INTERVAL_MS_MAX
+    {
+        violations.push(format!(
+            "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS={} exceeds safe max {}",
+            interval_ms, SAFE_WAL_SYNC_INTERVAL_MS_MAX
+        ));
+    }
+    let request_thread_batching_enabled =
+        !background_flush_only && (sync_every_records > 1 || append_buffer_records > 1);
+    if request_thread_batching_enabled && sync_interval_ms.is_none() {
         violations.push(
             "batched WAL durability requires DASH_INGEST_WAL_SYNC_INTERVAL_MS to cap unsynced window"
+                .to_string(),
+        );
+    }
+    if background_flush_only && async_flush_interval_ms.is_none() {
+        violations.push(
+            "DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY=true requires async flush worker (set DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS to a positive value or keep auto)"
                 .to_string(),
         );
     }
@@ -377,6 +491,8 @@ fn validate_wal_durability_guardrails(config: &WalDurabilityConfig) -> Result<()
         config.sync_every_records,
         config.append_buffer_records,
         config.sync_interval_ms,
+        config.async_flush_interval_ms,
+        config.background_flush_only,
     );
     if config.allow_unsafe_override || violations.is_empty() {
         Ok(())
@@ -496,6 +612,8 @@ mod tests {
             sync_every_records: 1,
             append_buffer_records: 1,
             sync_interval_ms: None,
+            async_flush_interval_ms: None,
+            background_flush_only: false,
             allow_unsafe_override: false,
         };
         assert!(validate_wal_durability_guardrails(&config).is_ok());
@@ -507,6 +625,8 @@ mod tests {
             sync_every_records: 32,
             append_buffer_records: 1,
             sync_interval_ms: None,
+            async_flush_interval_ms: Some(250),
+            background_flush_only: false,
             allow_unsafe_override: false,
         };
         let err = validate_wal_durability_guardrails(&config).expect_err("must reject");
@@ -519,6 +639,8 @@ mod tests {
             sync_every_records: 512,
             append_buffer_records: 512,
             sync_interval_ms: None,
+            async_flush_interval_ms: None,
+            background_flush_only: false,
             allow_unsafe_override: true,
         };
         assert!(validate_wal_durability_guardrails(&config).is_ok());
@@ -530,9 +652,45 @@ mod tests {
             sync_every_records: 2,
             append_buffer_records: 2,
             sync_interval_ms: Some(SAFE_WAL_SYNC_INTERVAL_MS_MAX + 1),
+            async_flush_interval_ms: Some(250),
+            background_flush_only: false,
             allow_unsafe_override: false,
         };
         let err = validate_wal_durability_guardrails(&config).expect_err("must reject");
         assert!(err.contains("DASH_INGEST_WAL_SYNC_INTERVAL_MS"));
+    }
+
+    #[test]
+    fn wal_durability_guardrails_reject_background_flush_without_async_worker() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 1,
+            append_buffer_records: 1,
+            sync_interval_ms: None,
+            async_flush_interval_ms: None,
+            background_flush_only: true,
+            allow_unsafe_override: false,
+        };
+        let err = validate_wal_durability_guardrails(&config).expect_err("must reject");
+        assert!(err.contains("DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY"));
+    }
+
+    #[test]
+    fn wal_durability_guardrails_allow_background_flush_with_async_worker() {
+        let config = WalDurabilityConfig {
+            sync_every_records: 1,
+            append_buffer_records: 1,
+            sync_interval_ms: None,
+            async_flush_interval_ms: Some(250),
+            background_flush_only: true,
+            allow_unsafe_override: false,
+        };
+        assert!(validate_wal_durability_guardrails(&config).is_ok());
+    }
+
+    #[test]
+    fn resolve_wal_async_flush_interval_auto_enables_for_background_mode() {
+        let resolved =
+            resolve_wal_async_flush_interval_ms(1, 1, None, true, AsyncWalFlushSetting::Auto);
+        assert_eq!(resolved, Some(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS));
     }
 }

@@ -16,6 +16,7 @@ RAW_OUTPUT_DIR="${DASH_WAL_DURABILITY_RAW_OUTPUT_DIR:-docs/benchmarks/history/co
 RUN_TAG="${DASH_WAL_DURABILITY_RUN_TAG:-ingest-wal-durability}"
 ALLOW_UNSAFE_WAL_DURABILITY="${DASH_WAL_DURABILITY_ALLOW_UNSAFE_WAL_DURABILITY:-true}"
 ASYNC_FLUSH_INTERVAL_MS="${DASH_WAL_DURABILITY_ASYNC_FLUSH_INTERVAL_MS:-auto}"
+BACKGROUND_FLUSH_ONLY="${DASH_WAL_DURABILITY_BACKGROUND_FLUSH_ONLY:-false}"
 
 STRICT_SYNC_EVERY="${DASH_WAL_DURABILITY_STRICT_SYNC_EVERY:-1}"
 STRICT_APPEND_BUFFER="${DASH_WAL_DURABILITY_STRICT_APPEND_BUFFER:-1}"
@@ -48,6 +49,8 @@ Options:
                                   set ingestion unsafe WAL durability override for stress modes
   --async-flush-interval-ms N|off|auto
                                   ingestion async WAL flush worker interval for benchmark runs
+  --background-flush-only true|false
+                                  enable background-only WAL flushing during benchmark runs
   --strict-sync-every N             strict mode sync threshold
   --strict-append-buffer N          strict mode append buffer threshold
   --strict-interval-ms N|off        strict mode sync interval
@@ -109,6 +112,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --async-flush-interval-ms)
       ASYNC_FLUSH_INTERVAL_MS="$2"
+      shift 2
+      ;;
+    --background-flush-only)
+      BACKGROUND_FLUSH_ONLY="$2"
       shift 2
       ;;
     --strict-sync-every)
@@ -216,6 +223,10 @@ if [[ "${ALLOW_UNSAFE_WAL_DURABILITY}" != "true" && "${ALLOW_UNSAFE_WAL_DURABILI
   echo "invalid --allow-unsafe-wal-durability: ${ALLOW_UNSAFE_WAL_DURABILITY}" >&2
   exit 2
 fi
+if [[ "${BACKGROUND_FLUSH_ONLY}" != "true" && "${BACKGROUND_FLUSH_ONLY}" != "false" ]]; then
+  echo "invalid --background-flush-only: ${BACKGROUND_FLUSH_ONLY}" >&2
+  exit 2
+fi
 
 STRICT_INTERVAL_MS="$(normalize_interval "${STRICT_INTERVAL_MS}")"
 GROUPED_INTERVAL_MS="$(normalize_interval "${GROUPED_INTERVAL_MS}")"
@@ -309,6 +320,7 @@ for idx in "${!mode_names[@]}"; do
       --ingest-wal-append-buffer-records "${append_buffer}" \
       --ingest-wal-sync-interval-ms "${interval_ms}" \
       "${async_flush_args[@]}" \
+      --ingest-wal-background-flush-only "${BACKGROUND_FLUSH_ONLY}" \
       --ingest-allow-unsafe-wal-durability "${ALLOW_UNSAFE_WAL_DURABILITY}" \
       --output-dir "${RAW_OUTPUT_DIR}" \
       --run-tag "${mode_tag}" 2>&1
@@ -406,6 +418,7 @@ cat > "${OUT_PATH}" <<EOF_MD
 - raw_output_dir: ${RAW_OUTPUT_DIR}
 - allow_unsafe_wal_durability: ${ALLOW_UNSAFE_WAL_DURABILITY}
 - async_flush_interval_ms: ${ASYNC_FLUSH_INTERVAL_MS}
+- background_flush_only: ${BACKGROUND_FLUSH_ONLY}
 
 | mode | sync_every_records | append_buffer_records | sync_interval_ms | throughput_rps | latency_avg_ms | latency_p95_ms | latency_p99_ms | success_rate_pct | throughput_vs_strict |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|

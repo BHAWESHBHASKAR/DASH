@@ -29,6 +29,7 @@ INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS="${DASH_RELEASE_GATE_INGEST_WAL_SYNC_EV
 INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS="${DASH_RELEASE_GATE_INGEST_WAL_APPEND_BUFFER_RECORDS:-1}"
 INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_SYNC_INTERVAL_MS:-off}"
 INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS:-auto}"
+INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY="${DASH_RELEASE_GATE_INGEST_WAL_BACKGROUND_FLUSH_ONLY:-false}"
 INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="${DASH_RELEASE_GATE_INGEST_ALLOW_UNSAFE_WAL_DURABILITY:-false}"
 
 usage() {
@@ -66,6 +67,8 @@ Options:
   --ingest-wal-sync-interval-ms N|off  Ingestion benchmark WAL interval sync policy
   --ingest-wal-async-flush-interval-ms N|off|auto
                                        Ingestion benchmark async flush worker interval
+  --ingest-wal-background-flush-only true|false
+                                       Ingestion benchmark background-only WAL flush mode
   --ingest-allow-unsafe-wal-durability true|false
                                        Ingestion benchmark unsafe WAL durability override
   -h, --help                           Show help
@@ -177,6 +180,10 @@ while [[ $# -gt 0 ]]; do
       INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="$2"
       shift 2
       ;;
+    --ingest-wal-background-flush-only)
+      INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY="$2"
+      shift 2
+      ;;
     --ingest-allow-unsafe-wal-durability)
       INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="$2"
       shift 2
@@ -211,6 +218,7 @@ validate_bool "--bench-include-large" "${BENCH_INCLUDE_LARGE}"
 validate_bool "--bench-include-xlarge" "${BENCH_INCLUDE_XLARGE}"
 validate_bool "--bench-include-hybrid" "${BENCH_INCLUDE_HYBRID}"
 validate_bool "--run-ingest-throughput-guard" "${RUN_INGEST_THROUGHPUT_GUARD}"
+validate_bool "--ingest-wal-background-flush-only" "${INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY}"
 validate_bool "--ingest-allow-unsafe-wal-durability" "${INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY}"
 
 if [[ -n "${SLO_ITERATIONS}" && ! "${SLO_ITERATIONS}" =~ ^[0-9]+$ ]]; then
@@ -397,6 +405,7 @@ if [[ "${RUN_INGEST_THROUGHPUT_GUARD}" == "true" ]]; then
     --ingest-wal-sync-every-records "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}"
     --ingest-wal-append-buffer-records "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}"
     --ingest-wal-sync-interval-ms "${INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS}"
+    --ingest-wal-background-flush-only "${INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY}"
     --ingest-allow-unsafe-wal-durability "${INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY}"
   )
   if [[ "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" != "auto" && "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" != "" ]]; then

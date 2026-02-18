@@ -185,6 +185,7 @@ pub struct FileWal {
     sync_every_records: usize,
     append_buffer_max_records: usize,
     sync_interval: Option<Duration>,
+    background_flush_only: bool,
     append_buffer: Vec<String>,
     unsynced_records: usize,
     last_sync_at: Instant,
@@ -195,6 +196,7 @@ pub struct WalWritePolicy {
     pub sync_every_records: usize,
     pub append_buffer_max_records: usize,
     pub sync_interval: Option<Duration>,
+    pub background_flush_only: bool,
 }
 
 impl Default for WalWritePolicy {
@@ -203,6 +205,7 @@ impl Default for WalWritePolicy {
             sync_every_records: 1,
             append_buffer_max_records: 1,
             sync_interval: None,
+            background_flush_only: false,
         }
     }
 }
@@ -243,6 +246,7 @@ impl FileWal {
             sync_every_records: policy.sync_every_records.max(1),
             append_buffer_max_records: policy.append_buffer_max_records.max(1),
             sync_interval: policy.sync_interval,
+            background_flush_only: policy.background_flush_only,
             append_buffer: Vec::new(),
             unsynced_records: 0,
             last_sync_at: Instant::now(),
@@ -263,6 +267,10 @@ impl FileWal {
 
     pub fn sync_interval(&self) -> Option<Duration> {
         self.sync_interval
+    }
+
+    pub fn background_flush_only(&self) -> bool {
+        self.background_flush_only
     }
 
     pub fn unsynced_record_count(&self) -> usize {
@@ -314,6 +322,9 @@ impl FileWal {
         self.append_buffer.push(record_to_line(record));
         self.wal_records += 1;
         self.unsynced_records += 1;
+        if self.background_flush_only {
+            return Ok(());
+        }
         if self.append_buffer.len() >= self.append_buffer_max_records {
             self.flush_append_buffer()?;
         }
@@ -2745,6 +2756,7 @@ mod tests {
                 sync_every_records: 10,
                 append_buffer_max_records: 3,
                 sync_interval: None,
+                background_flush_only: false,
             },
         )
         .unwrap();
@@ -2777,6 +2789,7 @@ mod tests {
                 sync_every_records: 100,
                 append_buffer_max_records: 100,
                 sync_interval: Some(Duration::from_millis(1)),
+                background_flush_only: false,
             },
         )
         .unwrap();
@@ -2808,6 +2821,7 @@ mod tests {
                 sync_every_records: 100,
                 append_buffer_max_records: 100,
                 sync_interval: None,
+                background_flush_only: false,
             },
         )
         .unwrap();
@@ -2827,6 +2841,52 @@ mod tests {
         assert!(flushed);
         assert_eq!(wal.unsynced_record_count(), 0);
         assert_eq!(wal.buffered_record_count(), 0);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_background_flush_only_defers_flush_until_explicit_tick() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open_with_policy(
+            &wal_path,
+            WalWritePolicy {
+                sync_every_records: 1,
+                append_buffer_max_records: 1,
+                sync_interval: None,
+                background_flush_only: true,
+            },
+        )
+        .unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-bg-1", "Background flush one"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-bg-2", "Background flush two"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        assert!(wal.background_flush_only());
+        assert_eq!(wal.unsynced_record_count(), 2);
+        assert_eq!(wal.buffered_record_count(), 2);
+        assert_eq!(std::fs::metadata(wal.path()).unwrap().len(), 0);
+
+        let flushed = wal.flush_pending_sync_if_unsynced().unwrap();
+        assert!(flushed);
+        assert_eq!(wal.unsynced_record_count(), 0);
+        assert_eq!(wal.buffered_record_count(), 0);
+        assert!(std::fs::metadata(wal.path()).unwrap().len() > 0);
 
         cleanup_persistence_files(&wal);
     }

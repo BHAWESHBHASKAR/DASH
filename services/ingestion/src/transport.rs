@@ -295,6 +295,9 @@ impl IngestionRuntime {
         let Some(wal) = self.wal.as_mut() else {
             return;
         };
+        if wal.background_flush_only() {
+            return;
+        }
         match wal.flush_pending_sync_if_interval_elapsed() {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
@@ -387,6 +390,11 @@ impl IngestionRuntime {
             .wal_async_flush_interval
             .map(|value| value.as_millis() as u64)
             .unwrap_or(0);
+        let wal_background_flush_only = self
+            .wal
+            .as_ref()
+            .map(FileWal::background_flush_only)
+            .unwrap_or(false) as usize;
         format!(
             "# TYPE dash_ingest_success_total counter\n\
 dash_ingest_success_total {}\n\
@@ -460,6 +468,8 @@ dash_ingest_wal_async_flush_enabled {}\n\
 dash_ingest_wal_async_flush_interval_ms {}\n\
 # TYPE dash_ingest_wal_async_flush_tick_total counter\n\
 dash_ingest_wal_async_flush_tick_total {}\n\
+# TYPE dash_ingest_wal_background_flush_only gauge\n\
+dash_ingest_wal_background_flush_only {}\n\
 # TYPE dash_ingest_claims_total gauge\n\
 dash_ingest_claims_total {}\n\
 # TYPE dash_ingest_uptime_seconds gauge\n\
@@ -500,6 +510,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             wal_async_flush_enabled,
             wal_async_flush_interval_ms,
             self.wal_async_flush_tick_total,
+            wal_background_flush_only,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         )
@@ -1539,7 +1550,8 @@ fn resolve_wal_async_flush_interval(wal: Option<&FileWal>) -> Option<Duration> {
         return override_value;
     }
 
-    let batching_enabled = wal.sync_every_records() > 1
+    let batching_enabled = wal.background_flush_only()
+        || wal.sync_every_records() > 1
         || wal.append_buffer_max_records() > 1
         || wal.sync_interval().is_some();
     if !batching_enabled {
@@ -3071,6 +3083,11 @@ mod tests {
                 .body
                 .contains("dash_ingest_wal_async_flush_enabled 0")
         );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_wal_background_flush_only 0")
+        );
     }
 
     #[test]
@@ -3082,6 +3099,7 @@ mod tests {
                 sync_every_records: 64,
                 append_buffer_max_records: 64,
                 sync_interval: None,
+                background_flush_only: false,
             },
         )
         .expect("wal should open");
@@ -3099,6 +3117,69 @@ mod tests {
     }
 
     #[test]
+    fn persistent_runtime_enables_async_flush_for_background_only_wal() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open_with_policy(
+            &wal_path,
+            store::WalWritePolicy {
+                sync_every_records: 1,
+                append_buffer_max_records: 1,
+                sync_interval: None,
+                background_flush_only: true,
+            },
+        )
+        .expect("wal should open");
+        let runtime =
+            IngestionRuntime::persistent(InMemoryStore::new(), wal, CheckpointPolicy::default());
+        assert_eq!(
+            runtime.wal_async_flush_interval(),
+            Some(Duration::from_millis(DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS))
+        );
+        drop(runtime);
+        let _ = std::fs::remove_file(&wal_path);
+        let mut snapshot = wal_path.into_os_string();
+        snapshot.push(".snapshot");
+        let _ = std::fs::remove_file(PathBuf::from(snapshot));
+    }
+
+    #[test]
+    fn background_only_mode_skips_request_thread_interval_flush() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open_with_policy(
+            &wal_path,
+            store::WalWritePolicy {
+                sync_every_records: 1,
+                append_buffer_max_records: 1,
+                sync_interval: Some(Duration::from_millis(1)),
+                background_flush_only: true,
+            },
+        )
+        .expect("wal should open");
+        let mut runtime =
+            IngestionRuntime::persistent(InMemoryStore::new(), wal, CheckpointPolicy::default());
+        let request = build_ingest_request_from_json(
+            r#"{"claim":{"claim_id":"c-bg","tenant_id":"tenant-a","canonical_text":"Background mode claim","confidence":0.9}}"#,
+        )
+        .expect("request should parse");
+        runtime.ingest(request).expect("ingest should succeed");
+        std::thread::sleep(Duration::from_millis(2));
+        runtime.flush_wal_if_due();
+        let metrics = runtime.metrics_text();
+        assert!(metrics.contains("dash_ingest_wal_unsynced_records 1"));
+        assert!(metrics.contains("dash_ingest_wal_background_flush_only 1"));
+
+        runtime.flush_wal_for_async_tick();
+        let flushed = runtime.metrics_text();
+        assert!(flushed.contains("dash_ingest_wal_unsynced_records 0"));
+
+        drop(runtime);
+        let _ = std::fs::remove_file(&wal_path);
+        let mut snapshot = wal_path.into_os_string();
+        snapshot.push(".snapshot");
+        let _ = std::fs::remove_file(PathBuf::from(snapshot));
+    }
+
+    #[test]
     fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
         let wal_path = temp_wal_path();
         let wal = FileWal::open_with_policy(
@@ -3107,6 +3188,7 @@ mod tests {
                 sync_every_records: 64,
                 append_buffer_max_records: 64,
                 sync_interval: None,
+                background_flush_only: false,
             },
         )
         .expect("wal should open");
