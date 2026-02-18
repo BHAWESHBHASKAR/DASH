@@ -20,7 +20,7 @@ cargo build --release -p ingestion -p retrieval -p benchmark-smoke
 
 echo "[package] preparing staging directory: ${STAGE_DIR}"
 rm -rf "${STAGE_DIR}"
-mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/docs" "${STAGE_DIR}/deploy"
+mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/docs" "${STAGE_DIR}/deploy" "${STAGE_DIR}/scripts"
 
 cp target/release/ingestion "${STAGE_DIR}/bin/"
 cp target/release/retrieval "${STAGE_DIR}/bin/"
@@ -34,6 +34,12 @@ cp docs/execution/dash-startup-env-matrix.md "${STAGE_DIR}/docs/"
 cp docs/execution/dash-release-checklist.md "${STAGE_DIR}/docs/"
 cp -R deploy/systemd "${STAGE_DIR}/deploy/"
 cp -R deploy/container "${STAGE_DIR}/deploy/"
+cp scripts/deploy_systemd.sh "${STAGE_DIR}/scripts/"
+cp scripts/deploy_container.sh "${STAGE_DIR}/scripts/"
+cp scripts/failover_drill.sh "${STAGE_DIR}/scripts/"
+cp scripts/backup_state_bundle.sh "${STAGE_DIR}/scripts/"
+cp scripts/restore_state_bundle.sh "${STAGE_DIR}/scripts/"
+cp scripts/recovery_drill.sh "${STAGE_DIR}/scripts/"
 
 mkdir -p "${OUT_DIR}"
 ARCHIVE_PATH="${OUT_DIR}/${PACKAGE_NAME}.tar.gz"

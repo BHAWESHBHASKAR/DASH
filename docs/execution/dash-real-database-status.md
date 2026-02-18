@@ -11,7 +11,7 @@ Define where DASH stands as a real production database platform, what is complet
 
 - Engine core readiness: 65%
 - Distributed database readiness: 40%
-- Production operations readiness: 55%
+- Production operations readiness: 65%
 
 These percentages are directional and tied to implemented code paths, tests, and run artifacts in this repository.
 
@@ -43,6 +43,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Segment compaction scheduler primitives.
 - Benchmark profiles through xlarge (100k claims).
 - Benchmark history and scorecard outputs with regression guardrails.
+- Backup/restore/recovery drill scripts for WAL+snapshot+segment operations.
 
 ## 4. Gaps to Production Database
 
@@ -60,7 +61,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 
 ### 4.3 Operational and safety gaps
 
-- Backup/restore workflow is not yet codified with timed recovery drills.
+- Backup/restore workflow is codified in scripts and runbook, but scheduled recurring recovery drills are not yet automated in staging/prod.
 - Security threat model execution and hardening validation remain incomplete.
 - SLO/error-budget automation is not yet fully gate-driving deployment decisions.
 

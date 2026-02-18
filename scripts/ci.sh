@@ -49,6 +49,47 @@ if [[ "${CHECK_ASYNC_TRANSPORT}" == "true" ]]; then
   cargo test -p retrieval --features async-transport
 fi
 
+echo "[ci] backup/restore script checks"
+scripts/backup_state_bundle.sh --help >/dev/null
+scripts/restore_state_bundle.sh --help >/dev/null
+scripts/recovery_drill.sh --help >/dev/null
+
+echo "[ci] backup/restore script functional smoke"
+(
+  set -euo pipefail
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dash-ci-backup-XXXXXX")"
+  trap 'rm -rf "${TMP_DIR}"' EXIT
+  SRC_DIR="${TMP_DIR}/source"
+  DST_DIR="${TMP_DIR}/restore"
+  OUT_DIR="${TMP_DIR}/out"
+  mkdir -p "${SRC_DIR}/segments/tenant-a" "${DST_DIR}" "${OUT_DIR}"
+  printf "CLAIM\t1\n" > "${SRC_DIR}/claims.wal"
+  printf "SNAP\t1\nCLAIM\t1\n" > "${SRC_DIR}/claims.wal.snapshot"
+  printf "tenant-a,0,1,node-a,leader,healthy\n" > "${SRC_DIR}/placement.csv"
+  printf "segment-marker\n" > "${SRC_DIR}/segments/tenant-a/.marker"
+
+  scripts/backup_state_bundle.sh \
+    --wal-path "${SRC_DIR}/claims.wal" \
+    --segment-dir "${SRC_DIR}/segments" \
+    --placement-file "${SRC_DIR}/placement.csv" \
+    --output-dir "${OUT_DIR}" \
+    --bundle-label ci-smoke >/dev/null
+  BUNDLE_PATH="$(find "${OUT_DIR}" -type f -name 'dash-backup-ci-smoke*.tar.gz' | head -n 1)"
+  [[ -n "${BUNDLE_PATH}" ]]
+
+  scripts/restore_state_bundle.sh \
+    --bundle "${BUNDLE_PATH}" \
+    --wal-path "${DST_DIR}/claims.wal" \
+    --segment-dir "${DST_DIR}/segments" \
+    --placement-file "${DST_DIR}/placement.csv" \
+    --force true >/dev/null
+
+  cmp "${SRC_DIR}/claims.wal" "${DST_DIR}/claims.wal"
+  cmp "${SRC_DIR}/claims.wal.snapshot" "${DST_DIR}/claims.wal.snapshot"
+  cmp "${SRC_DIR}/placement.csv" "${DST_DIR}/placement.csv"
+  cmp "${SRC_DIR}/segments/tenant-a/.marker" "${DST_DIR}/segments/tenant-a/.marker"
+)
+
 echo "[ci] benchmark history guard"
 cargo run -p benchmark-smoke --bin benchmark-smoke -- \
   --profile smoke \

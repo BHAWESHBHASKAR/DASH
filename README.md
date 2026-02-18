@@ -82,6 +82,12 @@ Key env groups:
   - ingestion publish: `DASH_INGEST_SEGMENT_DIR` (+ sizing/compaction knobs)
   - retrieval prefilter: `DASH_RETRIEVAL_SEGMENT_DIR`
 
+Operational scripts:
+- backup: `scripts/backup_state_bundle.sh`
+- restore: `scripts/restore_state_bundle.sh`
+- recovery drill: `scripts/recovery_drill.sh`
+- failover drill: `scripts/failover_drill.sh`
+
 ## Benchmarks
 
 Smoke / hybrid / large benchmark profiles are available in `tests/benchmarks`.

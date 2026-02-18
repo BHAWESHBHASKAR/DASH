@@ -28,6 +28,12 @@ Status: active
 - [ ] metrics endpoint probe prepared (`/metrics`)
 - [ ] rollback operator and fallback data restore path documented
 - [ ] deployment assets selected and validated (`deploy/systemd/*` or `deploy/container/*`)
+- [ ] backup bundle generated and archived:
+  - `scripts/backup_state_bundle.sh --wal-path <wal> --segment-dir <segments> --output-dir /var/backups/dash`
+- [ ] restore verification pass completed:
+  - `scripts/restore_state_bundle.sh --bundle <bundle.tar.gz> --wal-path <wal> --verify-only true`
+- [ ] recovery drill pass with measured RTO/RPO:
+  - `scripts/recovery_drill.sh --max-rto-seconds 60`
 
 ## 4. Post-Deploy Verification
 

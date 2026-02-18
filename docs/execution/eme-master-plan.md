@@ -50,6 +50,9 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/benchmark_trend.sh`
   - `scripts/deploy_systemd.sh`
   - `scripts/deploy_container.sh`
+  - `scripts/backup_state_bundle.sh`
+  - `scripts/restore_state_bundle.sh`
+  - `scripts/recovery_drill.sh`
 
 ### 2.1 Milestone Status (2026-02-18)
 
@@ -183,6 +186,7 @@ Deliverables:
 - authn/authz integration and per-tenant isolation tests
 - audit trail for claim and evidence mutations
 - on-call runbooks, dashboards, alert policy, rollback playbook
+- backup/restore operational scripts and timed recovery drill procedure
 - SLO policy and error budget tracking
 - security review and threat model sign-off
 

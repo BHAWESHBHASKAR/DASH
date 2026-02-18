@@ -72,6 +72,7 @@ Status: active
 Runtime note:
 
 - `axum` runtime selection requires build feature `async-transport` on each service crate.
+- backup/restore tooling (`scripts/backup_state_bundle.sh`, `scripts/restore_state_bundle.sh`) reads these same `DASH_*` paths by default, so keep runtime envs and restore targets aligned.
 
 ## CI / Benchmark Guard
 

@@ -5,7 +5,7 @@ Status: draft
 
 ## 1. Scope
 
-This runbook covers single-region production deployment for DASH ingestion and retrieval services with WAL durability and replay.
+This runbook covers single-region production deployment for DASH ingestion and retrieval services with WAL durability, replay, and backup/restore operations.
 
 ## 2. Build
 
@@ -149,6 +149,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/benchmark_trend.sh --run-tag release-candidate`
 - run placement failover drill before release candidates:
   - `scripts/failover_drill.sh --mode both --placement-reload-interval-ms 200 --keep-artifacts true`
+- run recovery drill before release candidates:
+  - `scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true`
 
 ### 7.1 API key rotation and revocation
 
@@ -167,10 +169,50 @@ If retrieval fails at startup:
 
 1. Check WAL file permissions and disk space.
 2. Validate WAL readability by running ingestion locally against same path.
-3. Restore from last known-good snapshot/WAL backup if corruption is detected.
+3. Restore from last known-good backup bundle if corruption is detected:
+   - `scripts/restore_state_bundle.sh --bundle /var/backups/dash/<bundle>.tar.gz --wal-path /var/lib/dash/claims.wal --segment-dir /var/lib/dash/segments --force true`
 4. Re-run benchmark smoke before re-enabling traffic.
 
-## 9. Deployment Assets
+## 9. Backup and Recovery Operations
+
+Create backup bundle:
+
+```bash
+scripts/backup_state_bundle.sh \
+  --wal-path /var/lib/dash/claims.wal \
+  --segment-dir /var/lib/dash/segments \
+  --placement-file /etc/dash/placements.csv \
+  --output-dir /var/backups/dash \
+  --bundle-label nightly-$(date -u +%Y%m%d-%H%M%S)
+```
+
+Verify backup bundle checksums (no writes):
+
+```bash
+scripts/restore_state_bundle.sh \
+  --bundle /var/backups/dash/dash-backup-<label>.tar.gz \
+  --wal-path /var/lib/dash/claims.wal \
+  --verify-only true
+```
+
+Restore backup bundle:
+
+```bash
+scripts/restore_state_bundle.sh \
+  --bundle /var/backups/dash/dash-backup-<label>.tar.gz \
+  --wal-path /var/lib/dash/claims.wal \
+  --segment-dir /var/lib/dash/segments \
+  --placement-file /etc/dash/placements.csv \
+  --force true
+```
+
+Run recovery drill and capture measured RTO/RPO (claim gap):
+
+```bash
+scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true
+```
+
+## 10. Deployment Assets
 
 - systemd units:
   - `deploy/systemd/dash-ingestion.service`
@@ -185,7 +227,7 @@ If retrieval fails at startup:
   - `scripts/deploy_systemd.sh` (plan/apply for systemd unit installation)
   - `scripts/deploy_container.sh` (build/up/down/ps/logs wrappers for compose)
 
-## 10. Deployment Automation Examples
+## 11. Deployment Automation Examples
 
 systemd plan (non-destructive):
 
