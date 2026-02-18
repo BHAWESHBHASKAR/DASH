@@ -40,6 +40,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Startup replay and replay-stat logging for persistent mode.
 - JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
 - JWT key rotation support (`active + fallback` secrets and optional `kid` secret maps).
+- Tamper-evident audit log chaining (`seq`, `prev_hash`, `hash`) with offline verifier script.
 
 ### 3.4 Index and scale path primitives
 

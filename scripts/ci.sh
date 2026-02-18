@@ -56,6 +56,7 @@ scripts/backup_state_bundle.sh --help >/dev/null
 scripts/restore_state_bundle.sh --help >/dev/null
 scripts/recovery_drill.sh --help >/dev/null
 scripts/slo_guard.sh --help >/dev/null
+scripts/verify_audit_chain.sh --help >/dev/null
 
 echo "[ci] backup/restore script functional smoke"
 (
@@ -91,6 +92,69 @@ echo "[ci] backup/restore script functional smoke"
   cmp "${SRC_DIR}/claims.wal.snapshot" "${DST_DIR}/claims.wal.snapshot"
   cmp "${SRC_DIR}/placement.csv" "${DST_DIR}/placement.csv"
   cmp "${SRC_DIR}/segments/tenant-a/.marker" "${DST_DIR}/segments/tenant-a/.marker"
+)
+
+echo "[ci] audit chain verifier functional smoke"
+(
+  set -euo pipefail
+  TMP_AUDIT="$(mktemp "${TMPDIR:-/tmp}/dash-audit-chain-XXXXXX.jsonl")"
+  trap 'rm -f "${TMP_AUDIT}"' EXIT
+
+  python3 - "${TMP_AUDIT}" <<'PY'
+import hashlib
+import json
+import sys
+
+path = sys.argv[1]
+
+def esc(raw: str) -> str:
+    return (
+        raw.replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+def opt(value):
+    if value is None:
+        return "null"
+    return f"\"{esc(value)}\""
+
+def canonical(record: dict) -> str:
+    return (
+        f'{{"seq":{record["seq"]},"ts_unix_ms":{record["ts_unix_ms"]},"service":"{esc(record["service"])}",'
+        f'"action":"{esc(record["action"])}","tenant_id":{opt(record["tenant_id"])},'
+        f'"claim_id":{opt(record["claim_id"])},"status":{record["status"]},'
+        f'"outcome":"{esc(record["outcome"])}","reason":"{esc(record["reason"])}",'
+        f'"prev_hash":"{record["prev_hash"]}"}}'
+    )
+
+records = []
+prev_hash = "0" * 64
+for seq in (1, 2):
+    record = {
+        "seq": seq,
+        "ts_unix_ms": 1_700_000_000_000 + seq,
+        "service": "ingestion",
+        "action": "ingest",
+        "tenant_id": "tenant-a",
+        "claim_id": f"claim-{seq}",
+        "status": 200,
+        "outcome": "success",
+        "reason": "ok",
+        "prev_hash": prev_hash,
+    }
+    record["hash"] = hashlib.sha256(canonical(record).encode("utf-8")).hexdigest()
+    prev_hash = record["hash"]
+    records.append(record)
+
+with open(path, "w", encoding="utf-8") as handle:
+    for record in records:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+PY
+
+  scripts/verify_audit_chain.sh --path "${TMP_AUDIT}" --service ingestion >/dev/null
 )
 
 echo "[ci] slo guard functional smoke"

@@ -162,6 +162,9 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true`
 - run SLO/error-budget guard before release candidates:
   - `scripts/slo_guard.sh --profile smoke --run-tag release-candidate --include-recovery-drill true`
+- run audit-chain integrity checks on JSONL audit files:
+  - `scripts/verify_audit_chain.sh --path /var/log/dash/ingestion-audit.jsonl --service ingestion`
+  - `scripts/verify_audit_chain.sh --path /var/log/dash/retrieval-audit.jsonl --service retrieval`
 
 ### 7.1 API key rotation and revocation
 
@@ -186,6 +189,16 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 - required tenant claim semantics:
   - JWT must carry tenant scope via `tenant_id`, `tenants`, or `tenant_ids`
   - request is denied if requested tenant is outside JWT claim scope
+
+### 7.3 Audit chain verification
+
+- audit JSONL records include tamper-evident chain fields:
+  - `seq`: monotonic record sequence
+  - `prev_hash`: previous record hash
+  - `hash`: SHA-256 over canonical record payload including `prev_hash`
+- verify chain integrity after rotation/deploy incidents and before release sign-off:
+  - `scripts/verify_audit_chain.sh --path /var/log/dash/ingestion-audit.jsonl --service ingestion`
+  - `scripts/verify_audit_chain.sh --path /var/log/dash/retrieval-audit.jsonl --service retrieval`
 
 ## 8. Incident Response (Minimal)
 

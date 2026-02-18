@@ -12,6 +12,7 @@ Status: active
 - [ ] benchmark history guard passes for smoke profile
 - [ ] `scripts/benchmark_trend.sh --run-tag release-candidate` (smoke + large history append + scorecards)
 - [ ] `scripts/slo_guard.sh --profile smoke --run-tag release-candidate --include-recovery-drill true`
+- [ ] `scripts/verify_audit_chain.sh --path <ingestion-audit.jsonl> --service ingestion` and `scripts/verify_audit_chain.sh --path <retrieval-audit.jsonl> --service retrieval`
 - [ ] optional transport concurrency benchmark: `scripts/benchmark_transport_concurrency.sh --workers-list 1,4 --clients 16 --requests-per-worker 30`
 
 ## 2. Build and Package

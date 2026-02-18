@@ -21,6 +21,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transports support configurable HTTP worker pools for concurrent request handling (`DASH_*_HTTP_WORKERS`).
 - Ingestion/retrieval transports support runtime selection (`std` default, optional `axum`) via `DASH_*_TRANSPORT_RUNTIME` with `EME_*` fallback.
 - Ingestion/retrieval transports include tenant-scoped authz policy controls (`DASH_*_ALLOWED_TENANTS`, `DASH_*_API_KEY_SCOPES`) and optional JSONL audit trails (`DASH_*_AUDIT_LOG_PATH`).
+- Audit trails are now tamper-evident with chained hashes (`seq`, `prev_hash`, `hash`) and verifiable via `scripts/verify_audit_chain.sh`.
 - Ingestion/retrieval auth now supports rotation overlap (`DASH_*_API_KEYS`) and hard revocation (`DASH_*_REVOKED_API_KEYS`) in addition to single-key compatibility envs.
 - Ingestion/retrieval transport integration tests now include scoped cross-tenant deny and revoked-key deny coverage.
 - Ingestion/retrieval now support JWT bearer auth mode (HS256) with issuer/audience/time-claim checks and tenant claim enforcement.
@@ -60,6 +61,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/restore_state_bundle.sh`
   - `scripts/recovery_drill.sh`
   - `scripts/slo_guard.sh`
+  - `scripts/verify_audit_chain.sh`
 
 ### 2.1 Milestone Status (2026-02-18)
 

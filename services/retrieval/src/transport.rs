@@ -4,11 +4,11 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use auth::{JwtValidationConfig, JwtValidationError, verify_hs256_token_for_tenant};
+use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
 use metadata_router::{
     PlacementRouteError, ReadPreference, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig,
     ShardPlacement, load_shard_placements_csv, route_read_with_placement,
@@ -1449,20 +1449,20 @@ fn emit_audit_event(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    let payload = format!(
-        "{{\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\"}}",
-        json_escape(action),
-        tenant_id
-            .map(|value| format!("\"{}\"", json_escape(value)))
-            .unwrap_or_else(|| "null".to_string()),
-        status,
-        json_escape(outcome),
-        json_escape(reason),
-    );
 
     let mut write_error = false;
     if let Some(path) = audit_log_path
-        && let Err(err) = append_audit_record(path, &payload)
+        && let Err(err) = append_audit_record(
+            path,
+            timestamp_ms,
+            AuditEvent {
+                action,
+                tenant_id,
+                status,
+                outcome,
+                reason,
+            },
+        )
     {
         write_error = true;
         eprintln!("retrieval audit write failed: {err}");
@@ -1473,18 +1473,173 @@ fn emit_audit_event(
     }
 }
 
-fn append_audit_record(path: &str, payload: &str) -> Result<(), String> {
+const AUDIT_CHAIN_GENESIS_HASH: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditChainState {
+    next_seq: u64,
+    last_hash: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuditEvent<'a> {
+    action: &'a str,
+    tenant_id: Option<&'a str>,
+    status: u16,
+    outcome: &'a str,
+    reason: &'a str,
+}
+
+fn append_audit_record(path: &str, timestamp_ms: u64, event: AuditEvent<'_>) -> Result<(), String> {
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
         create_dir_all(parent).map_err(|e| format!("creating audit directory failed: {e}"))?;
     }
+    let mut chain_states = audit_chain_states()
+        .lock()
+        .map_err(|_| "acquiring audit chain lock failed".to_string())?;
+    let state = if let Some(existing) = chain_states.get(path).cloned() {
+        existing
+    } else {
+        let loaded = load_audit_chain_state(path)?;
+        chain_states.insert(path.to_string(), loaded.clone());
+        loaded
+    };
+    let (payload, next_state) = render_chained_audit_payload(timestamp_ms, event, &state);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| format!("opening audit file failed: {e}"))?;
-    writeln!(file, "{payload}").map_err(|e| format!("appending audit file failed: {e}"))
+    writeln!(file, "{payload}").map_err(|e| format!("appending audit file failed: {e}"))?;
+    chain_states.insert(path.to_string(), next_state);
+    Ok(())
+}
+
+fn render_chained_audit_payload(
+    timestamp_ms: u64,
+    event: AuditEvent<'_>,
+    state: &AuditChainState,
+) -> (String, AuditChainState) {
+    let seq = state.next_seq;
+    let prev_hash = state.last_hash.as_str();
+    let canonical = canonical_audit_payload(seq, timestamp_ms, event, prev_hash);
+    let hash = sha256_hex(canonical.as_bytes());
+    let payload = format!(
+        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\",\"hash\":\"{}\"}}",
+        json_escape(event.action),
+        optional_json_string(event.tenant_id),
+        event.status,
+        json_escape(event.outcome),
+        json_escape(event.reason),
+        prev_hash,
+        hash,
+    );
+    (
+        payload,
+        AuditChainState {
+            next_seq: seq.saturating_add(1),
+            last_hash: hash,
+        },
+    )
+}
+
+fn canonical_audit_payload(
+    seq: u64,
+    timestamp_ms: u64,
+    event: AuditEvent<'_>,
+    prev_hash: &str,
+) -> String {
+    format!(
+        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\"}}",
+        json_escape(event.action),
+        optional_json_string(event.tenant_id),
+        event.status,
+        json_escape(event.outcome),
+        json_escape(event.reason),
+        prev_hash,
+    )
+}
+
+fn optional_json_string(value: Option<&str>) -> String {
+    value
+        .map(|raw| format!("\"{}\"", json_escape(raw)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn audit_chain_states() -> &'static Mutex<HashMap<String, AuditChainState>> {
+    static STATES: OnceLock<Mutex<HashMap<String, AuditChainState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_audit_chain_state(path: &str) -> Result<AuditChainState, String> {
+    if !Path::new(path).exists() {
+        return Ok(AuditChainState {
+            next_seq: 1,
+            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
+        });
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| format!("opening audit file failed: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut last_line: Option<String> = None;
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("reading audit file failed: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        last_line = Some(line);
+    }
+    let Some(last_line) = last_line else {
+        return Ok(AuditChainState {
+            next_seq: 1,
+            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
+        });
+    };
+    match parse_audit_chain_state_from_line(&last_line)? {
+        Some(state) => Ok(state),
+        None => Ok(AuditChainState {
+            next_seq: 1,
+            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
+        }),
+    }
+}
+
+fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainState>, String> {
+    let value = parse_json(line)?;
+    let object = match value {
+        JsonValue::Object(object) => object,
+        _ => return Ok(None),
+    };
+
+    let seq_value = object.get("seq");
+    let hash_value = object.get("hash");
+    if seq_value.is_none() && hash_value.is_none() {
+        return Ok(None);
+    }
+    let seq = match seq_value {
+        Some(JsonValue::Number(raw)) => raw
+            .parse::<u64>()
+            .map_err(|_| "audit seq must be u64".to_string())?,
+        _ => return Err("audit seq is missing or invalid".to_string()),
+    };
+    let hash = match hash_value {
+        Some(JsonValue::String(raw)) if is_sha256_hex(raw) => raw.clone(),
+        _ => return Err("audit hash is missing or invalid".to_string()),
+    };
+
+    Ok(Some(AuditChainState {
+        next_seq: seq.saturating_add(1),
+        last_hash: hash,
+    }))
+}
+
+fn is_sha256_hex(raw: &str) -> bool {
+    raw.len() == 64 && raw.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn execute_retrieve_and_observe(
@@ -3387,5 +3542,79 @@ tenant-a,0,12,node-a,follower,healthy\n",
             authorize_request_for_tenant(&request, "tenant-a", &policy),
             AuthDecision::Unauthorized("API key revoked")
         );
+    }
+
+    #[test]
+    fn append_audit_record_writes_chained_hash_and_seq() {
+        let mut audit_path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        audit_path.push(format!(
+            "dash-retrieve-audit-chain-{}-{}.jsonl",
+            std::process::id(),
+            nanos
+        ));
+        let audit_path_str = audit_path.to_string_lossy().to_string();
+        if let Ok(mut states) = audit_chain_states().lock() {
+            states.remove(&audit_path_str);
+        }
+
+        append_audit_record(
+            &audit_path_str,
+            1_700_000_000_001,
+            AuditEvent {
+                action: "retrieve",
+                tenant_id: Some("tenant-a"),
+                status: 200,
+                outcome: "success",
+                reason: "ok",
+            },
+        )
+        .expect("first audit append should succeed");
+        append_audit_record(
+            &audit_path_str,
+            1_700_000_000_002,
+            AuditEvent {
+                action: "retrieve",
+                tenant_id: Some("tenant-a"),
+                status: 200,
+                outcome: "success",
+                reason: "ok",
+            },
+        )
+        .expect("second audit append should succeed");
+
+        let payload = std::fs::read_to_string(&audit_path).expect("audit file should be readable");
+        let lines: Vec<&str> = payload
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        let first_obj = match parse_json(lines[0]).expect("first line JSON should parse") {
+            JsonValue::Object(object) => object,
+            _ => panic!("first line should be object"),
+        };
+        let second_obj = match parse_json(lines[1]).expect("second line JSON should parse") {
+            JsonValue::Object(object) => object,
+            _ => panic!("second line should be object"),
+        };
+
+        assert!(matches!(first_obj.get("seq"), Some(JsonValue::Number(raw)) if raw == "1"));
+        assert!(matches!(second_obj.get("seq"), Some(JsonValue::Number(raw)) if raw == "2"));
+        let first_hash = match first_obj.get("hash") {
+            Some(JsonValue::String(raw)) => raw.clone(),
+            _ => panic!("first hash should exist"),
+        };
+        let second_prev = match second_obj.get("prev_hash") {
+            Some(JsonValue::String(raw)) => raw.clone(),
+            _ => panic!("second prev_hash should exist"),
+        };
+        assert!(is_sha256_hex(&first_hash));
+        assert_eq!(second_prev, first_hash);
+
+        let _ = std::fs::remove_file(audit_path);
     }
 }

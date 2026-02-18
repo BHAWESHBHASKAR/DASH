@@ -89,6 +89,7 @@ Operational scripts:
 - recovery drill: `scripts/recovery_drill.sh`
 - failover drill: `scripts/failover_drill.sh`
 - slo/error-budget guard: `scripts/slo_guard.sh`
+- audit chain verifier: `scripts/verify_audit_chain.sh`
 
 ## Benchmarks
 

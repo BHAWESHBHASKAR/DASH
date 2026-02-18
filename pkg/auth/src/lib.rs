@@ -164,6 +164,11 @@ pub fn encode_hs256_token_with_kid(
     Ok(format!("{header}.{payload}.{signature_b64}"))
 }
 
+pub fn sha256_hex(input: &[u8]) -> String {
+    let digest = sha256(input);
+    bytes_to_hex(&digest)
+}
+
 fn split_jwt(token: &str) -> Option<(&str, &str, &str)> {
     let mut parts = token.split('.');
     let header = parts.next()?;
@@ -379,6 +384,16 @@ fn json_escape(raw: &str) -> String {
             '\t' => out.push_str("\\t"),
             _ => out.push(ch),
         }
+    }
+    out
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
 }
