@@ -23,6 +23,8 @@ BENCH_TREND_INCLUDE_XLARGE="${DASH_CI_BENCH_TREND_INCLUDE_XLARGE:-${EME_CI_BENCH
 BENCH_TREND_INCLUDE_HYBRID="${DASH_CI_BENCH_TREND_INCLUDE_HYBRID:-${EME_CI_BENCH_TREND_INCLUDE_HYBRID:-false}}"
 BENCH_TREND_TAG="${DASH_CI_BENCH_TREND_TAG:-ci-trend}"
 CHECK_ASYNC_TRANSPORT="${DASH_CI_CHECK_ASYNC_TRANSPORT:-${EME_CI_CHECK_ASYNC_TRANSPORT:-false}}"
+INCLUDE_SLO_GUARD="${DASH_CI_INCLUDE_SLO_GUARD:-${EME_CI_INCLUDE_SLO_GUARD:-false}}"
+CI_SLO_INCLUDE_RECOVERY_DRILL="${DASH_CI_SLO_INCLUDE_RECOVERY_DRILL:-false}"
 LARGE_GUARD_ITERATIONS="${DASH_CI_LARGE_GUARD_ITERATIONS:-}"
 XLARGE_GUARD_ITERATIONS="${DASH_CI_XLARGE_GUARD_ITERATIONS:-}"
 CI_LARGE_ANN_MAX_NEIGHBORS_BASE="${DASH_CI_LARGE_ANN_MAX_NEIGHBORS_BASE:-${DASH_BENCH_ANN_MAX_NEIGHBORS_BASE:-12}}"
@@ -53,6 +55,7 @@ echo "[ci] backup/restore script checks"
 scripts/backup_state_bundle.sh --help >/dev/null
 scripts/restore_state_bundle.sh --help >/dev/null
 scripts/recovery_drill.sh --help >/dev/null
+scripts/slo_guard.sh --help >/dev/null
 
 echo "[ci] backup/restore script functional smoke"
 (
@@ -152,6 +155,12 @@ if [[ "${RUN_BENCH_TREND}" == "true" ]]; then
     DASH_BENCH_INCLUDE_XLARGE="${BENCH_TREND_INCLUDE_XLARGE}" \
     DASH_BENCH_INCLUDE_HYBRID="${BENCH_TREND_INCLUDE_HYBRID}" \
     scripts/benchmark_trend.sh --run-tag "${BENCH_TREND_TAG}"
+fi
+
+if [[ "${INCLUDE_SLO_GUARD}" == "true" ]]; then
+  echo "[ci] slo guard"
+  DASH_SLO_INCLUDE_RECOVERY_DRILL="${CI_SLO_INCLUDE_RECOVERY_DRILL}" \
+    scripts/slo_guard.sh --run-tag ci
 fi
 
 echo "[ci] benchmark smoke"

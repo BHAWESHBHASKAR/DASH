@@ -151,6 +151,8 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/failover_drill.sh --mode both --placement-reload-interval-ms 200 --keep-artifacts true`
 - run recovery drill before release candidates:
   - `scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true`
+- run SLO/error-budget guard before release candidates:
+  - `scripts/slo_guard.sh --profile smoke --run-tag release-candidate --include-recovery-drill true`
 
 ### 7.1 API key rotation and revocation
 
@@ -212,6 +214,18 @@ Run recovery drill and capture measured RTO/RPO (claim gap):
 scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true
 ```
 
+Run SLO/error-budget gate and archive summary:
+
+```bash
+scripts/slo_guard.sh \
+  --profile smoke \
+  --run-tag release-candidate \
+  --include-recovery-drill true \
+  --max-dash-latency-ms 120 \
+  --window-runs 20 \
+  --max-failed-run-pct 10
+```
+
 ## 10. Deployment Assets
 
 - systemd units:
@@ -226,6 +240,7 @@ scripts/recovery_drill.sh --max-rto-seconds 60 --keep-artifacts true
 - deployment automation scripts:
   - `scripts/deploy_systemd.sh` (plan/apply for systemd unit installation)
   - `scripts/deploy_container.sh` (build/up/down/ps/logs wrappers for compose)
+  - `scripts/backup_state_bundle.sh`, `scripts/restore_state_bundle.sh`, `scripts/recovery_drill.sh`, `scripts/slo_guard.sh`
 
 ## 11. Deployment Automation Examples
 

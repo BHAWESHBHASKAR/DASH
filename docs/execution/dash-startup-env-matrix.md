@@ -105,3 +105,22 @@ Runtime note:
 | `DASH_CI_BENCH_TREND_INCLUDE_HYBRID` | no | `false` | include hybrid profile in CI trend automation | `EME_CI_BENCH_TREND_INCLUDE_HYBRID` |
 | `DASH_CI_BENCH_TREND_TAG` | no | `ci-trend` | run-tag suffix for CI trend artifacts | `EME_CI_BENCH_TREND_TAG` |
 | `DASH_CI_CHECK_ASYNC_TRANSPORT` | no | `false` | when `true`, runs async transport feature checks and tests (`cargo check` + `cargo test` for ingestion/retrieval with `--features async-transport`) | `EME_CI_CHECK_ASYNC_TRANSPORT` |
+| `DASH_CI_INCLUDE_SLO_GUARD` | no | `false` | when `true`, runs `scripts/slo_guard.sh` as an SLO/error-budget CI gate | `EME_CI_INCLUDE_SLO_GUARD` |
+| `DASH_CI_SLO_INCLUDE_RECOVERY_DRILL` | no | `false` | controls whether CI SLO guard includes recovery drill execution | none |
+
+SLO guard runtime envs (`scripts/slo_guard.sh`):
+
+- `DASH_SLO_PROFILE` (default `smoke`)
+- `DASH_SLO_ITERATIONS` (optional)
+- `DASH_SLO_MAX_DASH_LATENCY_MS` (default `120`)
+- `DASH_SLO_MIN_CONTRADICTION_F1` (default `0.80`)
+- `DASH_SLO_MIN_ANN_RECALL_AT_10` (default `0.95`)
+- `DASH_SLO_MIN_ANN_RECALL_AT_100` (default `0.99`)
+- `DASH_SLO_MIN_QUALITY_PROBES_PASSED` (default `5`)
+- `DASH_SLO_REQUIRE_DASH_HIT` (default `true`)
+- `DASH_SLO_WINDOW_RUNS` (default `20`)
+- `DASH_SLO_MAX_FAILED_RUN_PCT` (default `10`)
+- `DASH_SLO_REQUIRE_CURRENT_PASS` (default `true`)
+- `DASH_SLO_INCLUDE_RECOVERY_DRILL` (default `false`)
+- `DASH_SLO_RECOVERY_MAX_RTO_SECONDS` (default `60`)
+- `DASH_SLO_RECOVERY_MAX_RPO_CLAIM_GAP` (default `0`)

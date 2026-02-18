@@ -40,6 +40,7 @@ cp scripts/failover_drill.sh "${STAGE_DIR}/scripts/"
 cp scripts/backup_state_bundle.sh "${STAGE_DIR}/scripts/"
 cp scripts/restore_state_bundle.sh "${STAGE_DIR}/scripts/"
 cp scripts/recovery_drill.sh "${STAGE_DIR}/scripts/"
+cp scripts/slo_guard.sh "${STAGE_DIR}/scripts/"
 
 mkdir -p "${OUT_DIR}"
 ARCHIVE_PATH="${OUT_DIR}/${PACKAGE_NAME}.tar.gz"

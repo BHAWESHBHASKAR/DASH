@@ -160,6 +160,7 @@ Action items:
 - optionally run hybrid-profile history guard in staged CI (`DASH_CI_INCLUDE_HYBRID_GUARD=true`, `EME_CI_INCLUDE_HYBRID_GUARD` fallback)
 - optionally run full trend automation in staged CI (`DASH_CI_RUN_BENCH_TREND=true`) with profile scope control via `DASH_CI_BENCH_TREND_INCLUDE_LARGE`, `DASH_CI_BENCH_TREND_INCLUDE_XLARGE`, and `DASH_CI_BENCH_TREND_INCLUDE_HYBRID`
 - optionally run async transport feature checks and tests in staged CI (`DASH_CI_CHECK_ASYNC_TRANSPORT=true`)
+- optionally run SLO/error-budget guard in staged CI (`DASH_CI_INCLUDE_SLO_GUARD=true`) with optional recovery-drill inclusion (`DASH_CI_SLO_INCLUDE_RECOVERY_DRILL=true`)
 - run full benchmark nightly
 - block production promotion if any gate fails
 

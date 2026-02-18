@@ -87,6 +87,7 @@ Operational scripts:
 - restore: `scripts/restore_state_bundle.sh`
 - recovery drill: `scripts/recovery_drill.sh`
 - failover drill: `scripts/failover_drill.sh`
+- slo/error-budget guard: `scripts/slo_guard.sh`
 
 ## Benchmarks
 
