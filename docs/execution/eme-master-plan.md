@@ -22,6 +22,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transports support runtime selection (`std` default, optional `axum`) via `DASH_*_TRANSPORT_RUNTIME` with `EME_*` fallback.
 - Ingestion/retrieval transports include tenant-scoped authz policy controls (`DASH_*_ALLOWED_TENANTS`, `DASH_*_API_KEY_SCOPES`) and optional JSONL audit trails (`DASH_*_AUDIT_LOG_PATH`).
 - Indexer includes immutable segment lifecycle primitives (atomic segment+manifest persistence, checksum-verified load, compaction scheduler hook).
+- Metadata router now includes placement-aware routing primitives (leader/follower health policies, read preferences, and failover promotion with epoch bump).
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
 - Benchmark harness supports smoke, standard, and large fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).

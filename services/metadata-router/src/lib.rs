@@ -20,6 +20,60 @@ pub struct RouterConfig {
     pub replica_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaRole {
+    Leader,
+    Follower,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaHealth {
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaPlacement {
+    pub node_id: String,
+    pub role: ReplicaRole,
+    pub health: ReplicaHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardPlacement {
+    pub tenant_id: String,
+    pub shard_id: u32,
+    pub epoch: u64,
+    pub replicas: Vec<ReplicaPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPreference {
+    LeaderOnly,
+    PreferFollower,
+    AnyHealthy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedReplica {
+    pub tenant_id: String,
+    pub entity_key: String,
+    pub shard_id: u32,
+    pub epoch: u64,
+    pub node_id: String,
+    pub role: ReplicaRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementRouteError {
+    PlacementNotFound { tenant_id: String, shard_id: u32 },
+    NoWritableLeader { tenant_id: String, shard_id: u32 },
+    NoReadableReplica { tenant_id: String, shard_id: u32 },
+    ReplicaNotFound { node_id: String },
+    ReplicaUnhealthy { node_id: String },
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -86,6 +140,151 @@ pub fn route_with_replicas(
     RoutingPlan { primary, replicas }
 }
 
+pub fn route_write_with_placement(
+    tenant_id: &str,
+    entity_key: &str,
+    config: &RouterConfig,
+    placements: &[ShardPlacement],
+) -> Result<RoutedReplica, PlacementRouteError> {
+    let shard_id = route_with_replicas(tenant_id, entity_key, config)
+        .primary
+        .shard_id;
+    let placement = find_placement(placements, tenant_id, shard_id).ok_or_else(|| {
+        PlacementRouteError::PlacementNotFound {
+            tenant_id: tenant_id.to_string(),
+            shard_id,
+        }
+    })?;
+    let leader = placement
+        .replicas
+        .iter()
+        .find(|replica| {
+            replica.role == ReplicaRole::Leader && replica.health == ReplicaHealth::Healthy
+        })
+        .ok_or_else(|| PlacementRouteError::NoWritableLeader {
+            tenant_id: tenant_id.to_string(),
+            shard_id,
+        })?;
+    Ok(RoutedReplica {
+        tenant_id: tenant_id.to_string(),
+        entity_key: entity_key.to_string(),
+        shard_id,
+        epoch: placement.epoch,
+        node_id: leader.node_id.clone(),
+        role: ReplicaRole::Leader,
+    })
+}
+
+pub fn route_read_with_placement(
+    tenant_id: &str,
+    entity_key: &str,
+    config: &RouterConfig,
+    placements: &[ShardPlacement],
+    preference: ReadPreference,
+) -> Result<RoutedReplica, PlacementRouteError> {
+    let shard_id = route_with_replicas(tenant_id, entity_key, config)
+        .primary
+        .shard_id;
+    let placement = find_placement(placements, tenant_id, shard_id).ok_or_else(|| {
+        PlacementRouteError::PlacementNotFound {
+            tenant_id: tenant_id.to_string(),
+            shard_id,
+        }
+    })?;
+    let chosen = match preference {
+        ReadPreference::LeaderOnly => placement.replicas.iter().find(|replica| {
+            replica.role == ReplicaRole::Leader && is_readable_replica_health(replica.health)
+        }),
+        ReadPreference::PreferFollower => placement
+            .replicas
+            .iter()
+            .find(|replica| {
+                replica.role == ReplicaRole::Follower && is_readable_replica_health(replica.health)
+            })
+            .or_else(|| {
+                placement.replicas.iter().find(|replica| {
+                    replica.role == ReplicaRole::Leader
+                        && is_readable_replica_health(replica.health)
+                })
+            }),
+        ReadPreference::AnyHealthy => placement
+            .replicas
+            .iter()
+            .find(|replica| is_readable_replica_health(replica.health)),
+    }
+    .ok_or_else(|| PlacementRouteError::NoReadableReplica {
+        tenant_id: tenant_id.to_string(),
+        shard_id,
+    })?;
+    Ok(RoutedReplica {
+        tenant_id: tenant_id.to_string(),
+        entity_key: entity_key.to_string(),
+        shard_id,
+        epoch: placement.epoch,
+        node_id: chosen.node_id.clone(),
+        role: chosen.role,
+    })
+}
+
+pub fn set_replica_health(
+    placement: &mut ShardPlacement,
+    node_id: &str,
+    health: ReplicaHealth,
+) -> Result<(), PlacementRouteError> {
+    let replica = placement
+        .replicas
+        .iter_mut()
+        .find(|replica| replica.node_id == node_id)
+        .ok_or_else(|| PlacementRouteError::ReplicaNotFound {
+            node_id: node_id.to_string(),
+        })?;
+    replica.health = health;
+    Ok(())
+}
+
+pub fn promote_replica_to_leader(
+    placement: &mut ShardPlacement,
+    node_id: &str,
+) -> Result<u64, PlacementRouteError> {
+    let promoted_index = placement
+        .replicas
+        .iter()
+        .position(|replica| replica.node_id == node_id)
+        .ok_or_else(|| PlacementRouteError::ReplicaNotFound {
+            node_id: node_id.to_string(),
+        })?;
+    if !is_readable_replica_health(placement.replicas[promoted_index].health) {
+        return Err(PlacementRouteError::ReplicaUnhealthy {
+            node_id: node_id.to_string(),
+        });
+    }
+    if placement.replicas[promoted_index].role == ReplicaRole::Leader {
+        return Ok(placement.epoch);
+    }
+    for replica in &mut placement.replicas {
+        if replica.role == ReplicaRole::Leader {
+            replica.role = ReplicaRole::Follower;
+        }
+    }
+    placement.replicas[promoted_index].role = ReplicaRole::Leader;
+    placement.epoch = placement.epoch.saturating_add(1);
+    Ok(placement.epoch)
+}
+
+fn find_placement<'a>(
+    placements: &'a [ShardPlacement],
+    tenant_id: &str,
+    shard_id: u32,
+) -> Option<&'a ShardPlacement> {
+    placements
+        .iter()
+        .find(|placement| placement.tenant_id == tenant_id && placement.shard_id == shard_id)
+}
+
+fn is_readable_replica_health(health: ReplicaHealth) -> bool {
+    matches!(health, ReplicaHealth::Healthy | ReplicaHealth::Degraded)
+}
+
 fn build_ring(config: &RouterConfig) -> BTreeMap<u64, u32> {
     let mut ring = BTreeMap::new();
     let vnodes = config.virtual_nodes_per_shard.max(1);
@@ -141,5 +340,109 @@ mod tests {
         let b = route_with_replicas("tenant-a", "entity-x", &config);
         assert_eq!(a, b);
         assert!(a.replicas.len() <= 1);
+    }
+
+    fn single_shard_config() -> RouterConfig {
+        RouterConfig {
+            shard_ids: vec![5],
+            virtual_nodes_per_shard: 16,
+            replica_count: 3,
+        }
+    }
+
+    fn sample_placement() -> ShardPlacement {
+        ShardPlacement {
+            tenant_id: "tenant-a".to_string(),
+            shard_id: 5,
+            epoch: 7,
+            replicas: vec![
+                ReplicaPlacement {
+                    node_id: "node-a".to_string(),
+                    role: ReplicaRole::Leader,
+                    health: ReplicaHealth::Healthy,
+                },
+                ReplicaPlacement {
+                    node_id: "node-b".to_string(),
+                    role: ReplicaRole::Follower,
+                    health: ReplicaHealth::Healthy,
+                },
+                ReplicaPlacement {
+                    node_id: "node-c".to_string(),
+                    role: ReplicaRole::Follower,
+                    health: ReplicaHealth::Degraded,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn route_write_with_placement_returns_healthy_leader() {
+        let config = single_shard_config();
+        let placement = sample_placement();
+        let routed = route_write_with_placement("tenant-a", "entity-x", &config, &[placement])
+            .expect("write route should resolve");
+        assert_eq!(routed.node_id, "node-a");
+        assert_eq!(routed.role, ReplicaRole::Leader);
+        assert_eq!(routed.epoch, 7);
+    }
+
+    #[test]
+    fn route_read_with_placement_prefers_followers_when_requested() {
+        let config = single_shard_config();
+        let placement = sample_placement();
+        let routed = route_read_with_placement(
+            "tenant-a",
+            "entity-x",
+            &config,
+            &[placement],
+            ReadPreference::PreferFollower,
+        )
+        .expect("read route should resolve");
+        assert_eq!(routed.node_id, "node-b");
+        assert_eq!(routed.role, ReplicaRole::Follower);
+    }
+
+    #[test]
+    fn route_write_with_placement_fails_without_healthy_leader() {
+        let config = single_shard_config();
+        let mut placement = sample_placement();
+        set_replica_health(&mut placement, "node-a", ReplicaHealth::Unavailable)
+            .expect("leader health update should succeed");
+        let err = route_write_with_placement("tenant-a", "entity-x", &config, &[placement])
+            .expect_err("write route should fail");
+        assert!(matches!(err, PlacementRouteError::NoWritableLeader { .. }));
+    }
+
+    #[test]
+    fn promote_replica_to_leader_increments_epoch_and_flips_roles() {
+        let mut placement = sample_placement();
+        let new_epoch =
+            promote_replica_to_leader(&mut placement, "node-b").expect("promotion should succeed");
+        assert_eq!(new_epoch, 8);
+        let leader = placement
+            .replicas
+            .iter()
+            .find(|replica| replica.role == ReplicaRole::Leader)
+            .expect("leader should exist");
+        assert_eq!(leader.node_id, "node-b");
+    }
+
+    #[test]
+    fn route_read_with_placement_fails_without_readable_replicas() {
+        let config = single_shard_config();
+        let mut placement = sample_placement();
+        for node in ["node-a", "node-b", "node-c"] {
+            set_replica_health(&mut placement, node, ReplicaHealth::Unavailable)
+                .expect("health update should succeed");
+        }
+        let err = route_read_with_placement(
+            "tenant-a",
+            "entity-x",
+            &config,
+            &[placement],
+            ReadPreference::AnyHealthy,
+        )
+        .expect_err("read route should fail");
+        assert!(matches!(err, PlacementRouteError::NoReadableReplica { .. }));
     }
 }
