@@ -3,7 +3,7 @@ use std::{
     fs::{OpenOptions, create_dir_all},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +22,7 @@ const METRICS_WINDOW_SIZE: usize = 2048;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+type SharedPlacementRouting = Arc<Mutex<Option<PlacementRoutingState>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlacementRoutingRuntime {
@@ -29,6 +30,32 @@ struct PlacementRoutingRuntime {
     router_config: RouterConfig,
     placements: Vec<ShardPlacement>,
     read_preference: ReadPreference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementRoutingState {
+    runtime: PlacementRoutingRuntime,
+    reload: Option<PlacementReloadRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementReloadRuntime {
+    config: PlacementReloadConfig,
+    next_reload_at: Instant,
+    attempt_total: u64,
+    success_total: u64,
+    failure_total: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementReloadConfig {
+    placement_file: PathBuf,
+    shard_ids_override: Option<Vec<u32>>,
+    replica_count_override: Option<usize>,
+    virtual_nodes_per_shard: u32,
+    read_preference: ReadPreference,
+    reload_interval: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +79,16 @@ struct PlacementObservabilitySnapshot {
     replicas_unavailable: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PlacementReloadSnapshot {
+    enabled: bool,
+    interval_ms: Option<u64>,
+    attempt_total: u64,
+    success_total: u64,
+    failure_total: u64,
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TransportMetrics {
     started_at: Instant,
@@ -71,6 +108,12 @@ pub(crate) struct TransportMetrics {
     placement_last_shard_id: Option<u32>,
     placement_last_epoch: Option<u64>,
     placement_last_role: Option<ReplicaRole>,
+    placement_reload_enabled: bool,
+    placement_reload_interval_ms: Option<u64>,
+    placement_reload_attempt_total: u64,
+    placement_reload_success_total: u64,
+    placement_reload_failure_total: u64,
+    placement_reload_last_error: bool,
     retrieve_last_result_count: usize,
     retrieve_latency_ms_window: VecDeque<f64>,
     ingest_to_visible_lag_ms_window: VecDeque<f64>,
@@ -96,6 +139,12 @@ impl Default for TransportMetrics {
             placement_last_shard_id: None,
             placement_last_epoch: None,
             placement_last_role: None,
+            placement_reload_enabled: false,
+            placement_reload_interval_ms: None,
+            placement_reload_attempt_total: 0,
+            placement_reload_success_total: 0,
+            placement_reload_failure_total: 0,
+            placement_reload_last_error: false,
             retrieve_last_result_count: 0,
             retrieve_latency_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
             ingest_to_visible_lag_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
@@ -181,6 +230,15 @@ impl TransportMetrics {
         }
     }
 
+    fn observe_placement_reload_snapshot(&mut self, snapshot: &PlacementReloadSnapshot) {
+        self.placement_reload_enabled = snapshot.enabled;
+        self.placement_reload_interval_ms = snapshot.interval_ms;
+        self.placement_reload_attempt_total = snapshot.attempt_total;
+        self.placement_reload_success_total = snapshot.success_total;
+        self.placement_reload_failure_total = snapshot.failure_total;
+        self.placement_reload_last_error = snapshot.last_error.is_some();
+    }
+
     fn quantile(window: &VecDeque<f64>, quantile: f64) -> f64 {
         if window.is_empty() {
             return 0.0;
@@ -258,6 +316,18 @@ dash_retrieve_placement_replicas_healthy {}\n\
 dash_retrieve_placement_replicas_degraded {}\n\
 # TYPE dash_retrieve_placement_replicas_unavailable gauge\n\
 dash_retrieve_placement_replicas_unavailable {}\n\
+# TYPE dash_retrieve_placement_reload_enabled gauge\n\
+dash_retrieve_placement_reload_enabled {}\n\
+# TYPE dash_retrieve_placement_reload_interval_ms gauge\n\
+dash_retrieve_placement_reload_interval_ms {}\n\
+# TYPE dash_retrieve_placement_reload_attempt_total counter\n\
+dash_retrieve_placement_reload_attempt_total {}\n\
+# TYPE dash_retrieve_placement_reload_success_total counter\n\
+dash_retrieve_placement_reload_success_total {}\n\
+# TYPE dash_retrieve_placement_reload_failure_total counter\n\
+dash_retrieve_placement_reload_failure_total {}\n\
+# TYPE dash_retrieve_placement_reload_last_error gauge\n\
+dash_retrieve_placement_reload_last_error {}\n\
 # TYPE dash_retrieve_last_result_count gauge\n\
 dash_retrieve_last_result_count {}\n\
 # TYPE dash_retrieve_latency_ms_p50 gauge\n\
@@ -294,6 +364,12 @@ dash_transport_uptime_seconds {:.4}\n",
             placement_snapshot.replicas_healthy,
             placement_snapshot.replicas_degraded,
             placement_snapshot.replicas_unavailable,
+            self.placement_reload_enabled as usize,
+            self.placement_reload_interval_ms.unwrap_or(0),
+            self.placement_reload_attempt_total,
+            self.placement_reload_success_total,
+            self.placement_reload_failure_total,
+            self.placement_reload_last_error as usize,
             self.retrieve_last_result_count,
             retrieve_latency_p50,
             retrieve_latency_p95,
@@ -317,12 +393,14 @@ pub fn serve_http_with_workers(
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let placement_routing = Arc::new(PlacementRoutingRuntime::from_env().map_err(|reason| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid placement routing configuration: {reason}"),
-        )
-    })?);
+    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
+        |reason| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid placement routing configuration: {reason}"),
+            )
+        },
+    )?));
     let (tx, rx) = mpsc::channel::<TcpStream>();
     let rx = Arc::new(Mutex::new(rx));
 
@@ -343,12 +421,8 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) = handle_connection(
-                        store,
-                        stream,
-                        &metrics,
-                        placement_routing.as_ref().as_ref(),
-                    ) {
+                    if let Err(err) = handle_connection(store, stream, &metrics, &placement_routing)
+                    {
                         eprintln!("retrieval transport error: {err}");
                     }
                 }
@@ -382,14 +456,16 @@ pub fn serve_http_once_with_listener(
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let placement_routing = PlacementRoutingRuntime::from_env().map_err(|reason| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid placement routing configuration: {reason}"),
-        )
-    })?;
+    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
+        |reason| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid placement routing configuration: {reason}"),
+            )
+        },
+    )?));
     let (stream, _) = listener.accept()?;
-    handle_connection(store, stream, &metrics, placement_routing.as_ref())
+    handle_connection(store, stream, &metrics, &placement_routing)
 }
 
 pub fn handle_http_request_bytes(
@@ -441,12 +517,22 @@ pub fn handle_http_request_bytes(
         body: body.as_bytes().to_vec(),
     };
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let placement_routing = PlacementRoutingRuntime::from_env()?;
-    let response = handle_request_with_metrics_and_routing(
+    let mut placement_routing = PlacementRoutingState::from_env()?;
+    let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
+        state.maybe_refresh();
+        (Some(state.runtime().clone()), state.reload_snapshot())
+    } else {
+        (None, PlacementReloadSnapshot::default())
+    };
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_placement_reload_snapshot(&reload_snapshot);
+    }
+    let response = handle_request_with_metrics_and_reload(
         store,
         &request,
         &metrics,
-        placement_routing.as_ref(),
+        routing_snapshot.as_ref(),
+        Some(&reload_snapshot),
     );
     Ok(render_response_text(&response).into_bytes())
 }
@@ -455,7 +541,7 @@ fn handle_connection(
     store: &InMemoryStore,
     mut stream: TcpStream,
     metrics: &Arc<Mutex<TransportMetrics>>,
-    placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_routing: &SharedPlacementRouting,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
@@ -468,8 +554,34 @@ fn handle_connection(
         }
     };
 
-    let response =
-        handle_request_with_metrics_and_routing(store, &request, metrics, placement_routing);
+    let (routing_snapshot, reload_snapshot) = match placement_routing.lock() {
+        Ok(mut guard) => {
+            if let Some(state) = guard.as_mut() {
+                state.maybe_refresh();
+                (Some(state.runtime().clone()), state.reload_snapshot())
+            } else {
+                (None, PlacementReloadSnapshot::default())
+            }
+        }
+        Err(_) => {
+            return write_response(
+                &mut stream,
+                HttpResponse::internal_server_error(
+                    "failed to acquire retrieval placement routing lock",
+                ),
+            );
+        }
+    };
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_placement_reload_snapshot(&reload_snapshot);
+    }
+    let response = handle_request_with_metrics_and_reload(
+        store,
+        &request,
+        metrics,
+        routing_snapshot.as_ref(),
+        Some(&reload_snapshot),
+    );
     write_response(&mut stream, response)
 }
 
@@ -557,7 +669,7 @@ pub(crate) fn handle_request_with_metrics(
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
 ) -> HttpResponse {
-    let placement_routing = match PlacementRoutingRuntime::from_env() {
+    let mut placement_routing = match PlacementRoutingState::from_env() {
         Ok(runtime) => runtime,
         Err(reason) => {
             return HttpResponse::internal_server_error(&format!(
@@ -565,14 +677,40 @@ pub(crate) fn handle_request_with_metrics(
             ));
         }
     };
-    handle_request_with_metrics_and_routing(store, request, metrics, placement_routing.as_ref())
+    let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
+        state.maybe_refresh();
+        (Some(state.runtime().clone()), state.reload_snapshot())
+    } else {
+        (None, PlacementReloadSnapshot::default())
+    };
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_placement_reload_snapshot(&reload_snapshot);
+    }
+    handle_request_with_metrics_and_reload(
+        store,
+        request,
+        metrics,
+        routing_snapshot.as_ref(),
+        Some(&reload_snapshot),
+    )
 }
 
+#[cfg(test)]
 fn handle_request_with_metrics_and_routing(
     store: &InMemoryStore,
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
+) -> HttpResponse {
+    handle_request_with_metrics_and_reload(store, request, metrics, placement_routing, None)
+}
+
+fn handle_request_with_metrics_and_reload(
+    store: &InMemoryStore,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_reload: Option<&PlacementReloadSnapshot>,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
     let auth_policy = AuthPolicy::from_env(
@@ -604,9 +742,11 @@ fn handle_request_with_metrics_and_routing(
             };
             HttpResponse::ok_text(body)
         }
-        ("GET", "/debug/placement") => {
-            HttpResponse::ok_json(render_placement_debug_json(placement_routing, &query))
-        }
+        ("GET", "/debug/placement") => HttpResponse::ok_json(render_placement_debug_json(
+            placement_routing,
+            placement_reload,
+            &query,
+        )),
         ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
@@ -775,6 +915,7 @@ fn handle_request_with_metrics_and_routing(
 
 fn render_placement_debug_json(
     placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_reload: Option<&PlacementReloadSnapshot>,
     query: &HashMap<String, String>,
 ) -> String {
     let route_probe = build_read_route_probe_json(placement_routing, query);
@@ -791,7 +932,7 @@ fn render_placement_debug_json(
             (false, None, None, 0, &[][..])
         };
     format!(
-        "{{\"enabled\":{},\"local_node_id\":{},\"read_preference\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{}}}",
+        "{{\"enabled\":{},\"local_node_id\":{},\"read_preference\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{},\"reload\":{}}}",
         enabled,
         local_node_id
             .map(|value| format!("\"{}\"", json_escape(value)))
@@ -801,7 +942,28 @@ fn render_placement_debug_json(
             .unwrap_or_else(|| "null".to_string()),
         shard_count,
         render_placements_json(placements),
-        route_probe
+        route_probe,
+        render_placement_reload_json(placement_reload),
+    )
+}
+
+fn render_placement_reload_json(snapshot: Option<&PlacementReloadSnapshot>) -> String {
+    let snapshot = snapshot.cloned().unwrap_or_default();
+    format!(
+        "{{\"enabled\":{},\"interval_ms\":{},\"attempt_total\":{},\"success_total\":{},\"failure_total\":{},\"last_error\":{}}}",
+        snapshot.enabled,
+        snapshot
+            .interval_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        snapshot.attempt_total,
+        snapshot.success_total,
+        snapshot.failure_total,
+        snapshot
+            .last_error
+            .as_ref()
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
     )
 }
 
@@ -1185,7 +1347,9 @@ impl PlacementRoutingRuntime {
         }
         snapshot
     }
+}
 
+impl PlacementRoutingState {
     fn from_env() -> Result<Option<Self>, String> {
         let Some(placement_file) =
             env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
@@ -1208,29 +1372,10 @@ impl PlacementRoutingRuntime {
             );
         }
 
-        let placements = load_shard_placements_csv(Path::new(&placement_file))?;
-        if placements.is_empty() {
-            return Err(format!(
-                "placement file '{}' has no placement records",
-                placement_file
-            ));
-        }
-
-        let shard_ids = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS")
-            .unwrap_or_else(|| shard_ids_from_placements(&placements));
-        if shard_ids.is_empty() {
-            return Err("placement routing requires at least one shard id".to_string());
-        }
-        let replica_count =
+        let shard_ids_override = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS");
+        let replica_count_override =
             parse_env_first_usize(&["DASH_ROUTER_REPLICA_COUNT", "EME_ROUTER_REPLICA_COUNT"])
-                .filter(|value| *value > 0)
-                .unwrap_or_else(|| {
-                    placements
-                        .iter()
-                        .map(|placement| placement.replicas.len())
-                        .max()
-                        .unwrap_or(1)
-                });
+                .filter(|value| *value > 0);
         let virtual_nodes_per_shard = parse_env_first_usize(&[
             "DASH_ROUTER_VIRTUAL_NODES_PER_SHARD",
             "EME_ROUTER_VIRTUAL_NODES_PER_SHARD",
@@ -1239,18 +1384,132 @@ impl PlacementRoutingRuntime {
         .unwrap_or(64) as u32;
         let read_preference =
             parse_read_preference_env("DASH_ROUTER_READ_PREFERENCE", "EME_ROUTER_READ_PREFERENCE")?;
-
-        Ok(Some(Self {
-            local_node_id: local_node_id.to_string(),
-            router_config: RouterConfig {
-                shard_ids,
-                virtual_nodes_per_shard,
-                replica_count,
-            },
-            placements,
+        let runtime = load_placement_routing_runtime(
+            Path::new(&placement_file),
+            local_node_id,
+            shard_ids_override.as_deref(),
+            replica_count_override,
+            virtual_nodes_per_shard,
             read_preference,
-        }))
+        )?;
+
+        let reload_interval_ms = parse_env_first_u64(&[
+            "DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+            "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+        ])
+        .filter(|value| *value > 0);
+        let reload = reload_interval_ms.map(|interval_ms| {
+            let reload_interval = Duration::from_millis(interval_ms);
+            PlacementReloadRuntime {
+                config: PlacementReloadConfig {
+                    placement_file: PathBuf::from(&placement_file),
+                    shard_ids_override: shard_ids_override.clone(),
+                    replica_count_override,
+                    virtual_nodes_per_shard,
+                    read_preference,
+                    reload_interval,
+                },
+                next_reload_at: Instant::now() + reload_interval,
+                attempt_total: 0,
+                success_total: 0,
+                failure_total: 0,
+                last_error: None,
+            }
+        });
+
+        Ok(Some(Self { runtime, reload }))
     }
+
+    fn runtime(&self) -> &PlacementRoutingRuntime {
+        &self.runtime
+    }
+
+    fn reload_snapshot(&self) -> PlacementReloadSnapshot {
+        let Some(reload) = self.reload.as_ref() else {
+            return PlacementReloadSnapshot::default();
+        };
+        PlacementReloadSnapshot {
+            enabled: true,
+            interval_ms: Some(reload.config.reload_interval.as_millis() as u64),
+            attempt_total: reload.attempt_total,
+            success_total: reload.success_total,
+            failure_total: reload.failure_total,
+            last_error: reload.last_error.clone(),
+        }
+    }
+
+    fn maybe_refresh(&mut self) {
+        let Some(reload) = self.reload.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < reload.next_reload_at {
+            return;
+        }
+        reload.attempt_total = reload.attempt_total.saturating_add(1);
+        match load_placement_routing_runtime(
+            &reload.config.placement_file,
+            &self.runtime.local_node_id,
+            reload.config.shard_ids_override.as_deref(),
+            reload.config.replica_count_override,
+            reload.config.virtual_nodes_per_shard,
+            reload.config.read_preference,
+        ) {
+            Ok(runtime) => {
+                self.runtime = runtime;
+                reload.success_total = reload.success_total.saturating_add(1);
+                reload.last_error = None;
+            }
+            Err(reason) => {
+                reload.failure_total = reload.failure_total.saturating_add(1);
+                reload.last_error = Some(reason.clone());
+                eprintln!("retrieval placement reload failed: {reason}");
+            }
+        }
+        reload.next_reload_at = now + reload.config.reload_interval;
+    }
+}
+
+fn load_placement_routing_runtime(
+    placement_file: &Path,
+    local_node_id: &str,
+    shard_ids_override: Option<&[u32]>,
+    replica_count_override: Option<usize>,
+    virtual_nodes_per_shard: u32,
+    read_preference: ReadPreference,
+) -> Result<PlacementRoutingRuntime, String> {
+    let placements = load_shard_placements_csv(placement_file)?;
+    if placements.is_empty() {
+        return Err(format!(
+            "placement file '{}' has no placement records",
+            placement_file.display()
+        ));
+    }
+
+    let shard_ids = shard_ids_override
+        .map(|ids| ids.to_vec())
+        .unwrap_or_else(|| shard_ids_from_placements(&placements));
+    if shard_ids.is_empty() {
+        return Err("placement routing requires at least one shard id".to_string());
+    }
+    let replica_count = replica_count_override.unwrap_or_else(|| {
+        placements
+            .iter()
+            .map(|placement| placement.replicas.len())
+            .max()
+            .unwrap_or(1)
+    });
+
+    Ok(PlacementRoutingRuntime {
+        local_node_id: local_node_id.to_string(),
+        router_config: RouterConfig {
+            shard_ids,
+            virtual_nodes_per_shard,
+            replica_count,
+        },
+        placements,
+        read_preference,
+    })
 }
 
 fn parse_read_preference_env(primary: &str, fallback: &str) -> Result<ReadPreference, String> {
@@ -1292,6 +1551,17 @@ fn parse_env_first_usize(keys: &[&str]) -> Option<usize> {
     for key in keys {
         if let Ok(value) = std::env::var(key)
             && let Ok(parsed) = value.parse::<usize>()
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn parse_env_first_u64(keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key)
+            && let Ok(parsed) = value.parse::<u64>()
         {
             return Some(parsed);
         }
@@ -2274,6 +2544,13 @@ mod tests {
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
     use schema::{Claim, Evidence, Stance};
+    use std::{
+        fs::{File, OpenOptions},
+        io::Write,
+        path::PathBuf,
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     fn sample_store() -> InMemoryStore {
         let mut store = InMemoryStore::new();
@@ -2310,6 +2587,34 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    fn temp_placement_csv(contents: &str) -> PathBuf {
+        let mut out = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        out.push(format!(
+            "dash-retrieve-placement-runtime-test-{}-{}.csv",
+            std::process::id(),
+            nanos
+        ));
+        let mut file = File::create(&out).expect("placement file should be created");
+        file.write_all(contents.as_bytes())
+            .expect("placement file should be writable");
+        out
+    }
+
+    fn overwrite_placement_csv(path: &PathBuf, contents: &str) {
+        let mut file = OpenOptions::new()
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("placement file should be writable");
+        file.write_all(contents.as_bytes())
+            .expect("placement file should be writable");
+        file.flush().expect("placement file should flush");
     }
 
     #[test]
@@ -2588,6 +2893,78 @@ mod tests {
     }
 
     #[test]
+    fn placement_state_reloads_from_file_without_restart() {
+        let placement_file = temp_placement_csv(
+            "tenant-a,0,11,node-a,leader,healthy\n\
+tenant-a,0,11,node-b,follower,healthy\n",
+        );
+        let mut state = PlacementRoutingState {
+            runtime: load_placement_routing_runtime(
+                &placement_file,
+                "node-b",
+                Some(&[0]),
+                Some(2),
+                16,
+                ReadPreference::LeaderOnly,
+            )
+            .expect("initial placement should load"),
+            reload: Some(PlacementReloadRuntime {
+                config: PlacementReloadConfig {
+                    placement_file: placement_file.clone(),
+                    shard_ids_override: Some(vec![0]),
+                    replica_count_override: Some(2),
+                    virtual_nodes_per_shard: 16,
+                    read_preference: ReadPreference::LeaderOnly,
+                    reload_interval: Duration::from_millis(1),
+                },
+                next_reload_at: Instant::now(),
+                attempt_total: 0,
+                success_total: 0,
+                failure_total: 0,
+                last_error: None,
+            }),
+        };
+
+        let before = route_read_with_placement(
+            "tenant-a",
+            "company-x",
+            &state.runtime().router_config,
+            &state.runtime().placements,
+            state.runtime().read_preference,
+        )
+        .expect("route should resolve");
+        assert_eq!(before.node_id, "node-a");
+        assert_eq!(before.epoch, 11);
+
+        overwrite_placement_csv(
+            &placement_file,
+            "tenant-a,0,12,node-b,leader,healthy\n\
+tenant-a,0,12,node-a,follower,healthy\n",
+        );
+        thread::sleep(Duration::from_millis(5));
+        state.maybe_refresh();
+
+        let after = route_read_with_placement(
+            "tenant-a",
+            "company-x",
+            &state.runtime().router_config,
+            &state.runtime().placements,
+            state.runtime().read_preference,
+        )
+        .expect("route should resolve");
+        assert_eq!(after.node_id, "node-b");
+        assert_eq!(after.epoch, 12);
+
+        let reload = state.reload_snapshot();
+        assert_eq!(reload.attempt_total, 1);
+        assert_eq!(reload.success_total, 1);
+        assert_eq!(reload.failure_total, 0);
+        assert!(reload.last_error.is_none());
+
+        let _ = std::fs::remove_file(placement_file);
+    }
+
+    #[test]
     fn debug_placement_endpoint_returns_structured_route_probe() {
         let store = sample_store();
         let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -2680,6 +3057,11 @@ mod tests {
             metrics_response
                 .body
                 .contains("dash_retrieve_placement_enabled 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_placement_reload_enabled 0")
         );
         assert!(
             metrics_response

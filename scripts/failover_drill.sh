@@ -11,6 +11,8 @@ TENANT_ID="${DASH_FAILOVER_TENANT_ID:-sample-tenant}"
 ENTITY_KEY="${DASH_FAILOVER_ENTITY_KEY:-company-x}"
 MAX_WAIT_SECONDS="${DASH_FAILOVER_MAX_WAIT_SECONDS:-30}"
 KEEP_ARTIFACTS="false"
+MODE="${DASH_FAILOVER_MODE:-both}"
+PLACEMENT_RELOAD_INTERVAL_MS="${DASH_FAILOVER_PLACEMENT_RELOAD_INTERVAL_MS:-200}"
 
 usage() {
   cat <<'USAGE'
@@ -23,6 +25,9 @@ Options:
   --tenant-id TENANT            Tenant id for routing probes (default: sample-tenant)
   --entity-key KEY              Entity key for placement probes (default: company-x)
   --max-wait-seconds N          Health wait timeout per service (default: 30)
+  --mode MODE                   Drill mode: restart|no-restart|both (default: both)
+  --placement-reload-interval-ms N
+                               Placement live-reload interval in ms (default: 200)
   --keep-artifacts true|false   Keep logs/placement files after run (default: false)
   -h, --help                    Show help
 USAGE
@@ -52,6 +57,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-wait-seconds)
       MAX_WAIT_SECONDS="$2"
+      shift 2
+      ;;
+    --mode)
+      MODE="$2"
+      shift 2
+      ;;
+    --placement-reload-interval-ms)
+      PLACEMENT_RELOAD_INTERVAL_MS="$2"
       shift 2
       ;;
     --keep-artifacts)
@@ -133,6 +146,7 @@ start_services() {
   DASH_INGEST_BIND="${INGEST_BIND}" \
     DASH_ROUTER_PLACEMENT_FILE="${PLACEMENT_FILE}" \
     DASH_ROUTER_LOCAL_NODE_ID="${LOCAL_NODE_ID}" \
+    DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS="${PLACEMENT_RELOAD_INTERVAL_MS}" \
     cargo run -p ingestion -- --serve >"${INGEST_LOG}" 2>&1 &
   INGEST_PID=$!
 
@@ -140,6 +154,7 @@ start_services() {
     DASH_ROUTER_PLACEMENT_FILE="${PLACEMENT_FILE}" \
     DASH_ROUTER_LOCAL_NODE_ID="${LOCAL_NODE_ID}" \
     DASH_ROUTER_READ_PREFERENCE="leader_only" \
+    DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS="${PLACEMENT_RELOAD_INTERVAL_MS}" \
     cargo run -p retrieval -- --serve >"${RETRIEVE_LOG}" 2>&1 &
   RETRIEVE_PID=$!
 
@@ -173,29 +188,105 @@ assert_status() {
   fi
 }
 
+poll_status_until() {
+  local phase="$1"
+  local expected="$2"
+  local method="$3"
+  local url="$4"
+  local body="${5:-}"
+  local deadline=$((SECONDS + MAX_WAIT_SECONDS))
+  local status=""
+  while (( SECONDS < deadline )); do
+    status="$(http_status "${method}" "${url}" "${body}")"
+    if [[ "${status}" == "${expected}" ]]; then
+      echo "[failover-drill] ${phase}: observed HTTP ${status}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "[failover-drill] ${phase}: expected HTTP ${expected}, got ${status}" >&2
+  echo "[failover-drill] ingestion log: ${INGEST_LOG}" >&2
+  echo "[failover-drill] retrieval log: ${RETRIEVE_LOG}" >&2
+  exit 1
+}
+
+run_phase1_rejections() {
+  local claim_id="$1"
+  local phase_body="{\"claim\":{\"claim_id\":\"${claim_id}\",\"tenant_id\":\"${TENANT_ID}\",\"canonical_text\":\"failover drill phase one\",\"confidence\":0.9,\"entities\":[\"${ENTITY_KEY}\"]}}"
+  local phase_ingest_status
+  local phase_retrieve_status
+  phase_ingest_status="$(http_status "POST" "http://${INGEST_BIND}/v1/ingest" "${phase_body}")"
+  phase_retrieve_status="$(http_status "GET" "http://${RETRIEVE_BIND}/v1/retrieve?tenant_id=${TENANT_ID}&query=retrieval+initialized&top_k=1&stance_mode=balanced")"
+  assert_status "phase1 ingest route rejection" "${phase_ingest_status}" "503"
+  assert_status "phase1 retrieve route rejection" "${phase_retrieve_status}" "503"
+}
+
+run_restart_scenario() {
+  echo "[failover-drill] scenario=restart"
+  stop_services
+  write_placement_file 1 "node-a" "node-b"
+  start_services
+  run_phase1_rejections "drill-restart-phase1"
+
+  echo "[failover-drill] scenario=restart phase=2 promote local node and restart services"
+  stop_services
+  write_placement_file 2 "node-b" "node-a"
+  start_services
+
+  local phase2_ingest_body="{\"claim\":{\"claim_id\":\"drill-restart-phase2\",\"tenant_id\":\"${TENANT_ID}\",\"canonical_text\":\"failover drill phase two restart\",\"confidence\":0.9,\"entities\":[\"${ENTITY_KEY}\"]}}"
+  local phase2_ingest_status
+  local phase2_retrieve_status
+  phase2_ingest_status="$(http_status "POST" "http://${INGEST_BIND}/v1/ingest" "${phase2_ingest_body}")"
+  phase2_retrieve_status="$(http_status "GET" "http://${RETRIEVE_BIND}/v1/retrieve?tenant_id=${TENANT_ID}&query=retrieval+initialized&top_k=1&stance_mode=balanced")"
+  assert_status "restart phase2 ingest route acceptance" "${phase2_ingest_status}" "200"
+  assert_status "restart phase2 retrieve route acceptance" "${phase2_retrieve_status}" "200"
+}
+
+run_no_restart_scenario() {
+  echo "[failover-drill] scenario=no-restart"
+  stop_services
+  write_placement_file 1 "node-a" "node-b"
+  start_services
+  run_phase1_rejections "drill-no-restart-phase1"
+
+  echo "[failover-drill] scenario=no-restart phase=2 promote local node without restart"
+  write_placement_file 2 "node-b" "node-a"
+  local phase2_ingest_body="{\"claim\":{\"claim_id\":\"drill-no-restart-phase2\",\"tenant_id\":\"${TENANT_ID}\",\"canonical_text\":\"failover drill phase two no restart\",\"confidence\":0.9,\"entities\":[\"${ENTITY_KEY}\"]}}"
+  poll_status_until \
+    "no-restart phase2 ingest route acceptance" \
+    "200" \
+    "POST" \
+    "http://${INGEST_BIND}/v1/ingest" \
+    "${phase2_ingest_body}"
+  poll_status_until \
+    "no-restart phase2 retrieve route acceptance" \
+    "200" \
+    "GET" \
+    "http://${RETRIEVE_BIND}/v1/retrieve?tenant_id=${TENANT_ID}&query=retrieval+initialized&top_k=1&stance_mode=balanced"
+}
+
 echo "[failover-drill] artifact_dir=${ARTIFACT_DIR}"
-echo "[failover-drill] phase=1 leader=node-a local=${LOCAL_NODE_ID}"
-write_placement_file 1 "node-a" "node-b"
-start_services
 
-phase1_ingest_body="{\"claim\":{\"claim_id\":\"drill-phase1\",\"tenant_id\":\"${TENANT_ID}\",\"canonical_text\":\"failover drill phase one\",\"confidence\":0.9,\"entities\":[\"${ENTITY_KEY}\"]}}"
-phase1_ingest_status="$(http_status "POST" "http://${INGEST_BIND}/v1/ingest" "${phase1_ingest_body}")"
-phase1_retrieve_status="$(http_status "GET" "http://${RETRIEVE_BIND}/v1/retrieve?tenant_id=${TENANT_ID}&query=retrieval+initialized&top_k=1&stance_mode=balanced")"
-assert_status "phase1 ingest route rejection" "${phase1_ingest_status}" "503"
-assert_status "phase1 retrieve route rejection" "${phase1_retrieve_status}" "503"
-
-echo "[failover-drill] phase=2 promote local node to leader and restart services"
-stop_services
-write_placement_file 2 "node-b" "node-a"
-start_services
-
-phase2_ingest_body="{\"claim\":{\"claim_id\":\"drill-phase2\",\"tenant_id\":\"${TENANT_ID}\",\"canonical_text\":\"failover drill phase two\",\"confidence\":0.9,\"entities\":[\"${ENTITY_KEY}\"]}}"
-phase2_ingest_status="$(http_status "POST" "http://${INGEST_BIND}/v1/ingest" "${phase2_ingest_body}")"
-phase2_retrieve_status="$(http_status "GET" "http://${RETRIEVE_BIND}/v1/retrieve?tenant_id=${TENANT_ID}&query=retrieval+initialized&top_k=1&stance_mode=balanced")"
-assert_status "phase2 ingest route acceptance" "${phase2_ingest_status}" "200"
-assert_status "phase2 retrieve route acceptance" "${phase2_retrieve_status}" "200"
+case "${MODE}" in
+  restart)
+    run_restart_scenario
+    ;;
+  no-restart)
+    run_no_restart_scenario
+    ;;
+  both)
+    run_restart_scenario
+    run_no_restart_scenario
+    ;;
+  *)
+    echo "invalid mode '${MODE}'. expected restart|no-restart|both" >&2
+    exit 2
+    ;;
+esac
 
 echo "[failover-drill] success"
+echo "[failover-drill] mode=${MODE}"
+echo "[failover-drill] placement_reload_interval_ms=${PLACEMENT_RELOAD_INTERVAL_MS}"
 echo "[failover-drill] placement_file=${PLACEMENT_FILE}"
 echo "[failover-drill] ingestion_log=${INGEST_LOG}"
 echo "[failover-drill] retrieval_log=${RETRIEVE_LOG}"

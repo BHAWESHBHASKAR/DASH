@@ -118,9 +118,14 @@ fn main() {
             let read_preference =
                 env_with_fallback("DASH_ROUTER_READ_PREFERENCE", "EME_ROUTER_READ_PREFERENCE")
                     .unwrap_or_else(|| "any_healthy".to_string());
+            let reload_interval_ms = env_with_fallback(
+                "DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+                "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+            )
+            .unwrap_or_else(|| "0".to_string());
             println!(
-                "retrieval placement routing: file={}, local_node_id={}, read_preference={}",
-                placement_file, local_node, read_preference
+                "retrieval placement routing: file={}, local_node_id={}, read_preference={}, reload_interval_ms={}",
+                placement_file, local_node, read_preference, reload_interval_ms
             );
         }
         println!("retrieval health endpoint: http://{bind_addr}/health");

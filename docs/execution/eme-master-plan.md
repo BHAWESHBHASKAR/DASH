@@ -25,6 +25,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Metadata router now includes placement-aware routing primitives (leader/follower health policies, read preferences, and failover promotion with epoch bump).
 - Ingestion/retrieval transports now support placement-aware request admission gates (write-leader enforcement on ingest and read-replica preference enforcement on retrieve) using shared placement CSV metadata.
 - Ingestion/retrieval transports now expose placement-debug snapshots and route probe context at `GET /debug/placement`.
+- Ingestion/retrieval transports support optional in-process placement live reload (`DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS`) with reload observability metrics.
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
 - Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters.
 - Ingestion WAL durability now supports configurable batching controls with strict defaults:
@@ -34,7 +35,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - startup safety guardrails reject unsafe durability windows unless explicitly overridden via `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true`
 - Benchmark harness supports smoke, standard, and large fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).
-- Placement failover validation script is available via `scripts/failover_drill.sh`.
+- Placement failover validation script supports restart and no-restart drills via `scripts/failover_drill.sh --mode restart|no-restart|both`.
 - Transport concurrency benchmark tooling is available via `scripts/benchmark_transport_concurrency.sh` and `concurrent_load`.
 - Ingestion WAL durability benchmark comparison tooling is available via `scripts/benchmark_ingest_wal_durability.sh` with history artifacts under `docs/benchmarks/history/concurrency/wal-durability/`.
 - CI supports optional staged trend execution via `DASH_CI_RUN_BENCH_TREND=true`.
@@ -55,7 +56,10 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - contradiction-aware retrieval behavior is enforced
   - graph expansion is bounded in retrieval graph payload assembly
   - contradiction detection F1 probe gate is enforced in benchmark quality probes (`>= 0.80`)
-- Phase 2 (Scale Path): in progress
+- Phase 2 (Scale Path): complete
+  - shard routing/placement admission is active for ingest + retrieve with epoch-aware route probes
+  - failover drill validates routing epoch switch in restart and no-restart modes
+  - immutable segment publish + retrieval prefilter merge path is implemented with `segment base + WAL delta` semantics
 
 ## 3. Success Targets (v1)
 

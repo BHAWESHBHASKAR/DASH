@@ -30,7 +30,7 @@ pub struct IngestionRuntime {
     wal: Option<FileWal>,
     checkpoint_policy: CheckpointPolicy,
     segment_runtime: Option<SegmentRuntime>,
-    placement_routing: Result<Option<PlacementRoutingRuntime>, String>,
+    placement_routing: Result<Option<PlacementRoutingState>, String>,
     successful_ingests: u64,
     failed_ingests: u64,
     segment_publish_success_total: u64,
@@ -60,7 +60,7 @@ impl IngestionRuntime {
             wal: None,
             checkpoint_policy: CheckpointPolicy::default(),
             segment_runtime: SegmentRuntime::from_env(),
-            placement_routing: PlacementRoutingRuntime::from_env(),
+            placement_routing: PlacementRoutingState::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
             segment_publish_success_total: 0,
@@ -94,7 +94,7 @@ impl IngestionRuntime {
             wal: Some(wal),
             checkpoint_policy,
             segment_runtime: SegmentRuntime::from_env(),
-            placement_routing: PlacementRoutingRuntime::from_env(),
+            placement_routing: PlacementRoutingState::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
             segment_publish_success_total: 0,
@@ -128,11 +128,13 @@ impl IngestionRuntime {
 
     pub fn placement_routing_summary(&self) -> Option<String> {
         let routing = self.placement_routing.as_ref().ok()?.as_ref()?;
+        let reload_interval_ms = routing.reload_snapshot().interval_ms.unwrap_or_default();
         Some(format!(
-            "local_node_id={}, shards={}, replicas_per_shard={}",
-            routing.local_node_id,
-            routing.router_config.shard_ids.len(),
-            routing.router_config.replica_count
+            "local_node_id={}, shards={}, replicas_per_shard={}, reload_interval_ms={}",
+            routing.runtime().local_node_id,
+            routing.runtime().router_config.shard_ids.len(),
+            routing.runtime().router_config.replica_count,
+            reload_interval_ms
         ))
     }
 
@@ -147,19 +149,22 @@ impl IngestionRuntime {
         mut self,
         runtime: Result<Option<PlacementRoutingRuntime>, String>,
     ) -> Self {
-        self.placement_routing = runtime;
+        self.placement_routing =
+            runtime.map(|state| state.map(PlacementRoutingState::from_static_runtime));
         self
     }
 
     fn ensure_local_write_route_for_claim(&mut self, claim: &Claim) -> Result<(), WriteRouteError> {
-        let Some(routing) = self
+        let Some(routing_state) = self
             .placement_routing
-            .as_ref()
+            .as_mut()
             .map_err(|reason| WriteRouteError::Config(reason.clone()))?
-            .as_ref()
+            .as_mut()
         else {
             return Ok(());
         };
+        routing_state.maybe_refresh();
+        let routing = routing_state.runtime();
         let entity_key = write_entity_key_for_claim(claim);
         let routed = route_write_with_placement(
             &claim.tenant_id,
@@ -296,12 +301,18 @@ impl IngestionRuntime {
         }
     }
 
+    fn refresh_placement_if_due(&mut self) {
+        if let Ok(Some(state)) = self.placement_routing.as_mut() {
+            state.maybe_refresh();
+        }
+    }
+
     fn metrics_text(&self) -> String {
         let placement_enabled = self
             .placement_routing
             .as_ref()
             .ok()
-            .and_then(|runtime| runtime.as_ref())
+            .and_then(|state| state.as_ref())
             .map(|_| 1)
             .unwrap_or(0);
         let placement_config_error = if self.placement_routing.is_err() {
@@ -309,12 +320,16 @@ impl IngestionRuntime {
         } else {
             0
         };
-        let placement_snapshot = self
+        let placement_state = self
             .placement_routing
             .as_ref()
             .ok()
-            .and_then(|runtime| runtime.as_ref())
-            .map(PlacementRoutingRuntime::observability_snapshot)
+            .and_then(|state| state.as_ref());
+        let placement_snapshot = placement_state
+            .map(PlacementRoutingState::observability_snapshot)
+            .unwrap_or_default();
+        let placement_reload_snapshot = placement_state
+            .map(PlacementRoutingState::reload_snapshot)
             .unwrap_or_default();
         let placement_last_shard_id = self
             .placement_last_shard_id
@@ -383,6 +398,16 @@ dash_ingest_placement_replicas_healthy {}\n\
 dash_ingest_placement_replicas_degraded {}\n\
 # TYPE dash_ingest_placement_replicas_unavailable gauge\n\
 dash_ingest_placement_replicas_unavailable {}\n\
+# TYPE dash_ingest_placement_reload_enabled gauge\n\
+dash_ingest_placement_reload_enabled {}\n\
+# TYPE dash_ingest_placement_reload_attempt_total counter\n\
+dash_ingest_placement_reload_attempt_total {}\n\
+# TYPE dash_ingest_placement_reload_success_total counter\n\
+dash_ingest_placement_reload_success_total {}\n\
+# TYPE dash_ingest_placement_reload_failure_total counter\n\
+dash_ingest_placement_reload_failure_total {}\n\
+# TYPE dash_ingest_placement_reload_last_error gauge\n\
+dash_ingest_placement_reload_last_error {}\n\
 # TYPE dash_ingest_wal_unsynced_records gauge\n\
 dash_ingest_wal_unsynced_records {}\n\
 # TYPE dash_ingest_wal_buffered_records gauge\n\
@@ -420,6 +445,11 @@ dash_ingest_uptime_seconds {:.4}\n",
             placement_snapshot.replicas_healthy,
             placement_snapshot.replicas_degraded,
             placement_snapshot.replicas_unavailable,
+            placement_reload_snapshot.enabled as usize,
+            placement_reload_snapshot.attempt_total,
+            placement_reload_snapshot.success_total,
+            placement_reload_snapshot.failure_total,
+            placement_reload_snapshot.last_error.is_some() as usize,
             wal_unsynced_records,
             wal_buffered_records,
             self.wal_flush_due_total,
@@ -457,6 +487,31 @@ struct PlacementRoutingRuntime {
     placements: Vec<ShardPlacement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementRoutingState {
+    runtime: PlacementRoutingRuntime,
+    reload: Option<PlacementReloadRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementReloadRuntime {
+    config: PlacementReloadConfig,
+    next_reload_at: Instant,
+    attempt_total: u64,
+    success_total: u64,
+    failure_total: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementReloadConfig {
+    placement_file: PathBuf,
+    shard_ids_override: Option<Vec<u32>>,
+    replica_count_override: Option<usize>,
+    virtual_nodes_per_shard: u32,
+    reload_interval: Duration,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PlacementObservabilitySnapshot {
     leaders_total: usize,
@@ -464,6 +519,16 @@ struct PlacementObservabilitySnapshot {
     replicas_healthy: usize,
     replicas_degraded: usize,
     replicas_unavailable: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PlacementReloadSnapshot {
+    enabled: bool,
+    interval_ms: Option<u64>,
+    attempt_total: u64,
+    success_total: u64,
+    failure_total: u64,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,7 +627,7 @@ impl SegmentRuntime {
     }
 }
 
-impl PlacementRoutingRuntime {
+impl PlacementRoutingState {
     fn from_env() -> Result<Option<Self>, String> {
         let Some(placement_file) =
             env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
@@ -585,46 +650,149 @@ impl PlacementRoutingRuntime {
             );
         }
 
-        let placements = load_shard_placements_csv(Path::new(&placement_file))?;
-        if placements.is_empty() {
-            return Err(format!(
-                "placement file '{}' has no placement records",
-                placement_file
-            ));
-        }
-
-        let shard_ids = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS")
-            .unwrap_or_else(|| shard_ids_from_placements(&placements));
-        if shard_ids.is_empty() {
-            return Err("placement routing requires at least one shard id".to_string());
-        }
-        let replica_count =
+        let shard_ids_override = parse_csv_u32_env("DASH_ROUTER_SHARD_IDS", "EME_ROUTER_SHARD_IDS");
+        let replica_count_override =
             parse_env_first_usize(&["DASH_ROUTER_REPLICA_COUNT", "EME_ROUTER_REPLICA_COUNT"])
-                .filter(|value| *value > 0)
-                .unwrap_or_else(|| {
-                    placements
-                        .iter()
-                        .map(|placement| placement.replicas.len())
-                        .max()
-                        .unwrap_or(1)
-                });
+                .filter(|value| *value > 0);
         let virtual_nodes_per_shard = parse_env_first_usize(&[
             "DASH_ROUTER_VIRTUAL_NODES_PER_SHARD",
             "EME_ROUTER_VIRTUAL_NODES_PER_SHARD",
         ])
         .filter(|value| *value > 0)
         .unwrap_or(64) as u32;
+        let runtime = load_placement_routing_runtime(
+            Path::new(&placement_file),
+            local_node_id,
+            shard_ids_override.as_deref(),
+            replica_count_override,
+            virtual_nodes_per_shard,
+        )?;
 
-        Ok(Some(Self {
-            local_node_id: local_node_id.to_string(),
-            router_config: RouterConfig {
-                shard_ids,
-                virtual_nodes_per_shard,
-                replica_count,
-            },
-            placements,
-        }))
+        let reload_interval_ms = parse_env_first_u64(&[
+            "DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+            "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
+        ])
+        .filter(|value| *value > 0);
+        let reload = reload_interval_ms.map(|interval_ms| {
+            let reload_interval = Duration::from_millis(interval_ms);
+            PlacementReloadRuntime {
+                config: PlacementReloadConfig {
+                    placement_file: PathBuf::from(&placement_file),
+                    shard_ids_override: shard_ids_override.clone(),
+                    replica_count_override,
+                    virtual_nodes_per_shard,
+                    reload_interval,
+                },
+                next_reload_at: Instant::now() + reload_interval,
+                attempt_total: 0,
+                success_total: 0,
+                failure_total: 0,
+                last_error: None,
+            }
+        });
+
+        Ok(Some(Self { runtime, reload }))
     }
+
+    #[cfg(test)]
+    fn from_static_runtime(runtime: PlacementRoutingRuntime) -> Self {
+        Self {
+            runtime,
+            reload: None,
+        }
+    }
+
+    fn runtime(&self) -> &PlacementRoutingRuntime {
+        &self.runtime
+    }
+
+    fn observability_snapshot(&self) -> PlacementObservabilitySnapshot {
+        self.runtime.observability_snapshot()
+    }
+
+    fn reload_snapshot(&self) -> PlacementReloadSnapshot {
+        let Some(reload) = self.reload.as_ref() else {
+            return PlacementReloadSnapshot::default();
+        };
+        PlacementReloadSnapshot {
+            enabled: true,
+            interval_ms: Some(reload.config.reload_interval.as_millis() as u64),
+            attempt_total: reload.attempt_total,
+            success_total: reload.success_total,
+            failure_total: reload.failure_total,
+            last_error: reload.last_error.clone(),
+        }
+    }
+
+    fn maybe_refresh(&mut self) {
+        let Some(reload) = self.reload.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < reload.next_reload_at {
+            return;
+        }
+        reload.attempt_total = reload.attempt_total.saturating_add(1);
+        match load_placement_routing_runtime(
+            &reload.config.placement_file,
+            &self.runtime.local_node_id,
+            reload.config.shard_ids_override.as_deref(),
+            reload.config.replica_count_override,
+            reload.config.virtual_nodes_per_shard,
+        ) {
+            Ok(runtime) => {
+                self.runtime = runtime;
+                reload.success_total = reload.success_total.saturating_add(1);
+                reload.last_error = None;
+            }
+            Err(reason) => {
+                reload.failure_total = reload.failure_total.saturating_add(1);
+                reload.last_error = Some(reason.clone());
+                eprintln!("ingestion placement reload failed: {reason}");
+            }
+        }
+        reload.next_reload_at = now + reload.config.reload_interval;
+    }
+}
+
+fn load_placement_routing_runtime(
+    placement_file: &Path,
+    local_node_id: &str,
+    shard_ids_override: Option<&[u32]>,
+    replica_count_override: Option<usize>,
+    virtual_nodes_per_shard: u32,
+) -> Result<PlacementRoutingRuntime, String> {
+    let placements = load_shard_placements_csv(placement_file)?;
+    if placements.is_empty() {
+        return Err(format!(
+            "placement file '{}' has no placement records",
+            placement_file.display()
+        ));
+    }
+
+    let shard_ids = shard_ids_override
+        .map(|ids| ids.to_vec())
+        .unwrap_or_else(|| shard_ids_from_placements(&placements));
+    if shard_ids.is_empty() {
+        return Err("placement routing requires at least one shard id".to_string());
+    }
+    let replica_count = replica_count_override.unwrap_or_else(|| {
+        placements
+            .iter()
+            .map(|placement| placement.replicas.len())
+            .max()
+            .unwrap_or(1)
+    });
+
+    Ok(PlacementRoutingRuntime {
+        local_node_id: local_node_id.to_string(),
+        router_config: RouterConfig {
+            shard_ids,
+            virtual_nodes_per_shard,
+            replica_count,
+        },
+        placements,
+    })
 }
 
 fn write_entity_key_for_claim(claim: &Claim) -> &str {
@@ -888,6 +1056,7 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
             let body = match runtime.lock() {
                 Ok(mut rt) => {
                     rt.flush_wal_if_due();
+                    rt.refresh_placement_if_due();
                     rt.metrics_text()
                 }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
@@ -895,7 +1064,10 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
             HttpResponse::ok_text(body)
         }
         ("GET", "/debug/placement") => match runtime.lock() {
-            Ok(rt) => HttpResponse::ok_json(render_placement_debug_json(&rt, &query)),
+            Ok(mut rt) => {
+                rt.refresh_placement_if_due();
+                HttpResponse::ok_json(render_placement_debug_json(&rt, &query))
+            }
             Err(_) => {
                 HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
             }
@@ -1036,17 +1208,26 @@ fn render_placement_debug_json(
     runtime: &IngestionRuntime,
     query: &HashMap<String, String>,
 ) -> String {
-    let (enabled, config_error, local_node_id, shard_count, placements, route_probe) =
+    let (enabled, config_error, local_node_id, shard_count, placements, route_probe, reload) =
         match runtime.placement_routing.as_ref() {
             Ok(Some(routing)) => (
                 true,
                 None,
-                Some(routing.local_node_id.clone()),
-                routing.router_config.shard_ids.len(),
-                routing.placements.as_slice(),
-                build_write_route_probe_json(Some(routing), query),
+                Some(routing.runtime().local_node_id.clone()),
+                routing.runtime().router_config.shard_ids.len(),
+                routing.runtime().placements.as_slice(),
+                build_write_route_probe_json(Some(routing.runtime()), query),
+                render_placement_reload_json(Some(routing)),
             ),
-            Ok(None) => (false, None, None, 0, &[][..], "null".to_string()),
+            Ok(None) => (
+                false,
+                None,
+                None,
+                0,
+                &[][..],
+                "null".to_string(),
+                render_placement_reload_json(None),
+            ),
             Err(reason) => (
                 false,
                 Some(reason.as_str()),
@@ -1054,11 +1235,12 @@ fn render_placement_debug_json(
                 0,
                 &[][..],
                 "null".to_string(),
+                render_placement_reload_json(None),
             ),
         };
 
     format!(
-        "{{\"enabled\":{},\"config_error\":{},\"local_node_id\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{}}}",
+        "{{\"enabled\":{},\"config_error\":{},\"local_node_id\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{},\"reload\":{}}}",
         enabled,
         config_error
             .map(|value| format!("\"{}\"", json_escape(value)))
@@ -1069,7 +1251,30 @@ fn render_placement_debug_json(
             .unwrap_or_else(|| "null".to_string()),
         shard_count,
         render_placements_json(placements),
-        route_probe
+        route_probe,
+        reload
+    )
+}
+
+fn render_placement_reload_json(state: Option<&PlacementRoutingState>) -> String {
+    let snapshot = state
+        .map(PlacementRoutingState::reload_snapshot)
+        .unwrap_or_default();
+    format!(
+        "{{\"enabled\":{},\"interval_ms\":{},\"attempt_total\":{},\"success_total\":{},\"failure_total\":{},\"last_error\":{}}}",
+        snapshot.enabled,
+        snapshot
+            .interval_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        snapshot.attempt_total,
+        snapshot.success_total,
+        snapshot.failure_total,
+        snapshot
+            .last_error
+            .as_ref()
+            .map(|value| format!("\"{}\"", json_escape(value)))
+            .unwrap_or_else(|| "null".to_string()),
     )
 }
 
@@ -1204,6 +1409,17 @@ fn parse_env_first_usize(keys: &[&str]) -> Option<usize> {
     for key in keys {
         if let Ok(value) = std::env::var(key)
             && let Ok(parsed) = value.parse::<usize>()
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn parse_env_first_u64(keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key)
+            && let Ok(parsed) = value.parse::<u64>()
         {
             return Some(parsed);
         }
@@ -2449,7 +2665,7 @@ mod tests {
                 .expect("placement config should be present")
                 .as_mut()
                 .expect("placement routing should be enabled");
-            let epoch = promote_replica_to_leader(&mut routing.placements[0], "node-b")
+            let epoch = promote_replica_to_leader(&mut routing.runtime.placements[0], "node-b")
                 .expect("promotion should succeed");
             assert_eq!(epoch, 10);
         }

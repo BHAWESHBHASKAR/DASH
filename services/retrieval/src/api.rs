@@ -95,7 +95,6 @@ struct SegmentCacheEntry {
 
 static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
     OnceLock::new();
-static SEGMENT_PREFILTER_REFRESH_INTERVAL: OnceLock<Duration> = OnceLock::new();
 static SEGMENT_PREFILTER_CACHE_METRICS: OnceLock<SegmentPrefilterCacheMetricAtoms> =
     OnceLock::new();
 
@@ -475,16 +474,14 @@ fn sanitize_path_component(raw: &str) -> String {
 }
 
 fn segment_prefilter_refresh_interval() -> Duration {
-    *SEGMENT_PREFILTER_REFRESH_INTERVAL.get_or_init(|| {
-        let refresh_ms = env_with_fallback(
-            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
-            "EME_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
-        )
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1_000);
-        Duration::from_millis(refresh_ms)
-    })
+    let refresh_ms = env_with_fallback(
+        "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+        "EME_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|value| *value > 0)
+    .unwrap_or(1_000);
+    Duration::from_millis(refresh_ms)
 }
 
 fn segment_prefilter_cache() -> &'static RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>> {

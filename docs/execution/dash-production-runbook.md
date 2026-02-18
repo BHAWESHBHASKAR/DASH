@@ -133,17 +133,21 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `dash_ingest_wal_flush_due_total`, `dash_ingest_wal_flush_success_total`, `dash_ingest_wal_flush_failure_total`
   - `dash_ingest_auth_success_total`, `dash_ingest_auth_failure_total`, `dash_ingest_authz_denied_total`
   - `dash_ingest_audit_events_total`, `dash_ingest_audit_write_error_total`
+  - `dash_ingest_placement_route_reject_total`, `dash_ingest_placement_last_epoch`
+  - `dash_ingest_placement_reload_enabled`, `dash_ingest_placement_reload_attempt_total`, `dash_ingest_placement_reload_failure_total`
   - `dash_ingest_claims_total`
 - monitor `/metrics` for:
   - `dash_retrieve_latency_ms_p50`, `dash_retrieve_latency_ms_p95`, `dash_retrieve_latency_ms_p99`
   - `dash_ingest_to_visible_lag_ms_p50`, `dash_ingest_to_visible_lag_ms_p95` (estimated from claim event-time where present)
   - `dash_transport_auth_success_total`, `dash_transport_auth_failure_total`, `dash_transport_authz_denied_total`
   - `dash_transport_audit_events_total`, `dash_transport_audit_write_error_total`
+  - `dash_retrieve_placement_route_reject_total`, `dash_retrieve_placement_last_epoch`
+  - `dash_retrieve_placement_reload_enabled`, `dash_retrieve_placement_reload_attempt_total`, `dash_retrieve_placement_reload_failure_total`
 - keep benchmark history guard active in CI before production promotion
 - run benchmark trend automation for release candidates:
   - `scripts/benchmark_trend.sh --run-tag release-candidate`
 - run placement failover drill before release candidates:
-  - `scripts/failover_drill.sh --keep-artifacts true`
+  - `scripts/failover_drill.sh --mode both --placement-reload-interval-ms 200 --keep-artifacts true`
 
 ## 8. Incident Response (Minimal)
 

@@ -54,7 +54,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 
 ### 4.2 Distributed system gaps
 
-- No active shard placement service wired into ingestion/retrieval data plane.
+- No dedicated dynamic placement control-plane service (current routing uses file-backed placement metadata with optional live reload).
 - No replica replication stream and follower catch-up protocol.
 - No automatic leader election/failover runtime across shard replicas.
 

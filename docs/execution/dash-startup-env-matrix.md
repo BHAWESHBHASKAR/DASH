@@ -24,6 +24,7 @@ Status: active
 | `DASH_ROUTER_SHARD_IDS` | no | inferred from placement file | optional shard ring override (comma-separated u32 IDs) | `EME_ROUTER_SHARD_IDS` |
 | `DASH_ROUTER_VIRTUAL_NODES_PER_SHARD` | no | `64` | optional virtual-node count for consistent-hash shard ring | `EME_ROUTER_VIRTUAL_NODES_PER_SHARD` |
 | `DASH_ROUTER_REPLICA_COUNT` | no | inferred from placement file | optional replica count override for routing plan | `EME_ROUTER_REPLICA_COUNT` |
+| `DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` | no | unset (`0` / disabled) | optional live placement reload interval for in-process route re-resolution (no-restart failover) | `EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` |
 | `DASH_INGEST_WAL_PATH` | yes (for persistence) | none | WAL path for durable claim/evidence/edge writes | `EME_INGEST_WAL_PATH` |
 | `DASH_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | WAL durability batch interval (`1` = fsync every append; `N>1` = group-commit style sync every N records) | `EME_INGEST_WAL_SYNC_EVERY_RECORDS` |
 | `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS` | no | `1` | in-process WAL append buffer threshold before flushing batched lines to disk | `EME_INGEST_WAL_APPEND_BUFFER_RECORDS` |
@@ -56,6 +57,7 @@ Status: active
 | `DASH_ROUTER_SHARD_IDS` | no | inferred from placement file | optional shard ring override (comma-separated u32 IDs) | `EME_ROUTER_SHARD_IDS` |
 | `DASH_ROUTER_VIRTUAL_NODES_PER_SHARD` | no | `64` | optional virtual-node count for consistent-hash shard ring | `EME_ROUTER_VIRTUAL_NODES_PER_SHARD` |
 | `DASH_ROUTER_REPLICA_COUNT` | no | inferred from placement file | optional replica count override for routing plan | `EME_ROUTER_REPLICA_COUNT` |
+| `DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` | no | unset (`0` / disabled) | optional live placement reload interval for in-process route re-resolution (no-restart failover) | `EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` |
 | `DASH_RETRIEVAL_WAL_PATH` | no | unset | WAL path for startup replay mode | `EME_RETRIEVAL_WAL_PATH` |
 | `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` | no | `12` | ANN base-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` |
 | `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` | no | `6` | ANN upper-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` |

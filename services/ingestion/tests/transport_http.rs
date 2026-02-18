@@ -1,9 +1,11 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::File,
+    fs::{File, OpenOptions},
     io::Write,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -74,6 +76,17 @@ fn temp_placement_csv(contents: &str) -> PathBuf {
     file.write_all(contents.as_bytes())
         .expect("placement file should be writable");
     out
+}
+
+fn overwrite_placement_csv(path: &PathBuf, contents: &str) {
+    let mut file = OpenOptions::new()
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .expect("placement file should be writable");
+    file.write_all(contents.as_bytes())
+        .expect("placement file should be writable");
+    file.flush().expect("placement file should flush");
 }
 
 #[test]
@@ -165,6 +178,59 @@ tenant-http,0,7,node-b,follower,healthy\n",
     assert!(debug_response.contains("\"enabled\":true"));
     assert!(debug_response.contains("\"local_node_id\":\"node-b\""));
     assert!(debug_response.contains("\"target_node_id\":\"node-a\""));
+
+    let _ = std::fs::remove_file(placement_file);
+}
+
+#[test]
+fn transport_reloads_placement_routing_without_restart() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let placement_file = temp_placement_csv(
+        "tenant-http,0,7,node-a,leader,healthy\n\
+tenant-http,0,7,node-b,follower,healthy\n",
+    );
+    let _placement_env = EnvVarGuard::set("DASH_ROUTER_PLACEMENT_FILE", placement_file.as_os_str());
+    let _local_node_env = EnvVarGuard::set("DASH_ROUTER_LOCAL_NODE_ID", OsStr::new("node-b"));
+    let _reload_interval_env =
+        EnvVarGuard::set("DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS", OsStr::new("1"));
+
+    let runtime = sample_runtime();
+    let denied_body = r#"{"claim":{"claim_id":"claim-routing-before","tenant_id":"tenant-http","canonical_text":"Placement reload check","confidence":0.9,"entities":["company-x"]}}"#;
+    let denied_request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        denied_body.len(),
+        denied_body
+    );
+    let denied_response = handle_http_request_bytes(&runtime, denied_request.as_bytes())
+        .expect("request should parse and return response");
+    let denied_response = String::from_utf8(denied_response).expect("response should be UTF-8");
+    assert!(denied_response.starts_with("HTTP/1.1 503"));
+
+    overwrite_placement_csv(
+        &placement_file,
+        "tenant-http,0,8,node-b,leader,healthy\n\
+tenant-http,0,8,node-a,follower,healthy\n",
+    );
+    thread::sleep(Duration::from_millis(5));
+
+    let accepted_body = r#"{"claim":{"claim_id":"claim-routing-after","tenant_id":"tenant-http","canonical_text":"Placement reload check","confidence":0.9,"entities":["company-x"]}}"#;
+    let accepted_request = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        accepted_body.len(),
+        accepted_body
+    );
+    let accepted_response = handle_http_request_bytes(&runtime, accepted_request.as_bytes())
+        .expect("request should parse and return response");
+    let accepted_response = String::from_utf8(accepted_response).expect("response should be UTF-8");
+    assert!(accepted_response.starts_with("HTTP/1.1 200 OK"));
+
+    let debug_request = b"GET /debug/placement?tenant_id=tenant-http&entity_key=company-x HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let debug_response = handle_http_request_bytes(&runtime, debug_request)
+        .expect("debug request should parse and return response");
+    let debug_response = String::from_utf8(debug_response).expect("response should be UTF-8");
+    assert!(debug_response.contains("\"epoch\":8"));
+    assert!(debug_response.contains("\"local_admission\":true"));
+    assert!(debug_response.contains("\"reload\":{\"enabled\":true"));
 
     let _ = std::fs::remove_file(placement_file);
 }
