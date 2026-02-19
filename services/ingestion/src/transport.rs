@@ -13,6 +13,7 @@ mod audit;
 mod authz;
 mod config;
 mod http;
+mod ingest_routes;
 mod json;
 mod payload;
 mod persistence;
