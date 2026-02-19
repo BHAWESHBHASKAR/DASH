@@ -42,8 +42,8 @@ use placement_routing::{
     PlacementRoutingState, WriteRouteError, map_write_route_error, write_entity_key_for_claim,
 };
 use replication::{
-    ReplicationPullConfig, parse_replication_delta_frame, parse_replication_export_frame,
-    render_replication_delta_frame, render_replication_export_frame, request_replication_source,
+    ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
+    render_replication_export_frame, run_replication_pull_tick,
 };
 use request::{parse_query_usize, parse_request_line, read_http_request, split_target};
 use schema::Claim;
@@ -1572,130 +1572,6 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
-    }
-}
-
-fn replication_token() -> Option<String> {
-    env_with_fallback(
-        "DASH_INGEST_REPLICATION_TOKEN",
-        "EME_INGEST_REPLICATION_TOKEN",
-    )
-    .map(|value| value.trim().to_string())
-    .filter(|value| !value.is_empty())
-}
-
-fn is_replication_request_authorized(request: &HttpRequest) -> bool {
-    let Some(expected_token) = replication_token() else {
-        return true;
-    };
-    request
-        .headers
-        .get("x-replication-token")
-        .is_some_and(|value| value == &expected_token)
-}
-
-fn run_replication_pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) {
-    let from_offset = match runtime.lock() {
-        Ok(guard) => guard.replication_last_offset,
-        Err(_) => return,
-    };
-    let delta_response = match request_replication_source(
-        &config.wal_pull_url(from_offset),
-        config.token.as_deref(),
-    ) {
-        Ok(response) => response,
-        Err(err) => {
-            if let Ok(mut guard) = runtime.lock() {
-                guard.observe_replication_pull_failure(err.clone());
-            }
-            eprintln!("replication pull tick failed requesting WAL delta: {err}");
-            return;
-        }
-    };
-    if delta_response.status != 200 {
-        let message = format!(
-            "replication source WAL delta returned status {}",
-            delta_response.status
-        );
-        if let Ok(mut guard) = runtime.lock() {
-            guard.observe_replication_pull_failure(message.clone());
-        }
-        eprintln!("{message}");
-        return;
-    }
-    let delta_frame = match parse_replication_delta_frame(&delta_response.body) {
-        Ok(frame) => frame,
-        Err(err) => {
-            if let Ok(mut guard) = runtime.lock() {
-                guard.observe_replication_pull_failure(err.clone());
-            }
-            eprintln!("replication pull tick failed parsing WAL delta: {err}");
-            return;
-        }
-    };
-    if delta_frame.needs_resync {
-        let export_response =
-            match request_replication_source(&config.export_url(), config.token.as_deref()) {
-                Ok(response) => response,
-                Err(err) => {
-                    if let Ok(mut guard) = runtime.lock() {
-                        guard.observe_replication_pull_failure(err.clone());
-                    }
-                    eprintln!("replication resync failed requesting export: {err}");
-                    return;
-                }
-            };
-        if export_response.status != 200 {
-            let message = format!(
-                "replication export returned non-200 status: {}",
-                export_response.status
-            );
-            if let Ok(mut guard) = runtime.lock() {
-                guard.observe_replication_pull_failure(message.clone());
-            }
-            eprintln!("{message}");
-            return;
-        }
-        let export_frame = match parse_replication_export_frame(&export_response.body) {
-            Ok(frame) => frame,
-            Err(err) => {
-                if let Ok(mut guard) = runtime.lock() {
-                    guard.observe_replication_pull_failure(err.clone());
-                }
-                eprintln!("replication resync failed parsing export: {err}");
-                return;
-            }
-        };
-        let result = runtime
-            .lock()
-            .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
-            .and_then(|mut guard| {
-                guard.apply_replication_export(WalReplicationExport {
-                    snapshot_lines: export_frame.snapshot_lines,
-                    wal_lines: export_frame.wal_lines,
-                })
-            });
-        if let Err(err) = result {
-            let message = format!("replication resync apply failed: {err:?}");
-            if let Ok(mut guard) = runtime.lock() {
-                guard.observe_replication_pull_failure(message.clone());
-            }
-            eprintln!("{message}");
-        }
-        return;
-    }
-    let result = runtime
-        .lock()
-        .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
-        .and_then(|mut guard| {
-            guard.apply_replication_delta_lines(&delta_frame.wal_lines, delta_frame.next_offset)
-        });
-    if let Err(err) = result {
-        let message = format!("replication delta apply failed: {err:?}");
-        if let Ok(mut guard) = runtime.lock() {
-            guard.observe_replication_pull_failure(message.clone());
-        }
-        eprintln!("{message}");
     }
 }
 
