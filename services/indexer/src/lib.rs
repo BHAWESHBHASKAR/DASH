@@ -4,6 +4,7 @@ use std::{
     fs::{File, OpenOptions, create_dir_all, read_dir, remove_file, rename},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use store::{InMemoryStore, StoreIndexStats};
@@ -251,6 +252,20 @@ pub fn prune_unreferenced_segment_files(
     active_manifest: &SegmentManifest,
     previous_manifest: Option<&SegmentManifest>,
 ) -> Result<usize, SegmentStoreError> {
+    prune_unreferenced_segment_files_with_min_stale_age(
+        root_dir,
+        active_manifest,
+        previous_manifest,
+        Duration::ZERO,
+    )
+}
+
+pub fn prune_unreferenced_segment_files_with_min_stale_age(
+    root_dir: &Path,
+    active_manifest: &SegmentManifest,
+    previous_manifest: Option<&SegmentManifest>,
+    min_stale_age: Duration,
+) -> Result<usize, SegmentStoreError> {
     let mut keep_files: HashSet<&str> = active_manifest
         .entries
         .iter()
@@ -280,6 +295,15 @@ pub fn prune_unreferenced_segment_files(
         }
         if keep_files.contains(file_name) {
             continue;
+        }
+        if min_stale_age > Duration::ZERO {
+            let metadata = entry.metadata()?;
+            if let Ok(modified) = metadata.modified()
+                && let Ok(elapsed) = modified.elapsed()
+                && elapsed < min_stale_age
+            {
+                continue;
+            }
         }
         match remove_file(&path) {
             Ok(()) => {

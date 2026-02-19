@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{OpenOptions, create_dir_all},
+    fs::{OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_tok
 use indexer::{
     CompactionSchedulerConfig, SegmentStoreError, apply_compaction_plan, build_segments,
     load_manifest, persist_segments_atomic, plan_compaction_round,
-    prune_unreferenced_segment_files,
+    prune_unreferenced_segment_files, prune_unreferenced_segment_files_with_min_stale_age,
 };
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig, ShardPlacement,
@@ -46,6 +46,12 @@ pub struct IngestionRuntime {
     segment_last_segment_count: usize,
     segment_last_compaction_plans: usize,
     segment_last_stale_file_pruned_count: usize,
+    segment_maintenance_tick_total: u64,
+    segment_maintenance_success_total: u64,
+    segment_maintenance_failure_total: u64,
+    segment_maintenance_last_pruned_count: usize,
+    segment_maintenance_last_tenant_dirs: usize,
+    segment_maintenance_last_tenant_manifests: usize,
     auth_success_total: u64,
     auth_failure_total: u64,
     authz_denied_total: u64,
@@ -113,6 +119,12 @@ impl IngestionRuntime {
             segment_last_segment_count: 0,
             segment_last_compaction_plans: 0,
             segment_last_stale_file_pruned_count: 0,
+            segment_maintenance_tick_total: 0,
+            segment_maintenance_success_total: 0,
+            segment_maintenance_failure_total: 0,
+            segment_maintenance_last_pruned_count: 0,
+            segment_maintenance_last_tenant_dirs: 0,
+            segment_maintenance_last_tenant_manifests: 0,
             auth_success_total: 0,
             auth_failure_total: 0,
             authz_denied_total: 0,
@@ -152,6 +164,12 @@ impl IngestionRuntime {
             segment_last_segment_count: 0,
             segment_last_compaction_plans: 0,
             segment_last_stale_file_pruned_count: 0,
+            segment_maintenance_tick_total: 0,
+            segment_maintenance_success_total: 0,
+            segment_maintenance_failure_total: 0,
+            segment_maintenance_last_pruned_count: 0,
+            segment_maintenance_last_tenant_dirs: 0,
+            segment_maintenance_last_tenant_manifests: 0,
             auth_success_total: 0,
             auth_failure_total: 0,
             authz_denied_total: 0,
@@ -393,6 +411,31 @@ impl IngestionRuntime {
         }
     }
 
+    pub(crate) fn segment_maintenance_interval(&self) -> Option<Duration> {
+        self.segment_runtime.as_ref()?.maintenance_interval
+    }
+
+    pub(crate) fn run_segment_maintenance_tick(&mut self) {
+        let Some(segment_runtime) = self.segment_runtime.as_ref() else {
+            return;
+        };
+        self.segment_maintenance_tick_total = self.segment_maintenance_tick_total.saturating_add(1);
+        match segment_runtime.maintain_all_tenants() {
+            Ok(stats) => {
+                self.segment_maintenance_success_total =
+                    self.segment_maintenance_success_total.saturating_add(1);
+                self.segment_maintenance_last_pruned_count = stats.pruned_file_count;
+                self.segment_maintenance_last_tenant_dirs = stats.tenant_dirs_scanned;
+                self.segment_maintenance_last_tenant_manifests = stats.tenant_manifests_found;
+            }
+            Err(err) => {
+                self.segment_maintenance_failure_total =
+                    self.segment_maintenance_failure_total.saturating_add(1);
+                eprintln!("ingestion segment maintenance tick failed: {err:?}");
+            }
+        }
+    }
+
     fn metrics_text(&self) -> String {
         let placement_enabled = self
             .placement_routing
@@ -479,6 +522,18 @@ dash_ingest_segment_last_segment_count {}\n\
 dash_ingest_segment_last_compaction_plans {}\n\
 # TYPE dash_ingest_segment_last_stale_file_pruned_count gauge\n\
 dash_ingest_segment_last_stale_file_pruned_count {}\n\
+# TYPE dash_ingest_segment_maintenance_tick_total counter\n\
+dash_ingest_segment_maintenance_tick_total {}\n\
+# TYPE dash_ingest_segment_maintenance_success_total counter\n\
+dash_ingest_segment_maintenance_success_total {}\n\
+# TYPE dash_ingest_segment_maintenance_failure_total counter\n\
+dash_ingest_segment_maintenance_failure_total {}\n\
+# TYPE dash_ingest_segment_maintenance_last_pruned_count gauge\n\
+dash_ingest_segment_maintenance_last_pruned_count {}\n\
+# TYPE dash_ingest_segment_maintenance_last_tenant_dirs gauge\n\
+dash_ingest_segment_maintenance_last_tenant_dirs {}\n\
+# TYPE dash_ingest_segment_maintenance_last_tenant_manifests gauge\n\
+dash_ingest_segment_maintenance_last_tenant_manifests {}\n\
 # TYPE dash_ingest_auth_success_total counter\n\
 dash_ingest_auth_success_total {}\n\
 # TYPE dash_ingest_auth_failure_total counter\n\
@@ -557,6 +612,12 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.segment_last_segment_count,
             self.segment_last_compaction_plans,
             self.segment_last_stale_file_pruned_count,
+            self.segment_maintenance_tick_total,
+            self.segment_maintenance_success_total,
+            self.segment_maintenance_failure_total,
+            self.segment_maintenance_last_pruned_count,
+            self.segment_maintenance_last_tenant_dirs,
+            self.segment_maintenance_last_tenant_manifests,
             self.auth_success_total,
             self.auth_failure_total,
             self.authz_denied_total,
@@ -602,12 +663,16 @@ const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
+const DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS: u64 = 30_000;
+const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentRuntime {
     root_dir: PathBuf,
     max_segment_size: usize,
     scheduler: CompactionSchedulerConfig,
+    maintenance_interval: Option<Duration>,
+    maintenance_min_stale_age: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -616,6 +681,13 @@ struct SegmentPublishStats {
     segment_count: usize,
     compaction_plan_count: usize,
     stale_file_pruned_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SegmentMaintenanceStats {
+    tenant_dirs_scanned: usize,
+    tenant_manifests_found: usize,
+    pruned_file_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,6 +801,20 @@ impl SegmentRuntime {
         ])
         .filter(|value| *value > 1)
         .unwrap_or(4);
+        let maintenance_interval = parse_env_first_u64(&[
+            "DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS",
+            "EME_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS",
+        ])
+        .or(Some(DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS))
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis);
+        let maintenance_min_stale_age = Duration::from_millis(
+            parse_env_first_u64(&[
+                "DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS",
+                "EME_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS",
+            ])
+            .unwrap_or(DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS),
+        );
         Some(Self {
             root_dir: PathBuf::from(root_dir),
             max_segment_size,
@@ -736,6 +822,8 @@ impl SegmentRuntime {
                 max_segments_per_tier,
                 max_compaction_input_segments,
             },
+            maintenance_interval,
+            maintenance_min_stale_age,
         })
     }
 
@@ -766,6 +854,34 @@ impl SegmentRuntime {
 
     fn tenant_segment_dir(&self, tenant_id: &str) -> PathBuf {
         self.root_dir.join(sanitize_path_component(tenant_id))
+    }
+
+    fn maintain_all_tenants(&self) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
+        create_dir_all(&self.root_dir)?;
+        let mut stats = SegmentMaintenanceStats::default();
+        for entry in read_dir(&self.root_dir)? {
+            let entry = entry?;
+            let tenant_dir = entry.path();
+            if !tenant_dir.is_dir() {
+                continue;
+            }
+            stats.tenant_dirs_scanned += 1;
+
+            let manifest = match load_manifest(&tenant_dir)? {
+                Some(manifest) => manifest,
+                None => continue,
+            };
+            let _ = indexer::load_segments_from_manifest(&tenant_dir, &manifest)?;
+            stats.tenant_manifests_found += 1;
+            let pruned = prune_unreferenced_segment_files_with_min_stale_age(
+                &tenant_dir,
+                &manifest,
+                None,
+                self.maintenance_min_stale_age,
+            )?;
+            stats.pruned_file_count += pruned;
+        }
+        Ok(stats)
     }
 }
 
@@ -1035,6 +1151,7 @@ pub fn serve_http_with_workers(
     let worker_count = worker_count.max(1);
     let queue_capacity = resolve_http_queue_capacity(worker_count);
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
+    let segment_maintenance_interval = runtime.segment_maintenance_interval();
     let runtime = Arc::new(Mutex::new(runtime));
     let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
     if let Ok(mut guard) = runtime.lock() {
@@ -1043,6 +1160,7 @@ pub fn serve_http_with_workers(
     let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
     let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
+    let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
 
     std::thread::scope(|scope| {
         if let Some(async_interval) = wal_async_flush_interval {
@@ -1057,6 +1175,22 @@ pub fn serve_http_with_workers(
                         break;
                     };
                     guard.flush_wal_for_async_tick();
+                    guard.refresh_placement_if_due();
+                }
+            });
+        }
+        if let Some(maintenance_interval) = segment_maintenance_interval {
+            let runtime = Arc::clone(&runtime);
+            scope.spawn(move || {
+                loop {
+                    match segment_shutdown_rx.recv_timeout(maintenance_interval) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let Ok(mut guard) = runtime.lock() else {
+                        break;
+                    };
+                    guard.run_segment_maintenance_tick();
                     guard.refresh_placement_if_due();
                 }
             });
@@ -1114,6 +1248,7 @@ pub fn serve_http_with_workers(
             }
         }
         let _ = flush_shutdown_tx.send(());
+        let _ = segment_shutdown_tx.send(());
         drop(tx);
     });
 
@@ -2931,6 +3066,7 @@ impl HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexer::{Segment, Tier, persist_segments_atomic};
     use metadata_router::{
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
@@ -3711,6 +3847,8 @@ mod tests {
                         max_segments_per_tier: 2,
                         max_compaction_input_segments: 2,
                     },
+                    maintenance_interval: None,
+                    maintenance_min_stale_age: Duration::from_millis(0),
                 },
             )),
         ));
@@ -3745,6 +3883,59 @@ mod tests {
                 .body
                 .contains("dash_ingest_segment_last_claim_count 1")
         );
+
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn segment_maintenance_prunes_orphan_segment_files() {
+        let mut root_dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        root_dir.push(format!(
+            "dash-ingest-segment-maintenance-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+
+        let tenant_dir = root_dir.join("tenant-a");
+        persist_segments_atomic(
+            &tenant_dir,
+            &[Segment {
+                segment_id: "hot-0".to_string(),
+                tier: Tier::Hot,
+                claim_ids: vec!["c1".to_string()],
+            }],
+        )
+        .expect("segment persist should succeed");
+        let orphan_segment = tenant_dir.join("orphan.seg");
+        std::fs::write(&orphan_segment, "orphan-segment")
+            .expect("orphan segment write should succeed");
+        assert!(orphan_segment.exists());
+
+        let mut runtime = IngestionRuntime::in_memory(InMemoryStore::new())
+            .with_segment_runtime_for_tests(Some(SegmentRuntime {
+                root_dir: root_dir.clone(),
+                max_segment_size: 1,
+                scheduler: CompactionSchedulerConfig {
+                    max_segments_per_tier: 2,
+                    max_compaction_input_segments: 2,
+                },
+                maintenance_interval: Some(Duration::from_millis(1)),
+                maintenance_min_stale_age: Duration::from_millis(0),
+            }));
+        runtime.run_segment_maintenance_tick();
+
+        assert!(!orphan_segment.exists());
+        let metrics = runtime.metrics_text();
+        assert!(metrics.contains("dash_ingest_segment_maintenance_tick_total 1"));
+        assert!(metrics.contains("dash_ingest_segment_maintenance_success_total 1"));
+        assert!(metrics.contains("dash_ingest_segment_maintenance_failure_total 0"));
+        assert!(metrics.contains("dash_ingest_segment_maintenance_last_pruned_count 1"));
+        assert!(metrics.contains("dash_ingest_segment_maintenance_last_tenant_dirs 1"));
+        assert!(metrics.contains("dash_ingest_segment_maintenance_last_tenant_manifests 1"));
 
         let _ = std::fs::remove_dir_all(root_dir);
     }

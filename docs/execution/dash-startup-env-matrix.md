@@ -28,6 +28,8 @@ Status: active
 | `DASH_INGEST_SEGMENT_MAX_SEGMENT_SIZE` | no | `10000` | max claim IDs per segment before per-tier chunking | `EME_INGEST_SEGMENT_MAX_SEGMENT_SIZE` |
 | `DASH_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER` | no | `8` | compaction planning threshold per tier | `EME_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER` |
 | `DASH_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS` | no | `4` | max input segments consumed per compaction plan | `EME_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS` |
+| `DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS` | no | `30000` | in-process segment lifecycle maintenance tick interval; `0` disables scheduled maintenance worker | `EME_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS` |
+| `DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS` | no | `60000` | minimum age for unreferenced `.seg` files before maintenance GC can delete them | `EME_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS` |
 | `DASH_ROUTER_PLACEMENT_FILE` | no | unset | optional shard placement CSV file path (enables placement-aware write routing) | `EME_ROUTER_PLACEMENT_FILE` |
 | `DASH_ROUTER_LOCAL_NODE_ID` | conditional (required when `DASH_ROUTER_PLACEMENT_FILE` is set) | unset | local node identity used to verify this ingestion instance is the routed write leader | `EME_ROUTER_LOCAL_NODE_ID` |
 | `DASH_NODE_ID` | conditional alias | unset | fallback alias for local node identity if `DASH_ROUTER_LOCAL_NODE_ID` is unset | `EME_NODE_ID` |

@@ -510,6 +510,7 @@ Current implementation notes (2026-02-18):
   - manifest/segment reader with checksum integrity verification
   - compaction scheduler planning hook and compaction-plan application helper
 - ingestion publish now runs stale segment file GC after manifest swap, retaining active + previous manifest files for reader safety.
+- ingestion transport now runs a scheduled segment maintenance loop to verify tenant manifests and prune aged unreferenced segment files.
 - ingestion runtime can publish tenant-scoped immutable segment snapshots to disk (`DASH_INGEST_SEGMENT_DIR`).
 - retrieval API can apply segment-backed claim prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`) as a bounded read-path prototype.
 - retrieval read source-of-truth is now explicit: `immutable segment base + mutable WAL delta`, then optional metadata prefilter intersection.

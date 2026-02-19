@@ -38,6 +38,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transports support optional in-process placement live reload (`DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS`) with reload observability metrics.
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
 - Ingestion segment publish now enforces on-disk stale segment GC with one-generation safety retention (`active manifest + previous manifest`) to bound disk growth without breaking in-flight readers.
+- Ingestion transport now includes a scheduled in-process segment lifecycle maintenance worker (`DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS`) with stale-age policy control (`DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS`) and maintenance metrics.
 - Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters.
 - Ingestion WAL durability now supports configurable batching controls with strict defaults:
   - sync batch threshold: `DASH_INGEST_WAL_SYNC_EVERY_RECORDS`
