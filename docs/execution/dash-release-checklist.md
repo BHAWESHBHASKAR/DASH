@@ -6,7 +6,7 @@ Status: active
 ## 1. Pre-Release Validation
 
 - [ ] preferred: run consolidated gate with release settings:
-  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --verify-ingestion-audit <ingestion-audit.jsonl> --verify-retrieval-audit <retrieval-audit.jsonl> --ingest-min-rps <floor>`
+  - `scripts/release_candidate_gate.sh --run-tag release-candidate --run-benchmark-trend true --slo-include-recovery-drill true --run-incident-simulation-guard true --verify-ingestion-audit <ingestion-audit.jsonl> --verify-retrieval-audit <retrieval-audit.jsonl> --ingest-min-rps <floor>`
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
 - [ ] `cargo test --workspace`
@@ -43,6 +43,8 @@ Status: active
   - `scripts/restore_state_bundle.sh --bundle <bundle.tar.gz> --wal-path <wal> --verify-only true`
 - [ ] recovery drill pass with measured RTO/RPO:
   - `scripts/recovery_drill.sh --max-rto-seconds 60`
+- [ ] incident simulation gate pass (routing failover + auth revocation + recovery):
+  - `scripts/incident_simulation_gate.sh --failover-mode no-restart --recovery-max-rto-seconds 60`
 
 ## 4. Post-Deploy Verification
 

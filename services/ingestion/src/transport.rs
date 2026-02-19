@@ -62,10 +62,36 @@ pub struct IngestionRuntime {
 }
 
 #[derive(Debug, Default)]
-struct TransportBackpressureMetrics {
-    queue_depth: AtomicUsize,
-    queue_capacity: usize,
-    queue_full_reject_total: AtomicU64,
+pub(crate) struct TransportBackpressureMetrics {
+    pub(crate) queue_depth: AtomicUsize,
+    pub(crate) queue_capacity: usize,
+    pub(crate) queue_full_reject_total: AtomicU64,
+}
+
+impl TransportBackpressureMetrics {
+    pub(crate) fn new(queue_capacity: usize) -> Self {
+        Self {
+            queue_depth: AtomicUsize::new(0),
+            queue_capacity,
+            queue_full_reject_total: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn observe_enqueued(&self) {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_dequeued(&self) {
+        let _ = self
+            .queue_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+
+    pub(crate) fn observe_rejected(&self) {
+        self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl IngestionRuntime {
@@ -349,7 +375,10 @@ impl IngestionRuntime {
         self.wal_async_flush_interval
     }
 
-    fn set_transport_backpressure_metrics(&mut self, metrics: Arc<TransportBackpressureMetrics>) {
+    pub(crate) fn set_transport_backpressure_metrics(
+        &mut self,
+        metrics: Arc<TransportBackpressureMetrics>,
+    ) {
         self.transport_backpressure = Some(metrics);
     }
 
@@ -950,7 +979,7 @@ fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
     }
 }
 
-fn resolve_http_queue_capacity(worker_count: usize) -> usize {
+pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     let default_capacity = worker_count
         .saturating_mul(DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER)
         .max(worker_count);
@@ -962,13 +991,20 @@ fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     .unwrap_or(default_capacity)
 }
 
+const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: ingestion worker queue full";
+
+pub(crate) fn backpressure_rejection_response() -> HttpResponse {
+    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
+}
+
 fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-    let body = r#"{"error":"service unavailable: ingestion worker queue full"}"#;
+    let response = backpressure_rejection_response();
     let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        body.len(),
-        body
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response.content_type,
+        response.body.len(),
+        response.body
     );
     stream.write_all(response.as_bytes())
 }
@@ -987,11 +1023,7 @@ pub fn serve_http_with_workers(
     let queue_capacity = resolve_http_queue_capacity(worker_count);
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let runtime = Arc::new(Mutex::new(runtime));
-    let backpressure_metrics = Arc::new(TransportBackpressureMetrics {
-        queue_depth: AtomicUsize::new(0),
-        queue_capacity,
-        queue_full_reject_total: AtomicU64::new(0),
-    });
+    let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
     if let Ok(mut guard) = runtime.lock() {
         guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
     }
@@ -1030,9 +1062,7 @@ pub fn serve_http_with_workers(
                         };
                         match guard.recv() {
                             Ok(stream) => {
-                                backpressure_metrics
-                                    .queue_depth
-                                    .fetch_sub(1, Ordering::Relaxed);
+                                backpressure_metrics.observe_dequeued();
                                 stream
                             }
                             Err(_) => break,
@@ -1047,25 +1077,26 @@ pub fn serve_http_with_workers(
 
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => match tx.try_send(stream) {
-                    Ok(()) => {
-                        backpressure_metrics
-                            .queue_depth
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(mpsc::TrySendError::Full(stream)) => {
-                        backpressure_metrics
-                            .queue_full_reject_total
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Err(err) = write_backpressure_response(stream) {
-                            eprintln!("ingestion transport backpressure response failed: {err}");
+                Ok(stream) => {
+                    backpressure_metrics.observe_enqueued();
+                    match tx.try_send(stream) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(stream)) => {
+                            backpressure_metrics.observe_dequeued();
+                            backpressure_metrics.observe_rejected();
+                            if let Err(err) = write_backpressure_response(stream) {
+                                eprintln!(
+                                    "ingestion transport backpressure response failed: {err}"
+                                );
+                            }
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            backpressure_metrics.observe_dequeued();
+                            eprintln!("ingestion transport worker queue closed");
+                            break;
                         }
                     }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        eprintln!("ingestion transport worker queue closed");
-                        break;
-                    }
-                },
+                }
                 Err(err) => eprintln!("ingestion transport accept error: {err}"),
             }
         }

@@ -11,6 +11,11 @@ SLO_ITERATIONS="${DASH_RELEASE_GATE_SLO_ITERATIONS:-}"
 SLO_HISTORY_PATH="${DASH_RELEASE_GATE_SLO_HISTORY_PATH:-docs/benchmarks/history/runs/slo-history.csv}"
 SLO_INCLUDE_RECOVERY_DRILL="${DASH_RELEASE_GATE_SLO_INCLUDE_RECOVERY_DRILL:-false}"
 RECOVERY_MAX_RTO_SECONDS="${DASH_RELEASE_GATE_RECOVERY_MAX_RTO_SECONDS:-60}"
+RUN_INCIDENT_SIMULATION_GUARD="${DASH_RELEASE_GATE_RUN_INCIDENT_SIMULATION_GUARD:-false}"
+INCIDENT_SIMULATION_FAILOVER_MODE="${DASH_RELEASE_GATE_INCIDENT_FAILOVER_MODE:-no-restart}"
+INCIDENT_SIMULATION_FAILOVER_MAX_WAIT_SECONDS="${DASH_RELEASE_GATE_INCIDENT_FAILOVER_MAX_WAIT_SECONDS:-30}"
+INCIDENT_SIMULATION_AUTH_MAX_WAIT_SECONDS="${DASH_RELEASE_GATE_INCIDENT_AUTH_MAX_WAIT_SECONDS:-30}"
+INCIDENT_SIMULATION_RECOVERY_MAX_RTO_SECONDS="${DASH_RELEASE_GATE_INCIDENT_RECOVERY_MAX_RTO_SECONDS:-60}"
 RUN_BENCH_TREND="${DASH_RELEASE_GATE_RUN_BENCH_TREND:-false}"
 BENCH_INCLUDE_LARGE="${DASH_RELEASE_GATE_BENCH_INCLUDE_LARGE:-true}"
 BENCH_INCLUDE_XLARGE="${DASH_RELEASE_GATE_BENCH_INCLUDE_XLARGE:-false}"
@@ -47,6 +52,14 @@ Options:
   --slo-include-recovery-drill true|false
                                        Include recovery signal inside slo_guard step
   --recovery-max-rto-seconds N         Max allowed recovery drill RTO seconds
+  --run-incident-simulation-guard true|false
+                                       Run failover + auth revocation + recovery simulation gate
+  --incident-failover-mode MODE        Incident failover mode: restart|no-restart|both
+  --incident-failover-max-wait-seconds N
+                                       Incident failover drill health/poll timeout
+  --incident-auth-max-wait-seconds N   Incident auth revocation drill health timeout
+  --incident-recovery-max-rto-seconds N
+                                       Incident recovery drill max RTO threshold
   --run-benchmark-trend true|false     Run benchmark_trend as part of gate
   --bench-include-large true|false     Include large profile in benchmark_trend
   --bench-include-xlarge true|false    Include xlarge profile in benchmark_trend
@@ -106,6 +119,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --recovery-max-rto-seconds)
       RECOVERY_MAX_RTO_SECONDS="$2"
+      shift 2
+      ;;
+    --run-incident-simulation-guard)
+      RUN_INCIDENT_SIMULATION_GUARD="$2"
+      shift 2
+      ;;
+    --incident-failover-mode)
+      INCIDENT_SIMULATION_FAILOVER_MODE="$2"
+      shift 2
+      ;;
+    --incident-failover-max-wait-seconds)
+      INCIDENT_SIMULATION_FAILOVER_MAX_WAIT_SECONDS="$2"
+      shift 2
+      ;;
+    --incident-auth-max-wait-seconds)
+      INCIDENT_SIMULATION_AUTH_MAX_WAIT_SECONDS="$2"
+      shift 2
+      ;;
+    --incident-recovery-max-rto-seconds)
+      INCIDENT_SIMULATION_RECOVERY_MAX_RTO_SECONDS="$2"
       shift 2
       ;;
     --run-benchmark-trend)
@@ -213,6 +246,7 @@ validate_bool() {
 }
 
 validate_bool "--slo-include-recovery-drill" "${SLO_INCLUDE_RECOVERY_DRILL}"
+validate_bool "--run-incident-simulation-guard" "${RUN_INCIDENT_SIMULATION_GUARD}"
 validate_bool "--run-benchmark-trend" "${RUN_BENCH_TREND}"
 validate_bool "--bench-include-large" "${BENCH_INCLUDE_LARGE}"
 validate_bool "--bench-include-xlarge" "${BENCH_INCLUDE_XLARGE}"
@@ -229,6 +263,25 @@ if [[ ! "${RECOVERY_MAX_RTO_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "[release-gate] --recovery-max-rto-seconds must be a non-negative integer" >&2
   exit 2
 fi
+if [[ ! "${INCIDENT_SIMULATION_FAILOVER_MAX_WAIT_SECONDS}" =~ ^[0-9]+$ || "${INCIDENT_SIMULATION_FAILOVER_MAX_WAIT_SECONDS}" -eq 0 ]]; then
+  echo "[release-gate] --incident-failover-max-wait-seconds must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${INCIDENT_SIMULATION_AUTH_MAX_WAIT_SECONDS}" =~ ^[0-9]+$ || "${INCIDENT_SIMULATION_AUTH_MAX_WAIT_SECONDS}" -eq 0 ]]; then
+  echo "[release-gate] --incident-auth-max-wait-seconds must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "${INCIDENT_SIMULATION_RECOVERY_MAX_RTO_SECONDS}" =~ ^[0-9]+$ || "${INCIDENT_SIMULATION_RECOVERY_MAX_RTO_SECONDS}" -eq 0 ]]; then
+  echo "[release-gate] --incident-recovery-max-rto-seconds must be a positive integer" >&2
+  exit 2
+fi
+case "${INCIDENT_SIMULATION_FAILOVER_MODE}" in
+  restart|no-restart|both) ;;
+  *)
+    echo "[release-gate] --incident-failover-mode must be one of: restart, no-restart, both" >&2
+    exit 2
+    ;;
+esac
 for int_opt in \
   "${INGEST_THROUGHPUT_MIN_RPS}" \
   "${INGEST_THROUGHPUT_WORKERS}" \
@@ -400,6 +453,24 @@ run_step "slo guard" "${SLO_CMD[*]}" "${SLO_CMD[@]}"
 
 run_step "recovery drill" "scripts/recovery_drill.sh --max-rto-seconds ${RECOVERY_MAX_RTO_SECONDS}" \
   scripts/recovery_drill.sh --max-rto-seconds "${RECOVERY_MAX_RTO_SECONDS}"
+
+if [[ "${RUN_INCIDENT_SIMULATION_GUARD}" == "true" ]]; then
+  INCIDENT_CMD=(
+    scripts/incident_simulation_gate.sh
+    --run-tag "${RUN_TAG}-incident"
+    --summary-dir "${SUMMARY_DIR}"
+    --run-failover-drill true
+    --failover-mode "${INCIDENT_SIMULATION_FAILOVER_MODE}"
+    --failover-max-wait-seconds "${INCIDENT_SIMULATION_FAILOVER_MAX_WAIT_SECONDS}"
+    --run-auth-revocation-drill true
+    --auth-max-wait-seconds "${INCIDENT_SIMULATION_AUTH_MAX_WAIT_SECONDS}"
+    --run-recovery-drill true
+    --recovery-max-rto-seconds "${INCIDENT_SIMULATION_RECOVERY_MAX_RTO_SECONDS}"
+  )
+  run_step "incident simulation gate" "${INCIDENT_CMD[*]}" "${INCIDENT_CMD[@]}"
+else
+  skip_step "incident simulation gate" "scripts/incident_simulation_gate.sh --run-tag ${RUN_TAG}-incident" "disabled"
+fi
 
 if [[ "${RUN_INGEST_THROUGHPUT_GUARD}" == "true" ]]; then
   THROUGHPUT_CMD=(

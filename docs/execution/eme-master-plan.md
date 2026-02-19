@@ -19,7 +19,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Retrieval transport exposes runtime metrics at `/metrics` including DASH latency percentiles and visibility-lag estimates.
 - Schema layer includes claim/evidence metadata for citation-grade retrieval (`entities`, `embedding_ids`, `chunk_id`, `span_start`, `span_end`) with backward-compatible WAL replay.
 - Ingestion/retrieval transports support configurable HTTP worker pools for concurrent request handling (`DASH_*_HTTP_WORKERS`).
-- Ingestion std transport now uses a bounded worker queue with backpressure metrics (`DASH_INGEST_HTTP_QUEUE_CAPACITY`, queue depth/full-reject counters).
+- Ingestion and retrieval transport runtimes (`std` and `axum`) now enforce bounded admission with shared backpressure metrics (`DASH_*_HTTP_QUEUE_CAPACITY`, queue depth/full-reject counters).
 - Ingestion/retrieval transports support runtime selection (`std` default, optional `axum`) via `DASH_*_TRANSPORT_RUNTIME` with `EME_*` fallback.
 - Ingestion/retrieval transports include tenant-scoped authz policy controls (`DASH_*_ALLOWED_TENANTS`, `DASH_*_API_KEY_SCOPES`) and optional JSONL audit trails (`DASH_*_AUDIT_LOG_PATH`).
 - Audit trails are now tamper-evident with chained hashes (`seq`, `prev_hash`, `hash`) and verifiable via `scripts/verify_audit_chain.sh`.
@@ -52,6 +52,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - CI supports optional staged trend execution via `DASH_CI_RUN_BENCH_TREND=true`.
 - SLO/error-budget gate automation is available via `scripts/slo_guard.sh` (benchmark SLI checks + rolling failed-run budget + optional recovery drill signal).
 - Consolidated release-candidate gate automation is available via `scripts/release_candidate_gate.sh` (fmt/clippy/tests/ci + SLO + recovery + ingestion throughput floor + optional audit-chain and benchmark trend gates).
+- Incident simulation gate automation is available via `scripts/incident_simulation_gate.sh` (failover + auth revocation + recovery drills) with `scripts/auth_revocation_drill.sh` for focused auth-failure drills.
 - CI pipeline (`scripts/ci.sh`) runs fmt, clippy, workspace tests, and smoke benchmark.
 - Production packaging and operations artifacts are available:
   - `docs/execution/dash-production-runbook.md`
@@ -64,9 +65,12 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/backup_state_bundle.sh`
   - `scripts/restore_state_bundle.sh`
   - `scripts/recovery_drill.sh`
+  - `scripts/auth_revocation_drill.sh`
+  - `scripts/incident_simulation_gate.sh`
   - `scripts/slo_guard.sh`
   - `scripts/verify_audit_chain.sh`
   - `scripts/release_candidate_gate.sh`
+  - `docs/execution/dash-security-threat-model-signoff.md`
 
 ### 2.1 Milestone Status (2026-02-18)
 

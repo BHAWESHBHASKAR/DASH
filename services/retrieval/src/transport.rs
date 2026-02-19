@@ -4,7 +4,11 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,7 +27,41 @@ const METRICS_WINDOW_SIZE: usize = 2048;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 type SharedPlacementRouting = Arc<Mutex<Option<PlacementRoutingState>>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct TransportBackpressureMetrics {
+    pub(crate) queue_depth: AtomicUsize,
+    pub(crate) queue_capacity: usize,
+    pub(crate) queue_full_reject_total: AtomicU64,
+}
+
+impl TransportBackpressureMetrics {
+    pub(crate) fn new(queue_capacity: usize) -> Self {
+        Self {
+            queue_depth: AtomicUsize::new(0),
+            queue_capacity,
+            queue_full_reject_total: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn observe_enqueued(&self) {
+        self.queue_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_dequeued(&self) {
+        let _ = self
+            .queue_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+
+    pub(crate) fn observe_rejected(&self) {
+        self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlacementRoutingRuntime {
@@ -118,6 +156,7 @@ pub(crate) struct TransportMetrics {
     retrieve_last_result_count: usize,
     retrieve_latency_ms_window: VecDeque<f64>,
     ingest_to_visible_lag_ms_window: VecDeque<f64>,
+    transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
 }
 
 impl Default for TransportMetrics {
@@ -149,11 +188,19 @@ impl Default for TransportMetrics {
             retrieve_last_result_count: 0,
             retrieve_latency_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
             ingest_to_visible_lag_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
+            transport_backpressure: None,
         }
     }
 }
 
 impl TransportMetrics {
+    pub(crate) fn set_transport_backpressure_metrics(
+        &mut self,
+        metrics: Arc<TransportBackpressureMetrics>,
+    ) {
+        self.transport_backpressure = Some(metrics);
+    }
+
     fn push_window(window: &mut VecDeque<f64>, value: f64) {
         if window.len() >= METRICS_WINDOW_SIZE {
             let _ = window.pop_front();
@@ -271,6 +318,21 @@ impl TransportMetrics {
             Some(ReplicaRole::Follower) => 2,
             None => 0,
         };
+        let transport_queue_capacity = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_capacity)
+            .unwrap_or(0);
+        let transport_queue_depth = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_depth.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let transport_queue_full_reject_total = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
+            .unwrap_or(0);
 
         format!(
             "# TYPE dash_http_requests_total counter\n\
@@ -297,6 +359,12 @@ dash_transport_authz_denied_total {}\n\
 dash_transport_audit_events_total {}\n\
 # TYPE dash_transport_audit_write_error_total counter\n\
 dash_transport_audit_write_error_total {}\n\
+# TYPE dash_retrieve_transport_queue_capacity gauge\n\
+dash_retrieve_transport_queue_capacity {}\n\
+# TYPE dash_retrieve_transport_queue_depth gauge\n\
+dash_retrieve_transport_queue_depth {}\n\
+# TYPE dash_retrieve_transport_queue_full_reject_total counter\n\
+dash_retrieve_transport_queue_full_reject_total {}\n\
 # TYPE dash_retrieve_placement_enabled gauge\n\
 dash_retrieve_placement_enabled {}\n\
 # TYPE dash_retrieve_placement_route_reject_total counter\n\
@@ -355,6 +423,9 @@ dash_transport_uptime_seconds {:.4}\n",
             self.authz_denied_total,
             self.audit_events_total,
             self.audit_write_error_total,
+            transport_queue_capacity,
+            transport_queue_depth,
+            transport_queue_full_reject_total,
             placement_enabled,
             self.placement_route_reject_total,
             placement_last_shard_id,
@@ -382,6 +453,36 @@ dash_transport_uptime_seconds {:.4}\n",
     }
 }
 
+pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
+    let default_capacity = worker_count
+        .saturating_mul(DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER)
+        .max(worker_count);
+    parse_env_first_usize(&[
+        "DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY",
+        "EME_RETRIEVAL_HTTP_QUEUE_CAPACITY",
+    ])
+    .filter(|value| *value > 0)
+    .unwrap_or(default_capacity)
+}
+
+const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: retrieval worker queue full";
+
+pub(crate) fn backpressure_rejection_response() -> HttpResponse {
+    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
+}
+
+fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+    let response = backpressure_rejection_response();
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response.content_type,
+        response.body.len(),
+        response.body
+    );
+    stream.write_all(response.as_bytes())
+}
+
 pub fn serve_http(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
     serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS)
 }
@@ -394,6 +495,11 @@ pub fn serve_http_with_workers(
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+    let queue_capacity = resolve_http_queue_capacity(worker_count);
+    let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
+    if let Ok(mut guard) = metrics.lock() {
+        guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
+    }
     let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
         |reason| {
             std::io::Error::new(
@@ -402,7 +508,7 @@ pub fn serve_http_with_workers(
             )
         },
     )?));
-    let (tx, rx) = mpsc::channel::<TcpStream>();
+    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
 
     std::thread::scope(|scope| {
@@ -410,6 +516,7 @@ pub fn serve_http_with_workers(
             let metrics = Arc::clone(&metrics);
             let rx = Arc::clone(&rx);
             let placement_routing = Arc::clone(&placement_routing);
+            let backpressure_metrics = Arc::clone(&backpressure_metrics);
             scope.spawn(move || {
                 loop {
                     let stream = {
@@ -418,7 +525,10 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         };
                         match guard.recv() {
-                            Ok(stream) => stream,
+                            Ok(stream) => {
+                                backpressure_metrics.observe_dequeued();
+                                stream
+                            }
                             Err(_) => break,
                         }
                     };
@@ -433,9 +543,23 @@ pub fn serve_http_with_workers(
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if tx.send(stream).is_err() {
-                        eprintln!("retrieval transport worker queue closed");
-                        break;
+                    backpressure_metrics.observe_enqueued();
+                    match tx.try_send(stream) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(stream)) => {
+                            backpressure_metrics.observe_dequeued();
+                            backpressure_metrics.observe_rejected();
+                            if let Err(err) = write_backpressure_response(stream) {
+                                eprintln!(
+                                    "retrieval transport backpressure response failed: {err}"
+                                );
+                            }
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            backpressure_metrics.observe_dequeued();
+                            eprintln!("retrieval transport worker queue closed");
+                            break;
+                        }
                     }
                 }
                 Err(err) => eprintln!("retrieval transport accept error: {err}"),
@@ -664,7 +788,7 @@ fn handle_request(store: &InMemoryStore, request: &HttpRequest) -> HttpResponse 
     handle_request_with_metrics(store, request, &metrics)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "async-transport"))]
 pub(crate) fn handle_request_with_metrics(
     store: &InMemoryStore,
     request: &HttpRequest,
@@ -2897,9 +3021,11 @@ mod tests {
     };
     use schema::{Claim, Evidence, Stance};
     use std::{
+        ffi::OsStr,
         fs::{File, OpenOptions},
         io::Write,
         path::PathBuf,
+        sync::{Mutex, OnceLock},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -2967,6 +3093,29 @@ mod tests {
         file.write_all(contents.as_bytes())
             .expect("placement file should be writable");
         file.flush().expect("placement file should flush");
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[allow(unused_unsafe)]
+    fn set_env_var_for_tests(key: &str, value: &str) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    fn restore_env_var_for_tests(key: &str, value: Option<&OsStr>) {
+        unsafe {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
     }
 
     #[test]
@@ -3418,8 +3567,84 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert!(
             metrics_response
                 .body
+                .contains("dash_retrieve_transport_queue_capacity 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_transport_queue_depth 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_transport_queue_full_reject_total 0")
+        );
+        assert!(
+            metrics_response
+                .body
                 .contains("dash_retrieve_latency_ms_p95")
         );
+    }
+
+    #[test]
+    fn metrics_endpoint_reports_backpressure_queue_values() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let queue_metrics = Arc::new(TransportBackpressureMetrics {
+            queue_depth: AtomicUsize::new(3),
+            queue_capacity: 8,
+            queue_full_reject_total: AtomicU64::new(11),
+        });
+        {
+            let mut guard = metrics.lock().expect("metrics lock should be available");
+            guard.set_transport_backpressure_metrics(queue_metrics);
+        }
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics(&store, &metrics_request, &metrics);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_transport_queue_capacity 8")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_transport_queue_depth 3")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_transport_queue_full_reject_total 11")
+        );
+    }
+
+    #[test]
+    fn resolve_http_queue_capacity_defaults_to_workers_times_constant() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let key = "DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY";
+        let previous = std::env::var_os(key);
+        restore_env_var_for_tests(key, None);
+        let capacity = resolve_http_queue_capacity(3);
+        assert_eq!(capacity, 3 * DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER);
+        restore_env_var_for_tests(key, previous.as_deref());
+    }
+
+    #[test]
+    fn resolve_http_queue_capacity_prefers_env_override() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let key = "DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY";
+        let previous = std::env::var_os(key);
+        set_env_var_for_tests(key, "7");
+        let capacity = resolve_http_queue_capacity(3);
+        assert_eq!(capacity, 7);
+        restore_env_var_for_tests(key, previous.as_deref());
     }
 
     #[test]

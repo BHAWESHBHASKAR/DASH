@@ -68,7 +68,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 4.3 Operational and safety gaps
 
 - Backup/restore workflow is codified in scripts and runbook, but scheduled recurring recovery drills are not yet automated in staging/prod.
-- Security threat model execution and hardening validation remain incomplete.
+- Security threat model document and incident simulation gate now exist, but formal sign-off and staged recurring execution are still pending.
 - SLO/error-budget gate automation exists, but live-service telemetry and alert-driven budget burn integration are not yet complete.
 
 ## 5. Must-Have Before Production-Candidate DB

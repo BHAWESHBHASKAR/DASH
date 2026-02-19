@@ -11,9 +11,11 @@ use axum::{
     response::IntoResponse,
     routing::any,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::transport::{
-    HttpRequest, HttpResponse, IngestionRuntime, SharedRuntime, handle_request,
+    HttpRequest, HttpResponse, IngestionRuntime, SharedRuntime, TransportBackpressureMetrics,
+    backpressure_rejection_response, handle_request, resolve_http_queue_capacity,
 };
 
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -21,6 +23,8 @@ const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 struct AppState {
     runtime: SharedRuntime,
+    backpressure_limiter: Arc<Semaphore>,
+    backpressure_metrics: Arc<TransportBackpressureMetrics>,
 }
 
 pub fn serve_http_with_axum(
@@ -42,6 +46,11 @@ pub fn serve_http_with_axum(
             .map_err(|e| format!("failed to bind {bind_addr}: {e}"))?;
 
         let runtime = Arc::new(Mutex::new(ingestion_runtime));
+        let queue_capacity = resolve_http_queue_capacity(worker_threads);
+        let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
+        if let Ok(mut guard) = runtime.lock() {
+            guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
+        }
         let wal_async_flush_interval = runtime
             .lock()
             .ok()
@@ -70,7 +79,11 @@ pub fn serve_http_with_axum(
             })
         });
 
-        let state = AppState { runtime };
+        let state = AppState {
+            runtime,
+            backpressure_limiter: Arc::new(Semaphore::new(queue_capacity)),
+            backpressure_metrics,
+        };
 
         let app = Router::new()
             .fallback(any(dispatch))
@@ -90,6 +103,11 @@ pub fn serve_http_with_axum(
 }
 
 async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> impl IntoResponse {
+    let admission = match try_acquire_backpressure_permit(&state) {
+        Some(admission) => admission,
+        None => return response_from_transport(backpressure_rejection_response()),
+    };
+
     let method = request.method().to_string();
     let target = request
         .uri()
@@ -124,7 +142,35 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> impl
     };
 
     let response = handle_request(&state.runtime, &request);
+    drop(admission);
     response_from_transport(response)
+}
+
+struct BackpressureAdmission {
+    _permit: OwnedSemaphorePermit,
+    metrics: Arc<TransportBackpressureMetrics>,
+}
+
+impl Drop for BackpressureAdmission {
+    fn drop(&mut self) {
+        self.metrics.observe_dequeued();
+    }
+}
+
+fn try_acquire_backpressure_permit(state: &AppState) -> Option<BackpressureAdmission> {
+    match Arc::clone(&state.backpressure_limiter).try_acquire_owned() {
+        Ok(permit) => {
+            state.backpressure_metrics.observe_enqueued();
+            Some(BackpressureAdmission {
+                _permit: permit,
+                metrics: Arc::clone(&state.backpressure_metrics),
+            })
+        }
+        Err(_) => {
+            state.backpressure_metrics.observe_rejected();
+            None
+        }
+    }
 }
 
 fn response_from_transport(response: HttpResponse) -> Response<Body> {
@@ -146,12 +192,24 @@ mod tests {
     use super::*;
     use store::InMemoryStore;
 
-    fn sample_state() -> AppState {
-        AppState {
-            runtime: Arc::new(Mutex::new(
-                IngestionRuntime::in_memory(InMemoryStore::new()),
-            )),
+    fn sample_state_with_queue_capacity(queue_capacity: usize) -> AppState {
+        let runtime = Arc::new(Mutex::new(
+            IngestionRuntime::in_memory(InMemoryStore::new()),
+        ));
+        let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
+        {
+            let mut guard = runtime.lock().unwrap();
+            guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
         }
+        AppState {
+            runtime,
+            backpressure_limiter: Arc::new(Semaphore::new(queue_capacity)),
+            backpressure_metrics,
+        }
+    }
+
+    fn sample_state() -> AppState {
+        sample_state_with_queue_capacity(8)
     }
 
     async fn body_text(response: Response<Body>) -> String {
@@ -224,5 +282,42 @@ mod tests {
         assert_eq!(metrics_response.status(), StatusCode::OK);
         let body = body_text(metrics_response).await;
         assert!(body.contains("dash_ingest_success_total 1"));
+        assert!(body.contains("dash_ingest_transport_queue_capacity 8"));
+        assert!(body.contains("dash_ingest_transport_queue_depth "));
+        assert!(body.contains("dash_ingest_transport_queue_full_reject_total 0"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_request_when_queue_is_full() {
+        let state = sample_state_with_queue_capacity(1);
+        let _held = try_acquire_backpressure_permit(&state)
+            .expect("first backpressure permit should be available");
+        assert_eq!(
+            state
+                .backpressure_metrics
+                .queue_depth
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = dispatch(State(state.clone()), request)
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(response).await;
+        assert!(body.contains("ingestion worker queue full"));
+        assert_eq!(
+            state
+                .backpressure_metrics
+                .queue_full_reject_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
