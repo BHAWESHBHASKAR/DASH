@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -21,21 +20,16 @@ mod placement_debug;
 mod placement_routing;
 mod replication;
 mod request;
+mod segment_runtime;
 
 use audit::{AuditEvent, emit_audit_event};
 use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
 use config::{
-    env_with_fallback, generate_batch_commit_id, parse_env_first_u64, parse_env_first_usize,
-    resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, sanitize_path_component,
-    unix_timestamp_millis,
+    env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
+    resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
 };
 use http::{
     HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,
-};
-use indexer::{
-    CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentStoreError, apply_compaction_plan,
-    build_segments, load_manifest, maintain_segment_root, persist_segments_atomic,
-    plan_compaction_round, prune_unreferenced_segment_files,
 };
 use metadata_router::{ReplicaRole, RoutedReplica, route_write_with_placement};
 use payload::{
@@ -53,6 +47,7 @@ use replication::{
 };
 use request::{parse_query_usize, parse_request_line, read_http_request, split_target};
 use schema::Claim;
+use segment_runtime::SegmentRuntime;
 use store::{
     CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta, WalReplicationExport,
 };
@@ -1010,110 +1005,6 @@ const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
 const DEFAULT_INGEST_BATCH_MAX_ITEMS: usize = 128;
 const DEFAULT_REPLICATION_PULL_MAX_RECORDS: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SegmentRuntime {
-    root_dir: PathBuf,
-    max_segment_size: usize,
-    scheduler: CompactionSchedulerConfig,
-    maintenance_interval: Option<Duration>,
-    maintenance_min_stale_age: Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SegmentPublishStats {
-    claim_count: usize,
-    segment_count: usize,
-    compaction_plan_count: usize,
-    stale_file_pruned_count: usize,
-}
-
-impl SegmentRuntime {
-    fn from_env() -> Option<Self> {
-        let root_dir = env_with_fallback("DASH_INGEST_SEGMENT_DIR", "EME_INGEST_SEGMENT_DIR")?;
-        let max_segment_size = parse_env_first_usize(&[
-            "DASH_INGEST_SEGMENT_MAX_SEGMENT_SIZE",
-            "DASH_SEGMENT_MAX_SEGMENT_SIZE",
-            "EME_INGEST_SEGMENT_MAX_SEGMENT_SIZE",
-            "EME_SEGMENT_MAX_SEGMENT_SIZE",
-        ])
-        .filter(|value| *value > 0)
-        .unwrap_or(10_000);
-        let max_segments_per_tier = parse_env_first_usize(&[
-            "DASH_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER",
-            "DASH_SEGMENT_MAX_SEGMENTS_PER_TIER",
-            "EME_INGEST_SEGMENT_MAX_SEGMENTS_PER_TIER",
-            "EME_SEGMENT_MAX_SEGMENTS_PER_TIER",
-        ])
-        .filter(|value| *value > 0)
-        .unwrap_or(8);
-        let max_compaction_input_segments = parse_env_first_usize(&[
-            "DASH_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS",
-            "DASH_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS",
-            "EME_INGEST_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS",
-            "EME_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS",
-        ])
-        .filter(|value| *value > 1)
-        .unwrap_or(4);
-        let maintenance_interval = parse_env_first_u64(&[
-            "DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS",
-            "EME_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS",
-        ])
-        .or(Some(DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS))
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis);
-        let maintenance_min_stale_age = Duration::from_millis(
-            parse_env_first_u64(&[
-                "DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS",
-                "EME_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS",
-            ])
-            .unwrap_or(DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS),
-        );
-        Some(Self {
-            root_dir: PathBuf::from(root_dir),
-            max_segment_size,
-            scheduler: CompactionSchedulerConfig {
-                max_segments_per_tier,
-                max_compaction_input_segments,
-            },
-            maintenance_interval,
-            maintenance_min_stale_age,
-        })
-    }
-
-    fn publish_for_tenant(
-        &self,
-        store: &InMemoryStore,
-        tenant_id: &str,
-    ) -> Result<SegmentPublishStats, SegmentStoreError> {
-        let claims = store.claims_for_tenant(tenant_id);
-        let claim_count = claims.len();
-        let mut segments = build_segments(&claims, self.max_segment_size);
-        let plans = plan_compaction_round(&segments, &self.scheduler);
-        for plan in &plans {
-            segments = apply_compaction_plan(&segments, plan);
-        }
-        let tenant_dir = self.tenant_segment_dir(tenant_id);
-        let previous_manifest = load_manifest(&tenant_dir)?;
-        let manifest = persist_segments_atomic(&tenant_dir, &segments)?;
-        let stale_file_pruned_count =
-            prune_unreferenced_segment_files(&tenant_dir, &manifest, previous_manifest.as_ref())?;
-        Ok(SegmentPublishStats {
-            claim_count,
-            segment_count: manifest.entries.len(),
-            compaction_plan_count: plans.len(),
-            stale_file_pruned_count,
-        })
-    }
-
-    fn tenant_segment_dir(&self, tenant_id: &str) -> PathBuf {
-        self.root_dir.join(sanitize_path_component(tenant_id))
-    }
-
-    fn maintain_all_tenants(&self) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
-        maintain_segment_root(&self.root_dir, self.maintenance_min_stale_age)
-    }
-}
-
 pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     let default_capacity = worker_count
         .saturating_mul(DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER)
@@ -1829,7 +1720,7 @@ fn observe_authz_denied(runtime: &SharedRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexer::{Segment, Tier, persist_segments_atomic};
+    use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
     use metadata_router::{
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
@@ -2318,6 +2209,12 @@ mod tests {
 
     #[test]
     fn handle_request_internal_replication_wal_returns_delta_payload() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let previous_dash_token = std::env::var_os("DASH_INGEST_REPLICATION_TOKEN");
+        let previous_eme_token = std::env::var_os("EME_INGEST_REPLICATION_TOKEN");
+        restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", None);
+        restore_env_var_for_tests("EME_INGEST_REPLICATION_TOKEN", None);
+
         let wal_path = temp_wal_path();
         let wal = FileWal::open(&wal_path).expect("wal should open");
         let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
@@ -2360,6 +2257,14 @@ mod tests {
                 .as_ref()
                 .expect("persistent runtime should have wal")
                 .snapshot_path(),
+        );
+        restore_env_var_for_tests(
+            "DASH_INGEST_REPLICATION_TOKEN",
+            previous_dash_token.as_deref(),
+        );
+        restore_env_var_for_tests(
+            "EME_INGEST_REPLICATION_TOKEN",
+            previous_eme_token.as_deref(),
         );
     }
 
