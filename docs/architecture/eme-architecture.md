@@ -516,6 +516,7 @@ Current implementation notes (2026-02-18):
 - retrieval read source-of-truth is now explicit: `immutable segment base + mutable WAL delta`, then optional metadata prefilter intersection.
 - ingestion and retrieval transports expose placement-debug snapshots via `GET /debug/placement` (per-shard replicas, epoch, role, health, and optional route probe context).
 - retrieval transport now exposes planner-debug snapshots via `GET /debug/planner` (metadata prefilter count, segment base count, WAL delta count, ANN candidate count, and final planner candidate count).
+- retrieval transport now exposes storage-visibility snapshots via `GET /debug/storage-visibility` with segment/WAL divergence warnings (count + ratio threshold policies).
 
 ## 21. Implementation Reality Check (What we have discussed)
 

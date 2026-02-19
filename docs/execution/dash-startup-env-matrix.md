@@ -74,6 +74,8 @@ Status: active
 | `DASH_RETRIEVAL_API_KEY_SCOPES` | no | unset | optional per-key tenant scopes (`key-a:tenant-a,tenant-b;key-b:*`) | `EME_RETRIEVAL_API_KEY_SCOPES` |
 | `DASH_RETRIEVAL_AUDIT_LOG_PATH` | no | unset | optional JSONL audit log path for retrieval events (success/denied/error) | `EME_RETRIEVAL_AUDIT_LOG_PATH` |
 | `DASH_RETRIEVAL_SEGMENT_DIR` | no | unset | optional segment read root directory used as additional retrieval allow-list prefilter | `EME_RETRIEVAL_SEGMENT_DIR` |
+| `DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT` | no | `1000` | warning threshold for `/debug/storage-visibility` when WAL-delta claim count exceeds this value | `EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT` |
+| `DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO` | no | `0.25` | warning threshold for `/debug/storage-visibility` when `wal_delta_count / storage_visible_count` exceeds this value | `EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO` |
 | `DASH_ROUTER_PLACEMENT_FILE` | no | unset | optional shard placement CSV file path (enables placement-aware read routing) | `EME_ROUTER_PLACEMENT_FILE` |
 | `DASH_ROUTER_LOCAL_NODE_ID` | conditional (required when `DASH_ROUTER_PLACEMENT_FILE` is set) | unset | local node identity used to verify this retrieval instance is the routed read replica | `EME_ROUTER_LOCAL_NODE_ID` |
 | `DASH_NODE_ID` | conditional alias | unset | fallback alias for local node identity if `DASH_ROUTER_LOCAL_NODE_ID` is unset | `EME_NODE_ID` |

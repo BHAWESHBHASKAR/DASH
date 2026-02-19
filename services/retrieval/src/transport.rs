@@ -31,6 +31,8 @@ const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
+const DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT: usize = 1_000;
+const DEFAULT_STORAGE_DIVERGENCE_WARN_RATIO: f64 = 0.25;
 type SharedPlacementRouting = Arc<Mutex<Option<PlacementRoutingState>>>;
 
 #[derive(Debug, Default)]
@@ -159,6 +161,13 @@ pub(crate) struct TransportMetrics {
     retrieve_last_result_count: usize,
     retrieve_latency_ms_window: VecDeque<f64>,
     ingest_to_visible_lag_ms_window: VecDeque<f64>,
+    storage_last_segment_base_count: usize,
+    storage_last_wal_delta_count: usize,
+    storage_last_storage_visible_count: usize,
+    storage_last_allowed_claim_ids_count: usize,
+    storage_last_divergence_ratio: f64,
+    storage_last_divergence_warn: bool,
+    storage_divergence_warn_total: u64,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
 }
 
@@ -191,6 +200,13 @@ impl Default for TransportMetrics {
             retrieve_last_result_count: 0,
             retrieve_latency_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
             ingest_to_visible_lag_ms_window: VecDeque::with_capacity(METRICS_WINDOW_SIZE),
+            storage_last_segment_base_count: 0,
+            storage_last_wal_delta_count: 0,
+            storage_last_storage_visible_count: 0,
+            storage_last_allowed_claim_ids_count: 0,
+            storage_last_divergence_ratio: 0.0,
+            storage_last_divergence_warn: false,
+            storage_divergence_warn_total: 0,
             transport_backpressure: None,
         }
     }
@@ -288,6 +304,24 @@ impl TransportMetrics {
         self.placement_reload_success_total = snapshot.success_total;
         self.placement_reload_failure_total = snapshot.failure_total;
         self.placement_reload_last_error = snapshot.last_error.is_some();
+    }
+
+    fn observe_storage_visibility_debug(
+        &mut self,
+        snapshot: &RetrievePlannerDebugSnapshot,
+        divergence_ratio: f64,
+        divergence_warn: bool,
+    ) {
+        self.storage_last_segment_base_count = snapshot.segment_base_count;
+        self.storage_last_wal_delta_count = snapshot.wal_delta_count;
+        self.storage_last_storage_visible_count = snapshot.storage_visible_count;
+        self.storage_last_allowed_claim_ids_count = snapshot.allowed_claim_ids_count;
+        self.storage_last_divergence_ratio = divergence_ratio;
+        self.storage_last_divergence_warn = divergence_warn;
+        if divergence_warn {
+            self.storage_divergence_warn_total =
+                self.storage_divergence_warn_total.saturating_add(1);
+        }
     }
 
     fn quantile(window: &VecDeque<f64>, quantile: f64) -> f64 {
@@ -412,6 +446,20 @@ dash_retrieve_latency_ms_p99 {:.4}\n\
 dash_ingest_to_visible_lag_ms_p50 {:.4}\n\
 # TYPE dash_ingest_to_visible_lag_ms_p95 gauge\n\
 dash_ingest_to_visible_lag_ms_p95 {:.4}\n\
+# TYPE dash_retrieve_storage_last_segment_base_count gauge\n\
+dash_retrieve_storage_last_segment_base_count {}\n\
+# TYPE dash_retrieve_storage_last_wal_delta_count gauge\n\
+dash_retrieve_storage_last_wal_delta_count {}\n\
+# TYPE dash_retrieve_storage_last_storage_visible_count gauge\n\
+dash_retrieve_storage_last_storage_visible_count {}\n\
+# TYPE dash_retrieve_storage_last_allowed_claim_ids_count gauge\n\
+dash_retrieve_storage_last_allowed_claim_ids_count {}\n\
+# TYPE dash_retrieve_storage_last_divergence_ratio gauge\n\
+dash_retrieve_storage_last_divergence_ratio {:.6}\n\
+# TYPE dash_retrieve_storage_last_divergence_warn gauge\n\
+dash_retrieve_storage_last_divergence_warn {}\n\
+# TYPE dash_retrieve_storage_divergence_warn_total counter\n\
+dash_retrieve_storage_divergence_warn_total {}\n\
 # TYPE dash_transport_uptime_seconds gauge\n\
 dash_transport_uptime_seconds {:.4}\n",
             self.http_requests_total,
@@ -451,6 +499,13 @@ dash_transport_uptime_seconds {:.4}\n",
             retrieve_latency_p99,
             visibility_lag_p50,
             visibility_lag_p95,
+            self.storage_last_segment_base_count,
+            self.storage_last_wal_delta_count,
+            self.storage_last_storage_visible_count,
+            self.storage_last_allowed_claim_ids_count,
+            self.storage_last_divergence_ratio,
+            self.storage_last_divergence_warn as usize,
+            self.storage_divergence_warn_total,
             uptime_seconds
         )
     }
@@ -928,6 +983,73 @@ fn handle_request_with_metrics_and_reload(
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
+        ("GET", "/debug/storage-visibility") => match build_retrieve_request_from_query(&query) {
+            Ok(req) => {
+                let tenant_id = req.tenant_id.clone();
+                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                    AuthDecision::Unauthorized(reason) => {
+                        observe_auth_failure(metrics);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_storage_visibility",
+                            Some(&tenant_id),
+                            401,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::unauthorized(reason)
+                    }
+                    AuthDecision::Forbidden(reason) => {
+                        observe_authz_denied(metrics);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_storage_visibility",
+                            Some(&tenant_id),
+                            403,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::forbidden(reason)
+                    }
+                    AuthDecision::Allowed => {
+                        observe_auth_success(metrics);
+                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                        let warn_delta_count = resolve_storage_divergence_warn_delta_count();
+                        let warn_ratio = resolve_storage_divergence_warn_ratio();
+                        let (warn, reason, ratio) = evaluate_storage_divergence_warning(
+                            &snapshot,
+                            warn_delta_count,
+                            warn_ratio,
+                        );
+                        if let Ok(mut guard) = metrics.lock() {
+                            guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
+                        }
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_storage_visibility",
+                            Some(&tenant_id),
+                            200,
+                            if warn { "warning" } else { "success" },
+                            reason
+                                .as_deref()
+                                .unwrap_or("storage visibility snapshot generated"),
+                        );
+                        HttpResponse::ok_json(render_storage_visibility_debug_json(
+                            &snapshot,
+                            warn_delta_count,
+                            warn_ratio,
+                            warn,
+                            reason.as_deref(),
+                            ratio,
+                        ))
+                    }
+                }
+            }
+            Err(err) => HttpResponse::bad_request(&err),
+        },
         ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
@@ -1087,7 +1209,11 @@ fn handle_request_with_metrics_and_reload(
             }
         }
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
-        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") | (_, "/debug/planner") => {
+        (_, "/health")
+        | (_, "/metrics")
+        | (_, "/debug/placement")
+        | (_, "/debug/planner")
+        | (_, "/debug/storage-visibility") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
@@ -1113,6 +1239,92 @@ fn render_planner_debug_json(snapshot: &RetrievePlannerDebugSnapshot) -> String 
         snapshot.short_circuit_empty,
         snapshot.ann_candidate_count,
         snapshot.planner_candidate_count,
+    )
+}
+
+fn storage_divergence_ratio(snapshot: &RetrievePlannerDebugSnapshot) -> f64 {
+    if snapshot.storage_visible_count == 0 {
+        0.0
+    } else {
+        snapshot.wal_delta_count as f64 / snapshot.storage_visible_count as f64
+    }
+}
+
+fn resolve_storage_divergence_warn_delta_count() -> usize {
+    parse_env_first_usize(&[
+        "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT",
+        "EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT",
+    ])
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT)
+}
+
+fn resolve_storage_divergence_warn_ratio() -> f64 {
+    parse_env_first_f64(&[
+        "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO",
+        "EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO",
+    ])
+    .filter(|value| value.is_finite() && *value >= 0.0)
+    .unwrap_or(DEFAULT_STORAGE_DIVERGENCE_WARN_RATIO)
+}
+
+fn evaluate_storage_divergence_warning(
+    snapshot: &RetrievePlannerDebugSnapshot,
+    warn_delta_count: usize,
+    warn_ratio: f64,
+) -> (bool, Option<String>, f64) {
+    let ratio = storage_divergence_ratio(snapshot);
+    let delta_exceeded = snapshot.wal_delta_count >= warn_delta_count;
+    let ratio_exceeded = ratio >= warn_ratio;
+    let warn = snapshot.wal_delta_count > 0 && (delta_exceeded || ratio_exceeded);
+    let reason = if !warn {
+        None
+    } else if delta_exceeded && ratio_exceeded {
+        Some(format!(
+            "wal_delta_count={} exceeds {} and divergence_ratio={:.6} exceeds {:.6}",
+            snapshot.wal_delta_count, warn_delta_count, ratio, warn_ratio
+        ))
+    } else if delta_exceeded {
+        Some(format!(
+            "wal_delta_count={} exceeds {}",
+            snapshot.wal_delta_count, warn_delta_count
+        ))
+    } else {
+        Some(format!(
+            "divergence_ratio={:.6} exceeds {:.6}",
+            ratio, warn_ratio
+        ))
+    };
+    (warn, reason, ratio)
+}
+
+fn render_storage_visibility_debug_json(
+    snapshot: &RetrievePlannerDebugSnapshot,
+    warn_delta_count: usize,
+    warn_ratio: f64,
+    warn: bool,
+    reason: Option<&str>,
+    ratio: f64,
+) -> String {
+    let reason_json = reason
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"tenant_id\":\"{}\",\"segment_base_count\":{},\"wal_delta_count\":{},\"storage_visible_count\":{},\"metadata_prefilter_count\":{},\"allowed_claim_ids_count\":{},\"has_filtering\":{},\"short_circuit_empty\":{},\"divergence_ratio\":{:.6},\"divergence_active\":{},\"divergence_warn\":{},\"warn_delta_count\":{},\"warn_ratio\":{:.6},\"warn_reason\":{}}}",
+        json_escape(&snapshot.tenant_id),
+        snapshot.segment_base_count,
+        snapshot.wal_delta_count,
+        snapshot.storage_visible_count,
+        snapshot.metadata_prefilter_count,
+        snapshot.allowed_claim_ids_count,
+        snapshot.has_filtering,
+        snapshot.short_circuit_empty,
+        ratio,
+        snapshot.wal_delta_count > 0,
+        warn,
+        warn_delta_count,
+        warn_ratio,
+        reason_json
     )
 }
 
@@ -2118,6 +2330,17 @@ fn parse_env_first_u64(keys: &[&str]) -> Option<u64> {
     None
 }
 
+fn parse_env_first_f64(keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Ok(value) = std::env::var(key)
+            && let Ok(parsed) = value.parse::<f64>()
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
 fn read_entity_key_for_request(req: &RetrieveApiRequest) -> &str {
     req.entity_filters
         .iter()
@@ -3089,6 +3312,7 @@ impl HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexer::{Segment, Tier, persist_segments_atomic};
     use metadata_router::{
         ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader,
     };
@@ -3616,6 +3840,149 @@ tenant-a,0,12,node-a,follower,healthy\n",
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "/debug/planner?tenant_id=tenant-a".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(&store, &request);
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("query is required"));
+    }
+
+    #[test]
+    fn debug_storage_visibility_endpoint_reports_divergence_and_updates_metrics() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let prev_segment_dir = std::env::var_os("DASH_RETRIEVAL_SEGMENT_DIR");
+        let prev_warn_delta =
+            std::env::var_os("DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT");
+        let prev_warn_ratio = std::env::var_os("DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO");
+        let prev_refresh_ms = std::env::var_os("DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS");
+
+        let mut segment_root = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        segment_root.push(format!(
+            "dash-retrieve-storage-visibility-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let tenant_dir = segment_root.join("tenant-a");
+        persist_segments_atomic(
+            &tenant_dir,
+            &[Segment {
+                segment_id: "hot-0".to_string(),
+                tier: Tier::Hot,
+                claim_ids: vec!["c1".to_string()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        set_env_var_for_tests(
+            "DASH_RETRIEVAL_SEGMENT_DIR",
+            segment_root.to_string_lossy().as_ref(),
+        );
+        set_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS", "1");
+        set_env_var_for_tests("DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT", "1");
+        set_env_var_for_tests("DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO", "0.20");
+
+        let mut store = sample_store();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c2".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company X expanded acquisition program".into(),
+                    confidence: 0.88,
+                    event_time_unix: None,
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: "e2".into(),
+                    claim_id: "c2".into(),
+                    source_id: "source://doc-2".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.86,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .expect("ingest c2 should succeed");
+
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let debug_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/storage-visibility?tenant_id=tenant-a&query=company+x&top_k=2"
+                .to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let debug_response = handle_request_with_metrics(&store, &debug_request, &metrics);
+        assert_eq!(debug_response.status, 200);
+        assert!(debug_response.body.contains("\"tenant_id\":\"tenant-a\""));
+        assert!(debug_response.body.contains("\"segment_base_count\":1"));
+        assert!(debug_response.body.contains("\"wal_delta_count\":1"));
+        assert!(debug_response.body.contains("\"storage_visible_count\":2"));
+        assert!(debug_response.body.contains("\"divergence_warn\":true"));
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request_with_metrics(&store, &metrics_request, &metrics);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_wal_delta_count 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_divergence_warn 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_divergence_warn_total 1")
+        );
+
+        restore_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", prev_segment_dir.as_deref());
+        restore_env_var_for_tests(
+            "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT",
+            prev_warn_delta.as_deref(),
+        );
+        restore_env_var_for_tests(
+            "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO",
+            prev_warn_ratio.as_deref(),
+        );
+        restore_env_var_for_tests(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            prev_refresh_ms.as_deref(),
+        );
+        let _ = std::fs::remove_dir_all(segment_root);
+    }
+
+    #[test]
+    fn debug_storage_visibility_endpoint_rejects_invalid_query_shape() {
+        let store = sample_store();
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/storage-visibility?tenant_id=tenant-a".to_string(),
             headers: HashMap::new(),
             body: Vec::new(),
         };

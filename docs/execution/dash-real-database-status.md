@@ -31,6 +31,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Stance modes (`balanced`, `support_only`) and citation-grade outputs.
 - Optional graph payload in retrieval contracts.
 - Retrieval planner debug endpoint (`GET /debug/planner`) exposes stage-wise candidate counts for metadata prefilter, segment base, WAL delta, ANN, and final planner candidate set.
+- Retrieval storage-visibility endpoint (`GET /debug/storage-visibility`) exposes segment/WAL merge counts and divergence-warning state for tenant-scoped diagnostics.
 - Segment prefilter cache with runtime refresh controls and observability metrics.
 - Tenant-isolation coverage for retrieval segment prefilter/cache paths.
 
