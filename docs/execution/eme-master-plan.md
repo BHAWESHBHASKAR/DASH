@@ -67,6 +67,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/recovery_drill.sh`
   - `scripts/auth_revocation_drill.sh`
   - `scripts/incident_simulation_gate.sh`
+  - `scripts/security_signoff_gate.sh`
   - `scripts/slo_guard.sh`
   - `scripts/verify_audit_chain.sh`
   - `scripts/release_candidate_gate.sh`

@@ -132,6 +132,7 @@ Core validation commands:
 - `scripts/recovery_drill.sh --max-rto-seconds 60`
 - `scripts/incident_simulation_gate.sh --failover-mode no-restart --recovery-max-rto-seconds 60`
 - `scripts/release_candidate_gate.sh --run-incident-simulation-guard true ...`
+- `scripts/security_signoff_gate.sh --run-tag <tag> --ingestion-audit <path> --retrieval-audit <path>`
 
 Security-relevant expected outcomes:
 - revoked key requests return `401` in both services
