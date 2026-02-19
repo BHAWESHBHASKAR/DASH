@@ -72,6 +72,26 @@ pub struct RetrieveApiResponse {
     pub graph: Option<EvidenceGraph>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievePlannerDebugSnapshot {
+    pub tenant_id: String,
+    pub top_k: usize,
+    pub stance_mode: String,
+    pub has_query_embedding: bool,
+    pub entity_filter_count: usize,
+    pub embedding_filter_count: usize,
+    pub has_filtering: bool,
+    pub metadata_prefilter_count: usize,
+    pub segment_base_count: usize,
+    pub wal_delta_count: usize,
+    pub storage_visible_count: usize,
+    pub allowed_claim_ids_active: bool,
+    pub allowed_claim_ids_count: usize,
+    pub short_circuit_empty: bool,
+    pub ann_candidate_count: usize,
+    pub planner_candidate_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SegmentCacheKey {
     root_dir: String,
@@ -91,6 +111,22 @@ impl SegmentCacheKey {
 struct SegmentCacheEntry {
     claim_ids: Option<HashSet<String>>,
     next_refresh_instant: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannerContext {
+    tenant_id: String,
+    from_unix: Option<i64>,
+    to_unix: Option<i64>,
+    entity_filters: Vec<String>,
+    embedding_filters: Vec<String>,
+    metadata_allowed_claim_ids: Option<HashSet<String>>,
+    segment_base_claim_ids: Option<HashSet<String>>,
+    wal_delta_claim_ids: Option<HashSet<String>>,
+    storage_visible_claim_ids: Option<HashSet<String>>,
+    allowed_claim_ids: Option<HashSet<String>>,
+    has_filtering: bool,
+    short_circuit_empty: bool,
 }
 
 static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
@@ -117,62 +153,8 @@ struct SegmentPrefilterCacheMetricAtoms {
 }
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
-    let tenant_id = req.tenant_id.clone();
-    let (from_unix, to_unix) = req
-        .time_range
-        .as_ref()
-        .map(|t| (t.from_unix, t.to_unix))
-        .unwrap_or((None, None));
-    if let (Some(from), Some(to)) = (from_unix, to_unix)
-        && from > to
-    {
-        return RetrieveApiResponse {
-            results: Vec::new(),
-            graph: if req.return_graph {
-                Some(EvidenceGraph {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                })
-            } else {
-                None
-            },
-        };
-    }
-
-    let entity_filters: Vec<String> = req
-        .entity_filters
-        .iter()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect();
-    let embedding_filters: Vec<String> = req
-        .embedding_id_filters
-        .iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect();
-    let metadata_allowed_claim_ids =
-        build_metadata_prefilter_claim_ids(store, &tenant_id, &entity_filters, &embedding_filters);
-    let segment_base_claim_ids = build_segment_prefilter_claim_ids(&tenant_id);
-    let wal_delta_claim_ids =
-        build_wal_delta_claim_ids(store, &tenant_id, segment_base_claim_ids.as_ref());
-    let storage_visible_claim_ids = merge_segment_base_with_wal_delta_claim_ids(
-        segment_base_claim_ids.as_ref(),
-        wal_delta_claim_ids.as_ref(),
-    );
-    let has_filtering = !entity_filters.is_empty()
-        || !embedding_filters.is_empty()
-        || storage_visible_claim_ids.is_some();
-    let allowed_claim_ids = merge_allowed_claim_ids(
-        metadata_allowed_claim_ids.as_ref(),
-        storage_visible_claim_ids.as_ref(),
-    );
-
-    if has_filtering
-        && allowed_claim_ids
-            .as_ref()
-            .is_some_and(|claim_ids| claim_ids.is_empty())
-    {
+    let planner = build_planner_context(store, &req);
+    if planner.short_circuit_empty {
         return RetrieveApiResponse {
             results: Vec::new(),
             graph: if req.return_graph {
@@ -188,15 +170,15 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
 
     let results = store.retrieve_with_time_range_query_vector_and_allowed_claim_ids(
         &RetrievalRequest {
-            tenant_id: tenant_id.clone(),
+            tenant_id: planner.tenant_id.clone(),
             query: req.query,
             top_k: req.top_k,
             stance_mode: req.stance_mode,
         },
-        from_unix,
-        to_unix,
+        planner.from_unix,
+        planner.to_unix,
         req.query_embedding.as_deref(),
-        allowed_claim_ids.as_ref(),
+        planner.allowed_claim_ids.as_ref(),
     );
 
     let nodes: Vec<EvidenceNode> = results
@@ -227,7 +209,7 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         let selected: std::collections::HashSet<String> =
             nodes.iter().map(|n| n.claim_id.clone()).collect();
         let start_ids: Vec<String> = selected.iter().cloned().collect();
-        let tenant_claims = store.claims_for_tenant(&tenant_id);
+        let tenant_claims = store.claims_for_tenant(&planner.tenant_id);
 
         let mut all_edges = Vec::new();
         for claim in &tenant_claims {
@@ -299,6 +281,125 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
     RetrieveApiResponse {
         results: nodes,
         graph,
+    }
+}
+
+pub fn build_retrieve_planner_debug_snapshot(
+    store: &InMemoryStore,
+    req: &RetrieveApiRequest,
+) -> RetrievePlannerDebugSnapshot {
+    let planner = build_planner_context(store, req);
+    let diagnostics_req = RetrievalRequest {
+        tenant_id: planner.tenant_id.clone(),
+        query: req.query.clone(),
+        top_k: req.top_k,
+        stance_mode: req.stance_mode.clone(),
+    };
+    let ann_candidate_count = req
+        .query_embedding
+        .as_ref()
+        .map(|embedding| {
+            store.ann_candidate_count_for_query_vector(&planner.tenant_id, embedding, req.top_k)
+        })
+        .unwrap_or(0);
+    let planner_candidate_count = if planner.short_circuit_empty {
+        0
+    } else {
+        store.candidate_count_with_query_vector_and_allowed_claim_ids(
+            &diagnostics_req,
+            req.query_embedding.as_deref(),
+            (planner.from_unix, planner.to_unix),
+            planner.allowed_claim_ids.as_ref(),
+        )
+    };
+
+    RetrievePlannerDebugSnapshot {
+        tenant_id: planner.tenant_id,
+        top_k: req.top_k,
+        stance_mode: stance_mode_to_str(req.stance_mode.clone()).to_string(),
+        has_query_embedding: req.query_embedding.as_ref().is_some_and(|v| !v.is_empty()),
+        entity_filter_count: planner.entity_filters.len(),
+        embedding_filter_count: planner.embedding_filters.len(),
+        has_filtering: planner.has_filtering,
+        metadata_prefilter_count: planner
+            .metadata_allowed_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        segment_base_count: planner
+            .segment_base_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        wal_delta_count: planner.wal_delta_claim_ids.as_ref().map_or(0, HashSet::len),
+        storage_visible_count: planner
+            .storage_visible_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        allowed_claim_ids_active: planner.allowed_claim_ids.is_some(),
+        allowed_claim_ids_count: planner.allowed_claim_ids.as_ref().map_or(0, HashSet::len),
+        short_circuit_empty: planner.short_circuit_empty,
+        ann_candidate_count,
+        planner_candidate_count,
+    }
+}
+
+fn build_planner_context(store: &InMemoryStore, req: &RetrieveApiRequest) -> PlannerContext {
+    let tenant_id = req.tenant_id.clone();
+    let (from_unix, to_unix) = req
+        .time_range
+        .as_ref()
+        .map(|t| (t.from_unix, t.to_unix))
+        .unwrap_or((None, None));
+    let invalid_time_range = matches!(
+        (from_unix, to_unix),
+        (Some(from), Some(to)) if from > to
+    );
+    let entity_filters: Vec<String> = req
+        .entity_filters
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let embedding_filters: Vec<String> = req
+        .embedding_id_filters
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    let metadata_allowed_claim_ids =
+        build_metadata_prefilter_claim_ids(store, &tenant_id, &entity_filters, &embedding_filters);
+    let segment_base_claim_ids = build_segment_prefilter_claim_ids(&tenant_id);
+    let wal_delta_claim_ids =
+        build_wal_delta_claim_ids(store, &tenant_id, segment_base_claim_ids.as_ref());
+    let storage_visible_claim_ids = merge_segment_base_with_wal_delta_claim_ids(
+        segment_base_claim_ids.as_ref(),
+        wal_delta_claim_ids.as_ref(),
+    );
+    let has_filtering = !entity_filters.is_empty()
+        || !embedding_filters.is_empty()
+        || storage_visible_claim_ids.is_some();
+    let allowed_claim_ids = merge_allowed_claim_ids(
+        metadata_allowed_claim_ids.as_ref(),
+        storage_visible_claim_ids.as_ref(),
+    );
+    let short_circuit_empty = invalid_time_range
+        || (has_filtering
+            && allowed_claim_ids
+                .as_ref()
+                .is_some_and(|claim_ids| claim_ids.is_empty()));
+
+    PlannerContext {
+        tenant_id,
+        from_unix,
+        to_unix,
+        entity_filters,
+        embedding_filters,
+        metadata_allowed_claim_ids,
+        segment_base_claim_ids,
+        wal_delta_claim_ids,
+        storage_visible_claim_ids,
+        allowed_claim_ids,
+        has_filtering,
+        short_circuit_empty,
     }
 }
 
@@ -517,6 +618,13 @@ fn stance_to_str(stance: &Stance) -> &'static str {
         Stance::Supports => "supports",
         Stance::Contradicts => "contradicts",
         Stance::Neutral => "neutral",
+    }
+}
+
+fn stance_mode_to_str(mode: StanceMode) -> &'static str {
+    match mode {
+        StanceMode::Balanced => "balanced",
+        StanceMode::SupportOnly => "support_only",
     }
 }
 
@@ -920,6 +1028,128 @@ mod tests {
         assert!(merged.contains("c-segment"));
         assert!(merged.contains("c-shared"));
         assert!(merged.contains("c-delta"));
+    }
+
+    #[test]
+    fn planner_debug_snapshot_reports_stage_counts() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c1".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company X acquired Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://x".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("ingest c1 should succeed");
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c2".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company Z acquired Company Q".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company Z".into()],
+                    embedding_ids: vec!["emb://z".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("ingest c2 should succeed");
+        store
+            .upsert_claim_vector("c1", vec![0.8, 0.2, 0.1, 0.9])
+            .expect("upsert vector c1 should work");
+        store
+            .upsert_claim_vector("c2", vec![0.1, 0.9, 0.8, 0.2])
+            .expect("upsert vector c2 should work");
+
+        let snapshot = build_retrieve_planner_debug_snapshot(
+            &store,
+            &RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "acquired company".into(),
+                query_embedding: Some(vec![0.8, 0.2, 0.1, 0.9]),
+                entity_filters: vec!["company x".into()],
+                embedding_id_filters: vec!["emb://x".into()],
+                top_k: 5,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(snapshot.stance_mode, "balanced");
+        assert!(snapshot.has_query_embedding);
+        assert!(snapshot.has_filtering);
+        assert_eq!(snapshot.metadata_prefilter_count, 1);
+        assert!(snapshot.allowed_claim_ids_active);
+        assert_eq!(snapshot.allowed_claim_ids_count, 1);
+        assert_eq!(snapshot.ann_candidate_count, 2);
+        assert_eq!(snapshot.planner_candidate_count, 1);
+        assert!(!snapshot.short_circuit_empty);
+    }
+
+    #[test]
+    fn planner_debug_snapshot_short_circuits_when_prefilter_is_empty() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c1".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company X acquired Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://x".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("ingest should succeed");
+
+        let snapshot = build_retrieve_planner_debug_snapshot(
+            &store,
+            &RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "acquired company".into(),
+                query_embedding: None,
+                entity_filters: vec!["company-z".into()],
+                embedding_id_filters: vec!["emb://missing".into()],
+                top_k: 5,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert!(snapshot.has_filtering);
+        assert_eq!(snapshot.metadata_prefilter_count, 0);
+        assert_eq!(snapshot.allowed_claim_ids_count, 0);
+        assert!(snapshot.short_circuit_empty);
+        assert_eq!(snapshot.planner_candidate_count, 0);
     }
 
     #[test]

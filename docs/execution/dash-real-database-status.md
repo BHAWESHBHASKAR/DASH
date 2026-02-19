@@ -30,6 +30,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Hybrid retrieval across lexical + vector + metadata + temporal constraints.
 - Stance modes (`balanced`, `support_only`) and citation-grade outputs.
 - Optional graph payload in retrieval contracts.
+- Retrieval planner debug endpoint (`GET /debug/planner`) exposes stage-wise candidate counts for metadata prefilter, segment base, WAL delta, ANN, and final planner candidate set.
 - Segment prefilter cache with runtime refresh controls and observability metrics.
 - Tenant-isolation coverage for retrieval segment prefilter/cache paths.
 

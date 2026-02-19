@@ -21,7 +21,10 @@ use metadata_router::{
 use schema::StanceMode;
 use store::InMemoryStore;
 
-use crate::api::{CitationNode, EvidenceNode, RetrieveApiRequest, TimeRange, execute_api_query};
+use crate::api::{
+    CitationNode, EvidenceNode, RetrieveApiRequest, RetrievePlannerDebugSnapshot, TimeRange,
+    build_retrieve_planner_debug_snapshot, execute_api_query,
+};
 
 const METRICS_WINDOW_SIZE: usize = 2048;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -877,6 +880,54 @@ fn handle_request_with_metrics_and_reload(
             placement_reload,
             &query,
         )),
+        ("GET", "/debug/planner") => match build_retrieve_request_from_query(&query) {
+            Ok(req) => {
+                let tenant_id = req.tenant_id.clone();
+                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                    AuthDecision::Unauthorized(reason) => {
+                        observe_auth_failure(metrics);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_planner",
+                            Some(&tenant_id),
+                            401,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::unauthorized(reason)
+                    }
+                    AuthDecision::Forbidden(reason) => {
+                        observe_authz_denied(metrics);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_planner",
+                            Some(&tenant_id),
+                            403,
+                            "denied",
+                            reason,
+                        );
+                        HttpResponse::forbidden(reason)
+                    }
+                    AuthDecision::Allowed => {
+                        observe_auth_success(metrics);
+                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                        emit_audit_event(
+                            metrics,
+                            audit_log_path.as_deref(),
+                            "debug_planner",
+                            Some(&tenant_id),
+                            200,
+                            "success",
+                            "planner debug snapshot generated",
+                        );
+                        HttpResponse::ok_json(render_planner_debug_json(&snapshot))
+                    }
+                }
+            }
+            Err(err) => HttpResponse::bad_request(&err),
+        },
         ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
@@ -1036,11 +1087,33 @@ fn handle_request_with_metrics_and_reload(
             }
         }
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
-        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") => {
+        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") | (_, "/debug/planner") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
     }
+}
+
+fn render_planner_debug_json(snapshot: &RetrievePlannerDebugSnapshot) -> String {
+    format!(
+        "{{\"tenant_id\":\"{}\",\"top_k\":{},\"stance_mode\":\"{}\",\"has_query_embedding\":{},\"entity_filter_count\":{},\"embedding_filter_count\":{},\"has_filtering\":{},\"metadata_prefilter_count\":{},\"segment_base_count\":{},\"wal_delta_count\":{},\"storage_visible_count\":{},\"allowed_claim_ids_active\":{},\"allowed_claim_ids_count\":{},\"short_circuit_empty\":{},\"ann_candidate_count\":{},\"planner_candidate_count\":{}}}",
+        json_escape(&snapshot.tenant_id),
+        snapshot.top_k,
+        snapshot.stance_mode,
+        snapshot.has_query_embedding,
+        snapshot.entity_filter_count,
+        snapshot.embedding_filter_count,
+        snapshot.has_filtering,
+        snapshot.metadata_prefilter_count,
+        snapshot.segment_base_count,
+        snapshot.wal_delta_count,
+        snapshot.storage_visible_count,
+        snapshot.allowed_claim_ids_active,
+        snapshot.allowed_claim_ids_count,
+        snapshot.short_circuit_empty,
+        snapshot.ann_candidate_count,
+        snapshot.planner_candidate_count,
+    )
 }
 
 fn render_placement_debug_json(
@@ -3514,6 +3587,42 @@ tenant-a,0,12,node-a,follower,healthy\n",
                 .contains("\"read_preference\":\"leader_only\"")
         );
         assert!(response.body.contains("\"target_node_id\":\"node-a\""));
+    }
+
+    #[test]
+    fn debug_planner_endpoint_returns_stage_counts() {
+        let mut store = sample_store();
+        store
+            .upsert_claim_vector("c1", vec![0.8, 0.2, 0.1, 0.9])
+            .expect("vector upsert should succeed");
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/planner?tenant_id=tenant-a&query=company+x&query_embedding=0.8,0.2,0.1,0.9&top_k=3".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(&store, &request);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"tenant_id\":\"tenant-a\""));
+        assert!(response.body.contains("\"ann_candidate_count\":1"));
+        assert!(response.body.contains("\"planner_candidate_count\":1"));
+        assert!(response.body.contains("\"short_circuit_empty\":false"));
+    }
+
+    #[test]
+    fn debug_planner_endpoint_rejects_invalid_query_shape() {
+        let store = sample_store();
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/debug/planner?tenant_id=tenant-a".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response = handle_request(&store, &request);
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("query is required"));
     }
 
     #[test]

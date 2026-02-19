@@ -15,6 +15,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Rust workspace implementation is active across schema, ranking, graph, store, ingestion, retrieval, indexer, and metadata-router crates.
 - Persistent WAL replay is implemented with snapshot checkpoint compaction in `pkg/store`.
 - Retrieval API contracts are implemented with optional graph payload and transport layer support.
+- Retrieval transport now includes an authenticated planner-debug endpoint (`GET /debug/planner`) for stage-wise candidate observability.
 - Ingestion API transport is implemented (`POST /v1/ingest`, `GET /health`, `GET /metrics`) with persistent-policy wiring.
 - Retrieval transport exposes runtime metrics at `/metrics` including DASH latency percentiles and visibility-lag estimates.
 - Schema layer includes claim/evidence metadata for citation-grade retrieval (`entities`, `embedding_ids`, `chunk_id`, `span_start`, `span_end`) with backward-compatible WAL replay.
