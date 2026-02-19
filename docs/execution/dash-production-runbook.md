@@ -10,7 +10,7 @@ This runbook covers single-region production deployment for DASH ingestion and r
 ## 2. Build
 
 ```bash
-cargo build --release -p ingestion -p retrieval -p benchmark-smoke
+cargo build --release -p ingestion -p retrieval -p indexer -p benchmark-smoke
 ```
 
 Optional async runtime build (for `DASH_*_TRANSPORT_RUNTIME=axum`):
@@ -24,6 +24,7 @@ Artifacts:
 
 - `target/release/ingestion`
 - `target/release/retrieval`
+- `target/release/segment-maintenance-daemon`
 - `target/release/benchmark-smoke`
 
 ## 3. Required Paths
@@ -36,9 +37,10 @@ Artifacts:
 
 1. Start ingestion service.
 2. Start retrieval service with `--serve`.
-3. Verify `/health`.
-4. Verify `/metrics`.
-5. Run a retrieval probe request.
+3. Start segment maintenance daemon (recommended in production).
+4. Verify `/health`.
+5. Verify `/metrics`.
+6. Run a retrieval probe request.
 
 ## 5. Service Commands
 
@@ -86,6 +88,22 @@ DASH_RETRIEVAL_API_KEY_SCOPES="change-me-retrieval-key:tenant-a,tenant-b" \
 DASH_RETRIEVAL_AUDIT_LOG_PATH=/var/log/dash/retrieval-audit.jsonl \
 DASH_RETRIEVAL_SEGMENT_DIR=/var/lib/dash/segments \
 target/release/retrieval --serve
+```
+
+Segment maintenance daemon (standalone lifecycle worker):
+
+```bash
+DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
+DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS=30000 \
+DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS=60000 \
+target/release/segment-maintenance-daemon
+```
+
+One-shot verification tick:
+
+```bash
+DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
+target/release/segment-maintenance-daemon --once
 ```
 
 Compatibility note: legacy `EME_*` env vars are still accepted as fallback.
@@ -144,6 +162,7 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `scripts/benchmark_ingest_wal_durability.sh --workers 4 --clients 16 --requests-per-worker 25 --warmup-requests 5`
   - archive the generated markdown under `docs/benchmarks/history/concurrency/wal-durability/`
 - monitor replay startup logs (`snapshot_records`, `wal_delta_records`)
+- monitor segment maintenance daemon stdout JSON ticks (`tenant_dirs_scanned`, `tenant_manifests_found`, `pruned_file_count`, `error`)
 - monitor ingestion `/metrics` for:
   - `dash_ingest_success_total`
   - `dash_ingest_failed_total`

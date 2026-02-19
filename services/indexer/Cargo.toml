@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
+
+[[bin]]
+name = "segment-maintenance-daemon"
+path = "src/bin/segment_maintenance_daemon.rs"

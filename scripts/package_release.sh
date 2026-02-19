@@ -16,7 +16,7 @@ if [[ "${RUN_BENCH_TRENDS}" == "true" ]]; then
 fi
 
 echo "[package] building release binaries"
-cargo build --release -p ingestion -p retrieval -p benchmark-smoke
+cargo build --release -p ingestion -p retrieval -p indexer -p benchmark-smoke
 
 echo "[package] preparing staging directory: ${STAGE_DIR}"
 rm -rf "${STAGE_DIR}"
@@ -24,6 +24,7 @@ mkdir -p "${STAGE_DIR}/bin" "${STAGE_DIR}/docs" "${STAGE_DIR}/deploy" "${STAGE_D
 
 cp target/release/ingestion "${STAGE_DIR}/bin/"
 cp target/release/retrieval "${STAGE_DIR}/bin/"
+cp target/release/segment-maintenance-daemon "${STAGE_DIR}/bin/"
 cp target/release/benchmark-smoke "${STAGE_DIR}/bin/"
 
 cp docs/architecture/eme-architecture.md "${STAGE_DIR}/docs/"

@@ -50,6 +50,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Segment compaction scheduler primitives.
 - Segment publish now prunes stale `.seg` files with one-generation safety retention (`active + previous` manifest files).
 - Ingestion transport now runs scheduled in-process segment maintenance (manifest verification + stale-file GC by minimum age policy).
+- Standalone segment lifecycle daemon binary (`segment-maintenance-daemon`) is available for out-of-process maintenance loops and one-shot verification ticks.
 - Benchmark profiles through xlarge (100k claims).
 - Benchmark history and scorecard outputs with regression guardrails.
 - Backup/restore/recovery drill scripts for WAL+snapshot+segment operations.
@@ -60,7 +61,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 4.1 Core storage/runtime gaps
 
 - No fully disk-native query serving path (current serving remains memory-centric with WAL/snapshot recovery).
-- No standalone out-of-process segment lifecycle daemon yet (in-process scheduled maintenance exists, but independent daemon/service isolation is not implemented).
+- Standalone segment maintenance exists, but systemd/container orchestration wiring is still incomplete for fully managed production operation.
 - No transactional write batch API with durable commit metadata.
 
 ### 4.2 Distributed system gaps

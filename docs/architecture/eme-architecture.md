@@ -511,6 +511,7 @@ Current implementation notes (2026-02-18):
   - compaction scheduler planning hook and compaction-plan application helper
 - ingestion publish now runs stale segment file GC after manifest swap, retaining active + previous manifest files for reader safety.
 - ingestion transport now runs a scheduled segment maintenance loop to verify tenant manifests and prune aged unreferenced segment files.
+- standalone segment lifecycle daemon binary (`segment-maintenance-daemon`) now supports out-of-process maintenance loops and one-shot maintenance verification.
 - ingestion runtime can publish tenant-scoped immutable segment snapshots to disk (`DASH_INGEST_SEGMENT_DIR`).
 - retrieval API can apply segment-backed claim prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`) as a bounded read-path prototype.
 - retrieval read source-of-truth is now explicit: `immutable segment base + mutable WAL delta`, then optional metadata prefilter intersection.
@@ -543,7 +544,7 @@ Current implementation notes (2026-02-18):
 
 - ANN recall/latency tuning toward production-grade HNSW-style behavior
 - metadata-filter planning over larger ANN candidate pools (to avoid filter drop-off on strict constraints)
-- full segment runtime integration (delta->segment promotion in live serving path + object-store tier + standalone lifecycle daemon)
+- full segment runtime integration (delta->segment promotion in live serving path + object-store tier + managed orchestration of lifecycle daemon/runtime)
 - distributed shard ownership + failover orchestration runtime (routing primitives are wired, but epoch-health observability and failover automation are still pending)
 - full authn federation (OIDC/JWT), hard tenant isolation audits, encryption controls
 - production observability + formal SLO enforcement loops

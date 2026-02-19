@@ -52,6 +52,10 @@ Status: active
 | `DASH_INGEST_ANN_SEARCH_EXPANSION_MIN` | no | `64` | ANN minimum expansion budget clamp | `EME_INGEST_ANN_SEARCH_EXPANSION_MIN` |
 | `DASH_INGEST_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | ANN maximum expansion budget clamp | `EME_INGEST_ANN_SEARCH_EXPANSION_MAX` |
 
+Ingestion segment lifecycle daemon note:
+
+- `target/release/segment-maintenance-daemon` reads the same segment env keys (`DASH_INGEST_SEGMENT_DIR`, `DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS`, `DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS`) for out-of-process maintenance loops.
+
 ## Retrieval Service
 
 | Variable | Required | Default | Description | Legacy Fallback |

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{OpenOptions, create_dir_all, read_dir},
+    fs::{OpenOptions, create_dir_all},
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -14,9 +14,9 @@ use std::{
 
 use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
 use indexer::{
-    CompactionSchedulerConfig, SegmentStoreError, apply_compaction_plan, build_segments,
-    load_manifest, persist_segments_atomic, plan_compaction_round,
-    prune_unreferenced_segment_files, prune_unreferenced_segment_files_with_min_stale_age,
+    CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentStoreError, apply_compaction_plan,
+    build_segments, load_manifest, maintain_segment_root, persist_segments_atomic,
+    plan_compaction_round, prune_unreferenced_segment_files,
 };
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig, ShardPlacement,
@@ -683,13 +683,6 @@ struct SegmentPublishStats {
     stale_file_pruned_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct SegmentMaintenanceStats {
-    tenant_dirs_scanned: usize,
-    tenant_manifests_found: usize,
-    pruned_file_count: usize,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlacementRoutingRuntime {
     local_node_id: String,
@@ -857,31 +850,7 @@ impl SegmentRuntime {
     }
 
     fn maintain_all_tenants(&self) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
-        create_dir_all(&self.root_dir)?;
-        let mut stats = SegmentMaintenanceStats::default();
-        for entry in read_dir(&self.root_dir)? {
-            let entry = entry?;
-            let tenant_dir = entry.path();
-            if !tenant_dir.is_dir() {
-                continue;
-            }
-            stats.tenant_dirs_scanned += 1;
-
-            let manifest = match load_manifest(&tenant_dir)? {
-                Some(manifest) => manifest,
-                None => continue,
-            };
-            let _ = indexer::load_segments_from_manifest(&tenant_dir, &manifest)?;
-            stats.tenant_manifests_found += 1;
-            let pruned = prune_unreferenced_segment_files_with_min_stale_age(
-                &tenant_dir,
-                &manifest,
-                None,
-                self.maintenance_min_stale_age,
-            )?;
-            stats.pruned_file_count += pruned;
-        }
-        Ok(stats)
+        maintain_segment_root(&self.root_dir, self.maintenance_min_stale_age)
     }
 }
 

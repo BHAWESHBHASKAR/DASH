@@ -72,6 +72,13 @@ pub struct SegmentManifest {
     pub entries: Vec<SegmentManifestEntry>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegmentMaintenanceStats {
+    pub tenant_dirs_scanned: usize,
+    pub tenant_manifests_found: usize,
+    pub pruned_file_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentStoreError {
     Io(String),
@@ -314,6 +321,37 @@ pub fn prune_unreferenced_segment_files_with_min_stale_age(
         }
     }
     Ok(removed_total)
+}
+
+pub fn maintain_segment_root(
+    root_dir: &Path,
+    min_stale_age: Duration,
+) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
+    create_dir_all(root_dir)?;
+    let mut stats = SegmentMaintenanceStats::default();
+    for entry in read_dir(root_dir)? {
+        let entry = entry?;
+        let tenant_dir = entry.path();
+        if !tenant_dir.is_dir() {
+            continue;
+        }
+        stats.tenant_dirs_scanned += 1;
+
+        let manifest = match load_manifest(&tenant_dir)? {
+            Some(manifest) => manifest,
+            None => continue,
+        };
+        let _ = load_segments_from_manifest(&tenant_dir, &manifest)?;
+        stats.tenant_manifests_found += 1;
+        let pruned = prune_unreferenced_segment_files_with_min_stale_age(
+            &tenant_dir,
+            &manifest,
+            None,
+            min_stale_age,
+        )?;
+        stats.pruned_file_count += pruned;
+    }
+    Ok(stats)
 }
 
 pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, SegmentStoreError> {
@@ -633,7 +671,7 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn claim(claim_id: &str, confidence: f32) -> Claim {
@@ -857,6 +895,38 @@ mod tests {
             })
             .any(|entry| root.join(&entry.file_name).exists());
         assert!(!old_only_exists);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintain_segment_root_scans_tenants_and_prunes_orphans() {
+        let root = temp_dir("segment-maintenance-root");
+        let tenant_a = root.join("tenant-a");
+        let tenant_b = root.join("tenant-b");
+        fs::create_dir_all(&tenant_b).expect("tenant-b dir should be created");
+
+        let active_manifest = persist_segments_atomic(
+            &tenant_a,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-1".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+        assert_eq!(active_manifest.entries.len(), 1);
+
+        let orphan_path = tenant_a.join("orphan.seg");
+        fs::write(&orphan_path, "stale segment file").expect("orphan file write should succeed");
+        assert!(orphan_path.exists());
+
+        let stats = maintain_segment_root(&root, Duration::ZERO)
+            .expect("segment maintenance should succeed");
+        assert_eq!(stats.tenant_dirs_scanned, 2);
+        assert_eq!(stats.tenant_manifests_found, 1);
+        assert_eq!(stats.pruned_file_count, 1);
+        assert!(!orphan_path.exists());
 
         let _ = fs::remove_dir_all(root);
     }
