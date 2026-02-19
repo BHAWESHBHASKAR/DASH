@@ -23,6 +23,14 @@ pub enum WalEvent {
     BatchCommit(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchCommitMetadata {
+    pub commit_id: String,
+    pub batch_size: usize,
+    pub ts_unix_ms: u64,
+    pub claim_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreError {
     Validation(ValidationError),
@@ -585,6 +593,7 @@ pub struct InMemoryStore {
     entity_index: HashMap<String, HashMap<String, HashSet<String>>>,
     embedding_index: HashMap<String, HashMap<String, HashSet<String>>>,
     temporal_index: HashMap<String, BTreeMap<i64, HashSet<String>>>,
+    batch_commits: HashMap<String, BatchCommitMetadata>,
     claim_tokens: HashMap<String, Vec<String>>,
     ann_tuning: AnnTuningConfig,
     wal: Vec<WalEvent>,
@@ -657,7 +666,7 @@ impl InMemoryStore {
                     store.apply_claim_vector(&record.claim_id, record.values)?;
                 }
                 PersistedRecord::BatchCommit(record) => {
-                    store.wal.push(WalEvent::BatchCommit(record.commit_id));
+                    store.apply_batch_commit_record(record)?;
                 }
             }
         }
@@ -747,8 +756,23 @@ impl InMemoryStore {
         wal.compact_with_snapshot(&records)
     }
 
-    pub fn observe_batch_commit(&mut self, commit_id: &str) {
-        self.wal.push(WalEvent::BatchCommit(commit_id.to_string()));
+    pub fn observe_batch_commit(
+        &mut self,
+        commit_id: &str,
+        batch_size: usize,
+        ts_unix_ms: u64,
+        claim_ids: &[String],
+    ) -> Result<(), StoreError> {
+        self.apply_batch_commit_record(BatchCommitRecord {
+            commit_id: commit_id.to_string(),
+            batch_size,
+            ts_unix_ms,
+            claim_ids: claim_ids.to_vec(),
+        })
+    }
+
+    pub fn batch_commit_metadata(&self, commit_id: &str) -> Option<&BatchCommitMetadata> {
+        self.batch_commits.get(commit_id)
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {
@@ -1431,6 +1455,21 @@ impl InMemoryStore {
             }
         }
 
+        let mut commit_ids: Vec<&String> = self.batch_commits.keys().collect();
+        commit_ids.sort_unstable();
+        for commit_id in commit_ids {
+            let metadata = self
+                .batch_commits
+                .get(commit_id)
+                .expect("batch commit should exist");
+            records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
+                commit_id: metadata.commit_id.clone(),
+                batch_size: metadata.batch_size,
+                ts_unix_ms: metadata.ts_unix_ms,
+                claim_ids: metadata.claim_ids.clone(),
+            }));
+        }
+
         records
     }
 
@@ -1560,6 +1599,30 @@ impl InMemoryStore {
         self.add_vector_index_entry(&tenant_id, claim_id, &stored_vector);
         self.wal
             .push(WalEvent::ClaimVectorUpsert(claim_id.to_string()));
+        Ok(())
+    }
+
+    fn apply_batch_commit_record(&mut self, record: BatchCommitRecord) -> Result<(), StoreError> {
+        if let Some(existing) = self.batch_commits.get(&record.commit_id) {
+            if existing.batch_size != record.batch_size || existing.claim_ids != record.claim_ids {
+                return Err(StoreError::Conflict(format!(
+                    "batch commit_id '{}' already exists with different payload",
+                    record.commit_id
+                )));
+            }
+            return Ok(());
+        }
+
+        self.batch_commits.insert(
+            record.commit_id.clone(),
+            BatchCommitMetadata {
+                commit_id: record.commit_id.clone(),
+                batch_size: record.batch_size,
+                ts_unix_ms: record.ts_unix_ms,
+                claim_ids: record.claim_ids,
+            },
+        );
+        self.wal.push(WalEvent::BatchCommit(record.commit_id));
         Ok(())
     }
 
@@ -3485,6 +3548,55 @@ mod tests {
         assert_eq!(stats.claims_loaded, 1);
 
         cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn observe_batch_commit_is_idempotent_for_same_payload() {
+        let mut store = InMemoryStore::new();
+        let claim_ids = vec!["c-idem-1".to_string(), "c-idem-2".to_string()];
+        store
+            .observe_batch_commit(
+                "commit-idem-1",
+                claim_ids.len(),
+                1_700_000_000_000,
+                &claim_ids,
+            )
+            .expect("first commit metadata insert should succeed");
+        store
+            .observe_batch_commit(
+                "commit-idem-1",
+                claim_ids.len(),
+                1_700_000_000_123,
+                &claim_ids,
+            )
+            .expect("same payload should replay idempotently");
+        let metadata = store
+            .batch_commit_metadata("commit-idem-1")
+            .expect("metadata should be retained");
+        assert_eq!(metadata.batch_size, 2);
+        assert_eq!(metadata.claim_ids, claim_ids);
+    }
+
+    #[test]
+    fn observe_batch_commit_rejects_payload_conflict_for_existing_commit_id() {
+        let mut store = InMemoryStore::new();
+        store
+            .observe_batch_commit(
+                "commit-conflict-1",
+                1,
+                1_700_000_000_000,
+                &["c-conflict-1".to_string()],
+            )
+            .expect("first commit metadata insert should succeed");
+        let err = store
+            .observe_batch_commit(
+                "commit-conflict-1",
+                1,
+                1_700_000_000_111,
+                &["c-conflict-2".to_string()],
+            )
+            .expect_err("conflicting payload should fail");
+        assert!(matches!(err, StoreError::Conflict(_)));
     }
 
     #[test]

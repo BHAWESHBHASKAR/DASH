@@ -142,13 +142,13 @@ curl -sS -X POST http://127.0.0.1:8081/v1/ingest \
   -d '{"claim":{"claim_id":"claim-1","tenant_id":"tenant-a","canonical_text":"Company X acquired Company Y","confidence":0.9},"evidence":[{"evidence_id":"ev-1","claim_id":"claim-1","source_id":"source://doc-1","stance":"supports","source_quality":0.95}]}'
 ```
 
-Ingest batch (durable commit metadata in WAL):
+Ingest batch (durable commit metadata in WAL, optional idempotent `commit_id`):
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/v1/ingest/batch \
   -H "X-API-Key: change-me-ingest-key" \
   -H "Content-Type: application/json" \
-  -d '{"items":[{"claim":{"claim_id":"claim-b-1","tenant_id":"tenant-a","canonical_text":"Company X announced expansion","confidence":0.88}},{"claim":{"claim_id":"claim-b-2","tenant_id":"tenant-a","canonical_text":"Company X closed acquisition","confidence":0.91}}]}'
+  -d '{"commit_id":"commit-ops-001","items":[{"claim":{"claim_id":"claim-b-1","tenant_id":"tenant-a","canonical_text":"Company X announced expansion","confidence":0.88}},{"claim":{"claim_id":"claim-b-2","tenant_id":"tenant-a","canonical_text":"Company X closed acquisition","confidence":0.91}}]}'
 ```
 
 Retrieve:
@@ -182,7 +182,7 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
 - monitor ingestion `/metrics` for:
   - `dash_ingest_success_total`
   - `dash_ingest_failed_total`
-  - `dash_ingest_batch_success_total`, `dash_ingest_batch_failed_total`, `dash_ingest_batch_commit_total`, `dash_ingest_batch_last_size`
+  - `dash_ingest_batch_success_total`, `dash_ingest_batch_failed_total`, `dash_ingest_batch_commit_total`, `dash_ingest_batch_last_size`, `dash_ingest_batch_idempotent_hit_total`
   - `dash_ingest_segment_publish_success_total`, `dash_ingest_segment_publish_failure_total`
   - `dash_ingest_segment_last_claim_count`, `dash_ingest_segment_last_segment_count`
   - `dash_ingest_wal_unsynced_records`, `dash_ingest_wal_buffered_records`

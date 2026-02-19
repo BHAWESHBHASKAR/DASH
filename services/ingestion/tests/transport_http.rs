@@ -167,9 +167,108 @@ fn transport_post_ingest_batch_parses_json_and_returns_commit_metadata() {
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("\"commit_id\":\"commit-"));
+    assert!(response.contains("\"idempotent_replay\":false"));
     assert!(response.contains("\"batch_size\":2"));
     assert!(response.contains("\"ingested_claim_ids\":[\"claim-batch-1\",\"claim-batch-2\"]"));
     assert!(response.contains("\"claims_total\":2"));
+}
+
+#[test]
+fn transport_post_ingest_batch_replays_idempotently_for_same_commit_id() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let body = r#"{
+      "commit_id": "http-idem-1",
+      "items": [
+        {
+          "claim": {
+            "claim_id": "claim-http-idem-1",
+            "tenant_id": "tenant-http",
+            "canonical_text": "HTTP idempotent one",
+            "confidence": 0.95
+          }
+        },
+        {
+          "claim": {
+            "claim_id": "claim-http-idem-2",
+            "tenant_id": "tenant-http",
+            "canonical_text": "HTTP idempotent two",
+            "confidence": 0.93
+          }
+        }
+      ]
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/batch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let first = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("first request should parse and return response");
+    let first = String::from_utf8(first).expect("first response should be UTF-8");
+    assert!(first.starts_with("HTTP/1.1 200 OK"));
+    assert!(first.contains("\"idempotent_replay\":false"));
+
+    let second = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("second request should parse and return response");
+    let second = String::from_utf8(second).expect("second response should be UTF-8");
+    assert!(second.starts_with("HTTP/1.1 200 OK"));
+    assert!(second.contains("\"idempotent_replay\":true"));
+}
+
+#[test]
+fn transport_post_ingest_batch_rejects_commit_id_reuse_with_different_payload() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let first_body = r#"{
+      "commit_id": "http-conflict-1",
+      "items": [
+        {
+          "claim": {
+            "claim_id": "claim-http-conflict-1",
+            "tenant_id": "tenant-http",
+            "canonical_text": "HTTP conflict one",
+            "confidence": 0.95
+          }
+        }
+      ]
+    }"#;
+    let first_request = format!(
+        "POST /v1/ingest/batch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        first_body.len(),
+        first_body
+    );
+    let first_response = handle_http_request_bytes(&runtime, first_request.as_bytes())
+        .expect("first request should parse and return response");
+    let first_response = String::from_utf8(first_response).expect("response should be UTF-8");
+    assert!(first_response.starts_with("HTTP/1.1 200 OK"));
+
+    let second_body = r#"{
+      "commit_id": "http-conflict-1",
+      "items": [
+        {
+          "claim": {
+            "claim_id": "claim-http-conflict-2",
+            "tenant_id": "tenant-http",
+            "canonical_text": "HTTP conflict two",
+            "confidence": 0.93
+          }
+        }
+      ]
+    }"#;
+    let second_request = format!(
+        "POST /v1/ingest/batch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        second_body.len(),
+        second_body
+    );
+    let second_response = handle_http_request_bytes(&runtime, second_request.as_bytes())
+        .expect("second request should parse and return response");
+    let second_response = String::from_utf8(second_response).expect("response should be UTF-8");
+    assert!(
+        second_response.starts_with("HTTP/1.1 409"),
+        "response was: {second_response}"
+    );
+    assert!(second_response.contains("state conflict"));
 }
 
 #[test]

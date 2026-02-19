@@ -44,6 +44,7 @@ pub struct IngestionRuntime {
     batch_failed_total: u64,
     batch_commit_total: u64,
     batch_last_size: usize,
+    batch_idempotent_hit_total: u64,
     segment_publish_success_total: u64,
     segment_publish_failure_total: u64,
     segment_last_claim_count: usize,
@@ -121,6 +122,7 @@ impl IngestionRuntime {
             batch_failed_total: 0,
             batch_commit_total: 0,
             batch_last_size: 0,
+            batch_idempotent_hit_total: 0,
             segment_publish_success_total: 0,
             segment_publish_failure_total: 0,
             segment_last_claim_count: 0,
@@ -170,6 +172,7 @@ impl IngestionRuntime {
             batch_failed_total: 0,
             batch_commit_total: 0,
             batch_last_size: 0,
+            batch_idempotent_hit_total: 0,
             segment_publish_success_total: 0,
             segment_publish_failure_total: 0,
             segment_last_claim_count: 0,
@@ -315,11 +318,37 @@ impl IngestionRuntime {
             ingested_claim_ids.push(claim_id);
         }
 
+        if let Some(existing) = self.store.batch_commit_metadata(&commit_id) {
+            if existing.batch_size != ingested_claim_ids.len()
+                || existing.claim_ids != ingested_claim_ids
+            {
+                return Err(StoreError::Conflict(format!(
+                    "batch commit_id '{}' already exists with different payload",
+                    commit_id
+                )));
+            }
+
+            self.batch_success_total = self.batch_success_total.saturating_add(1);
+            self.batch_last_size = ingested_claim_ids.len();
+            self.batch_idempotent_hit_total = self.batch_idempotent_hit_total.saturating_add(1);
+            return Ok(IngestBatchApiResponse {
+                commit_id,
+                idempotent_replay: true,
+                batch_size: ingested_claim_ids.len(),
+                ingested_claim_ids,
+                claims_total: self.store.claims_len(),
+                checkpoint_triggered: false,
+                checkpoint_snapshot_records: None,
+                checkpoint_truncated_wal_records: None,
+            });
+        }
+
         let mut staged_store = self.store.clone();
         for input in &inputs {
             ingest_document(&mut staged_store, input.clone())?;
         }
 
+        let commit_ts_unix_ms = unix_timestamp_millis();
         if let Some(wal) = self.wal.as_mut() {
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
@@ -329,7 +358,7 @@ impl IngestionRuntime {
                 wal.append_batch_commit(
                     &commit_id,
                     ingested_claim_ids.len(),
-                    unix_timestamp_millis(),
+                    commit_ts_unix_ms,
                     &ingested_claim_ids,
                 )?;
                 Ok::<(), StoreError>(())
@@ -349,14 +378,19 @@ impl IngestionRuntime {
             .saturating_add(ingested_claim_ids.len() as u64);
 
         let mut checkpoint_stats = None;
-        if let Some(wal) = self.wal.as_mut() {
-            self.store.observe_batch_commit(&commit_id);
-            if should_checkpoint_now(&self.checkpoint_policy, wal)? {
-                match self.store.checkpoint_and_compact(wal) {
-                    Ok(stats) => checkpoint_stats = Some(stats),
-                    Err(err) => {
-                        eprintln!("ingestion batch checkpoint failed after commit: {err:?}");
-                    }
+        self.store.observe_batch_commit(
+            &commit_id,
+            ingested_claim_ids.len(),
+            commit_ts_unix_ms,
+            &ingested_claim_ids,
+        )?;
+        if let Some(wal) = self.wal.as_mut()
+            && should_checkpoint_now(&self.checkpoint_policy, wal)?
+        {
+            match self.store.checkpoint_and_compact(wal) {
+                Ok(stats) => checkpoint_stats = Some(stats),
+                Err(err) => {
+                    eprintln!("ingestion batch checkpoint failed after commit: {err:?}");
                 }
             }
         }
@@ -369,6 +403,7 @@ impl IngestionRuntime {
         self.batch_last_size = ingested_claim_ids.len();
         Ok(IngestBatchApiResponse {
             commit_id,
+            idempotent_replay: false,
             batch_size: ingested_claim_ids.len(),
             ingested_claim_ids,
             claims_total: self.store.claims_len(),
@@ -634,6 +669,8 @@ dash_ingest_batch_failed_total {}\n\
 dash_ingest_batch_commit_total {}\n\
 # TYPE dash_ingest_batch_last_size gauge\n\
 dash_ingest_batch_last_size {}\n\
+# TYPE dash_ingest_batch_idempotent_hit_total counter\n\
+dash_ingest_batch_idempotent_hit_total {}\n\
 # TYPE dash_ingest_segment_publish_success_total counter\n\
 dash_ingest_segment_publish_success_total {}\n\
 # TYPE dash_ingest_segment_publish_failure_total counter\n\
@@ -734,6 +771,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.batch_failed_total,
             self.batch_commit_total,
             self.batch_last_size,
+            self.batch_idempotent_hit_total,
             self.segment_publish_success_total,
             self.segment_publish_failure_total,
             self.segment_last_claim_count,
@@ -3012,8 +3050,9 @@ fn render_ingest_batch_response_json(resp: &IngestBatchApiResponse) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"commit_id\":\"{}\",\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        "{{\"commit_id\":\"{}\",\"idempotent_replay\":{},\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
         json_escape(&resp.commit_id),
+        resp.idempotent_replay,
         resp.batch_size,
         ingested_claim_ids,
         resp.claims_total,
@@ -3700,6 +3739,7 @@ mod tests {
         let response = handle_request(&runtime, &request);
         assert_eq!(response.status, 200);
         assert!(response.body.contains("\"commit_id\":\"commit-"));
+        assert!(response.body.contains("\"idempotent_replay\":false"));
         assert!(response.body.contains("\"batch_size\":2"));
         assert!(
             response
@@ -3725,6 +3765,146 @@ mod tests {
             metrics_response
                 .body
                 .contains("dash_ingest_batch_last_size 2")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_idempotent_hit_total 0")
+        );
+    }
+
+    #[test]
+    fn handle_request_post_batch_replays_idempotently_for_same_commit_id() {
+        let runtime = sample_runtime();
+        let body = br#"{
+            "commit_id": "commit-idem-1",
+            "items": [
+                {
+                    "claim": {
+                        "claim_id": "c-idem-1",
+                        "tenant_id": "tenant-a",
+                        "canonical_text": "Idempotent batch one",
+                        "confidence": 0.91
+                    }
+                },
+                {
+                    "claim": {
+                        "claim_id": "c-idem-2",
+                        "tenant_id": "tenant-a",
+                        "canonical_text": "Idempotent batch two",
+                        "confidence": 0.89
+                    }
+                }
+            ]
+        }"#
+        .to_vec();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest/batch".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: body.clone(),
+        };
+        let first = handle_request(&runtime, &request);
+        assert_eq!(first.status, 200);
+        assert!(first.body.contains("\"idempotent_replay\":false"));
+        assert!(first.body.contains("\"claims_total\":2"));
+
+        let second = handle_request(&runtime, &HttpRequest { body, ..request });
+        assert_eq!(second.status, 200);
+        assert!(second.body.contains("\"idempotent_replay\":true"));
+        assert!(second.body.contains("\"claims_total\":2"));
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_success_total 2")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_idempotent_hit_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_success_total 2")
+        );
+    }
+
+    #[test]
+    fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
+        let runtime = sample_runtime();
+        let first_request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest/batch".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{
+                "commit_id": "commit-conflict-1",
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-conflict-1",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Commit conflict one",
+                            "confidence": 0.91
+                        }
+                    }
+                ]
+            }"#
+            .to_vec(),
+        };
+        let first = handle_request(&runtime, &first_request);
+        assert_eq!(first.status, 200);
+        assert!(first.body.contains("\"idempotent_replay\":false"));
+
+        let second_request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest/batch".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{
+                "commit_id": "commit-conflict-1",
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-conflict-2",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Commit conflict two",
+                            "confidence": 0.89
+                        }
+                    }
+                ]
+            }"#
+            .to_vec(),
+        };
+        let second = handle_request(&runtime, &second_request);
+        assert_eq!(second.status, 409);
+        assert!(second.body.contains("state conflict"));
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_failed_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_idempotent_hit_total 0")
         );
     }
 

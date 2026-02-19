@@ -40,6 +40,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 - Ingestion and retrieval HTTP transports with health and metrics endpoints.
 - Ingestion batch write API (`POST /v1/ingest/batch`) with durable WAL commit metadata records.
 - Batch writes now enforce strict atomic rollback semantics (store state and WAL are rolled back on batch failure).
+- Batch `commit_id` retry semantics are now explicit: same payload replays idempotently, mismatched payload returns conflict.
 - Runtime policy controls for auth, worker pools, and transport mode selection.
 - Startup replay and replay-stat logging for persistent mode.
 - JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
@@ -64,7 +65,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 
 - No fully disk-native query serving path (current serving remains memory-centric with WAL/snapshot recovery).
 - Standalone segment maintenance now has basic systemd/container wiring; higher-level orchestration (k8s/operator automation and policy-driven lifecycle management) is still incomplete.
-- Multi-item batch rollback semantics are implemented; remaining gap is higher-level idempotency/retry orchestration across distributed replicas.
+- Single-node batch idempotency/retry semantics are implemented; remaining gap is cross-replica idempotency orchestration in distributed deployments.
 
 ### 4.2 Distributed system gaps
 

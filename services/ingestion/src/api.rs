@@ -26,6 +26,7 @@ pub struct IngestApiResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestBatchApiResponse {
     pub commit_id: String,
+    pub idempotent_replay: bool,
     pub ingested_claim_ids: Vec<String>,
     pub batch_size: usize,
     pub claims_total: usize,
