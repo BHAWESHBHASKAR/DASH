@@ -8,9 +8,26 @@ pub struct IngestApiRequest {
     pub edges: Vec<ClaimEdge>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct IngestBatchApiRequest {
+    pub commit_id: Option<String>,
+    pub items: Vec<IngestApiRequest>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestApiResponse {
     pub ingested_claim_id: String,
+    pub claims_total: usize,
+    pub checkpoint_triggered: bool,
+    pub checkpoint_snapshot_records: Option<usize>,
+    pub checkpoint_truncated_wal_records: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestBatchApiResponse {
+    pub commit_id: String,
+    pub ingested_claim_ids: Vec<String>,
+    pub batch_size: usize,
     pub claims_total: usize,
     pub checkpoint_triggered: bool,
     pub checkpoint_snapshot_records: Option<usize>,

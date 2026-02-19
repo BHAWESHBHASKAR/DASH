@@ -36,6 +36,7 @@ Status: active
 - [ ] `DASH_*` runtime envs configured (or explicit `EME_*` fallback plan documented)
 - [ ] if JWT auth mode is enabled, `DASH_*_JWT_*` envs validated (active secret, optional rotation secret set and/or `kid` map, issuer/audience policy, exp requirement)
 - [ ] health endpoint, ingest endpoint, and retrieve endpoint probes prepared
+- [ ] batch ingest endpoint probe prepared (`POST /v1/ingest/batch`)
 - [ ] metrics endpoint probe prepared (`/metrics`)
 - [ ] rollback operator and fallback data restore path documented
 - [ ] deployment assets selected and validated (`deploy/systemd/*` or `deploy/container/*`)

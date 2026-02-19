@@ -20,6 +20,7 @@ pub enum WalEvent {
     EvidenceUpsert(String),
     EdgeUpsert(String),
     ClaimVectorUpsert(String),
+    BatchCommit(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,12 +51,21 @@ enum PersistedRecord {
     Evidence(Evidence),
     Edge(ClaimEdge),
     ClaimVector(ClaimVectorRecord),
+    BatchCommit(BatchCommitRecord),
 }
 
 #[derive(Debug, Clone)]
 struct ClaimVectorRecord {
     claim_id: String,
     values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct BatchCommitRecord {
+    commit_id: String,
+    batch_size: usize,
+    ts_unix_ms: u64,
+    claim_ids: Vec<String>,
 }
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";
@@ -307,6 +317,21 @@ impl FileWal {
         self.append_record(&PersistedRecord::ClaimVector(ClaimVectorRecord {
             claim_id: claim_id.to_string(),
             values: values.to_vec(),
+        }))
+    }
+
+    pub fn append_batch_commit(
+        &mut self,
+        commit_id: &str,
+        batch_size: usize,
+        ts_unix_ms: u64,
+        claim_ids: &[String],
+    ) -> Result<(), StoreError> {
+        self.append_record(&PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: commit_id.to_string(),
+            batch_size,
+            ts_unix_ms,
+            claim_ids: claim_ids.to_vec(),
         }))
     }
 
@@ -601,6 +626,9 @@ impl InMemoryStore {
                 PersistedRecord::ClaimVector(record) => {
                     vectors_loaded += 1;
                     store.apply_claim_vector(&record.claim_id, record.values)?;
+                }
+                PersistedRecord::BatchCommit(record) => {
+                    store.wal.push(WalEvent::BatchCommit(record.commit_id));
                 }
             }
         }
@@ -1981,6 +2009,13 @@ fn record_to_line(record: &PersistedRecord) -> String {
             escape_field(&record.claim_id),
             pack_f32_list(&record.values)
         ),
+        PersistedRecord::BatchCommit(record) => format!(
+            "B\t{}\t{}\t{}\t{}",
+            escape_field(&record.commit_id),
+            record.batch_size,
+            record.ts_unix_ms,
+            pack_string_list(&record.claim_ids)
+        ),
     }
 }
 
@@ -2107,6 +2142,25 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
             Ok(PersistedRecord::ClaimVector(ClaimVectorRecord {
                 claim_id: unescape_field(parts[1])?,
                 values: unpack_f32_list(parts[2])?,
+            }))
+        }
+        "B" => {
+            if parts.len() != 5 {
+                return Err(StoreError::Parse(
+                    "batch commit record has invalid field count".to_string(),
+                ));
+            }
+            let batch_size = parts[2].parse::<usize>().map_err(|_| {
+                StoreError::Parse("batch commit record has invalid batch_size".to_string())
+            })?;
+            let ts_unix_ms = parts[3].parse::<u64>().map_err(|_| {
+                StoreError::Parse("batch commit record has invalid ts_unix_ms".to_string())
+            })?;
+            Ok(PersistedRecord::BatchCommit(BatchCommitRecord {
+                commit_id: unescape_field(parts[1])?,
+                batch_size,
+                ts_unix_ms,
+                claim_ids: unpack_string_list(parts[4])?,
             }))
         }
         _ => Err(StoreError::Parse("unknown wal record kind".to_string())),
@@ -3367,6 +3421,35 @@ mod tests {
             Some(&[0.1, 0.3, 0.5, 0.7]),
         );
         assert_eq!(results.first().map(|r| r.claim_id.as_str()), Some("c-vec"));
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn batch_commit_wal_record_replays_without_mutating_claim_state() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open(&wal_path).unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-batch", "Batch WAL claim"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        wal.append_batch_commit(
+            "commit-test-123",
+            1,
+            1_700_000_000_000,
+            &["c-batch".to_string()],
+        )
+        .expect("batch commit append should succeed");
+
+        let (replayed, stats) = InMemoryStore::load_from_wal_with_stats(&wal).unwrap();
+        assert_eq!(replayed.claims_len(), 1);
+        assert_eq!(stats.claims_loaded, 1);
 
         cleanup_persistence_files(&wal);
     }

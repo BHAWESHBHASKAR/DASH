@@ -27,7 +27,7 @@ use store::{CheckpointPolicy, FileWal, InMemoryStore, StoreError};
 
 use crate::{
     IngestInput,
-    api::{IngestApiRequest, IngestApiResponse},
+    api::{IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse},
     ingest_document, ingest_document_persistent_with_policy,
 };
 
@@ -40,6 +40,10 @@ pub struct IngestionRuntime {
     placement_routing: Result<Option<PlacementRoutingState>, String>,
     successful_ingests: u64,
     failed_ingests: u64,
+    batch_success_total: u64,
+    batch_failed_total: u64,
+    batch_commit_total: u64,
+    batch_last_size: usize,
     segment_publish_success_total: u64,
     segment_publish_failure_total: u64,
     segment_last_claim_count: usize,
@@ -113,6 +117,10 @@ impl IngestionRuntime {
             placement_routing: PlacementRoutingState::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
+            batch_success_total: 0,
+            batch_failed_total: 0,
+            batch_commit_total: 0,
+            batch_last_size: 0,
             segment_publish_success_total: 0,
             segment_publish_failure_total: 0,
             segment_last_claim_count: 0,
@@ -158,6 +166,10 @@ impl IngestionRuntime {
             placement_routing: PlacementRoutingState::from_env(),
             successful_ingests: 0,
             failed_ingests: 0,
+            batch_success_total: 0,
+            batch_failed_total: 0,
+            batch_commit_total: 0,
+            batch_last_size: 0,
             segment_publish_success_total: 0,
             segment_publish_failure_total: 0,
             segment_last_claim_count: 0,
@@ -266,38 +278,10 @@ impl IngestionRuntime {
             evidence: request.evidence,
             edges: request.edges,
         };
-
-        let checkpoint_stats = if let Some(wal) = self.wal.as_mut() {
-            ingest_document_persistent_with_policy(
-                &mut self.store,
-                wal,
-                &self.checkpoint_policy,
-                input,
-            )?
-        } else {
-            ingest_document(&mut self.store, input)?;
-            None
-        };
+        let checkpoint_stats = self.ingest_input_internal(input)?;
 
         self.successful_ingests += 1;
-        if let Some(segment_runtime) = self.segment_runtime.as_ref() {
-            match segment_runtime.publish_for_tenant(&self.store, &tenant_id) {
-                Ok(stats) => {
-                    self.segment_publish_success_total += 1;
-                    self.segment_last_claim_count = stats.claim_count;
-                    self.segment_last_segment_count = stats.segment_count;
-                    self.segment_last_compaction_plans = stats.compaction_plan_count;
-                    self.segment_last_stale_file_pruned_count = stats.stale_file_pruned_count;
-                }
-                Err(err) => {
-                    self.segment_publish_failure_total += 1;
-                    eprintln!(
-                        "ingestion segment publish failed for tenant '{}': {err:?}",
-                        tenant_id
-                    );
-                }
-            }
-        }
+        self.publish_segments_for_tenant(&tenant_id);
         Ok(IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
@@ -309,8 +293,111 @@ impl IngestionRuntime {
         })
     }
 
+    fn ingest_batch(
+        &mut self,
+        request: IngestBatchApiRequest,
+    ) -> Result<IngestBatchApiResponse, StoreError> {
+        let commit_id = request.commit_id.unwrap_or_else(generate_batch_commit_id);
+        let mut ingested_claim_ids = Vec::with_capacity(request.items.len());
+        let mut touched_tenants = HashSet::new();
+        let mut checkpoint_snapshot_records = None;
+        let mut checkpoint_truncated_wal_records = None;
+        let mut checkpoint_triggered = false;
+
+        for item in request.items {
+            let tenant_id = item.claim.tenant_id.clone();
+            let claim_id = item.claim.claim_id.clone();
+            let input = IngestInput {
+                claim: item.claim,
+                claim_embedding: item.claim_embedding,
+                evidence: item.evidence,
+                edges: item.edges,
+            };
+            let checkpoint_stats = self.ingest_input_internal(input)?;
+            if let Some(stats) = checkpoint_stats {
+                checkpoint_triggered = true;
+                checkpoint_snapshot_records = Some(stats.snapshot_records);
+                checkpoint_truncated_wal_records = Some(stats.truncated_wal_records);
+            }
+            self.successful_ingests += 1;
+            touched_tenants.insert(tenant_id);
+            ingested_claim_ids.push(claim_id);
+        }
+
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append_batch_commit(
+                &commit_id,
+                ingested_claim_ids.len(),
+                unix_timestamp_millis(),
+                &ingested_claim_ids,
+            )?;
+            self.batch_commit_total = self.batch_commit_total.saturating_add(1);
+        }
+
+        for tenant_id in touched_tenants {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
+
+        self.batch_success_total = self.batch_success_total.saturating_add(1);
+        self.batch_last_size = ingested_claim_ids.len();
+        Ok(IngestBatchApiResponse {
+            commit_id,
+            batch_size: ingested_claim_ids.len(),
+            ingested_claim_ids,
+            claims_total: self.store.claims_len(),
+            checkpoint_triggered,
+            checkpoint_snapshot_records,
+            checkpoint_truncated_wal_records,
+        })
+    }
+
+    fn ingest_input_internal(
+        &mut self,
+        input: IngestInput,
+    ) -> Result<Option<store::WalCheckpointStats>, StoreError> {
+        let checkpoint_stats = if let Some(wal) = self.wal.as_mut() {
+            ingest_document_persistent_with_policy(
+                &mut self.store,
+                wal,
+                &self.checkpoint_policy,
+                input,
+            )?
+        } else {
+            ingest_document(&mut self.store, input)?;
+            None
+        };
+        Ok(checkpoint_stats)
+    }
+
+    fn publish_segments_for_tenant(&mut self, tenant_id: &str) {
+        if let Some(segment_runtime) = self.segment_runtime.as_ref() {
+            match segment_runtime.publish_for_tenant(&self.store, tenant_id) {
+                Ok(stats) => {
+                    self.segment_publish_success_total =
+                        self.segment_publish_success_total.saturating_add(1);
+                    self.segment_last_claim_count = stats.claim_count;
+                    self.segment_last_segment_count = stats.segment_count;
+                    self.segment_last_compaction_plans = stats.compaction_plan_count;
+                    self.segment_last_stale_file_pruned_count = stats.stale_file_pruned_count;
+                }
+                Err(err) => {
+                    self.segment_publish_failure_total =
+                        self.segment_publish_failure_total.saturating_add(1);
+                    eprintln!(
+                        "ingestion segment publish failed for tenant '{}': {err:?}",
+                        tenant_id
+                    );
+                }
+            }
+        }
+    }
+
     fn observe_failure(&mut self) {
         self.failed_ingests += 1;
+    }
+
+    fn observe_batch_failure(&mut self) {
+        self.batch_failed_total = self.batch_failed_total.saturating_add(1);
     }
 
     fn observe_auth_success(&mut self) {
@@ -510,6 +597,14 @@ impl IngestionRuntime {
 dash_ingest_success_total {}\n\
 # TYPE dash_ingest_failed_total counter\n\
 dash_ingest_failed_total {}\n\
+# TYPE dash_ingest_batch_success_total counter\n\
+dash_ingest_batch_success_total {}\n\
+# TYPE dash_ingest_batch_failed_total counter\n\
+dash_ingest_batch_failed_total {}\n\
+# TYPE dash_ingest_batch_commit_total counter\n\
+dash_ingest_batch_commit_total {}\n\
+# TYPE dash_ingest_batch_last_size gauge\n\
+dash_ingest_batch_last_size {}\n\
 # TYPE dash_ingest_segment_publish_success_total counter\n\
 dash_ingest_segment_publish_success_total {}\n\
 # TYPE dash_ingest_segment_publish_failure_total counter\n\
@@ -606,6 +701,10 @@ dash_ingest_claims_total {}\n\
 dash_ingest_uptime_seconds {:.4}\n",
             self.successful_ingests,
             self.failed_ingests,
+            self.batch_success_total,
+            self.batch_failed_total,
+            self.batch_commit_total,
+            self.batch_last_size,
             self.segment_publish_success_total,
             self.segment_publish_failure_total,
             self.segment_last_claim_count,
@@ -665,6 +764,8 @@ const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
 const DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
+const DEFAULT_INGEST_BATCH_MAX_ITEMS: usize = 128;
+static BATCH_COMMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentRuntime {
@@ -1520,7 +1621,151 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
                 Err(err) => HttpResponse::bad_request(&err),
             }
         }
+        ("POST", "/v1/ingest/batch") => {
+            if let Some(content_type) = request.headers.get("content-type")
+                && !content_type
+                    .to_ascii_lowercase()
+                    .contains("application/json")
+            {
+                return HttpResponse::bad_request(
+                    "content-type must include application/json for POST /v1/ingest/batch",
+                );
+            }
+            let body = match std::str::from_utf8(&request.body) {
+                Ok(body) => body,
+                Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
+            };
+            let max_items = resolve_ingest_batch_max_items();
+            match build_ingest_batch_request_from_json(body, max_items) {
+                Ok(api_req) => {
+                    let tenant_id = api_req.items[0].claim.tenant_id.clone();
+                    match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                        AuthDecision::Unauthorized(reason) => {
+                            observe_auth_failure(runtime);
+                            emit_audit_event(
+                                runtime,
+                                audit_log_path.as_deref(),
+                                AuditEvent {
+                                    action: "ingest_batch",
+                                    tenant_id: Some(&tenant_id),
+                                    claim_id: None,
+                                    status: 401,
+                                    outcome: "denied",
+                                    reason,
+                                },
+                            );
+                            return HttpResponse::unauthorized(reason);
+                        }
+                        AuthDecision::Forbidden(reason) => {
+                            observe_authz_denied(runtime);
+                            emit_audit_event(
+                                runtime,
+                                audit_log_path.as_deref(),
+                                AuditEvent {
+                                    action: "ingest_batch",
+                                    tenant_id: Some(&tenant_id),
+                                    claim_id: None,
+                                    status: 403,
+                                    outcome: "denied",
+                                    reason,
+                                },
+                            );
+                            return HttpResponse::forbidden(reason);
+                        }
+                        AuthDecision::Allowed => {
+                            observe_auth_success(runtime);
+                        }
+                    }
+
+                    let mut audit_status = 500;
+                    let mut audit_outcome = "error";
+                    let mut audit_reason = "runtime lock unavailable".to_string();
+                    let mut guard = match runtime.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            emit_audit_event(
+                                runtime,
+                                audit_log_path.as_deref(),
+                                AuditEvent {
+                                    action: "ingest_batch",
+                                    tenant_id: Some(&tenant_id),
+                                    claim_id: None,
+                                    status: audit_status,
+                                    outcome: audit_outcome,
+                                    reason: &audit_reason,
+                                },
+                            );
+                            return HttpResponse::internal_server_error(
+                                "failed to acquire ingestion runtime lock",
+                            );
+                        }
+                    };
+                    guard.flush_wal_if_due();
+                    for item in &api_req.items {
+                        if let Err(route_err) =
+                            guard.ensure_local_write_route_for_claim(&item.claim)
+                        {
+                            guard.observe_failure();
+                            guard.observe_batch_failure();
+                            guard.observe_write_route_rejection(&route_err);
+                            audit_outcome = "denied";
+                            let (status, message) = map_write_route_error(&route_err);
+                            audit_status = status;
+                            audit_reason = message.clone();
+                            let response = HttpResponse::error_with_status(status, &message);
+                            drop(guard);
+                            emit_audit_event(
+                                runtime,
+                                audit_log_path.as_deref(),
+                                AuditEvent {
+                                    action: "ingest_batch",
+                                    tenant_id: Some(&tenant_id),
+                                    claim_id: None,
+                                    status: audit_status,
+                                    outcome: audit_outcome,
+                                    reason: &audit_reason,
+                                },
+                            );
+                            return response;
+                        }
+                    }
+                    let response = match guard.ingest_batch(api_req) {
+                        Ok(resp) => {
+                            audit_status = 200;
+                            audit_outcome = "success";
+                            audit_reason =
+                                format!("ingest batch accepted (commit_id={})", resp.commit_id);
+                            HttpResponse::ok_json(render_ingest_batch_response_json(&resp))
+                        }
+                        Err(err) => {
+                            guard.observe_failure();
+                            guard.observe_batch_failure();
+                            let (status, message) = map_store_error(&err);
+                            audit_status = status;
+                            audit_reason = message.clone();
+                            HttpResponse::error_with_status(status, &message)
+                        }
+                    };
+                    drop(guard);
+                    emit_audit_event(
+                        runtime,
+                        audit_log_path.as_deref(),
+                        AuditEvent {
+                            action: "ingest_batch",
+                            tenant_id: Some(&tenant_id),
+                            claim_id: None,
+                            status: audit_status,
+                            outcome: audit_outcome,
+                            reason: &audit_reason,
+                        },
+                    );
+                    response
+                }
+                Err(err) => HttpResponse::bad_request(&err),
+            }
+        }
         (_, "/v1/ingest") => HttpResponse::method_not_allowed("only POST is supported"),
+        (_, "/v1/ingest/batch") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/health") | (_, "/metrics") | (_, "/debug/placement") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
@@ -1722,6 +1967,29 @@ fn map_store_error(error: &StoreError) -> (u16, String) {
             (500, format!("internal persistence error: {message}"))
         }
     }
+}
+
+fn resolve_ingest_batch_max_items() -> usize {
+    parse_env_first_usize(&["DASH_INGEST_BATCH_MAX_ITEMS", "EME_INGEST_BATCH_MAX_ITEMS"])
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INGEST_BATCH_MAX_ITEMS)
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn generate_batch_commit_id() -> String {
+    let nonce = BATCH_COMMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "commit-{}-{}-{}",
+        unix_timestamp_millis(),
+        std::process::id(),
+        nonce
+    )
 }
 
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
@@ -2354,12 +2622,67 @@ fn is_sha256_hex(raw: &str) -> bool {
 
 fn build_ingest_request_from_json(body: &str) -> Result<IngestApiRequest, String> {
     let value = parse_json(body)?;
+    if !matches!(value, JsonValue::Object(_)) {
+        return Err("request body must be a JSON object".to_string());
+    }
+    build_ingest_request_from_json_value(&value)
+}
+
+fn build_ingest_batch_request_from_json(
+    body: &str,
+    max_items: usize,
+) -> Result<IngestBatchApiRequest, String> {
+    let value = parse_json(body)?;
     let object = match value {
         JsonValue::Object(map) => map,
         _ => return Err("request body must be a JSON object".to_string()),
     };
+    let items = match object.get("items") {
+        Some(JsonValue::Array(items)) => items,
+        Some(_) => return Err("items must be an array".to_string()),
+        None => return Err("items is required".to_string()),
+    };
+    if items.is_empty() {
+        return Err("items must not be empty".to_string());
+    }
+    if items.len() > max_items {
+        return Err(format!(
+            "items length {} exceeds max batch size {}",
+            items.len(),
+            max_items
+        ));
+    }
+    let commit_id = parse_optional_string(object.get("commit_id"), "commit_id")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
-    let claim_obj = require_object(&object, "claim")?;
+    let mut parsed = Vec::with_capacity(items.len());
+    let mut expected_tenant: Option<String> = None;
+    for item in items {
+        let req = build_ingest_request_from_json_value(item)?;
+        if let Some(tenant_id) = expected_tenant.as_deref() {
+            if tenant_id != req.claim.tenant_id {
+                return Err("all batch items must share the same claim.tenant_id".to_string());
+            }
+        } else {
+            expected_tenant = Some(req.claim.tenant_id.clone());
+        }
+        parsed.push(req);
+    }
+
+    Ok(IngestBatchApiRequest {
+        commit_id,
+        items: parsed,
+    })
+}
+
+fn build_ingest_request_from_json_value(value: &JsonValue) -> Result<IngestApiRequest, String> {
+    let object = match value {
+        JsonValue::Object(map) => map,
+        _ => return Err("ingest item must be a JSON object".to_string()),
+    };
+
+    let claim_obj = require_object(object, "claim")?;
     let claim = Claim {
         claim_id: require_string(&claim_obj, "claim_id")?,
         tenant_id: require_string(&claim_obj, "tenant_id")?,
@@ -2609,6 +2932,33 @@ fn render_ingest_response_json(resp: &IngestApiResponse) -> String {
     format!(
         "{{\"ingested_claim_id\":\"{}\",\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
         json_escape(&resp.ingested_claim_id),
+        resp.claims_total,
+        resp.checkpoint_triggered,
+        checkpoint_snapshot_records,
+        checkpoint_truncated_wal_records
+    )
+}
+
+fn render_ingest_batch_response_json(resp: &IngestBatchApiResponse) -> String {
+    let checkpoint_snapshot_records = resp
+        .checkpoint_snapshot_records
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let checkpoint_truncated_wal_records = resp
+        .checkpoint_truncated_wal_records
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let ingested_claim_ids = resp
+        .ingested_claim_ids
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"commit_id\":\"{}\",\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        json_escape(&resp.commit_id),
+        resp.batch_size,
+        ingested_claim_ids,
         resp.claims_total,
         resp.checkpoint_triggered,
         checkpoint_snapshot_records,
@@ -3188,6 +3538,63 @@ mod tests {
     }
 
     #[test]
+    fn build_ingest_batch_request_from_json_accepts_items_and_commit_id() {
+        let body = r#"{
+            "commit_id": "commit-test-1",
+            "items": [
+                {
+                    "claim": {
+                        "claim_id": "c1",
+                        "tenant_id": "tenant-a",
+                        "canonical_text": "Company X acquired Company Y",
+                        "confidence": 0.9
+                    }
+                },
+                {
+                    "claim": {
+                        "claim_id": "c2",
+                        "tenant_id": "tenant-a",
+                        "canonical_text": "Company X expanded into region Z",
+                        "confidence": 0.88
+                    }
+                }
+            ]
+        }"#;
+
+        let req = build_ingest_batch_request_from_json(body, 8).expect("batch parse should work");
+        assert_eq!(req.commit_id.as_deref(), Some("commit-test-1"));
+        assert_eq!(req.items.len(), 2);
+        assert_eq!(req.items[0].claim.claim_id, "c1");
+        assert_eq!(req.items[1].claim.claim_id, "c2");
+    }
+
+    #[test]
+    fn build_ingest_batch_request_from_json_rejects_cross_tenant_batch() {
+        let body = r#"{
+            "items": [
+                {
+                    "claim": {
+                        "claim_id": "c1",
+                        "tenant_id": "tenant-a",
+                        "canonical_text": "A",
+                        "confidence": 0.9
+                    }
+                },
+                {
+                    "claim": {
+                        "claim_id": "c2",
+                        "tenant_id": "tenant-b",
+                        "canonical_text": "B",
+                        "confidence": 0.8
+                    }
+                }
+            ]
+        }"#;
+        let err = build_ingest_batch_request_from_json(body, 16).expect_err("batch should fail");
+        assert!(err.contains("same claim.tenant_id"));
+    }
+
+    #[test]
     fn handle_request_post_ingests_claim() {
         let runtime = sample_runtime();
         let request = HttpRequest {
@@ -3201,6 +3608,67 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.contains("\"ingested_claim_id\":\"c1\""));
         assert!(response.body.contains("\"claims_total\":1"));
+    }
+
+    #[test]
+    fn handle_request_post_batch_ingests_claims_and_returns_commit_metadata() {
+        let runtime = sample_runtime();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest/batch".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-b1",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Batch item one",
+                            "confidence": 0.91
+                        }
+                    },
+                    {
+                        "claim": {
+                            "claim_id": "c-b2",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Batch item two",
+                            "confidence": 0.89
+                        }
+                    }
+                ]
+            }"#
+            .to_vec(),
+        };
+
+        let response = handle_request(&runtime, &request);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"commit_id\":\"commit-"));
+        assert!(response.body.contains("\"batch_size\":2"));
+        assert!(
+            response
+                .body
+                .contains("\"ingested_claim_ids\":[\"c-b1\",\"c-b2\"]")
+        );
+        assert!(response.body.contains("\"claims_total\":2"));
+
+        let metrics_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/metrics".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let metrics_response = handle_request(&runtime, &metrics_request);
+        assert_eq!(metrics_response.status, 200);
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_success_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_ingest_batch_last_size 2")
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 3.3 Services and transport
 
 - Ingestion and retrieval HTTP transports with health and metrics endpoints.
+- Ingestion batch write API (`POST /v1/ingest/batch`) with durable WAL commit metadata records.
 - Runtime policy controls for auth, worker pools, and transport mode selection.
 - Startup replay and replay-stat logging for persistent mode.
 - JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
@@ -62,7 +63,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 
 - No fully disk-native query serving path (current serving remains memory-centric with WAL/snapshot recovery).
 - Standalone segment maintenance now has basic systemd/container wiring; higher-level orchestration (k8s/operator automation and policy-driven lifecycle management) is still incomplete.
-- No transactional write batch API with durable commit metadata.
+- Strict multi-item rollback semantics for batch writes are not yet implemented (current batch API validates upfront and records durable commit metadata, but partial failure recovery is still roadmap).
 
 ### 4.2 Distributed system gaps
 

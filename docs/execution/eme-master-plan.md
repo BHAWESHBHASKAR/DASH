@@ -18,6 +18,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Retrieval transport now includes an authenticated planner-debug endpoint (`GET /debug/planner`) for stage-wise candidate observability.
 - Retrieval transport now includes an authenticated storage-visibility endpoint (`GET /debug/storage-visibility`) with segment/WAL divergence warning evaluation and metrics.
 - Ingestion API transport is implemented (`POST /v1/ingest`, `GET /health`, `GET /metrics`) with persistent-policy wiring.
+- Ingestion batch API transport is implemented (`POST /v1/ingest/batch`) with durable WAL batch commit metadata records.
 - Retrieval transport exposes runtime metrics at `/metrics` including DASH latency percentiles and visibility-lag estimates.
 - Schema layer includes claim/evidence metadata for citation-grade retrieval (`entities`, `embedding_ids`, `chunk_id`, `span_start`, `span_end`) with backward-compatible WAL replay.
 - Ingestion/retrieval transports support configurable HTTP worker pools for concurrent request handling (`DASH_*_HTTP_WORKERS`).

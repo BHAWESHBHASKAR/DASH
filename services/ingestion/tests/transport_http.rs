@@ -133,6 +133,46 @@ fn transport_post_ingest_parses_json_and_returns_response() {
 }
 
 #[test]
+fn transport_post_ingest_batch_parses_json_and_returns_commit_metadata() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let body = r#"{
+      "items": [
+        {
+          "claim": {
+            "claim_id": "claim-batch-1",
+            "tenant_id": "tenant-http",
+            "canonical_text": "Batch claim one",
+            "confidence": 0.95
+          }
+        },
+        {
+          "claim": {
+            "claim_id": "claim-batch-2",
+            "tenant_id": "tenant-http",
+            "canonical_text": "Batch claim two",
+            "confidence": 0.93
+          }
+        }
+      ]
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/batch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"commit_id\":\"commit-"));
+    assert!(response.contains("\"batch_size\":2"));
+    assert!(response.contains("\"ingested_claim_ids\":[\"claim-batch-1\",\"claim-batch-2\"]"));
+    assert!(response.contains("\"claims_total\":2"));
+}
+
+#[test]
 fn transport_rejects_cross_tenant_claim_id_collision_with_conflict_status() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let runtime = sample_runtime();
