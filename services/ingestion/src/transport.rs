@@ -15,7 +15,8 @@ use std::{
 use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
 use indexer::{
     CompactionSchedulerConfig, SegmentStoreError, apply_compaction_plan, build_segments,
-    persist_segments_atomic, plan_compaction_round,
+    load_manifest, persist_segments_atomic, plan_compaction_round,
+    prune_unreferenced_segment_files,
 };
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig, ShardPlacement,
@@ -44,6 +45,7 @@ pub struct IngestionRuntime {
     segment_last_claim_count: usize,
     segment_last_segment_count: usize,
     segment_last_compaction_plans: usize,
+    segment_last_stale_file_pruned_count: usize,
     auth_success_total: u64,
     auth_failure_total: u64,
     authz_denied_total: u64,
@@ -110,6 +112,7 @@ impl IngestionRuntime {
             segment_last_claim_count: 0,
             segment_last_segment_count: 0,
             segment_last_compaction_plans: 0,
+            segment_last_stale_file_pruned_count: 0,
             auth_success_total: 0,
             auth_failure_total: 0,
             authz_denied_total: 0,
@@ -148,6 +151,7 @@ impl IngestionRuntime {
             segment_last_claim_count: 0,
             segment_last_segment_count: 0,
             segment_last_compaction_plans: 0,
+            segment_last_stale_file_pruned_count: 0,
             auth_success_total: 0,
             auth_failure_total: 0,
             authz_denied_total: 0,
@@ -265,6 +269,7 @@ impl IngestionRuntime {
                     self.segment_last_claim_count = stats.claim_count;
                     self.segment_last_segment_count = stats.segment_count;
                     self.segment_last_compaction_plans = stats.compaction_plan_count;
+                    self.segment_last_stale_file_pruned_count = stats.stale_file_pruned_count;
                 }
                 Err(err) => {
                     self.segment_publish_failure_total += 1;
@@ -472,6 +477,8 @@ dash_ingest_segment_last_claim_count {}\n\
 dash_ingest_segment_last_segment_count {}\n\
 # TYPE dash_ingest_segment_last_compaction_plans gauge\n\
 dash_ingest_segment_last_compaction_plans {}\n\
+# TYPE dash_ingest_segment_last_stale_file_pruned_count gauge\n\
+dash_ingest_segment_last_stale_file_pruned_count {}\n\
 # TYPE dash_ingest_auth_success_total counter\n\
 dash_ingest_auth_success_total {}\n\
 # TYPE dash_ingest_auth_failure_total counter\n\
@@ -549,6 +556,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.segment_last_claim_count,
             self.segment_last_segment_count,
             self.segment_last_compaction_plans,
+            self.segment_last_stale_file_pruned_count,
             self.auth_success_total,
             self.auth_failure_total,
             self.authz_denied_total,
@@ -607,6 +615,7 @@ struct SegmentPublishStats {
     claim_count: usize,
     segment_count: usize,
     compaction_plan_count: usize,
+    stale_file_pruned_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -743,11 +752,15 @@ impl SegmentRuntime {
             segments = apply_compaction_plan(&segments, plan);
         }
         let tenant_dir = self.tenant_segment_dir(tenant_id);
+        let previous_manifest = load_manifest(&tenant_dir)?;
         let manifest = persist_segments_atomic(&tenant_dir, &segments)?;
+        let stale_file_pruned_count =
+            prune_unreferenced_segment_files(&tenant_dir, &manifest, previous_manifest.as_ref())?;
         Ok(SegmentPublishStats {
             claim_count,
             segment_count: manifest.entries.len(),
             compaction_plan_count: plans.len(),
+            stale_file_pruned_count,
         })
     }
 

@@ -46,6 +46,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 
 - Segment persistence + manifest checksum verification.
 - Segment compaction scheduler primitives.
+- Segment publish now prunes stale `.seg` files with one-generation safety retention (`active + previous` manifest files).
 - Benchmark profiles through xlarge (100k claims).
 - Benchmark history and scorecard outputs with regression guardrails.
 - Backup/restore/recovery drill scripts for WAL+snapshot+segment operations.
@@ -56,7 +57,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 4.1 Core storage/runtime gaps
 
 - No fully disk-native query serving path (current serving remains memory-centric with WAL/snapshot recovery).
-- No background segment lifecycle daemon with retention and garbage collection policy enforcement.
+- No standalone background segment lifecycle daemon yet (publish-time stale-file GC exists, but policy execution is not independently scheduled).
 - No transactional write batch API with durable commit metadata.
 
 ### 4.2 Distributed system gaps

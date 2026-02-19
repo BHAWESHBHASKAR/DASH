@@ -36,6 +36,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Ingestion/retrieval transports now expose placement-debug snapshots and route probe context at `GET /debug/placement`.
 - Ingestion/retrieval transports support optional in-process placement live reload (`DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS`) with reload observability metrics.
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
+- Ingestion segment publish now enforces on-disk stale segment GC with one-generation safety retention (`active manifest + previous manifest`) to bound disk growth without breaking in-flight readers.
 - Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters.
 - Ingestion WAL durability now supports configurable batching controls with strict defaults:
   - sync batch threshold: `DASH_INGEST_WAL_SYNC_EVERY_RECORDS`
@@ -84,6 +85,9 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - shard routing/placement admission is active for ingest + retrieve with epoch-aware route probes
   - failover drill validates routing epoch switch in restart and no-restart modes
   - immutable segment publish + retrieval prefilter merge path is implemented with `segment base + WAL delta` semantics
+- Phase 3 (Production Hardening): complete
+  - tenant isolation, authn/authz, JWT rotation/revocation, and tamper-evident audit trails are implemented with regression coverage
+  - incident simulation gate and release-candidate sign-off wrapper are implemented and passing
 
 ## 3. Success Targets (v1)
 

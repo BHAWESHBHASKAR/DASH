@@ -1,7 +1,7 @@
 use schema::Claim;
 use std::{
-    collections::HashMap,
-    fs::{File, OpenOptions, create_dir_all, rename},
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions, create_dir_all, read_dir, remove_file, rename},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
@@ -244,6 +244,52 @@ pub fn persist_segments_atomic(
     let manifest = SegmentManifest { entries };
     write_manifest_atomic(root_dir, &manifest)?;
     Ok(manifest)
+}
+
+pub fn prune_unreferenced_segment_files(
+    root_dir: &Path,
+    active_manifest: &SegmentManifest,
+    previous_manifest: Option<&SegmentManifest>,
+) -> Result<usize, SegmentStoreError> {
+    let mut keep_files: HashSet<&str> = active_manifest
+        .entries
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect();
+    if let Some(previous) = previous_manifest {
+        keep_files.extend(
+            previous
+                .entries
+                .iter()
+                .map(|entry| entry.file_name.as_str()),
+        );
+    }
+
+    let mut removed_total = 0usize;
+    for entry in read_dir(root_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(SEGMENT_FILE_SUFFIX) {
+            continue;
+        }
+        if keep_files.contains(file_name) {
+            continue;
+        }
+        match remove_file(&path) {
+            Ok(()) => {
+                removed_total += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(SegmentStoreError::Io(err.to_string())),
+        }
+    }
+    Ok(removed_total)
 }
 
 pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, SegmentStoreError> {
@@ -719,5 +765,75 @@ mod tests {
                 .iter()
                 .any(|segment| segment.segment_id.ends_with("merged"))
         );
+    }
+
+    #[test]
+    fn prune_unreferenced_segment_files_keeps_active_and_previous_manifests() {
+        let root = temp_dir("segment-prune");
+        let first_segments = vec![
+            Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-1".into()],
+            },
+            Segment {
+                segment_id: "warm-0".into(),
+                tier: Tier::Warm,
+                claim_ids: vec!["claim-2".into()],
+            },
+        ];
+        let previous_manifest =
+            persist_segments_atomic(&root, &first_segments).expect("first persist should succeed");
+
+        let second_segments = vec![Segment {
+            segment_id: "hot-0".into(),
+            tier: Tier::Hot,
+            claim_ids: vec!["claim-1".into(), "claim-3".into()],
+        }];
+        let active_manifest =
+            persist_segments_atomic(&root, &second_segments).expect("second persist should work");
+
+        let removed =
+            prune_unreferenced_segment_files(&root, &active_manifest, Some(&previous_manifest))
+                .expect("prune should succeed");
+        assert_eq!(removed, 0);
+        let old_only_file = previous_manifest
+            .entries
+            .iter()
+            .find(|entry| {
+                !active_manifest
+                    .entries
+                    .iter()
+                    .any(|current| current.file_name == entry.file_name)
+            })
+            .expect("old-only file should exist")
+            .file_name
+            .clone();
+        assert!(root.join(old_only_file).exists());
+
+        let third_segments = vec![Segment {
+            segment_id: "hot-0".into(),
+            tier: Tier::Hot,
+            claim_ids: vec!["claim-1".into(), "claim-3".into(), "claim-4".into()],
+        }];
+        let latest_manifest =
+            persist_segments_atomic(&root, &third_segments).expect("third persist should work");
+        let removed =
+            prune_unreferenced_segment_files(&root, &latest_manifest, Some(&active_manifest))
+                .expect("prune should remove stale files");
+        assert_eq!(removed, 1);
+        let old_only_exists = previous_manifest
+            .entries
+            .iter()
+            .filter(|entry| {
+                !active_manifest
+                    .entries
+                    .iter()
+                    .any(|current| current.file_name == entry.file_name)
+            })
+            .any(|entry| root.join(&entry.file_name).exists());
+        assert!(!old_only_exists);
+
+        let _ = fs::remove_dir_all(root);
     }
 }
