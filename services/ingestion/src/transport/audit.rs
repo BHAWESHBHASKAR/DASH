@@ -9,7 +9,10 @@ use std::{
 
 use auth::sha256_hex;
 
-use super::{JsonValue, SharedRuntime, json_escape, parse_json};
+use super::{
+    SharedRuntime,
+    json::{JsonValue, json_escape, parse_json},
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AuditEvent<'a> {

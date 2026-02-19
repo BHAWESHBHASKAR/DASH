@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Write, net::TcpStream, time::Duration};
 
-use super::json_escape;
+use super::json::json_escape;
 
 const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: ingestion worker queue full";
 
