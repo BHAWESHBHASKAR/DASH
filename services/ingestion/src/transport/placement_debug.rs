@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use metadata_router::{ReplicaHealth, ReplicaRole, ShardPlacement, route_write_with_placement};
 
-use super::{IngestionRuntime, PlacementRoutingRuntime, PlacementRoutingState, json::json_escape};
+use super::{
+    IngestionRuntime,
+    json::json_escape,
+    placement_routing::{PlacementRoutingRuntime, PlacementRoutingState},
+};
 
 pub(super) fn render_placement_debug_json(
     runtime: &IngestionRuntime,
