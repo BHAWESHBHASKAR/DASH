@@ -177,6 +177,21 @@ echo "[ci] slo guard functional smoke"
     --include-recovery-drill false >/dev/null
 )
 
+echo "[ci] segment maintenance daemon functional smoke"
+(
+  set -euo pipefail
+  TMP_SEGMENT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dash-segment-maintenance-XXXXXX")"
+  trap 'rm -rf "${TMP_SEGMENT_ROOT}"' EXIT
+
+  OUTPUT="$(
+    DASH_INGEST_SEGMENT_DIR="${TMP_SEGMENT_ROOT}" \
+      cargo run -p indexer --bin segment-maintenance-daemon -- --once
+  )"
+  grep -q '"tenant_dirs_scanned":0' <<<"${OUTPUT}"
+  grep -q '"tenant_manifests_found":0' <<<"${OUTPUT}"
+  grep -q '"error":null' <<<"${OUTPUT}"
+)
+
 echo "[ci] benchmark history guard"
 cargo run -p benchmark-smoke --bin benchmark-smoke -- \
   --profile smoke \

@@ -27,7 +27,7 @@ Status: active
 
 - [ ] optional: `DASH_RELEASE_RUN_BENCH_TRENDS=true scripts/package_release.sh` (runs trend automation before packaging)
 - [ ] `scripts/package_release.sh`
-- [ ] verify archive includes `ingestion`, `retrieval`, and benchmark binary
+- [ ] verify archive includes `ingestion`, `retrieval`, `segment-maintenance-daemon`, and benchmark binary
 - [ ] verify release notes include benchmark metrics and quality probe status
 
 ## 3. Deployment Readiness
@@ -39,6 +39,9 @@ Status: active
 - [ ] metrics endpoint probe prepared (`/metrics`)
 - [ ] rollback operator and fallback data restore path documented
 - [ ] deployment assets selected and validated (`deploy/systemd/*` or `deploy/container/*`)
+- [ ] segment maintenance deployment mode selected and validated:
+  - managed service mode (`dash-segment-maintenance.service` / `dash-segment-maintenance` container)
+  - if managed daemon mode is enabled, ingestion `DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS=0`
 - [ ] backup bundle generated and archived:
   - `scripts/backup_state_bundle.sh --wal-path <wal> --segment-dir <segments> --output-dir /var/backups/dash`
 - [ ] restore verification pass completed:
