@@ -209,6 +209,12 @@ pub struct WalWritePolicy {
     pub background_flush_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalRollbackPoint {
+    file_len_bytes: u64,
+    wal_records: usize,
+}
+
 impl Default for WalWritePolicy {
     fn default() -> Self {
         Self {
@@ -341,6 +347,29 @@ impl FileWal {
 
     pub fn wal_size_bytes(&self) -> Result<u64, StoreError> {
         Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    pub fn begin_rollback_point(&mut self) -> Result<WalRollbackPoint, StoreError> {
+        self.flush_pending_sync()?;
+        Ok(WalRollbackPoint {
+            file_len_bytes: self.wal_size_bytes()?,
+            wal_records: self.wal_records,
+        })
+    }
+
+    pub fn rollback_to(&mut self, point: WalRollbackPoint) -> Result<(), StoreError> {
+        self.append_buffer.clear();
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        file.set_len(point.file_len_bytes)?;
+        file.sync_data()?;
+        self.wal_records = point.wal_records;
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
+        Ok(())
     }
 
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
@@ -543,7 +572,7 @@ impl Drop for FileWal {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct InMemoryStore {
     claims: HashMap<String, Claim>,
     evidence_by_claim: HashMap<String, Vec<Evidence>>,
@@ -716,6 +745,10 @@ impl InMemoryStore {
     ) -> Result<WalCheckpointStats, StoreError> {
         let records = self.snapshot_records();
         wal.compact_with_snapshot(&records)
+    }
+
+    pub fn observe_batch_commit(&mut self, commit_id: &str) {
+        self.wal.push(WalEvent::BatchCommit(commit_id.to_string()));
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {

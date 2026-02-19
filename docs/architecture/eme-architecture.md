@@ -500,7 +500,7 @@ Current implementation notes (2026-02-18):
 - Retrieval now enforces request `time_range` semantics on claim `event_time_unix` and rejects invalid ranges where `from_unix > to_unix`.
 - WAL checkpoint policy checks use cached record counts in-memory (avoids O(N) WAL scans on each ingest decision).
 - Ingestion and retrieval binaries support startup replay from persisted WAL with replay breakdown logging (snapshot records vs WAL delta records).
-- Ingestion transport now supports batch writes (`POST /v1/ingest/batch`) and appends durable batch commit metadata records to WAL.
+- Ingestion transport now supports batch writes (`POST /v1/ingest/batch`) with strict atomic rollback semantics and durable batch commit metadata records in WAL.
 - Ingestion and retrieval transports default to dependency-light `std` HTTP runtime and now support optional `axum` runtime selection via `DASH_*_TRANSPORT_RUNTIME` (`EME_*` fallback) when built with feature `async-transport`.
 - Ingestion/retrieval transports now support tenant-scoped authz policy controls:
   - service-level tenant allowlists (`DASH_*_ALLOWED_TENANTS`)

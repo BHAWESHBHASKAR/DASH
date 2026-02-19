@@ -298,40 +298,67 @@ impl IngestionRuntime {
         request: IngestBatchApiRequest,
     ) -> Result<IngestBatchApiResponse, StoreError> {
         let commit_id = request.commit_id.unwrap_or_else(generate_batch_commit_id);
+        let mut inputs = Vec::with_capacity(request.items.len());
         let mut ingested_claim_ids = Vec::with_capacity(request.items.len());
         let mut touched_tenants = HashSet::new();
-        let mut checkpoint_snapshot_records = None;
-        let mut checkpoint_truncated_wal_records = None;
-        let mut checkpoint_triggered = false;
 
         for item in request.items {
             let tenant_id = item.claim.tenant_id.clone();
             let claim_id = item.claim.claim_id.clone();
-            let input = IngestInput {
+            inputs.push(IngestInput {
                 claim: item.claim,
                 claim_embedding: item.claim_embedding,
                 evidence: item.evidence,
                 edges: item.edges,
-            };
-            let checkpoint_stats = self.ingest_input_internal(input)?;
-            if let Some(stats) = checkpoint_stats {
-                checkpoint_triggered = true;
-                checkpoint_snapshot_records = Some(stats.snapshot_records);
-                checkpoint_truncated_wal_records = Some(stats.truncated_wal_records);
-            }
-            self.successful_ingests += 1;
+            });
             touched_tenants.insert(tenant_id);
             ingested_claim_ids.push(claim_id);
         }
 
+        let mut staged_store = self.store.clone();
+        for input in &inputs {
+            ingest_document(&mut staged_store, input.clone())?;
+        }
+
         if let Some(wal) = self.wal.as_mut() {
-            wal.append_batch_commit(
-                &commit_id,
-                ingested_claim_ids.len(),
-                unix_timestamp_millis(),
-                &ingested_claim_ids,
-            )?;
+            let rollback_point = wal.begin_rollback_point()?;
+            let append_result = (|| {
+                for input in &inputs {
+                    append_input_to_wal(wal, input)?;
+                }
+                wal.append_batch_commit(
+                    &commit_id,
+                    ingested_claim_ids.len(),
+                    unix_timestamp_millis(),
+                    &ingested_claim_ids,
+                )?;
+                Ok::<(), StoreError>(())
+            })();
+            if let Err(err) = append_result {
+                if let Err(rollback_err) = wal.rollback_to(rollback_point) {
+                    eprintln!("batch rollback failed after WAL append error: {rollback_err:?}");
+                }
+                return Err(err);
+            }
             self.batch_commit_total = self.batch_commit_total.saturating_add(1);
+        }
+
+        self.store = staged_store;
+        self.successful_ingests = self
+            .successful_ingests
+            .saturating_add(ingested_claim_ids.len() as u64);
+
+        let mut checkpoint_stats = None;
+        if let Some(wal) = self.wal.as_mut() {
+            self.store.observe_batch_commit(&commit_id);
+            if should_checkpoint_now(&self.checkpoint_policy, wal)? {
+                match self.store.checkpoint_and_compact(wal) {
+                    Ok(stats) => checkpoint_stats = Some(stats),
+                    Err(err) => {
+                        eprintln!("ingestion batch checkpoint failed after commit: {err:?}");
+                    }
+                }
+            }
         }
 
         for tenant_id in touched_tenants {
@@ -345,9 +372,11 @@ impl IngestionRuntime {
             batch_size: ingested_claim_ids.len(),
             ingested_claim_ids,
             claims_total: self.store.claims_len(),
-            checkpoint_triggered,
-            checkpoint_snapshot_records,
-            checkpoint_truncated_wal_records,
+            checkpoint_triggered: checkpoint_stats.is_some(),
+            checkpoint_snapshot_records: checkpoint_stats.as_ref().map(|s| s.snapshot_records),
+            checkpoint_truncated_wal_records: checkpoint_stats
+                .as_ref()
+                .map(|s| s.truncated_wal_records),
         })
     }
 
@@ -1967,6 +1996,34 @@ fn map_store_error(error: &StoreError) -> (u16, String) {
             (500, format!("internal persistence error: {message}"))
         }
     }
+}
+
+fn append_input_to_wal(wal: &mut FileWal, input: &IngestInput) -> Result<(), StoreError> {
+    wal.append_claim(&input.claim)?;
+    for evidence in &input.evidence {
+        wal.append_evidence(evidence)?;
+    }
+    for edge in &input.edges {
+        wal.append_edge(edge)?;
+    }
+    if let Some(vector) = input.claim_embedding.as_deref() {
+        wal.append_claim_vector(&input.claim.claim_id, vector)?;
+    }
+    Ok(())
+}
+
+fn should_checkpoint_now(policy: &CheckpointPolicy, wal: &FileWal) -> Result<bool, StoreError> {
+    if let Some(max_wal_records) = policy.max_wal_records
+        && wal.wal_record_count()? >= max_wal_records
+    {
+        return Ok(true);
+    }
+    if let Some(max_wal_bytes) = policy.max_wal_bytes
+        && wal.wal_size_bytes()? >= max_wal_bytes
+    {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn resolve_ingest_batch_max_items() -> usize {
@@ -3669,6 +3726,66 @@ mod tests {
                 .body
                 .contains("dash_ingest_batch_last_size 2")
         );
+    }
+
+    #[test]
+    fn handle_request_post_batch_is_atomic_on_validation_failure() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open(&wal_path).expect("wal should open");
+        let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
+            InMemoryStore::new(),
+            wal,
+            CheckpointPolicy::default(),
+        )));
+
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest/batch".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-a1",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Batch atomic item one",
+                            "confidence": 0.91,
+                            "embedding_vector": [0.1, 0.2, 0.3, 0.4]
+                        }
+                    },
+                    {
+                        "claim": {
+                            "claim_id": "c-a2",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Batch atomic item two",
+                            "confidence": 0.89,
+                            "embedding_vector": [0.1, 0.2]
+                        }
+                    }
+                ]
+            }"#
+            .to_vec(),
+        };
+
+        let response = handle_request(&runtime, &request);
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("invalid vector"));
+
+        let guard = runtime.lock().expect("runtime lock should be available");
+        assert_eq!(guard.claims_len(), 0);
+        let wal_records = guard
+            .wal
+            .as_ref()
+            .expect("persistent runtime should have wal")
+            .wal_record_count()
+            .expect("wal record count should be readable");
+        assert_eq!(wal_records, 0);
+        drop(guard);
+
+        let _ = std::fs::remove_file(&wal_path);
+        let mut snapshot_path = wal_path.clone().into_os_string();
+        snapshot_path.push(".snapshot");
+        let _ = std::fs::remove_file(PathBuf::from(snapshot_path));
     }
 
     #[test]
