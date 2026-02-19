@@ -12,9 +12,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod http;
 mod replication;
 
 use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
+use http::{
+    HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,
+};
 use indexer::{
     CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentStoreError, apply_compaction_plan,
     build_segments, load_manifest, maintain_segment_root, persist_segments_atomic,
@@ -1400,24 +1404,6 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     .unwrap_or(default_capacity)
 }
 
-const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: ingestion worker queue full";
-
-pub(crate) fn backpressure_rejection_response() -> HttpResponse {
-    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
-}
-
-fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-    let response = backpressure_rejection_response();
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response.content_type,
-        response.body.len(),
-        response.body
-    );
-    stream.write_all(response.as_bytes())
-}
-
 pub fn serve_http(runtime: IngestionRuntime, bind_addr: &str) -> std::io::Result<()> {
     serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS)
 }
@@ -1525,7 +1511,9 @@ pub fn serve_http_with_workers(
                         Err(mpsc::TrySendError::Full(stream)) => {
                             backpressure_metrics.observe_dequeued();
                             backpressure_metrics.observe_rejected();
-                            if let Err(err) = write_backpressure_response(stream) {
+                            if let Err(err) =
+                                write_backpressure_response(stream, SOCKET_TIMEOUT_SECS)
+                            {
                                 eprintln!(
                                     "ingestion transport backpressure response failed: {err}"
                                 );
@@ -3681,149 +3669,6 @@ fn json_escape(raw: &str) -> String {
     out
 }
 
-fn write_response(stream: &mut TcpStream, response: HttpResponse) -> std::io::Result<()> {
-    stream.write_all(render_response_text(&response).as_bytes())?;
-    stream.flush()
-}
-
-fn render_response_text(response: &HttpResponse) -> String {
-    let status_text = match response.status {
-        200 => "200 OK",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        409 => "409 Conflict",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        503 => "503 Service Unavailable",
-        500 => "500 Internal Server Error",
-        _ => "500 Internal Server Error",
-    };
-    let body_len = response.body.len();
-    format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
-        response.content_type, response.body
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HttpRequest {
-    pub(crate) method: String,
-    pub(crate) target: String,
-    pub(crate) headers: HashMap<String, String>,
-    pub(crate) body: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HttpResponse {
-    pub(crate) status: u16,
-    pub(crate) content_type: &'static str,
-    pub(crate) body: String,
-}
-
-impl HttpResponse {
-    fn ok_json(body: String) -> Self {
-        Self {
-            status: 200,
-            content_type: "application/json",
-            body,
-        }
-    }
-
-    fn ok_text(body: String) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/plain; version=0.0.4; charset=utf-8",
-            body,
-        }
-    }
-
-    fn ok_plain(body: String) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/plain; charset=utf-8",
-            body,
-        }
-    }
-
-    fn bad_request(message: &str) -> Self {
-        Self {
-            status: 400,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn not_found(message: &str) -> Self {
-        Self {
-            status: 404,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn forbidden(message: &str) -> Self {
-        Self {
-            status: 403,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn conflict(message: &str) -> Self {
-        Self {
-            status: 409,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn method_not_allowed(message: &str) -> Self {
-        Self {
-            status: 405,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn unauthorized(message: &str) -> Self {
-        Self {
-            status: 401,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn internal_server_error(message: &str) -> Self {
-        Self {
-            status: 500,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn service_unavailable(message: &str) -> Self {
-        Self {
-            status: 503,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-        }
-    }
-
-    fn error_with_status(status: u16, message: &str) -> Self {
-        match status {
-            400 => Self::bad_request(message),
-            401 => Self::unauthorized(message),
-            403 => Self::forbidden(message),
-            409 => Self::conflict(message),
-            404 => Self::not_found(message),
-            405 => Self::method_not_allowed(message),
-            503 => Self::service_unavailable(message),
-            _ => Self::internal_server_error(message),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4657,7 +4502,8 @@ mod tests {
         });
 
         let (server_stream, _) = listener.accept().expect("accept should succeed");
-        write_backpressure_response(server_stream).expect("response write should succeed");
+        write_backpressure_response(server_stream, SOCKET_TIMEOUT_SECS)
+            .expect("response write should succeed");
         let response = client.join().expect("client thread should join");
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
         assert!(response.contains("content-type: application/json"));
