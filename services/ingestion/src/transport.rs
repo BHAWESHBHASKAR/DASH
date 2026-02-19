@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod replication;
+
 use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
 use indexer::{
     CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentStoreError, apply_compaction_plan,
@@ -22,8 +24,14 @@ use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig, ShardPlacement,
     load_shard_placements_csv, route_write_with_placement, shard_ids_from_placements,
 };
+use replication::{
+    ReplicationPullConfig, parse_replication_delta_frame, parse_replication_export_frame,
+    render_replication_delta_frame, render_replication_export_frame, request_replication_source,
+};
 use schema::{Claim, ClaimEdge, Evidence, Relation, Stance};
-use store::{CheckpointPolicy, FileWal, InMemoryStore, StoreError};
+use store::{
+    CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta, WalReplicationExport,
+};
 
 use crate::{
     IngestInput,
@@ -70,6 +78,12 @@ pub struct IngestionRuntime {
     wal_flush_success_total: u64,
     wal_flush_failure_total: u64,
     wal_async_flush_tick_total: u64,
+    replication_pull_success_total: u64,
+    replication_pull_failure_total: u64,
+    replication_applied_records_total: u64,
+    replication_resync_total: u64,
+    replication_last_offset: usize,
+    replication_last_error: Option<String>,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
 }
@@ -148,6 +162,12 @@ impl IngestionRuntime {
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
             wal_async_flush_tick_total: 0,
+            replication_pull_success_total: 0,
+            replication_pull_failure_total: 0,
+            replication_applied_records_total: 0,
+            replication_resync_total: 0,
+            replication_last_offset: 0,
+            replication_last_error: None,
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -198,6 +218,12 @@ impl IngestionRuntime {
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
             wal_async_flush_tick_total: 0,
+            replication_pull_success_total: 0,
+            replication_pull_failure_total: 0,
+            replication_applied_records_total: 0,
+            replication_resync_total: 0,
+            replication_last_offset: 0,
+            replication_last_error: None,
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -587,6 +613,104 @@ impl IngestionRuntime {
         }
     }
 
+    fn replication_delta_for_followers(
+        &mut self,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationDelta, StoreError> {
+        let wal = self.wal.as_mut().ok_or_else(|| {
+            StoreError::Io("replication source requires persistent WAL mode".to_string())
+        })?;
+        wal.replication_delta_from(from_offset, max_records)
+    }
+
+    fn replication_export_for_followers(&mut self) -> Result<WalReplicationExport, StoreError> {
+        let wal = self.wal.as_mut().ok_or_else(|| {
+            StoreError::Io("replication source requires persistent WAL mode".to_string())
+        })?;
+        wal.replication_export()
+    }
+
+    fn apply_replication_delta_lines(
+        &mut self,
+        wal_lines: &[String],
+        next_offset: usize,
+    ) -> Result<(), StoreError> {
+        if wal_lines.is_empty() {
+            self.replication_pull_success_total =
+                self.replication_pull_success_total.saturating_add(1);
+            self.replication_last_offset = next_offset;
+            self.replication_last_error = None;
+            return Ok(());
+        }
+
+        let mut staged_store = self.store.clone();
+        for line in wal_lines {
+            staged_store.apply_persisted_record_line(line)?;
+        }
+
+        if let Some(wal) = self.wal.as_mut() {
+            let rollback_point = wal.begin_rollback_point()?;
+            let append_result = (|| {
+                for line in wal_lines {
+                    wal.append_raw_record_line(line)?;
+                }
+                Ok::<(), StoreError>(())
+            })();
+            if let Err(err) = append_result {
+                if let Err(rollback_err) = wal.rollback_to(rollback_point) {
+                    eprintln!(
+                        "replication rollback failed after WAL append error: {rollback_err:?}"
+                    );
+                }
+                return Err(err);
+            }
+        }
+
+        self.store = staged_store;
+        for tenant_id in self.store.tenant_ids() {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
+        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
+        self.replication_applied_records_total = self
+            .replication_applied_records_total
+            .saturating_add(wal_lines.len() as u64);
+        self.replication_last_offset = next_offset;
+        self.replication_last_error = None;
+        Ok(())
+    }
+
+    fn apply_replication_export(&mut self, export: WalReplicationExport) -> Result<(), StoreError> {
+        let ann_tuning = self.store.ann_tuning().clone();
+        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        for line in &export.snapshot_lines {
+            rebuilt_store.apply_persisted_record_line(line)?;
+        }
+        for line in &export.wal_lines {
+            rebuilt_store.apply_persisted_record_line(line)?;
+        }
+        if let Some(wal) = self.wal.as_mut() {
+            wal.replace_with_replication_export(&export)?;
+        }
+        self.store = rebuilt_store;
+        for tenant_id in self.store.tenant_ids() {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
+        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
+        self.replication_applied_records_total = self
+            .replication_applied_records_total
+            .saturating_add(export.wal_lines.len() as u64);
+        self.replication_resync_total = self.replication_resync_total.saturating_add(1);
+        self.replication_last_offset = export.wal_lines.len();
+        self.replication_last_error = None;
+        Ok(())
+    }
+
+    fn observe_replication_pull_failure(&mut self, error: String) {
+        self.replication_pull_failure_total = self.replication_pull_failure_total.saturating_add(1);
+        self.replication_last_error = Some(error);
+    }
+
     fn metrics_text(&self) -> String {
         let placement_enabled = self
             .placement_routing
@@ -761,6 +885,18 @@ dash_ingest_transport_queue_capacity {}\n\
 dash_ingest_transport_queue_depth {}\n\
 # TYPE dash_ingest_transport_queue_full_reject_total counter\n\
 dash_ingest_transport_queue_full_reject_total {}\n\
+# TYPE dash_ingest_replication_pull_success_total counter\n\
+dash_ingest_replication_pull_success_total {}\n\
+# TYPE dash_ingest_replication_pull_failure_total counter\n\
+dash_ingest_replication_pull_failure_total {}\n\
+# TYPE dash_ingest_replication_applied_records_total counter\n\
+dash_ingest_replication_applied_records_total {}\n\
+# TYPE dash_ingest_replication_resync_total counter\n\
+dash_ingest_replication_resync_total {}\n\
+# TYPE dash_ingest_replication_last_offset gauge\n\
+dash_ingest_replication_last_offset {}\n\
+# TYPE dash_ingest_replication_last_error gauge\n\
+dash_ingest_replication_last_error {}\n\
 # TYPE dash_ingest_claims_total gauge\n\
 dash_ingest_claims_total {}\n\
 # TYPE dash_ingest_uptime_seconds gauge\n\
@@ -817,6 +953,12 @@ dash_ingest_uptime_seconds {:.4}\n",
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            self.replication_pull_success_total,
+            self.replication_pull_failure_total,
+            self.replication_applied_records_total,
+            self.replication_resync_total,
+            self.replication_last_offset,
+            self.replication_last_error.is_some() as usize,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         )
@@ -832,6 +974,7 @@ const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
 const DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
 const DEFAULT_INGEST_BATCH_MAX_ITEMS: usize = 128;
+const DEFAULT_REPLICATION_PULL_MAX_RECORDS: usize = 512;
 static BATCH_COMMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1289,6 +1432,7 @@ pub fn serve_http_with_workers(
     let queue_capacity = resolve_http_queue_capacity(worker_count);
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let segment_maintenance_interval = runtime.segment_maintenance_interval();
+    let replication_pull = ReplicationPullConfig::from_env();
     let runtime = Arc::new(Mutex::new(runtime));
     let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
     if let Ok(mut guard) = runtime.lock() {
@@ -1298,6 +1442,7 @@ pub fn serve_http_with_workers(
     let rx = Arc::new(Mutex::new(rx));
     let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
     let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
+    let (replication_shutdown_tx, replication_shutdown_rx) = mpsc::channel::<()>();
 
     std::thread::scope(|scope| {
         if let Some(async_interval) = wal_async_flush_interval {
@@ -1329,6 +1474,18 @@ pub fn serve_http_with_workers(
                     };
                     guard.run_segment_maintenance_tick();
                     guard.refresh_placement_if_due();
+                }
+            });
+        }
+        if let Some(replication_pull) = replication_pull.clone() {
+            let runtime = Arc::clone(&runtime);
+            scope.spawn(move || {
+                loop {
+                    match replication_shutdown_rx.recv_timeout(replication_pull.poll_interval) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    run_replication_pull_tick(&runtime, &replication_pull);
                 }
             });
         }
@@ -1386,6 +1543,7 @@ pub fn serve_http_with_workers(
         }
         let _ = flush_shutdown_tx.send(());
         let _ = segment_shutdown_tx.send(());
+        let _ = replication_shutdown_tx.send(());
         drop(tx);
     });
 
@@ -1564,6 +1722,48 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
                 HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
             }
         },
+        ("GET", "/internal/replication/wal") => {
+            if !is_replication_request_authorized(request) {
+                return HttpResponse::forbidden("replication request is not authorized");
+            }
+            let from_offset = match parse_query_usize(&query, "from_offset") {
+                Ok(value) => value.unwrap_or(0),
+                Err(err) => return HttpResponse::bad_request(&err),
+            };
+            let max_records = match parse_query_usize(&query, "max_records") {
+                Ok(value) => value.unwrap_or(DEFAULT_REPLICATION_PULL_MAX_RECORDS),
+                Err(err) => return HttpResponse::bad_request(&err),
+            };
+            match runtime.lock() {
+                Ok(mut rt) => match rt.replication_delta_for_followers(from_offset, max_records) {
+                    Ok(delta) => HttpResponse::ok_plain(render_replication_delta_frame(&delta)),
+                    Err(err) => {
+                        let (status, message) = map_store_error(&err);
+                        HttpResponse::error_with_status(status, &message)
+                    }
+                },
+                Err(_) => {
+                    HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+                }
+            }
+        }
+        ("GET", "/internal/replication/export") => {
+            if !is_replication_request_authorized(request) {
+                return HttpResponse::forbidden("replication request is not authorized");
+            }
+            match runtime.lock() {
+                Ok(mut rt) => match rt.replication_export_for_followers() {
+                    Ok(export) => HttpResponse::ok_plain(render_replication_export_frame(&export)),
+                    Err(err) => {
+                        let (status, message) = map_store_error(&err);
+                        HttpResponse::error_with_status(status, &message)
+                    }
+                },
+                Err(_) => {
+                    HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+                }
+            }
+        }
         ("POST", "/v1/ingest") => {
             if let Some(content_type) = request.headers.get("content-type")
                 && !content_type
@@ -1833,7 +2033,11 @@ pub(crate) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
         }
         (_, "/v1/ingest") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/v1/ingest/batch") => HttpResponse::method_not_allowed("only POST is supported"),
-        (_, "/health") | (_, "/metrics") | (_, "/debug/placement") => {
+        (_, "/health")
+        | (_, "/metrics")
+        | (_, "/debug/placement")
+        | (_, "/internal/replication/wal")
+        | (_, "/internal/replication/export") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
@@ -2062,6 +2266,130 @@ fn should_checkpoint_now(policy: &CheckpointPolicy, wal: &FileWal) -> Result<boo
         return Ok(true);
     }
     Ok(false)
+}
+
+fn replication_token() -> Option<String> {
+    env_with_fallback(
+        "DASH_INGEST_REPLICATION_TOKEN",
+        "EME_INGEST_REPLICATION_TOKEN",
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn is_replication_request_authorized(request: &HttpRequest) -> bool {
+    let Some(expected_token) = replication_token() else {
+        return true;
+    };
+    request
+        .headers
+        .get("x-replication-token")
+        .is_some_and(|value| value == &expected_token)
+}
+
+fn run_replication_pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) {
+    let from_offset = match runtime.lock() {
+        Ok(guard) => guard.replication_last_offset,
+        Err(_) => return,
+    };
+    let delta_response = match request_replication_source(
+        &config.wal_pull_url(from_offset),
+        config.token.as_deref(),
+    ) {
+        Ok(response) => response,
+        Err(err) => {
+            if let Ok(mut guard) = runtime.lock() {
+                guard.observe_replication_pull_failure(err.clone());
+            }
+            eprintln!("replication pull tick failed requesting WAL delta: {err}");
+            return;
+        }
+    };
+    if delta_response.status != 200 {
+        let message = format!(
+            "replication source WAL delta returned status {}",
+            delta_response.status
+        );
+        if let Ok(mut guard) = runtime.lock() {
+            guard.observe_replication_pull_failure(message.clone());
+        }
+        eprintln!("{message}");
+        return;
+    }
+    let delta_frame = match parse_replication_delta_frame(&delta_response.body) {
+        Ok(frame) => frame,
+        Err(err) => {
+            if let Ok(mut guard) = runtime.lock() {
+                guard.observe_replication_pull_failure(err.clone());
+            }
+            eprintln!("replication pull tick failed parsing WAL delta: {err}");
+            return;
+        }
+    };
+    if delta_frame.needs_resync {
+        let export_response =
+            match request_replication_source(&config.export_url(), config.token.as_deref()) {
+                Ok(response) => response,
+                Err(err) => {
+                    if let Ok(mut guard) = runtime.lock() {
+                        guard.observe_replication_pull_failure(err.clone());
+                    }
+                    eprintln!("replication resync failed requesting export: {err}");
+                    return;
+                }
+            };
+        if export_response.status != 200 {
+            let message = format!(
+                "replication export returned non-200 status: {}",
+                export_response.status
+            );
+            if let Ok(mut guard) = runtime.lock() {
+                guard.observe_replication_pull_failure(message.clone());
+            }
+            eprintln!("{message}");
+            return;
+        }
+        let export_frame = match parse_replication_export_frame(&export_response.body) {
+            Ok(frame) => frame,
+            Err(err) => {
+                if let Ok(mut guard) = runtime.lock() {
+                    guard.observe_replication_pull_failure(err.clone());
+                }
+                eprintln!("replication resync failed parsing export: {err}");
+                return;
+            }
+        };
+        let result = runtime
+            .lock()
+            .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
+            .and_then(|mut guard| {
+                guard.apply_replication_export(WalReplicationExport {
+                    snapshot_lines: export_frame.snapshot_lines,
+                    wal_lines: export_frame.wal_lines,
+                })
+            });
+        if let Err(err) = result {
+            let message = format!("replication resync apply failed: {err:?}");
+            if let Ok(mut guard) = runtime.lock() {
+                guard.observe_replication_pull_failure(message.clone());
+            }
+            eprintln!("{message}");
+        }
+        return;
+    }
+    let result = runtime
+        .lock()
+        .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
+        .and_then(|mut guard| {
+            guard.apply_replication_delta_lines(&delta_frame.wal_lines, delta_frame.next_offset)
+        });
+    if let Err(err) = result {
+        let message = format!("replication delta apply failed: {err:?}");
+        if let Ok(mut guard) = runtime.lock() {
+            guard.observe_replication_pull_failure(message.clone());
+        }
+        eprintln!("{message}");
+    }
 }
 
 fn resolve_ingest_batch_max_items() -> usize {
@@ -3080,6 +3408,16 @@ fn split_target(target: &str) -> (String, HashMap<String, String>) {
     (path.to_string(), query)
 }
 
+fn parse_query_usize(query: &HashMap<String, String>, key: &str) -> Result<Option<usize>, String> {
+    match query.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("query parameter '{key}' must be a positive integer")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum JsonValue {
     Object(HashMap<String, JsonValue>),
@@ -3396,6 +3734,14 @@ impl HttpResponse {
         Self {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body,
+        }
+    }
+
+    fn ok_plain(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/plain; charset=utf-8",
             body,
         }
     }
@@ -3966,6 +4312,103 @@ mod tests {
         let mut snapshot_path = wal_path.clone().into_os_string();
         snapshot_path.push(".snapshot");
         let _ = std::fs::remove_file(PathBuf::from(snapshot_path));
+    }
+
+    #[test]
+    fn handle_request_internal_replication_wal_returns_delta_payload() {
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open(&wal_path).expect("wal should open");
+        let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
+            InMemoryStore::new(),
+            wal,
+            CheckpointPolicy::default(),
+        )));
+        let ingest_request = HttpRequest {
+            method: "POST".to_string(),
+            target: "/v1/ingest".to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: br#"{"claim":{"claim_id":"c-repl-1","tenant_id":"tenant-a","canonical_text":"replication source claim","confidence":0.9}}"#.to_vec(),
+        };
+        let ingest_response = handle_request(&runtime, &ingest_request);
+        assert_eq!(ingest_response.status, 200);
+
+        let pull_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/internal/replication/wal?from_offset=0&max_records=10".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let pull_response = handle_request(&runtime, &pull_request);
+        assert_eq!(pull_response.status, 200);
+        assert!(pull_response.body.contains("status=ok"));
+        assert!(pull_response.body.contains("records=1"));
+        assert!(pull_response.body.contains("next_offset=1"));
+
+        let guard = runtime.lock().expect("runtime lock should be available");
+        let _ = std::fs::remove_file(
+            guard
+                .wal
+                .as_ref()
+                .expect("persistent runtime should have wal")
+                .path(),
+        );
+        let _ = std::fs::remove_file(
+            guard
+                .wal
+                .as_ref()
+                .expect("persistent runtime should have wal")
+                .snapshot_path(),
+        );
+    }
+
+    #[test]
+    fn handle_request_internal_replication_endpoints_require_token_when_configured() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let previous = std::env::var_os("DASH_INGEST_REPLICATION_TOKEN");
+        set_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", "token-a");
+
+        let wal_path = temp_wal_path();
+        let wal = FileWal::open(&wal_path).expect("wal should open");
+        let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
+            InMemoryStore::new(),
+            wal,
+            CheckpointPolicy::default(),
+        )));
+        let unauthorized = HttpRequest {
+            method: "GET".to_string(),
+            target: "/internal/replication/wal?from_offset=0".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let unauthorized_response = handle_request(&runtime, &unauthorized);
+        assert_eq!(unauthorized_response.status, 403);
+
+        let authorized = HttpRequest {
+            method: "GET".to_string(),
+            target: "/internal/replication/export".to_string(),
+            headers: HashMap::from([("x-replication-token".to_string(), "token-a".to_string())]),
+            body: Vec::new(),
+        };
+        let authorized_response = handle_request(&runtime, &authorized);
+        assert_eq!(authorized_response.status, 200);
+        assert!(authorized_response.body.contains("status=ok"));
+
+        restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", previous.as_deref());
+        let guard = runtime.lock().expect("runtime lock should be available");
+        let _ = std::fs::remove_file(
+            guard
+                .wal
+                .as_ref()
+                .expect("persistent runtime should have wal")
+                .path(),
+        );
+        let _ = std::fs::remove_file(
+            guard
+                .wal
+                .as_ref()
+                .expect("persistent runtime should have wal")
+                .snapshot_path(),
+        );
     }
 
     #[test]

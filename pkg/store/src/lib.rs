@@ -102,6 +102,21 @@ pub struct WalReplayStats {
     pub wal_records: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalReplicationDelta {
+    pub from_offset: usize,
+    pub next_offset: usize,
+    pub total_records: usize,
+    pub needs_resync: bool,
+    pub wal_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalReplicationExport {
+    pub snapshot_lines: Vec<String>,
+    pub wal_lines: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StoreLoadStats {
     pub replay: WalReplayStats,
@@ -380,8 +395,80 @@ impl FileWal {
         Ok(())
     }
 
+    pub fn append_raw_record_line(&mut self, line: &str) -> Result<(), StoreError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err(StoreError::Parse(
+                "raw WAL record line must not be empty".to_string(),
+            ));
+        }
+        let _ = line_to_record(line)?;
+        self.append_raw_record_line_unchecked(line.to_string())
+    }
+
+    pub fn replication_delta_from(
+        &mut self,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationDelta, StoreError> {
+        self.flush_pending_sync()?;
+        let wal_lines = self.replay_wal_lines_raw()?;
+        let total_records = wal_lines.len();
+        if from_offset > total_records {
+            return Ok(WalReplicationDelta {
+                from_offset,
+                next_offset: total_records,
+                total_records,
+                needs_resync: true,
+                wal_lines: Vec::new(),
+            });
+        }
+        let limit = max_records.max(1);
+        let next_offset = from_offset.saturating_add(limit).min(total_records);
+        Ok(WalReplicationDelta {
+            from_offset,
+            next_offset,
+            total_records,
+            needs_resync: false,
+            wal_lines: wal_lines[from_offset..next_offset].to_vec(),
+        })
+    }
+
+    pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
+        self.flush_pending_sync()?;
+        Ok(WalReplicationExport {
+            snapshot_lines: self.replay_snapshot_lines_raw()?,
+            wal_lines: self.replay_wal_lines_raw()?,
+        })
+    }
+
+    pub fn replace_with_replication_export(
+        &mut self,
+        export: &WalReplicationExport,
+    ) -> Result<(), StoreError> {
+        self.flush_pending_sync()?;
+        for line in &export.snapshot_lines {
+            let _ = line_to_record(line)?;
+        }
+        for line in &export.wal_lines {
+            let _ = line_to_record(line)?;
+        }
+
+        self.write_snapshot_lines_raw(&export.snapshot_lines)?;
+        self.write_wal_lines_raw(&export.wal_lines)?;
+        self.wal_records = export.wal_lines.len();
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
+        self.append_buffer.clear();
+        Ok(())
+    }
+
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
-        self.append_buffer.push(record_to_line(record));
+        self.append_raw_record_line_unchecked(record_to_line(record))
+    }
+
+    fn append_raw_record_line_unchecked(&mut self, line: String) -> Result<(), StoreError> {
+        self.append_buffer.push(line);
         self.wal_records += 1;
         self.unsynced_records += 1;
         if self.background_flush_only {
@@ -468,6 +555,13 @@ impl FileWal {
     }
 
     fn replay_snapshot_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
+        self.replay_snapshot_lines_raw()?
+            .into_iter()
+            .map(|line| line_to_record(&line))
+            .collect()
+    }
+
+    fn replay_snapshot_lines_raw(&self) -> Result<Vec<String>, StoreError> {
         let snapshot_path = self.snapshot_path();
         if !snapshot_path.exists() {
             return Ok(Vec::new());
@@ -501,12 +595,19 @@ impl FileWal {
             if line.trim().is_empty() {
                 continue;
             }
-            out.push(line_to_record(&line)?);
+            out.push(line);
         }
         Ok(out)
     }
 
     fn replay_wal_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
+        self.replay_wal_lines_raw()?
+            .into_iter()
+            .map(|line| line_to_record(&line))
+            .collect()
+    }
+
+    fn replay_wal_lines_raw(&self) -> Result<Vec<String>, StoreError> {
         let file = OpenOptions::new().read(true).open(&self.path)?;
         let reader = BufReader::new(file);
         let mut out = Vec::new();
@@ -515,12 +616,16 @@ impl FileWal {
             if line.trim().is_empty() {
                 continue;
             }
-            out.push(line_to_record(&line)?);
+            out.push(line);
         }
         Ok(out)
     }
 
     fn write_snapshot_records(&self, records: &[PersistedRecord]) -> Result<(), StoreError> {
+        self.write_snapshot_lines_raw(&records.iter().map(record_to_line).collect::<Vec<String>>())
+    }
+
+    fn write_snapshot_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
         let snapshot_path = self.snapshot_path();
         if let Some(parent) = snapshot_path.parent()
             && !parent.as_os_str().is_empty()
@@ -538,11 +643,24 @@ impl FileWal {
             .truncate(true)
             .open(&tmp_path)?;
         writeln!(file, "{SNAPSHOT_HEADER}")?;
-        for record in records {
-            writeln!(file, "{}", record_to_line(record))?;
+        for line in lines {
+            writeln!(file, "{line}")?;
         }
         file.sync_all()?;
         rename(tmp_path, snapshot_path)?;
+        Ok(())
+    }
+
+    fn write_wal_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        file.sync_data()?;
         Ok(())
     }
 
@@ -648,27 +766,14 @@ impl InMemoryStore {
         let mut vectors_loaded = 0usize;
 
         for record in records {
-            match record {
-                PersistedRecord::Claim(claim) => {
-                    claims_loaded += 1;
-                    store.apply_claim(claim)?;
-                }
-                PersistedRecord::Evidence(evidence) => {
-                    evidence_loaded += 1;
-                    store.apply_evidence(evidence)?;
-                }
-                PersistedRecord::Edge(edge) => {
-                    edges_loaded += 1;
-                    store.apply_edge(edge)?;
-                }
-                PersistedRecord::ClaimVector(record) => {
-                    vectors_loaded += 1;
-                    store.apply_claim_vector(&record.claim_id, record.values)?;
-                }
-                PersistedRecord::BatchCommit(record) => {
-                    store.apply_batch_commit_record(record)?;
-                }
+            match &record {
+                PersistedRecord::Claim(_) => claims_loaded += 1,
+                PersistedRecord::Evidence(_) => evidence_loaded += 1,
+                PersistedRecord::Edge(_) => edges_loaded += 1,
+                PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
+                PersistedRecord::BatchCommit(_) => {}
             }
+            store.apply_persisted_record(record)?;
         }
         Ok((
             store,
@@ -773,6 +878,10 @@ impl InMemoryStore {
 
     pub fn batch_commit_metadata(&self, commit_id: &str) -> Option<&BatchCommitMetadata> {
         self.batch_commits.get(commit_id)
+    }
+
+    pub fn apply_persisted_record_line(&mut self, line: &str) -> Result<(), StoreError> {
+        self.apply_persisted_record(line_to_record(line)?)
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {
@@ -928,6 +1037,12 @@ impl InMemoryStore {
             .filter(|claim| claim.tenant_id == tenant_id)
             .cloned()
             .collect()
+    }
+
+    pub fn tenant_ids(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.tenant_claim_ids.keys().cloned().collect();
+        out.sort_unstable();
+        out
     }
 
     pub fn claim_ids_for_tenant(&self, tenant_id: &str) -> HashSet<String> {
@@ -1517,6 +1632,18 @@ impl InMemoryStore {
             self.apply_edge(edge)?;
         }
         Ok(())
+    }
+
+    fn apply_persisted_record(&mut self, record: PersistedRecord) -> Result<(), StoreError> {
+        match record {
+            PersistedRecord::Claim(claim) => self.apply_claim(claim),
+            PersistedRecord::Evidence(evidence) => self.apply_evidence(evidence),
+            PersistedRecord::Edge(edge) => self.apply_edge(edge),
+            PersistedRecord::ClaimVector(record) => {
+                self.apply_claim_vector(&record.claim_id, record.values)
+            }
+            PersistedRecord::BatchCommit(record) => self.apply_batch_commit_record(record),
+        }
     }
 
     fn apply_claim(&mut self, claim: Claim) -> Result<(), StoreError> {
@@ -3548,6 +3675,82 @@ mod tests {
         assert_eq!(stats.claims_loaded, 1);
 
         cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_replication_delta_returns_window_and_resync_signal() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open(&wal_path).unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-r1", "Replication claim one"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c-r2", "Replication claim two"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let first = wal.replication_delta_from(0, 1).unwrap();
+        assert!(!first.needs_resync);
+        assert_eq!(first.from_offset, 0);
+        assert_eq!(first.next_offset, 1);
+        assert_eq!(first.total_records, 2);
+        assert_eq!(first.wal_lines.len(), 1);
+
+        let gap = wal.replication_delta_from(10, 2).unwrap();
+        assert!(gap.needs_resync);
+        assert_eq!(gap.next_offset, 2);
+        assert!(gap.wal_lines.is_empty());
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
+    fn wal_replication_export_replaces_snapshot_and_wal_state() {
+        let src_wal_path = temp_wal_path();
+        let mut src_wal = FileWal::open(&src_wal_path).unwrap();
+        let mut src_store = InMemoryStore::new();
+        src_store
+            .ingest_bundle_persistent(
+                &mut src_wal,
+                claim("c-src-1", "Source claim one"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        src_store.checkpoint_and_compact(&mut src_wal).unwrap();
+        src_store
+            .ingest_bundle_persistent(
+                &mut src_wal,
+                claim("c-src-2", "Source claim two"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let export = src_wal.replication_export().unwrap();
+        assert!(!export.snapshot_lines.is_empty());
+        assert_eq!(export.wal_lines.len(), 1);
+
+        let dst_wal_path = temp_wal_path();
+        let mut dst_wal = FileWal::open(&dst_wal_path).unwrap();
+        dst_wal.replace_with_replication_export(&export).unwrap();
+
+        let replayed = InMemoryStore::load_from_wal(&dst_wal).unwrap();
+        assert_eq!(replayed.claims_len(), 2);
+        assert!(dst_wal.snapshot_path().exists());
+
+        cleanup_persistence_files(&src_wal);
+        cleanup_persistence_files(&dst_wal);
     }
 
     #[test]

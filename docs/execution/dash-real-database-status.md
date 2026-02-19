@@ -46,6 +46,9 @@ These percentages are directional and tied to implemented code paths, tests, and
 - JWT bearer auth mode (HS256) with claim validation and tenant-scope enforcement.
 - JWT key rotation support (`active + fallback` secrets and optional `kid` secret maps).
 - Tamper-evident audit log chaining (`seq`, `prev_hash`, `hash`) with offline verifier script.
+- Ingestion replication source/sink v1:
+  - source endpoints: `GET /internal/replication/wal`, `GET /internal/replication/export`
+  - follower pull loop with WAL-delta apply and full export resync fallback.
 
 ### 3.4 Index and scale path primitives
 
@@ -70,7 +73,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 4.2 Distributed system gaps
 
 - No dedicated dynamic placement control-plane service (current routing uses file-backed placement metadata with optional live reload).
-- No replica replication stream and follower catch-up protocol.
+- Pull-based replica replication stream exists for ingestion v1; remaining gap is multi-replica ack/quorum replication protocol and formal lag SLO enforcement.
 - No automatic leader election/failover runtime across shard replicas.
 
 ### 4.3 Operational and safety gaps

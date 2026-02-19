@@ -62,6 +62,10 @@ DASH_INGEST_ALLOWED_TENANTS=tenant-a,tenant-b \
 DASH_INGEST_API_KEY_SCOPES="change-me-ingest-key:tenant-a,tenant-b" \
 DASH_INGEST_AUDIT_LOG_PATH=/var/log/dash/ingestion-audit.jsonl \
 DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
+DASH_INGEST_REPLICATION_SOURCE_URL=http://leader-node:8081 \
+DASH_INGEST_REPLICATION_POLL_INTERVAL_MS=500 \
+DASH_INGEST_REPLICATION_MAX_RECORDS=512 \
+DASH_INGEST_REPLICATION_TOKEN=change-me-replication-token \
 DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1 \
 DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=1 \
 DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS=250 \
@@ -157,6 +161,13 @@ Retrieve:
 curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retrieve?tenant_id=sample-tenant&query=retrieval+initialized&top_k=5&stance_mode=balanced"
 ```
 
+Internal replication source probe (leader):
+
+```bash
+curl -sS http://127.0.0.1:8081/internal/replication/wal?from_offset=0&max_records=16 \
+  -H "X-Replication-Token: change-me-replication-token"
+```
+
 ## 7. Operational Guardrails
 
 - set checkpoint limits to avoid unbounded WAL growth
@@ -194,6 +205,9 @@ curl -sS -H "X-API-Key: change-me-retrieval-key" "http://127.0.0.1:8080/v1/retri
   - `dash_ingest_audit_events_total`, `dash_ingest_audit_write_error_total`
   - `dash_ingest_placement_route_reject_total`, `dash_ingest_placement_last_epoch`
   - `dash_ingest_placement_reload_enabled`, `dash_ingest_placement_reload_attempt_total`, `dash_ingest_placement_reload_failure_total`
+  - `dash_ingest_replication_pull_success_total`, `dash_ingest_replication_pull_failure_total`
+  - `dash_ingest_replication_applied_records_total`, `dash_ingest_replication_resync_total`
+  - `dash_ingest_replication_last_offset`, `dash_ingest_replication_last_error`
   - `dash_ingest_claims_total`
 - monitor `/metrics` for:
   - `dash_retrieve_latency_ms_p50`, `dash_retrieve_latency_ms_p95`, `dash_retrieve_latency_ms_p99`
