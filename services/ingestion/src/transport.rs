@@ -19,6 +19,7 @@ mod payload;
 mod persistence;
 mod placement_debug;
 mod placement_routing;
+mod read_routes;
 mod replication;
 mod request;
 mod routes;
