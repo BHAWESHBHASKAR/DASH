@@ -37,7 +37,7 @@ Artifacts:
 
 1. Start ingestion service.
 2. Start retrieval service with `--serve`.
-3. Start segment maintenance daemon (recommended in production).
+3. Start segment maintenance daemon (recommended in production; use dedicated service in systemd/container deployments).
 4. Verify `/health`.
 5. Verify `/metrics`.
 6. Run a retrieval probe request.
@@ -104,6 +104,12 @@ One-shot verification tick:
 ```bash
 DASH_INGEST_SEGMENT_DIR=/var/lib/dash/segments \
 target/release/segment-maintenance-daemon --once
+```
+
+Systemd deployment includes maintenance service support:
+
+```bash
+scripts/deploy_systemd.sh --mode apply --service all
 ```
 
 Compatibility note: legacy `EME_*` env vars are still accepted as fallback.

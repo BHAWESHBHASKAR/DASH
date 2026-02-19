@@ -16,7 +16,7 @@ Usage: scripts/deploy_systemd.sh [options]
 
 Options:
   --mode plan|apply              Default: plan
-  --service ingestion|retrieval|all
+  --service ingestion|retrieval|maintenance|all
   --prefix-dir PATH              Default: /opt/dash
   --etc-dir PATH                 Default: /etc/dash
   --systemd-dir PATH             Default: /etc/systemd/system
@@ -25,6 +25,7 @@ Options:
 Examples:
   scripts/deploy_systemd.sh --mode plan --service all
   scripts/deploy_systemd.sh --mode apply --service retrieval --prefix-dir /srv/dash
+  scripts/deploy_systemd.sh --mode apply --service maintenance --prefix-dir /srv/dash
 USAGE
 }
 
@@ -67,8 +68,8 @@ if [[ "${MODE}" != "plan" && "${MODE}" != "apply" ]]; then
   exit 2
 fi
 
-if [[ "${SERVICE}" != "ingestion" && "${SERVICE}" != "retrieval" && "${SERVICE}" != "all" ]]; then
-  echo "--service must be ingestion, retrieval, or all" >&2
+if [[ "${SERVICE}" != "ingestion" && "${SERVICE}" != "retrieval" && "${SERVICE}" != "maintenance" && "${SERVICE}" != "all" ]]; then
+  echo "--service must be ingestion, retrieval, maintenance, or all" >&2
   exit 2
 fi
 
@@ -93,6 +94,10 @@ stage_selected_units() {
     stage_unit "${DEPLOY_DIR}/dash-retrieval.service" "${TMP_DIR}/dash-retrieval.service"
     cp "${DEPLOY_DIR}/retrieval.env.example" "${TMP_DIR}/retrieval.env.example"
   fi
+  if [[ "${SERVICE}" == "maintenance" || "${SERVICE}" == "all" ]]; then
+    stage_unit "${DEPLOY_DIR}/dash-segment-maintenance.service" "${TMP_DIR}/dash-segment-maintenance.service"
+    cp "${DEPLOY_DIR}/segment-maintenance.env.example" "${TMP_DIR}/segment-maintenance.env.example"
+  fi
 }
 
 print_plan() {
@@ -114,6 +119,11 @@ print_plan() {
     echo "  install -m 0644 \"${TMP_DIR}/retrieval.env.example\" \"${ETC_DIR}/retrieval.env\""
     echo "  systemctl enable --now dash-retrieval.service"
   fi
+  if [[ "${SERVICE}" == "maintenance" || "${SERVICE}" == "all" ]]; then
+    echo "  install -m 0644 \"${TMP_DIR}/dash-segment-maintenance.service\" \"${SYSTEMD_DIR}/dash-segment-maintenance.service\""
+    echo "  install -m 0644 \"${TMP_DIR}/segment-maintenance.env.example\" \"${ETC_DIR}/segment-maintenance.env\""
+    echo "  systemctl enable --now dash-segment-maintenance.service"
+  fi
   echo "  systemctl daemon-reload"
 }
 
@@ -129,6 +139,10 @@ apply_plan() {
     install -m 0644 "${TMP_DIR}/dash-retrieval.service" "${SYSTEMD_DIR}/dash-retrieval.service"
     install -m 0644 "${TMP_DIR}/retrieval.env.example" "${ETC_DIR}/retrieval.env"
   fi
+  if [[ "${SERVICE}" == "maintenance" || "${SERVICE}" == "all" ]]; then
+    install -m 0644 "${TMP_DIR}/dash-segment-maintenance.service" "${SYSTEMD_DIR}/dash-segment-maintenance.service"
+    install -m 0644 "${TMP_DIR}/segment-maintenance.env.example" "${ETC_DIR}/segment-maintenance.env"
+  fi
 
   systemctl daemon-reload
   if [[ "${SERVICE}" == "ingestion" || "${SERVICE}" == "all" ]]; then
@@ -136,6 +150,9 @@ apply_plan() {
   fi
   if [[ "${SERVICE}" == "retrieval" || "${SERVICE}" == "all" ]]; then
     systemctl enable --now dash-retrieval.service
+  fi
+  if [[ "${SERVICE}" == "maintenance" || "${SERVICE}" == "all" ]]; then
+    systemctl enable --now dash-segment-maintenance.service
   fi
   echo "[deploy-systemd] apply complete"
 }

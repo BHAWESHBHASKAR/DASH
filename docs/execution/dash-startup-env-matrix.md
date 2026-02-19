@@ -55,6 +55,7 @@ Status: active
 Ingestion segment lifecycle daemon note:
 
 - `target/release/segment-maintenance-daemon` reads the same segment env keys (`DASH_INGEST_SEGMENT_DIR`, `DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS`, `DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS`) for out-of-process maintenance loops.
+- when daemon mode is active, set ingestion `DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS=0` to avoid duplicate in-process maintenance loops.
 
 ## Retrieval Service
 

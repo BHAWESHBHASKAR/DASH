@@ -67,6 +67,8 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/benchmark_trend.sh`
   - `scripts/deploy_systemd.sh`
   - `scripts/deploy_container.sh`
+  - `deploy/systemd/dash-segment-maintenance.service`
+  - `deploy/systemd/segment-maintenance.env.example`
   - `scripts/backup_state_bundle.sh`
   - `scripts/restore_state_bundle.sh`
   - `scripts/recovery_drill.sh`

@@ -61,7 +61,7 @@ These percentages are directional and tied to implemented code paths, tests, and
 ### 4.1 Core storage/runtime gaps
 
 - No fully disk-native query serving path (current serving remains memory-centric with WAL/snapshot recovery).
-- Standalone segment maintenance exists, but systemd/container orchestration wiring is still incomplete for fully managed production operation.
+- Standalone segment maintenance now has basic systemd/container wiring; higher-level orchestration (k8s/operator automation and policy-driven lifecycle management) is still incomplete.
 - No transactional write batch API with durable commit metadata.
 
 ### 4.2 Distributed system gaps
