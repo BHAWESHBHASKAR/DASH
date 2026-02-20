@@ -267,4 +267,38 @@ mod tests {
         );
         assert_eq!(results.first().map(|r| r.claim_id.as_str()), Some("c-vec"));
     }
+
+    #[test]
+    fn ingest_document_preserves_temporal_claim_metadata() {
+        let mut store = InMemoryStore::new();
+        let input = IngestInput {
+            claim: Claim {
+                claim_id: "c-temporal".into(),
+                tenant_id: "tenant-a".into(),
+                canonical_text: "Temporal metadata ingestion".into(),
+                confidence: 0.9,
+                event_time_unix: Some(200),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: Some(schema::ClaimType::Temporal),
+                valid_from: Some(120),
+                valid_to: Some(260),
+                created_at: Some(1_771_620_000_000),
+                updated_at: Some(1_771_620_100_000),
+            },
+            claim_embedding: None,
+            evidence: vec![],
+            edges: vec![],
+        };
+
+        ingest_document(&mut store, input).unwrap();
+        let claim = store
+            .claim_by_id("c-temporal")
+            .expect("claim should be persisted");
+        assert_eq!(claim.claim_type, Some(schema::ClaimType::Temporal));
+        assert_eq!(claim.valid_from, Some(120));
+        assert_eq!(claim.valid_to, Some(260));
+        assert_eq!(claim.created_at, Some(1_771_620_000_000));
+        assert_eq!(claim.updated_at, Some(1_771_620_100_000));
+    }
 }

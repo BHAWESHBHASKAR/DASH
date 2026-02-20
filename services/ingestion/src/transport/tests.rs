@@ -126,6 +126,46 @@ fn build_ingest_request_from_json_accepts_metadata_fields() {
 }
 
 #[test]
+fn build_ingest_request_from_json_accepts_temporal_claim_fields() {
+    let body = r#"{
+            "claim": {
+                "claim_id": "c1",
+                "tenant_id": "tenant-a",
+                "canonical_text": "Temporal claim payload",
+                "confidence": 0.9,
+                "claim_type": "temporal",
+                "valid_from": 120,
+                "valid_to": 240,
+                "created_at": 1771620000000,
+                "updated_at": 1771620001000
+            }
+        }"#;
+
+    let req = build_ingest_request_from_json(body).unwrap();
+    assert_eq!(req.claim.claim_type, Some(schema::ClaimType::Temporal));
+    assert_eq!(req.claim.valid_from, Some(120));
+    assert_eq!(req.claim.valid_to, Some(240));
+    assert_eq!(req.claim.created_at, Some(1_771_620_000_000));
+    assert_eq!(req.claim.updated_at, Some(1_771_620_001_000));
+}
+
+#[test]
+fn build_ingest_request_from_json_rejects_invalid_claim_type() {
+    let body = r#"{
+            "claim": {
+                "claim_id": "c1",
+                "tenant_id": "tenant-a",
+                "canonical_text": "Temporal claim payload",
+                "confidence": 0.9,
+                "claim_type": "invalid"
+            }
+        }"#;
+
+    let err = build_ingest_request_from_json(body).unwrap_err();
+    assert!(err.contains("claim.claim_type"));
+}
+
+#[test]
 fn build_ingest_request_from_json_rejects_invalid_relation() {
     let body = r#"{
             "claim": {

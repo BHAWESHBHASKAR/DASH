@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use schema::{Claim, ClaimEdge, Evidence, Relation, Stance};
+use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::api::{
     IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse,
@@ -138,11 +138,11 @@ fn build_ingest_request_from_json_value(value: &JsonValue) -> Result<IngestApiRe
             claim_obj.get("embedding_ids"),
             "claim.embedding_ids",
         )?,
-        claim_type: None,
+        claim_type: parse_optional_claim_type(claim_obj.get("claim_type"), "claim.claim_type")?,
         valid_from: parse_optional_i64(claim_obj.get("valid_from"), "claim.valid_from")?,
         valid_to: parse_optional_i64(claim_obj.get("valid_to"), "claim.valid_to")?,
-        created_at: None,
-        updated_at: None,
+        created_at: parse_optional_i64(claim_obj.get("created_at"), "claim.created_at")?,
+        updated_at: parse_optional_i64(claim_obj.get("updated_at"), "claim.updated_at")?,
     };
 
     let evidence = match object.get("evidence") {
@@ -354,5 +354,27 @@ fn parse_optional_string_array(
             Ok(out)
         }
         _ => Err(format!("{field_name} must be an array of strings or null")),
+    }
+}
+
+fn parse_optional_claim_type(
+    value: Option<&JsonValue>,
+    field_name: &str,
+) -> Result<Option<ClaimType>, String> {
+    let raw = match value {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(JsonValue::String(raw)) => raw.trim().to_ascii_lowercase(),
+        _ => return Err(format!("{field_name} must be a string or null")),
+    };
+
+    match raw.as_str() {
+        "factual" => Ok(Some(ClaimType::Factual)),
+        "opinion" => Ok(Some(ClaimType::Opinion)),
+        "prediction" => Ok(Some(ClaimType::Prediction)),
+        "temporal" => Ok(Some(ClaimType::Temporal)),
+        "causal" => Ok(Some(ClaimType::Causal)),
+        _ => Err(format!(
+            "{field_name} must be one of: factual, opinion, prediction, temporal, causal"
+        )),
     }
 }
