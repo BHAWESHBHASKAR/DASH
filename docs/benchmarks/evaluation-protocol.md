@@ -498,7 +498,49 @@ Optional overrides:
   - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-quick --mode quick`
   - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-staged --mode staged`
 
-## 22. Phase 4 Closure Checklist Gate
+## 22. Tier-C Rehearsal Wrapper (recovery + incident + closure)
+
+- Script:
+  - `scripts/phase4_tierc_rehearsal.sh`
+- Purpose:
+  - run a single command Tier-C rehearsal that orchestrates:
+    - `phase4_scale_proof` execution with rebalance shard gate
+    - recovery drill artifact generation
+    - incident simulation gate artifact generation
+    - `tier-c` closure checklist evaluation
+- Preset modes:
+  - `quick` (default):
+    - profile: `smoke`
+    - fixture size: `6000`
+    - failover mode: `both`
+    - lightweight concurrency knobs
+  - `staged`:
+    - profile: `xlarge`
+    - fixture size: `150000`
+    - failover mode: `both`
+    - higher concurrency knobs for closer Tier-C rehearsal
+  - both modes enforce:
+    - rebalance target shards: `>=8` gate model
+    - recovery + incident artifacts when closure checklist is enabled
+- Artifact outputs:
+  - recovery summary:
+    - `docs/benchmarks/history/recovery/<run-id>-recovery-drill.md`
+  - incident simulation summary:
+    - `docs/benchmarks/history/incidents/<timestamp>-<run-id>-tierc-incident-gate.md`
+  - closure checklist:
+    - `docs/benchmarks/history/runs/<run-id>-closure-tier-c.md`
+- Override options include:
+  - `--mode quick|staged`
+  - `--run-recovery-drill true|false`
+  - `--run-incident-gate true|false`
+  - `--run-closure-checklist true|false`
+  - `--recovery-artifact PATH` / `--incident-artifact PATH` (for externally produced artifacts)
+  - standard profile/shard/concurrency/failover knobs
+- Example:
+  - `scripts/phase4_tierc_rehearsal.sh --run-id phase4-tierc-quick --mode quick`
+  - `scripts/phase4_tierc_rehearsal.sh --run-id phase4-tierc-staged --mode staged`
+
+## 23. Phase 4 Closure Checklist Gate
 
 - Script:
   - `scripts/phase4_closure_checklist.sh`
