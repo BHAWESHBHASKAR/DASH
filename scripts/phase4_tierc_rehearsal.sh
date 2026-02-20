@@ -37,6 +37,7 @@ FAILOVER_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERC_FAILOVER_MAX_WAIT_SECONDS:-30}"
 RUN_RECOVERY_DRILL="${DASH_PHASE4_TIERC_RUN_RECOVERY_DRILL:-true}"
 RUN_INCIDENT_GATE="${DASH_PHASE4_TIERC_RUN_INCIDENT_GATE:-true}"
 RUN_CLOSURE_CHECKLIST="${DASH_PHASE4_TIERC_RUN_CLOSURE_CHECKLIST:-true}"
+RUN_SCALE_PROOF="${DASH_PHASE4_TIERC_RUN_SCALE_PROOF:-true}"
 RECOVERY_MAX_RTO_SECONDS="${DASH_PHASE4_TIERC_RECOVERY_MAX_RTO_SECONDS:-120}"
 INCIDENT_FAILOVER_MODE="${DASH_PHASE4_TIERC_INCIDENT_FAILOVER_MODE:-both}"
 INCIDENT_FAILOVER_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERC_INCIDENT_FAILOVER_MAX_WAIT_SECONDS:-30}"
@@ -46,6 +47,7 @@ RECOVERY_ARTIFACT_DIR="${DASH_PHASE4_TIERC_RECOVERY_ARTIFACT_DIR:-docs/benchmark
 INCIDENT_SUMMARY_DIR="${DASH_PHASE4_TIERC_INCIDENT_SUMMARY_DIR:-docs/benchmarks/history/incidents}"
 RECOVERY_ARTIFACT_OVERRIDE="${DASH_PHASE4_TIERC_RECOVERY_ARTIFACT:-}"
 INCIDENT_ARTIFACT_OVERRIDE="${DASH_PHASE4_TIERC_INCIDENT_ARTIFACT:-}"
+SUMMARY_PATH_OVERRIDE="${DASH_PHASE4_TIERC_SUMMARY_PATH:-}"
 
 if [[ "${MODE}" == "staged" ]]; then
   PROFILE="${DASH_PHASE4_TIERC_PROFILE:-xlarge}"
@@ -112,6 +114,9 @@ Options:
   --run-recovery-drill true|false        Run recovery drill step (default: true)
   --run-incident-gate true|false         Run incident simulation gate step (default: true)
   --run-closure-checklist true|false     Run tier-c closure checklist (default: true)
+  --run-scale-proof true|false           Run phase4_scale_proof step (default: true)
+  --summary-path PATH                    Existing scale-proof summary path to reuse when
+                                         --run-scale-proof=false (or to force closure input)
   --recovery-max-rto-seconds N           Recovery drill max RTO (default: 120)
   --recovery-artifact-dir DIR            Output dir for generated recovery summary
                                          (default: docs/benchmarks/history/recovery)
@@ -157,6 +162,8 @@ while [[ $# -gt 0 ]]; do
     --run-recovery-drill) RUN_RECOVERY_DRILL="$2"; shift 2 ;;
     --run-incident-gate) RUN_INCIDENT_GATE="$2"; shift 2 ;;
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
+    --run-scale-proof) RUN_SCALE_PROOF="$2"; shift 2 ;;
+    --summary-path) SUMMARY_PATH_OVERRIDE="$2"; shift 2 ;;
     --recovery-max-rto-seconds) RECOVERY_MAX_RTO_SECONDS="$2"; shift 2 ;;
     --recovery-artifact-dir) RECOVERY_ARTIFACT_DIR="$2"; shift 2 ;;
     --recovery-artifact) RECOVERY_ARTIFACT_OVERRIDE="$2"; shift 2 ;;
@@ -189,7 +196,7 @@ case "${MODE}" in
 esac
 
 for bool_opt in "${RUN_RECOVERY_DRILL}" "${RUN_INCIDENT_GATE}" "${RUN_CLOSURE_CHECKLIST}" \
-  "${BENCH_RELEASE}"; do
+  "${RUN_SCALE_PROOF}" "${BENCH_RELEASE}"; do
   case "${bool_opt}" in
     true|false) ;;
     *)
@@ -242,7 +249,7 @@ echo "[phase4-tierc] run_id=${RUN_ID}"
 echo "[phase4-tierc] mode=${MODE}"
 echo "[phase4-tierc] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=${ITERATIONS}"
 echo "[phase4-tierc] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
-echo "[phase4-tierc] recovery=${RUN_RECOVERY_DRILL} incident=${RUN_INCIDENT_GATE} closure=${RUN_CLOSURE_CHECKLIST}"
+echo "[phase4-tierc] scale_proof=${RUN_SCALE_PROOF} recovery=${RUN_RECOVERY_DRILL} incident=${RUN_INCIDENT_GATE} closure=${RUN_CLOSURE_CHECKLIST}"
 
 cmd=(
   scripts/phase4_scale_proof.sh
@@ -270,11 +277,47 @@ cmd=(
   --rebalance-max-wait-seconds "${REBALANCE_MAX_WAIT_SECONDS}"
 )
 
-if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
-  cmd+=("${EXTRA_ARGS[@]}")
+SUMMARY_PATH="${SUMMARY_PATH_OVERRIDE}"
+
+if [[ "${RUN_SCALE_PROOF}" == "true" ]]; then
+  if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
+    cmd+=("${EXTRA_ARGS[@]}")
+  fi
+
+  "${cmd[@]}"
+
+  if [[ -z "${SUMMARY_PATH}" ]]; then
+    SUMMARY_PATH="docs/benchmarks/history/runs/${RUN_ID}.md"
+  fi
+
+  if [[ ! -f "${SUMMARY_PATH}" ]]; then
+    echo "unable to find scale-proof summary at ${SUMMARY_PATH}" >&2
+    echo "set --summary-path if phase4_scale_proof used a non-default summary dir" >&2
+    exit 1
+  fi
+else
+  if [[ -z "${SUMMARY_PATH}" ]]; then
+    candidate_path="docs/benchmarks/history/runs/${RUN_ID}.md"
+    if [[ -f "${candidate_path}" ]]; then
+      SUMMARY_PATH="${candidate_path}"
+    fi
+  fi
+
+  if [[ "${RUN_CLOSURE_CHECKLIST}" == "true" ]]; then
+    if [[ -z "${SUMMARY_PATH}" ]]; then
+      echo "--run-scale-proof=false with closure enabled requires --summary-path (or existing docs/benchmarks/history/runs/<run-id>.md)" >&2
+      exit 2
+    fi
+    if [[ ! -f "${SUMMARY_PATH}" ]]; then
+      echo "summary path not found: ${SUMMARY_PATH}" >&2
+      exit 1
+    fi
+  fi
 fi
 
-"${cmd[@]}"
+if [[ -n "${SUMMARY_PATH}" ]]; then
+  echo "[phase4-tierc] summary_path=${SUMMARY_PATH}"
+fi
 
 RECOVERY_ARTIFACT_PATH="${RECOVERY_ARTIFACT_OVERRIDE}"
 INCIDENT_ARTIFACT_PATH="${INCIDENT_ARTIFACT_OVERRIDE}"
@@ -367,6 +410,7 @@ if [[ "${RUN_CLOSURE_CHECKLIST}" == "true" ]]; then
   scripts/phase4_closure_checklist.sh \
     --tier tier-c \
     --run-id "${RUN_ID}" \
+    --summary-path "${SUMMARY_PATH}" \
     --min-shards "${MIN_SHARDS_GATE}" \
     --recovery-artifact "${RECOVERY_ARTIFACT_PATH}" \
     --incident-artifact "${INCIDENT_ARTIFACT_PATH}"

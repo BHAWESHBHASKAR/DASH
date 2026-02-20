@@ -58,7 +58,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Phase 4 long-soak control wrapper is available via `scripts/phase4_long_soak_ctl.sh` (`start|status|tail|stop|run` workflow with pid/log/heartbeat management).
 - Rebalance/split drill automation is available via `scripts/rebalance_drill.sh` (placement split + epoch transition verification with before/after route snapshots and probe-diff artifacts).
 - Tier-B rehearsal wrapper is available via `scripts/phase4_tierb_rehearsal.sh` (one-command `>=8` shard rebalance gate preset over phase4 scale-proof runner).
-- Tier-C rehearsal wrapper is available via `scripts/phase4_tierc_rehearsal.sh` (phase4 scale-proof + recovery drill + incident simulation + tier-c closure checklist orchestration).
+- Tier-C rehearsal wrapper is available via `scripts/phase4_tierc_rehearsal.sh` (phase4 scale-proof + recovery drill + incident simulation + tier-c closure checklist orchestration, with optional dev-mode reuse of existing scale-proof summaries).
 - Phase 4 closure checklist gate is available via `scripts/phase4_closure_checklist.sh` (tier-aware PASS/FAIL checklist from scale-proof summary artifacts).
 - Placement failover validation script supports restart and no-restart drills via `scripts/failover_drill.sh --mode restart|no-restart|both`.
 - Transport concurrency benchmark tooling is available via `scripts/benchmark_transport_concurrency.sh` and `concurrent_load`.

@@ -531,6 +531,8 @@ Optional overrides:
     - `docs/benchmarks/history/runs/<run-id>-closure-tier-c.md`
 - Override options include:
   - `--mode quick|staged`
+  - `--run-scale-proof true|false` (development mode: skip expensive scale-proof rerun)
+  - `--summary-path <path>` (reuse an existing phase4 summary when `--run-scale-proof=false`)
   - `--run-recovery-drill true|false`
   - `--run-incident-gate true|false`
   - `--run-closure-checklist true|false`
