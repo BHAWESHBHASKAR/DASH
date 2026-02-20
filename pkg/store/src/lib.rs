@@ -10,8 +10,9 @@ use std::{
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, RetrievalResult, Stance,
-    StanceMode, ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, ClaimType, Evidence, Relation, RetrievalRequest, RetrievalResult,
+    Stance, StanceMode, ValidationError, tokenize, validate_claim, validate_edge,
+    validate_evidence,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1300,8 +1301,11 @@ impl InMemoryStore {
         }
 
         if from_unix.is_some() || to_unix.is_some() {
-            let ranged = self.temporal_claim_ids(tenant_id, from_unix, to_unix);
-            candidates = candidates.intersection(&ranged).cloned().collect();
+            candidates.retain(|claim_id| {
+                self.claims
+                    .get(claim_id)
+                    .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix))
+            });
         }
         if let Some(allowed_ids) = allowed_claim_ids {
             candidates = candidates.intersection(allowed_ids).cloned().collect();
@@ -1471,25 +1475,6 @@ impl InMemoryStore {
             }
         }
 
-        out
-    }
-
-    fn temporal_claim_ids(
-        &self,
-        tenant_id: &str,
-        from_unix: Option<i64>,
-        to_unix: Option<i64>,
-    ) -> HashSet<String> {
-        let mut out = HashSet::new();
-        let Some(tenant_timeline) = self.temporal_index.get(tenant_id) else {
-            return out;
-        };
-
-        let start = from_unix.unwrap_or(i64::MIN);
-        let end = to_unix.unwrap_or(i64::MAX);
-        for (_, ids) in tenant_timeline.range(start..=end) {
-            out.extend(ids.iter().cloned());
-        }
         out
     }
 
@@ -2149,6 +2134,53 @@ impl InMemoryStore {
     }
 }
 
+fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
+    if let Some(from) = from_unix
+        && value < from
+    {
+        return false;
+    }
+    if let Some(to) = to_unix
+        && value > to
+    {
+        return false;
+    }
+    true
+}
+
+fn time_windows_overlap(
+    window_start: Option<i64>,
+    window_end: Option<i64>,
+    query_from: Option<i64>,
+    query_to: Option<i64>,
+) -> bool {
+    let start = window_start.unwrap_or(i64::MIN);
+    let end = window_end.unwrap_or(i64::MAX);
+    let query_start = query_from.unwrap_or(i64::MIN);
+    let query_end = query_to.unwrap_or(i64::MAX);
+    start <= query_end && end >= query_start
+}
+
+fn claim_matches_time_range(claim: &Claim, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
+    if from_unix.is_none() && to_unix.is_none() {
+        return true;
+    }
+
+    let event_match = claim
+        .event_time_unix
+        .is_some_and(|value| value_in_time_range(value, from_unix, to_unix));
+    let has_valid_window = claim.valid_from.is_some() || claim.valid_to.is_some();
+    let validity_match = has_valid_window
+        && time_windows_overlap(claim.valid_from, claim.valid_to, from_unix, to_unix);
+
+    match (claim.event_time_unix.is_some(), has_valid_window) {
+        (true, true) => event_match && validity_match,
+        (true, false) => event_match,
+        (false, true) => validity_match,
+        (false, false) => false,
+    }
+}
+
 fn normalize_index_key(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -2190,7 +2222,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
 fn record_to_line(record: &PersistedRecord) -> String {
     match record {
         PersistedRecord::Claim(c) => format!(
-            "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&c.claim_id),
             escape_field(&c.tenant_id),
             escape_field(&c.canonical_text),
@@ -2199,7 +2231,23 @@ fn record_to_line(record: &PersistedRecord) -> String {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             pack_string_list(&c.entities),
-            pack_string_list(&c.embedding_ids)
+            pack_string_list(&c.embedding_ids),
+            c.claim_type
+                .as_ref()
+                .map(claim_type_to_str)
+                .unwrap_or("null"),
+            c.valid_from
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            c.valid_to
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            c.created_at
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            c.updated_at
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string())
         ),
         PersistedRecord::Evidence(e) => format!(
             "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -2262,7 +2310,7 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
     }
     match parts[0] {
         "C" => {
-            if !(parts.len() == 6 || parts.len() == 8) {
+            if !(parts.len() == 6 || parts.len() == 8 || parts.len() == 13) {
                 return Err(StoreError::Parse(
                     "claim record has invalid field count".to_string(),
                 ));
@@ -2284,6 +2332,31 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
             } else {
                 Vec::new()
             };
+            let claim_type = if parts.len() >= 13 {
+                parse_optional_claim_type_field(parts[8])?
+            } else {
+                None
+            };
+            let valid_from = if parts.len() >= 13 {
+                parse_optional_i64_field(parts[9], "valid_from")?
+            } else {
+                None
+            };
+            let valid_to = if parts.len() >= 13 {
+                parse_optional_i64_field(parts[10], "valid_to")?
+            } else {
+                None
+            };
+            let created_at = if parts.len() >= 13 {
+                parse_optional_i64_field(parts[11], "created_at")?
+            } else {
+                None
+            };
+            let updated_at = if parts.len() >= 13 {
+                parse_optional_i64_field(parts[12], "updated_at")?
+            } else {
+                None
+            };
             Ok(PersistedRecord::Claim(Claim {
                 claim_id: unescape_field(parts[1])?,
                 tenant_id: unescape_field(parts[2])?,
@@ -2294,11 +2367,11 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
                 event_time_unix,
                 entities,
                 embedding_ids,
-                claim_type: None,
-                valid_from: None,
-                valid_to: None,
-                created_at: None,
-                updated_at: None,
+                claim_type,
+                valid_from,
+                valid_to,
+                created_at,
+                updated_at,
             }))
         }
         "E" => {
@@ -2486,6 +2559,22 @@ fn parse_optional_u32_field(raw: &str, field: &str) -> Result<Option<u32>, Store
         .map_err(|_| StoreError::Parse(format!("evidence record has invalid {field}")))
 }
 
+fn parse_optional_i64_field(raw: &str, field: &str) -> Result<Option<i64>, StoreError> {
+    if raw == "null" {
+        return Ok(None);
+    }
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|_| StoreError::Parse(format!("claim record has invalid {field}")))
+}
+
+fn parse_optional_claim_type_field(raw: &str) -> Result<Option<ClaimType>, StoreError> {
+    if raw == "null" {
+        return Ok(None);
+    }
+    Ok(Some(str_to_claim_type(raw)?))
+}
+
 fn unescape_field(value: &str) -> Result<String, StoreError> {
     let mut output = String::with_capacity(value.len());
     let mut escaped = false;
@@ -2524,6 +2613,29 @@ fn stance_to_str(stance: &Stance) -> &'static str {
     }
 }
 
+fn claim_type_to_str(value: &ClaimType) -> &'static str {
+    match value {
+        ClaimType::Factual => "factual",
+        ClaimType::Opinion => "opinion",
+        ClaimType::Prediction => "prediction",
+        ClaimType::Temporal => "temporal",
+        ClaimType::Causal => "causal",
+    }
+}
+
+fn str_to_claim_type(value: &str) -> Result<ClaimType, StoreError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "factual" => Ok(ClaimType::Factual),
+        "opinion" => Ok(ClaimType::Opinion),
+        "prediction" => Ok(ClaimType::Prediction),
+        "temporal" => Ok(ClaimType::Temporal),
+        "causal" => Ok(ClaimType::Causal),
+        _ => Err(StoreError::Parse(
+            "claim record has invalid claim_type".to_string(),
+        )),
+    }
+}
+
 fn str_to_stance(raw: &str) -> Result<Stance, StoreError> {
     match raw {
         "supports" => Ok(Stance::Supports),
@@ -2557,7 +2669,7 @@ fn str_to_relation(raw: &str) -> Result<Relation, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schema::{Claim, ClaimEdge, Relation, RetrievalRequest, Stance, StanceMode};
+    use schema::{Claim, ClaimEdge, ClaimType, Relation, RetrievalRequest, Stance, StanceMode};
     use std::{
         fs::{read_to_string, remove_file},
         sync::atomic::{AtomicU64, Ordering},
@@ -2800,6 +2912,164 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].claim_id, "c-new");
+    }
+
+    #[test]
+    fn retrieve_with_time_range_uses_validity_window_when_event_time_missing() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c-window-hit".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Claim with active validity window".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(120),
+                    valid_to: Some(260),
+                    created_at: Some(10),
+                    updated_at: Some(20),
+                },
+                vec![Evidence {
+                    evidence_id: "e-window-hit".into(),
+                    claim_id: "c-window-hit".into(),
+                    source_id: "doc-window-hit".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c-window-miss".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Claim with non-overlapping validity window".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(400),
+                    valid_to: Some(500),
+                    created_at: Some(11),
+                    updated_at: Some(21),
+                },
+                vec![Evidence {
+                    evidence_id: "e-window-miss".into(),
+                    claim_id: "c-window-miss".into(),
+                    source_id: "doc-window-miss".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+
+        let req = RetrievalRequest {
+            tenant_id: "tenant-a".into(),
+            query: "claim validity window".into(),
+            top_k: 5,
+            stance_mode: StanceMode::Balanced,
+        };
+        let results = store.retrieve_with_time_range(&req, Some(150), Some(240));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].claim_id, "c-window-hit");
+    }
+
+    #[test]
+    fn retrieve_with_time_range_requires_event_and_validity_match_when_both_present() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c-both-miss".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Claim where event and validity disagree".into(),
+                    confidence: 0.9,
+                    event_time_unix: Some(100),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(140),
+                    valid_to: Some(260),
+                    created_at: Some(12),
+                    updated_at: Some(22),
+                },
+                vec![Evidence {
+                    evidence_id: "e-both-miss".into(),
+                    claim_id: "c-both-miss".into(),
+                    source_id: "doc-both-miss".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c-both-hit".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Claim where event and validity align".into(),
+                    confidence: 0.9,
+                    event_time_unix: Some(200),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(140),
+                    valid_to: Some(260),
+                    created_at: Some(13),
+                    updated_at: Some(23),
+                },
+                vec![Evidence {
+                    evidence_id: "e-both-hit".into(),
+                    claim_id: "c-both-hit".into(),
+                    source_id: "doc-both-hit".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.9,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+
+        let req = RetrievalRequest {
+            tenant_id: "tenant-a".into(),
+            query: "claim event validity".into(),
+            top_k: 5,
+            stance_mode: StanceMode::Balanced,
+        };
+        let results = store.retrieve_with_time_range(&req, Some(150), Some(240));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].claim_id, "c-both-hit");
     }
 
     #[test]
@@ -3185,11 +3455,11 @@ mod tests {
                     event_time_unix: Some(200),
                     entities: vec!["Company X".into(), "Company Y".into()],
                     embedding_ids: vec!["emb://v1/42".into()],
-                    claim_type: None,
-                    valid_from: None,
-                    valid_to: None,
-                    created_at: None,
-                    updated_at: None,
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(180),
+                    valid_to: Some(260),
+                    created_at: Some(1_771_620_000_000),
+                    updated_at: Some(1_771_620_100_000),
                 },
                 vec![Evidence {
                     evidence_id: "e-meta".into(),
@@ -3218,6 +3488,11 @@ mod tests {
             vec!["Company X".to_string(), "Company Y".to_string()]
         );
         assert_eq!(claim.embedding_ids, vec!["emb://v1/42".to_string()]);
+        assert_eq!(claim.claim_type, Some(ClaimType::Temporal));
+        assert_eq!(claim.valid_from, Some(180));
+        assert_eq!(claim.valid_to, Some(260));
+        assert_eq!(claim.created_at, Some(1_771_620_000_000));
+        assert_eq!(claim.updated_at, Some(1_771_620_100_000));
 
         let evidence = replayed
             .evidence_by_claim
