@@ -58,6 +58,8 @@ pub struct EvidenceNode {
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
     pub event_time_unix: Option<i64>,
+    pub temporal_match_mode: Option<String>,
+    pub temporal_in_range: Option<bool>,
     pub claim_type: Option<String>,
     pub valid_from: Option<i64>,
     pub valid_to: Option<i64>,
@@ -142,6 +144,14 @@ struct PlannerContext {
     short_circuit_empty: bool,
 }
 
+#[derive(Debug, Clone)]
+struct EvidenceNodeSignals {
+    score: f32,
+    supports: usize,
+    contradicts: usize,
+    citations: Vec<CitationNode>,
+}
+
 static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
     OnceLock::new();
 static SEGMENT_PREFILTER_CACHE_METRICS: OnceLock<SegmentPrefilterCacheMetricAtoms> =
@@ -207,25 +217,30 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
             evidence_node_from_parts(
                 r.claim_id.clone(),
                 r.canonical_text.clone(),
-                r.score,
-                r.supports,
-                r.contradicts,
-                r.citations
-                    .iter()
-                    .map(|citation| CitationNode {
-                        evidence_id: citation.evidence_id.clone(),
-                        source_id: citation.source_id.clone(),
-                        stance: stance_to_str(&citation.stance).to_string(),
-                        source_quality: citation.source_quality,
-                        chunk_id: citation.chunk_id.clone(),
-                        span_start: citation.span_start,
-                        span_end: citation.span_end,
-                        doc_id: citation.doc_id.clone(),
-                        extraction_model: citation.extraction_model.clone(),
-                        ingested_at: citation.ingested_at,
-                    })
-                    .collect(),
+                EvidenceNodeSignals {
+                    score: r.score,
+                    supports: r.supports,
+                    contradicts: r.contradicts,
+                    citations: r
+                        .citations
+                        .iter()
+                        .map(|citation| CitationNode {
+                            evidence_id: citation.evidence_id.clone(),
+                            source_id: citation.source_id.clone(),
+                            stance: stance_to_str(&citation.stance).to_string(),
+                            source_quality: citation.source_quality,
+                            chunk_id: citation.chunk_id.clone(),
+                            span_start: citation.span_start,
+                            span_end: citation.span_end,
+                            doc_id: citation.doc_id.clone(),
+                            extraction_model: citation.extraction_model.clone(),
+                            ingested_at: citation.ingested_at,
+                        })
+                        .collect(),
+                },
                 tenant_claim_by_id.get(&r.claim_id),
+                planner.from_unix,
+                planner.to_unix,
             )
         })
         .collect();
@@ -256,11 +271,15 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
                     evidence_node_from_parts(
                         edge.from_claim_id.clone(),
                         claim.canonical_text.clone(),
-                        0.0,
-                        0,
-                        0,
-                        Vec::new(),
+                        EvidenceNodeSignals {
+                            score: 0.0,
+                            supports: 0,
+                            contradicts: 0,
+                            citations: Vec::new(),
+                        },
                         Some(claim),
+                        planner.from_unix,
+                        planner.to_unix,
                     ),
                 );
             }
@@ -272,11 +291,15 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
                     evidence_node_from_parts(
                         edge.to_claim_id.clone(),
                         claim.canonical_text.clone(),
-                        0.0,
-                        0,
-                        0,
-                        Vec::new(),
+                        EvidenceNodeSignals {
+                            score: 0.0,
+                            supports: 0,
+                            contradicts: 0,
+                            citations: Vec::new(),
+                        },
                         Some(claim),
+                        planner.from_unix,
+                        planner.to_unix,
                     ),
                 );
             }
@@ -308,25 +331,28 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
 fn evidence_node_from_parts(
     claim_id: String,
     canonical_text: String,
-    score: f32,
-    supports: usize,
-    contradicts: usize,
-    citations: Vec<CitationNode>,
+    signals: EvidenceNodeSignals,
     claim: Option<&Claim>,
+    query_from_unix: Option<i64>,
+    query_to_unix: Option<i64>,
 ) -> EvidenceNode {
+    let temporal_annotation = temporal_annotation_for_claim(claim, query_from_unix, query_to_unix);
     EvidenceNode {
         claim_id,
         canonical_text,
-        score,
+        score: signals.score,
         claim_confidence: claim.map(|value| value.confidence),
         confidence_band: claim
             .map(|value| confidence_band_for_claim_confidence(value.confidence).to_string()),
-        dominant_stance: dominant_stance_for_counts(supports, contradicts).map(str::to_string),
-        contradiction_risk: contradiction_risk_for_counts(supports, contradicts),
-        supports,
-        contradicts,
-        citations,
+        dominant_stance: dominant_stance_for_counts(signals.supports, signals.contradicts)
+            .map(str::to_string),
+        contradiction_risk: contradiction_risk_for_counts(signals.supports, signals.contradicts),
+        supports: signals.supports,
+        contradicts: signals.contradicts,
+        citations: signals.citations,
         event_time_unix: claim.and_then(|value| value.event_time_unix),
+        temporal_match_mode: temporal_annotation.match_mode.map(str::to_string),
+        temporal_in_range: temporal_annotation.in_range,
         claim_type: claim
             .and_then(|value| value.claim_type.as_ref())
             .map(claim_type_to_str)
@@ -335,6 +361,56 @@ fn evidence_node_from_parts(
         valid_to: claim.and_then(|value| value.valid_to),
         created_at: claim.and_then(|value| value.created_at),
         updated_at: claim.and_then(|value| value.updated_at),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TemporalAnnotation {
+    match_mode: Option<&'static str>,
+    in_range: Option<bool>,
+}
+
+fn temporal_annotation_for_claim(
+    claim: Option<&Claim>,
+    query_from_unix: Option<i64>,
+    query_to_unix: Option<i64>,
+) -> TemporalAnnotation {
+    if query_from_unix.is_none() && query_to_unix.is_none() {
+        return TemporalAnnotation {
+            match_mode: None,
+            in_range: None,
+        };
+    }
+
+    let Some(claim) = claim else {
+        return TemporalAnnotation {
+            match_mode: Some("missing_claim"),
+            in_range: Some(false),
+        };
+    };
+
+    let has_event = claim.event_time_unix.is_some();
+    let has_validity = claim.valid_from.is_some() || claim.valid_to.is_some();
+    let event_match = claim
+        .event_time_unix
+        .is_some_and(|value| value_in_time_range(value, query_from_unix, query_to_unix));
+    let validity_match = has_validity
+        && time_windows_overlap(
+            claim.valid_from,
+            claim.valid_to,
+            query_from_unix,
+            query_to_unix,
+        );
+
+    let (mode, in_range) = match (has_event, has_validity) {
+        (true, true) => ("event_and_validity_window", event_match && validity_match),
+        (true, false) => ("event_time", event_match),
+        (false, true) => ("validity_window", validity_match),
+        (false, false) => ("no_temporal_data", false),
+    };
+    TemporalAnnotation {
+        match_mode: Some(mode),
+        in_range: Some(in_range),
     }
 }
 
@@ -377,6 +453,33 @@ fn contradiction_risk_for_counts(supports: usize, contradicts: usize) -> Option<
     } else {
         Some(contradicts as f32 / total as f32)
     }
+}
+
+fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
+    if let Some(from) = from_unix
+        && value < from
+    {
+        return false;
+    }
+    if let Some(to) = to_unix
+        && value > to
+    {
+        return false;
+    }
+    true
+}
+
+fn time_windows_overlap(
+    window_start: Option<i64>,
+    window_end: Option<i64>,
+    query_from: Option<i64>,
+    query_to: Option<i64>,
+) -> bool {
+    let start = window_start.unwrap_or(i64::MIN);
+    let end = window_end.unwrap_or(i64::MAX);
+    let query_start = query_from.unwrap_or(i64::MIN);
+    let query_end = query_to.unwrap_or(i64::MAX);
+    start <= query_end && end >= query_start
 }
 
 pub fn build_retrieve_planner_debug_snapshot(
@@ -987,6 +1090,8 @@ mod tests {
         assert_eq!(node.dominant_stance.as_deref(), Some("supports"));
         assert_eq!(node.contradiction_risk, Some(0.0));
         assert_eq!(node.event_time_unix, Some(1_735_689_600));
+        assert_eq!(node.temporal_match_mode, None);
+        assert_eq!(node.temporal_in_range, None);
         assert_eq!(node.claim_type.as_deref(), Some("temporal"));
         assert_eq!(node.valid_from, Some(1_735_603_200));
         assert_eq!(node.valid_to, Some(1_735_776_000));
@@ -1003,6 +1108,8 @@ mod tests {
         assert_eq!(c2_graph_node.confidence_band.as_deref(), Some("high"));
         assert_eq!(c2_graph_node.dominant_stance, None);
         assert_eq!(c2_graph_node.contradiction_risk, None);
+        assert_eq!(c2_graph_node.temporal_match_mode, None);
+        assert_eq!(c2_graph_node.temporal_in_range, None);
         assert_eq!(c2_graph_node.claim_type.as_deref(), Some("factual"));
         assert_eq!(c2_graph_node.valid_to, Some(1_735_862_400));
         assert_eq!(c2_graph_node.updated_at, Some(1_735_692_000_000));
@@ -1027,6 +1134,114 @@ mod tests {
         assert_eq!(contradiction_risk_for_counts(0, 2), Some(1.0));
         assert_eq!(contradiction_risk_for_counts(2, 2), Some(0.5));
         assert_eq!(contradiction_risk_for_counts(0, 0), None);
+    }
+
+    #[test]
+    fn temporal_annotation_for_claim_uses_expected_match_modes() {
+        let claim_event_only = Claim {
+            claim_id: "c-event".into(),
+            tenant_id: "tenant-a".into(),
+            canonical_text: "event only".into(),
+            confidence: 0.8,
+            event_time_unix: Some(100),
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: None,
+            valid_to: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let event_annotation =
+            temporal_annotation_for_claim(Some(&claim_event_only), Some(90), Some(110));
+        assert_eq!(
+            event_annotation,
+            TemporalAnnotation {
+                match_mode: Some("event_time"),
+                in_range: Some(true)
+            }
+        );
+
+        let claim_window_only = Claim {
+            claim_id: "c-window".into(),
+            tenant_id: "tenant-a".into(),
+            canonical_text: "window only".into(),
+            confidence: 0.8,
+            event_time_unix: None,
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: Some(95),
+            valid_to: Some(120),
+            created_at: None,
+            updated_at: None,
+        };
+        let window_annotation =
+            temporal_annotation_for_claim(Some(&claim_window_only), Some(90), Some(110));
+        assert_eq!(
+            window_annotation,
+            TemporalAnnotation {
+                match_mode: Some("validity_window"),
+                in_range: Some(true)
+            }
+        );
+
+        let claim_both = Claim {
+            claim_id: "c-both".into(),
+            tenant_id: "tenant-a".into(),
+            canonical_text: "both".into(),
+            confidence: 0.8,
+            event_time_unix: Some(200),
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: Some(50),
+            valid_to: Some(80),
+            created_at: None,
+            updated_at: None,
+        };
+        let both_annotation = temporal_annotation_for_claim(Some(&claim_both), Some(90), Some(110));
+        assert_eq!(
+            both_annotation,
+            TemporalAnnotation {
+                match_mode: Some("event_and_validity_window"),
+                in_range: Some(false)
+            }
+        );
+
+        let missing_temporal = Claim {
+            claim_id: "c-none".into(),
+            tenant_id: "tenant-a".into(),
+            canonical_text: "none".into(),
+            confidence: 0.8,
+            event_time_unix: None,
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: None,
+            valid_to: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let none_annotation =
+            temporal_annotation_for_claim(Some(&missing_temporal), Some(90), Some(110));
+        assert_eq!(
+            none_annotation,
+            TemporalAnnotation {
+                match_mode: Some("no_temporal_data"),
+                in_range: Some(false)
+            }
+        );
+
+        let no_filter_annotation =
+            temporal_annotation_for_claim(Some(&claim_event_only), None, None);
+        assert_eq!(
+            no_filter_annotation,
+            TemporalAnnotation {
+                match_mode: None,
+                in_range: None
+            }
+        );
     }
 
     #[test]
@@ -1117,6 +1332,11 @@ mod tests {
 
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].claim_id, "c-new");
+        assert_eq!(
+            response.results[0].temporal_match_mode.as_deref(),
+            Some("event_time")
+        );
+        assert_eq!(response.results[0].temporal_in_range, Some(true));
     }
 
     #[test]

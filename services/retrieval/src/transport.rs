@@ -3126,6 +3126,10 @@ fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) 
     out.push_str(&render_citations_json(&node.citations));
     out.push_str(",\"event_time_unix\":");
     render_optional_i64(out, node.event_time_unix);
+    out.push_str(",\"temporal_match_mode\":");
+    render_optional_string(out, node.temporal_match_mode.as_deref());
+    out.push_str(",\"temporal_in_range\":");
+    render_optional_bool(out, node.temporal_in_range);
     out.push_str(",\"claim_type\":");
     render_optional_string(out, node.claim_type.as_deref());
     out.push_str(",\"valid_from\":");
@@ -3150,6 +3154,14 @@ fn render_optional_i64(out: &mut String, value: Option<i64>) {
 fn render_optional_f32(out: &mut String, value: Option<f32>) {
     if let Some(value) = value {
         out.push_str(&format!("{:.6}", value));
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn render_optional_bool(out: &mut String, value: Option<bool>) {
+    if let Some(value) = value {
+        out.push_str(if value { "true" } else { "false" });
     } else {
         out.push_str("null");
     }

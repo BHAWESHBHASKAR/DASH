@@ -137,6 +137,8 @@ fn transport_get_request_parses_and_returns_json_response() {
     assert!(response.contains("\"extraction_model\":\"extractor-v5\""));
     assert!(response.contains("\"ingested_at\":1735689700000"));
     assert!(response.contains("\"event_time_unix\":1735689600"));
+    assert!(response.contains("\"temporal_match_mode\":null"));
+    assert!(response.contains("\"temporal_in_range\":null"));
     assert!(response.contains("\"claim_type\":\"factual\""));
     assert!(response.contains("\"valid_from\":1735603200"));
     assert!(response.contains("\"valid_to\":1735862400"));
@@ -169,6 +171,8 @@ fn transport_post_request_parses_json_body_and_returns_json_response() {
     assert!(response.contains("\"doc_id\":\"doc://transport-http\""));
     assert!(response.contains("\"claim_type\":\"factual\""));
     assert!(response.contains("\"event_time_unix\":1735689600"));
+    assert!(response.contains("\"temporal_match_mode\":null"));
+    assert!(response.contains("\"temporal_in_range\":null"));
 }
 
 #[test]
