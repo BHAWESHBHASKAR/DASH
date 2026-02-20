@@ -50,6 +50,8 @@ pub struct EvidenceNode {
     pub claim_id: String,
     pub canonical_text: String,
     pub score: f32,
+    pub claim_confidence: Option<f32>,
+    pub confidence_band: Option<String>,
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
@@ -314,6 +316,9 @@ fn evidence_node_from_parts(
         claim_id,
         canonical_text,
         score,
+        claim_confidence: claim.map(|value| value.confidence),
+        confidence_band: claim
+            .map(|value| confidence_band_for_claim_confidence(value.confidence).to_string()),
         supports,
         contradicts,
         citations,
@@ -336,6 +341,16 @@ fn claim_type_to_str(value: &ClaimType) -> &'static str {
         ClaimType::Prediction => "prediction",
         ClaimType::Temporal => "temporal",
         ClaimType::Causal => "causal",
+    }
+}
+
+fn confidence_band_for_claim_confidence(value: f32) -> &'static str {
+    if value >= 0.8 {
+        "high"
+    } else if value >= 0.5 {
+        "medium"
+    } else {
+        "low"
     }
 }
 
@@ -942,6 +957,8 @@ mod tests {
         assert_eq!(response.results.len(), 1);
         let node = &response.results[0];
         assert_eq!(node.claim_id, "c1");
+        assert_eq!(node.claim_confidence, Some(0.91));
+        assert_eq!(node.confidence_band.as_deref(), Some("high"));
         assert_eq!(node.event_time_unix, Some(1_735_689_600));
         assert_eq!(node.claim_type.as_deref(), Some("temporal"));
         assert_eq!(node.valid_from, Some(1_735_603_200));
@@ -955,9 +972,19 @@ mod tests {
             .iter()
             .find(|entry| entry.claim_id == "c2")
             .expect("graph should include connected c2 node");
+        assert_eq!(c2_graph_node.claim_confidence, Some(0.86));
+        assert_eq!(c2_graph_node.confidence_band.as_deref(), Some("high"));
         assert_eq!(c2_graph_node.claim_type.as_deref(), Some("factual"));
         assert_eq!(c2_graph_node.valid_to, Some(1_735_862_400));
         assert_eq!(c2_graph_node.updated_at, Some(1_735_692_000_000));
+    }
+
+    #[test]
+    fn confidence_band_for_claim_confidence_uses_expected_thresholds() {
+        assert_eq!(confidence_band_for_claim_confidence(0.80), "high");
+        assert_eq!(confidence_band_for_claim_confidence(0.79), "medium");
+        assert_eq!(confidence_band_for_claim_confidence(0.50), "medium");
+        assert_eq!(confidence_band_for_claim_confidence(0.49), "low");
     }
 
     #[test]

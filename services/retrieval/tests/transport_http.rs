@@ -129,6 +129,8 @@ fn transport_get_request_parses_and_returns_json_response() {
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
     assert!(response.contains("\"source_id\":\"source://transport-http\""));
+    assert!(response.contains("\"claim_confidence\":0.950000"));
+    assert!(response.contains("\"confidence_band\":\"high\""));
     assert!(response.contains("\"doc_id\":\"doc://transport-http\""));
     assert!(response.contains("\"extraction_model\":\"extractor-v5\""));
     assert!(response.contains("\"ingested_at\":1735689700000"));
@@ -158,6 +160,8 @@ fn transport_post_request_parses_json_body_and_returns_json_response() {
     assert!(response.contains("\"results\""));
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
+    assert!(response.contains("\"claim_confidence\":0.950000"));
+    assert!(response.contains("\"confidence_band\":\"high\""));
     assert!(response.contains("\"doc_id\":\"doc://transport-http\""));
     assert!(response.contains("\"claim_type\":\"factual\""));
     assert!(response.contains("\"event_time_unix\":1735689600"));

@@ -3110,6 +3110,10 @@ fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) 
     out.push_str(&json_escape(&node.canonical_text));
     out.push_str("\",\"score\":");
     out.push_str(&format!("{:.6}", node.score));
+    out.push_str(",\"claim_confidence\":");
+    render_optional_f32(out, node.claim_confidence);
+    out.push_str(",\"confidence_band\":");
+    render_optional_string(out, node.confidence_band.as_deref());
     out.push_str(",\"supports\":");
     out.push_str(&node.supports.to_string());
     out.push_str(",\"contradicts\":");
@@ -3134,6 +3138,14 @@ fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) 
 fn render_optional_i64(out: &mut String, value: Option<i64>) {
     if let Some(value) = value {
         out.push_str(&value.to_string());
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn render_optional_f32(out: &mut String, value: Option<f32>) {
+    if let Some(value) = value {
+        out.push_str(&format!("{:.6}", value));
     } else {
         out.push_str("null");
     }
