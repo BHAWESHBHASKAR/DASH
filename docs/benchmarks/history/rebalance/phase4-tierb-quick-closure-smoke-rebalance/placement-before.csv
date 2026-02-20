@@ -1,0 +1,2 @@
+sample-tenant,0,1,node-a,leader,healthy
+sample-tenant,0,1,node-b,follower,healthy

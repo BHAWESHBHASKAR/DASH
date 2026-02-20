@@ -471,6 +471,7 @@ Optional overrides:
   - `scripts/phase4_tierb_rehearsal.sh`
 - Purpose:
   - run a single command rehearsal for Tier-B defaults with strict `>=8` shard rebalance gate.
+  - by default, also runs closure checklist generation via `scripts/phase4_closure_checklist.sh`.
 - Preset modes:
   - `quick` (default):
     - profile: `smoke`
@@ -487,6 +488,7 @@ Optional overrides:
     - rebalance min gate: `8` (default)
 - Override options include:
   - `--mode quick|staged`
+  - `--run-closure-checklist true|false`
   - `--profile`
   - `--fixture-size`
   - `--target-shards`
@@ -495,3 +497,27 @@ Optional overrides:
 - Example:
   - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-quick --mode quick`
   - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-staged --mode staged`
+
+## 22. Phase 4 Closure Checklist Gate
+
+- Script:
+  - `scripts/phase4_closure_checklist.sh`
+- Purpose:
+  - verify tier-specific artifact/metric gates from a `phase4_scale_proof` summary and emit a reproducible checklist markdown artifact.
+- Supported tiers:
+  - `tier-a|1m`
+  - `tier-b|10m`
+  - `tier-c|100m`
+- Core checks:
+  - summary overall status
+  - required step statuses (`benchmark`, concurrency, failover, and rebalance for tier-b/c)
+  - ANN recall thresholds (`ann_recall_at_10`, `ann_recall_at_100`)
+  - ingestion freshness guard
+  - required artifact file existence
+  - rebalance shard gate checks for tier-b/c
+  - optional recovery/incident artifact checks for tier-c
+- Output:
+  - default checklist path:
+    - `docs/benchmarks/history/runs/<run-id>-closure-<tier>.md`
+- Example:
+  - `scripts/phase4_closure_checklist.sh --tier tier-b --run-id phase4-tierb-staged`

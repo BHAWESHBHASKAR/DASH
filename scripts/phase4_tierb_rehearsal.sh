@@ -34,6 +34,7 @@ REBALANCE_REQUIRE_MOVED_KEYS="${DASH_PHASE4_TIERB_REBALANCE_REQUIRE_MOVED_KEYS:-
 REBALANCE_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERB_REBALANCE_MAX_WAIT_SECONDS:-60}"
 PLACEMENT_RELOAD_INTERVAL_MS="${DASH_PHASE4_TIERB_PLACEMENT_RELOAD_INTERVAL_MS:-200}"
 FAILOVER_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERB_FAILOVER_MAX_WAIT_SECONDS:-30}"
+RUN_CLOSURE_CHECKLIST="${DASH_PHASE4_TIERB_RUN_CLOSURE_CHECKLIST:-true}"
 
 if [[ "${MODE}" == "staged" ]]; then
   PROFILE="${DASH_PHASE4_TIERB_PROFILE:-xlarge}"
@@ -96,6 +97,7 @@ Options:
   --rebalance-max-wait-seconds N         Rebalance max wait (default: 60)
   --placement-reload-interval-ms N       Placement reload interval (default: 200)
   --failover-max-wait-seconds N          Failover max wait (default: 30)
+  --run-closure-checklist true|false     Run closure checklist gate (default: true)
   -h, --help                             Show help
 
 Any extra args after `--` are forwarded to `phase4_scale_proof.sh`.
@@ -127,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --rebalance-max-wait-seconds) REBALANCE_MAX_WAIT_SECONDS="$2"; shift 2 ;;
     --placement-reload-interval-ms) PLACEMENT_RELOAD_INTERVAL_MS="$2"; shift 2 ;;
     --failover-max-wait-seconds) FAILOVER_MAX_WAIT_SECONDS="$2"; shift 2 ;;
+    --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --)
       shift
@@ -145,6 +148,14 @@ case "${MODE}" in
   quick|staged) ;;
   *)
     echo "--mode must be quick or staged" >&2
+    exit 2
+    ;;
+esac
+
+case "${RUN_CLOSURE_CHECKLIST}" in
+  true|false) ;;
+  *)
+    echo "--run-closure-checklist must be true or false" >&2
     exit 2
     ;;
 esac
@@ -206,3 +217,10 @@ if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
 fi
 
 "${cmd[@]}"
+
+if [[ "${RUN_CLOSURE_CHECKLIST}" == "true" ]]; then
+  scripts/phase4_closure_checklist.sh \
+    --tier tier-b \
+    --run-id "${RUN_ID}" \
+    --min-shards "${MIN_SHARDS_GATE}"
+fi
