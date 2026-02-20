@@ -3185,6 +3185,12 @@ fn render_citations_json(citations: &[CitationNode]) -> String {
         } else {
             out.push_str("null");
         }
+        out.push_str(",\"doc_id\":");
+        render_optional_string(&mut out, citation.doc_id.as_deref());
+        out.push_str(",\"extraction_model\":");
+        render_optional_string(&mut out, citation.extraction_model.as_deref());
+        out.push_str(",\"ingested_at\":");
+        render_optional_i64(&mut out, citation.ingested_at);
         out.push('}');
     }
     out.push(']');

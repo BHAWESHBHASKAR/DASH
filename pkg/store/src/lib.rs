@@ -1016,6 +1016,9 @@ impl InMemoryStore {
                     chunk_id: e.chunk_id.clone(),
                     span_start: e.span_start,
                     span_end: e.span_end,
+                    doc_id: e.doc_id.clone(),
+                    extraction_model: e.extraction_model.clone(),
+                    ingested_at: e.ingested_at,
                 })
                 .collect();
             ranked.push(RetrievalResult {
@@ -2250,7 +2253,7 @@ fn record_to_line(record: &PersistedRecord) -> String {
                 .unwrap_or_else(|| "null".to_string())
         ),
         PersistedRecord::Evidence(e) => format!(
-            "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&e.evidence_id),
             escape_field(&e.claim_id),
             escape_field(&e.source_id),
@@ -2264,6 +2267,17 @@ fn record_to_line(record: &PersistedRecord) -> String {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             e.span_end
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            e.doc_id
+                .as_ref()
+                .map(|v| escape_field(v))
+                .unwrap_or_else(|| "null".to_string()),
+            e.extraction_model
+                .as_ref()
+                .map(|v| escape_field(v))
+                .unwrap_or_else(|| "null".to_string()),
+            e.ingested_at
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string())
         ),
@@ -2375,7 +2389,7 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
             }))
         }
         "E" => {
-            if !(parts.len() == 6 || parts.len() == 9) {
+            if !(parts.len() == 6 || parts.len() == 9 || parts.len() == 12) {
                 return Err(StoreError::Parse(
                     "evidence record has invalid field count".to_string(),
                 ));
@@ -2395,6 +2409,21 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
             } else {
                 None
             };
+            let doc_id = if parts.len() >= 12 {
+                parse_optional_escaped_field(parts[9])?
+            } else {
+                None
+            };
+            let extraction_model = if parts.len() >= 12 {
+                parse_optional_escaped_field(parts[10])?
+            } else {
+                None
+            };
+            let ingested_at = if parts.len() >= 12 {
+                parse_optional_i64_field(parts[11], "ingested_at")?
+            } else {
+                None
+            };
             Ok(PersistedRecord::Evidence(Evidence {
                 evidence_id: unescape_field(parts[1])?,
                 claim_id: unescape_field(parts[2])?,
@@ -2406,9 +2435,9 @@ fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
                 chunk_id,
                 span_start,
                 span_end,
-                doc_id: None,
-                extraction_model: None,
-                ingested_at: None,
+                doc_id,
+                extraction_model,
+                ingested_at,
             }))
         }
         "G" => {
@@ -3470,9 +3499,9 @@ mod tests {
                     chunk_id: Some("chunk-17".into()),
                     span_start: Some(12),
                     span_end: Some(48),
-                    doc_id: None,
-                    extraction_model: None,
-                    ingested_at: None,
+                    doc_id: Some("doc://meta".into()),
+                    extraction_model: Some("extractor-v5".into()),
+                    ingested_at: Some(1_771_620_200_000),
                 }],
                 vec![],
             )
@@ -3502,6 +3531,9 @@ mod tests {
         assert_eq!(evidence.chunk_id.as_deref(), Some("chunk-17"));
         assert_eq!(evidence.span_start, Some(12));
         assert_eq!(evidence.span_end, Some(48));
+        assert_eq!(evidence.doc_id.as_deref(), Some("doc://meta"));
+        assert_eq!(evidence.extraction_model.as_deref(), Some("extractor-v5"));
+        assert_eq!(evidence.ingested_at, Some(1_771_620_200_000));
 
         cleanup_persistence_files(&wal);
     }

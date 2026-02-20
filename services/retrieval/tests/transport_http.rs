@@ -38,9 +38,9 @@ fn sample_store() -> InMemoryStore {
                 chunk_id: None,
                 span_start: None,
                 span_end: None,
-                doc_id: None,
-                extraction_model: None,
-                ingested_at: None,
+                doc_id: Some("doc://transport-http".into()),
+                extraction_model: Some("extractor-v5".into()),
+                ingested_at: Some(1_735_689_700_000),
             }],
             vec![],
         )
@@ -129,6 +129,9 @@ fn transport_get_request_parses_and_returns_json_response() {
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
     assert!(response.contains("\"source_id\":\"source://transport-http\""));
+    assert!(response.contains("\"doc_id\":\"doc://transport-http\""));
+    assert!(response.contains("\"extraction_model\":\"extractor-v5\""));
+    assert!(response.contains("\"ingested_at\":1735689700000"));
     assert!(response.contains("\"event_time_unix\":1735689600"));
     assert!(response.contains("\"claim_type\":\"factual\""));
     assert!(response.contains("\"valid_from\":1735603200"));
@@ -155,6 +158,7 @@ fn transport_post_request_parses_json_body_and_returns_json_response() {
     assert!(response.contains("\"results\""));
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
+    assert!(response.contains("\"doc_id\":\"doc://transport-http\""));
     assert!(response.contains("\"claim_type\":\"factual\""));
     assert!(response.contains("\"event_time_unix\":1735689600"));
 }

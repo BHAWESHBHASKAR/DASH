@@ -40,6 +40,9 @@ pub struct CitationNode {
     pub chunk_id: Option<String>,
     pub span_start: Option<u32>,
     pub span_end: Option<u32>,
+    pub doc_id: Option<String>,
+    pub extraction_model: Option<String>,
+    pub ingested_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +216,9 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
                         chunk_id: citation.chunk_id.clone(),
                         span_start: citation.span_start,
                         span_end: citation.span_end,
+                        doc_id: citation.doc_id.clone(),
+                        extraction_model: citation.extraction_model.clone(),
+                        ingested_at: citation.ingested_at,
                     })
                     .collect(),
                 tenant_claim_by_id.get(&r.claim_id),

@@ -119,6 +119,9 @@ pub struct Citation {
     pub chunk_id: Option<String>,
     pub span_start: Option<u32>,
     pub span_end: Option<u32>,
+    pub doc_id: Option<String>,
+    pub extraction_model: Option<String>,
+    pub ingested_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

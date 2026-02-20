@@ -31,9 +31,9 @@ fn end_to_end_retrieval_returns_citations_and_support_counts() {
                 chunk_id: None,
                 span_start: None,
                 span_end: None,
-                doc_id: None,
-                extraction_model: None,
-                ingested_at: None,
+                doc_id: Some("doc://press-release".into()),
+                extraction_model: Some("extractor-v5".into()),
+                ingested_at: Some(1_736_035_200_000),
             }],
             vec![ClaimEdge {
                 edge_id: "edge1".into(),
@@ -62,4 +62,13 @@ fn end_to_end_retrieval_returns_citations_and_support_counts() {
     assert_eq!(results[0].supports, 2);
     assert_eq!(results[0].citations.len(), 1);
     assert_eq!(results[0].citations[0].source_id, "source://press-release");
+    assert_eq!(
+        results[0].citations[0].doc_id.as_deref(),
+        Some("doc://press-release")
+    );
+    assert_eq!(
+        results[0].citations[0].extraction_model.as_deref(),
+        Some("extractor-v5")
+    );
+    assert_eq!(results[0].citations[0].ingested_at, Some(1_736_035_200_000));
 }
