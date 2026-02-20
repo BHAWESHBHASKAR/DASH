@@ -52,6 +52,8 @@ pub struct EvidenceNode {
     pub score: f32,
     pub claim_confidence: Option<f32>,
     pub confidence_band: Option<String>,
+    pub dominant_stance: Option<String>,
+    pub contradiction_risk: Option<f32>,
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
@@ -319,6 +321,8 @@ fn evidence_node_from_parts(
         claim_confidence: claim.map(|value| value.confidence),
         confidence_band: claim
             .map(|value| confidence_band_for_claim_confidence(value.confidence).to_string()),
+        dominant_stance: dominant_stance_for_counts(supports, contradicts).map(str::to_string),
+        contradiction_risk: contradiction_risk_for_counts(supports, contradicts),
         supports,
         contradicts,
         citations,
@@ -351,6 +355,27 @@ fn confidence_band_for_claim_confidence(value: f32) -> &'static str {
         "medium"
     } else {
         "low"
+    }
+}
+
+fn dominant_stance_for_counts(supports: usize, contradicts: usize) -> Option<&'static str> {
+    if supports == 0 && contradicts == 0 {
+        None
+    } else if supports > contradicts {
+        Some("supports")
+    } else if contradicts > supports {
+        Some("contradicts")
+    } else {
+        Some("balanced")
+    }
+}
+
+fn contradiction_risk_for_counts(supports: usize, contradicts: usize) -> Option<f32> {
+    let total = supports + contradicts;
+    if total == 0 {
+        None
+    } else {
+        Some(contradicts as f32 / total as f32)
     }
 }
 
@@ -959,6 +984,8 @@ mod tests {
         assert_eq!(node.claim_id, "c1");
         assert_eq!(node.claim_confidence, Some(0.91));
         assert_eq!(node.confidence_band.as_deref(), Some("high"));
+        assert_eq!(node.dominant_stance.as_deref(), Some("supports"));
+        assert_eq!(node.contradiction_risk, Some(0.0));
         assert_eq!(node.event_time_unix, Some(1_735_689_600));
         assert_eq!(node.claim_type.as_deref(), Some("temporal"));
         assert_eq!(node.valid_from, Some(1_735_603_200));
@@ -974,6 +1001,8 @@ mod tests {
             .expect("graph should include connected c2 node");
         assert_eq!(c2_graph_node.claim_confidence, Some(0.86));
         assert_eq!(c2_graph_node.confidence_band.as_deref(), Some("high"));
+        assert_eq!(c2_graph_node.dominant_stance, None);
+        assert_eq!(c2_graph_node.contradiction_risk, None);
         assert_eq!(c2_graph_node.claim_type.as_deref(), Some("factual"));
         assert_eq!(c2_graph_node.valid_to, Some(1_735_862_400));
         assert_eq!(c2_graph_node.updated_at, Some(1_735_692_000_000));
@@ -985,6 +1014,19 @@ mod tests {
         assert_eq!(confidence_band_for_claim_confidence(0.79), "medium");
         assert_eq!(confidence_band_for_claim_confidence(0.50), "medium");
         assert_eq!(confidence_band_for_claim_confidence(0.49), "low");
+    }
+
+    #[test]
+    fn stance_summary_for_counts_uses_expected_values() {
+        assert_eq!(dominant_stance_for_counts(2, 0), Some("supports"));
+        assert_eq!(dominant_stance_for_counts(0, 2), Some("contradicts"));
+        assert_eq!(dominant_stance_for_counts(2, 2), Some("balanced"));
+        assert_eq!(dominant_stance_for_counts(0, 0), None);
+
+        assert_eq!(contradiction_risk_for_counts(2, 0), Some(0.0));
+        assert_eq!(contradiction_risk_for_counts(0, 2), Some(1.0));
+        assert_eq!(contradiction_risk_for_counts(2, 2), Some(0.5));
+        assert_eq!(contradiction_risk_for_counts(0, 0), None);
     }
 
     #[test]

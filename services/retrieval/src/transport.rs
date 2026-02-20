@@ -3114,6 +3114,10 @@ fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) 
     render_optional_f32(out, node.claim_confidence);
     out.push_str(",\"confidence_band\":");
     render_optional_string(out, node.confidence_band.as_deref());
+    out.push_str(",\"dominant_stance\":");
+    render_optional_string(out, node.dominant_stance.as_deref());
+    out.push_str(",\"contradiction_risk\":");
+    render_optional_f32(out, node.contradiction_risk);
     out.push_str(",\"supports\":");
     out.push_str(&node.supports.to_string());
     out.push_str(",\"contradicts\":");
