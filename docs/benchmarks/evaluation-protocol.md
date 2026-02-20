@@ -176,6 +176,7 @@ Current benchmark binary (`tests/benchmarks/src/main.rs`) exposes:
 
 Optional overrides:
 
+- `--fixture-size <N>` to override profile fixture cardinality for scale-proof runs
 - `--iterations <N>` for explicit loop count
 - `--history-out <PATH>` to append run metrics as a markdown row
 - `--history-csv-out <PATH>` to append the same metrics in CSV format
@@ -210,6 +211,7 @@ Optional overrides:
   - `DASH_BENCH_HISTORY_CSV_OUT`
   - `DASH_BENCH_MIN_SEGMENT_REFRESH_SUCCESSES`
   - `DASH_BENCH_MIN_SEGMENT_CACHE_HITS`
+  - `DASH_BENCH_FIXTURE_SIZE` (same behavior as `--fixture-size`)
   - `DASH_BENCH_WAL_SCALE_CLAIMS` (override claim volume used by WAL checkpoint/replay scale slice)
 
 ## 13. Benchmark History Outputs
@@ -331,3 +333,165 @@ Optional overrides:
   - per-mode raw runs: `docs/benchmarks/history/concurrency/*.md`
 - Baseline recommendation:
   - run with fixed `workers`, `clients`, and request profile, then compare `throughput_vs_strict` deltas only across mode rows from the same run artifact.
+
+## 18. Phase 4 Scale-Proof Runner
+
+- Orchestration script:
+  - `scripts/phase4_scale_proof.sh`
+- Purpose:
+  - run the Phase 4 kickoff evidence lane in one command with reproducible artifacts
+- Script actions:
+  - executes benchmark lane with profile + `--fixture-size` override and appends history + scorecard
+  - executes retrieval transport concurrency benchmark (captures throughput + p95/p99)
+  - executes ingestion transport concurrency benchmark (captures throughput + p95/p99 + freshness proxy guard)
+  - executes failover drill (`restart`, `no-restart`, or `both`)
+  - executes rebalance/split drill (placement shard-count increase + epoch transition + route movement evidence)
+  - emits consolidated summary under `docs/benchmarks/history/runs/*.md`
+- Key options:
+  - `--profile <smoke|standard|large|xlarge|hybrid>`
+  - `--run-id <ID>` (optional explicit run id; enables deterministic summary/scorecard artifact names)
+  - `--fixture-size <N>`
+  - `--iterations <N>`
+  - `--wal-scale-claims <N>`
+  - `--bench-release true|false` (default `true`; uses optimized benchmark binary for large fixtures)
+  - `--retrieval-workers-list <csv>`
+  - `--ingestion-workers-list <csv>`
+  - `--ingest-freshness-p95-slo-ms <N>`
+  - `--failover-mode restart|no-restart|both`
+  - `--run-rebalance-drill true|false`
+  - `--rebalance-artifact-dir <dir>`
+  - `--rebalance-require-moved-keys <N>`
+  - `--rebalance-probe-keys-count <N>`
+  - `--rebalance-max-wait-seconds <N>`
+  - `--rebalance-target-shards <N>` (default `8`)
+  - `--rebalance-min-shards-gate <N>` (default `8`)
+
+## 19. Phase 4 Distributed Protocol Gates (`10M` / `100M`)
+
+### 19.1 Gate tiers
+
+- Tier A (`1M` baseline)
+  - retrieval latency: `p95 <= 350 ms`, `p99 <= 500 ms`
+  - freshness proxy: ingestion transport benchmark `latency_p95_ms <= 5000`
+  - quality: benchmark expected top1 hit `true`, quality probes pass, contradiction F1 gate satisfied
+  - ANN recall: `recall@10 >= 0.95`, `recall@100 >= 0.98`
+- Tier B (`10M` staged distributed)
+  - routing: placement-enabled routed traffic across `>= 8` shards
+  - rebalance: shard split/rebalance epoch transition drill passes with artifacts
+  - retrieval latency: `p95 <= 350 ms`, `p99 <= 600 ms`
+  - freshness: sustained ingest freshness `p95 <= 5000 ms`
+  - security/isolation: scoped cross-tenant deny checks pass under routed workload
+- Tier C (`100M` world-scale proof)
+  - distributed staged topology: multi-shard groups with leader/follower placement
+  - retrieval latency: `p95 <= 350 ms`, `p99 <= 700 ms`
+  - freshness: sustained ingest freshness `p95 <= 5000 ms` during segment maintenance
+  - durability/recovery: replay+restore drill meets agreed RTO/RPO envelope and post-recovery retrieval correctness checks
+  - operational resilience: incident simulation gate passes with scale placement active
+
+### 19.2 Required artifact bundle per gate run
+
+- phase-4 run summary: `docs/benchmarks/history/runs/<run-id>.md`
+- benchmark scorecard: `docs/benchmarks/scorecards/<run-id>-<profile>-fixture-<n>.md`
+- benchmark history row in:
+  - `docs/benchmarks/history/benchmark-history.md`
+- retrieval concurrency artifact:
+  - `docs/benchmarks/history/concurrency/<run-id>-*-retrieval.md`
+- ingestion concurrency artifact:
+  - `docs/benchmarks/history/concurrency/<run-id>-*-ingestion.md`
+- failover/rebalance artifact references embedded in run summary
+- rebalance drill summary:
+  - `docs/benchmarks/history/rebalance/<run-id>-rebalance/summary.md`
+
+### 19.3 Recommended execution protocol
+
+1. Run baseline scale lane:
+   - `scripts/phase4_scale_proof.sh --run-tag phase4-1m --fixture-size 1000000 --iterations 1`
+2. Run staged distributed lane (`10M`) with routed placement metadata and rebalance drill attached:
+   - use `scripts/phase4_scale_proof.sh` for benchmark+concurrency+failover+rebalance bundle
+   - if needed, run standalone rebalance rehearsal:
+     - `scripts/rebalance_drill.sh --run-id <run-id>-rebalance`
+3. Run world-scale lane (`100M`) with distributed placement and recovery drills:
+   - execute phase4 lane command in staged distributed environment
+   - execute `scripts/recovery_drill.sh` and `scripts/incident_simulation_gate.sh`
+   - include all outputs in progress log and phase closure checklist
+
+### 19.4 Gate decision rule
+
+- PASS only if all required metrics and artifact classes for the tier are present and within thresholds.
+- Any missing artifact or threshold breach is a FAIL and blocks promotion to next tier.
+- For Tier-B shard topology proof, `phase4_scale_proof` now enforces a rebalance shard gate:
+  - `rebalance_shard_count_after >= rebalance_min_shards_gate`
+
+## 20. Long-Soak Launcher (Deterministic Paths + Heartbeat)
+
+- Script:
+  - `scripts/phase4_long_soak.sh`
+- Purpose:
+  - run long Phase 4 scale jobs with deterministic artifact paths and a continuously refreshed heartbeat file.
+- Required:
+  - `--run-id <ID>`
+- Deterministic artifacts for run id `R`:
+  - summary: `docs/benchmarks/history/runs/R.md`
+  - log: `docs/benchmarks/history/runs/R.log` (default)
+  - heartbeat: `docs/benchmarks/history/runs/R.heartbeat` (default)
+  - scorecard: `docs/benchmarks/scorecards/R-<profile>-fixture-<n>.md`
+- Heartbeat payload fields:
+  - `run_id`
+  - `status` (`running|success|failed`)
+  - `heartbeat_utc`
+  - `elapsed_seconds`
+  - `summary_path`
+  - `scorecard_path`
+  - `log_path`
+  - final write includes `exit_code`
+- Example:
+  - `scripts/phase4_long_soak.sh --run-id phase4-1m-long --fixture-size 1000000 --iterations 1`
+
+### 20.1 Long-Soak Control Script
+
+- Script:
+  - `scripts/phase4_long_soak_ctl.sh`
+- Purpose:
+  - lifecycle control for long-soak jobs (`start`, `status`, `tail`, `stop`, `run`) with stable pid/log/heartbeat file conventions.
+- Actions:
+  - `start`: launches `phase4_long_soak.sh` in background and writes `<run_id>.pid`
+  - `status`: reports pid state and prints heartbeat payload if present
+  - `tail`: tails `<run_id>.log` (`--follow true|false`)
+  - `stop`: sends signal to pid from `<run_id>.pid`
+  - `run`: foreground execution wrapper around `phase4_long_soak.sh`
+- Example:
+  - `scripts/phase4_long_soak_ctl.sh start --run-id phase4-1m-long -- --fixture-size 1000000 --iterations 1`
+  - `scripts/phase4_long_soak_ctl.sh status --run-id phase4-1m-long`
+  - `scripts/phase4_long_soak_ctl.sh tail --run-id phase4-1m-long --lines 200 --follow true`
+  - `scripts/phase4_long_soak_ctl.sh stop --run-id phase4-1m-long`
+
+## 21. Tier-B Rehearsal Wrapper (`>=8` shard gate preset)
+
+- Script:
+  - `scripts/phase4_tierb_rehearsal.sh`
+- Purpose:
+  - run a single command rehearsal for Tier-B defaults with strict `>=8` shard rebalance gate.
+- Preset modes:
+  - `quick` (default):
+    - profile: `smoke`
+    - fixture size: `4000`
+    - failover mode: `no-restart`
+    - lightweight concurrency knobs
+  - `staged`:
+    - profile: `xlarge`
+    - fixture size: `150000`
+    - failover mode: `both`
+    - higher concurrency knobs for closer Tier-B rehearsal
+  - both modes enforce:
+    - rebalance target shards: `8` (default)
+    - rebalance min gate: `8` (default)
+- Override options include:
+  - `--mode quick|staged`
+  - `--profile`
+  - `--fixture-size`
+  - `--target-shards`
+  - `--min-shards-gate`
+  - standard concurrency/failover knobs
+- Example:
+  - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-quick --mode quick`
+  - `scripts/phase4_tierb_rehearsal.sh --run-id phase4-tierb-staged --mode staged`

@@ -2,7 +2,7 @@ use std::{
     collections::{HashSet, VecDeque},
     ffi::{OsStr, OsString},
     fs::{OpenOptions, create_dir_all},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +17,9 @@ use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore, StoreIndexStats, WalCheckpointStats};
 
 const CONTRADICTION_DETECTION_F1_GATE: f64 = 0.80;
+const BENCHMARK_HISTORY_TITLE: &str = "# Benchmark History";
+const BENCHMARK_HISTORY_TABLE_HEADER: &str = "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | ann_recall_at_10 | ann_recall_at_100 | ann_recall_curve | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |";
+const BENCHMARK_HISTORY_TABLE_SEPARATOR: &str = "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkProfile {
@@ -73,6 +76,7 @@ impl BenchmarkProfile {
 #[derive(Debug, Clone)]
 struct BenchmarkConfig {
     profile: BenchmarkProfile,
+    fixture_size_override: Option<usize>,
     iterations: Option<usize>,
     history_out: Option<String>,
     history_csv_out: Option<String>,
@@ -194,7 +198,9 @@ fn main() {
         }
     };
 
-    let fixture_size = config.profile.fixture_size();
+    let fixture_size = config
+        .fixture_size_override
+        .unwrap_or_else(|| config.profile.fixture_size());
     let iterations = config
         .iterations
         .unwrap_or_else(|| config.profile.default_iterations());
@@ -522,6 +528,10 @@ where
     I: Iterator<Item = String>,
 {
     let mut profile = BenchmarkProfile::Standard;
+    let mut fixture_size_override = std::env::var("DASH_BENCH_FIXTURE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
     let mut iterations = None;
     let mut history_out = None;
     let mut history_csv_out = std::env::var("DASH_BENCH_HISTORY_CSV_OUT").ok();
@@ -576,6 +586,10 @@ where
                         "Invalid profile '{value}'. Valid values: smoke, standard, large, xlarge, hybrid."
                     )
                 })?;
+            }
+            "--fixture-size" => {
+                fixture_size_override =
+                    Some(parse_positive_usize_arg(args.next(), "--fixture-size")?);
             }
             "--iterations" => {
                 let value = args
@@ -684,6 +698,7 @@ where
 
     Ok(BenchmarkConfig {
         profile,
+        fixture_size_override,
         iterations,
         history_out,
         history_csv_out,
@@ -745,7 +760,7 @@ fn parse_non_negative_usize_arg(value: Option<String>, flag: &str) -> Result<usi
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [quality probe enforces contradiction_detection_f1 >= 0.80]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--fixture-size N] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [quality probe enforces contradiction_detection_f1 >= 0.80]"
 }
 
 #[allow(unused_unsafe)]
@@ -1150,24 +1165,51 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         create_dir_all(parent)?;
     }
 
-    let needs_header = !history_path.exists() || std::fs::metadata(history_path)?.len() == 0;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(history_path)?;
-
-    if needs_header {
-        writeln!(file, "# Benchmark History")?;
-        writeln!(file)?;
-        writeln!(
-            file,
-            "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | ann_recall_at_10 | ann_recall_at_100 | ann_recall_curve | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |"
-        )?;
-        writeln!(
-            file,
-            "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
-        )?;
+    let row = render_history_row(summary);
+    if !history_path.exists() || std::fs::metadata(history_path)?.len() == 0 {
+        let initial = format!(
+            "{BENCHMARK_HISTORY_TITLE}\n\n{BENCHMARK_HISTORY_TABLE_HEADER}\n{BENCHMARK_HISTORY_TABLE_SEPARATOR}\n{row}\n"
+        );
+        std::fs::write(history_path, initial)?;
+        return Ok(());
     }
+
+    let mut content = std::fs::read_to_string(history_path)?;
+    if let Some(table_header_pos) = content.find(BENCHMARK_HISTORY_TABLE_HEADER) {
+        let table_end = content[table_header_pos..]
+            .find("\n## ")
+            .map(|offset| table_header_pos + offset)
+            .unwrap_or(content.len());
+        if !content[..table_end].ends_with('\n') {
+            content.insert(table_end, '\n');
+        }
+        let insert_pos = if !content[..table_end].ends_with('\n') {
+            table_end + 1
+        } else {
+            table_end
+        };
+        content.insert_str(insert_pos, &format!("{row}\n"));
+    } else {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(BENCHMARK_HISTORY_TITLE);
+        content.push('\n');
+        content.push('\n');
+        content.push_str(BENCHMARK_HISTORY_TABLE_HEADER);
+        content.push('\n');
+        content.push_str(BENCHMARK_HISTORY_TABLE_SEPARATOR);
+        content.push('\n');
+        content.push_str(&row);
+        content.push('\n');
+    }
+
+    std::fs::write(history_path, content)?;
+    Ok(())
+}
+
+fn render_history_row(summary: &BenchmarkSummary) -> String {
     let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
         0.0
     } else {
@@ -1221,8 +1263,7 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         .unwrap_or_else(|| "none".to_string());
     let ann_recall_curve = format_ann_recall_curve(&summary.ann_recall.curve);
 
-    writeln!(
-        file,
+    format!(
         "| {} | {} | {} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.4} | {:.4} | {} | {} | {} | {} | {} | {:.4} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         summary.run_epoch_secs,
         summary.profile.as_str(),
@@ -1256,8 +1297,7 @@ fn append_history(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io:
         wal_replay_wal_records,
         wal_replay_validation_hit,
         wal_replay_validation_top_claim
-    )?;
-    Ok(())
+    )
 }
 
 fn append_history_csv(path: &str, summary: &BenchmarkSummary) -> Result<(), std::io::Error> {
@@ -1687,13 +1727,11 @@ fn read_latest_history_row(
         return Ok(None);
     }
 
-    let file = std::fs::File::open(history_path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
+    let content = std::fs::read_to_string(history_path).map_err(|e| e.to_string())?;
+    let lines = benchmark_history_table_lines(&content);
     let mut matching_rows: VecDeque<HistoryRow> = VecDeque::new();
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| e.to_string())?;
-        let trimmed = line.trim();
+    for trimmed in lines {
         if !trimmed.starts_with('|') {
             continue;
         }
@@ -1709,6 +1747,28 @@ fn read_latest_history_row(
     }
 
     Ok(matching_rows.pop_back())
+}
+
+fn benchmark_history_table_lines(content: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let has_named_section = content.contains(BENCHMARK_HISTORY_TITLE);
+    let mut in_target_section = !has_named_section;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == BENCHMARK_HISTORY_TITLE {
+            in_target_section = true;
+            continue;
+        }
+        if in_target_section && trimmed.starts_with("## ") {
+            break;
+        }
+        if in_target_section {
+            lines.push(trimmed);
+        }
+    }
+
+    lines
 }
 
 fn parse_history_row(line: &str) -> Result<Option<HistoryRow>, String> {
@@ -2194,18 +2254,44 @@ fn f1_score(true_positive: usize, false_positive: usize, false_negative: usize) 
 
 fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
     let vector_upsert_stride = vector_upsert_stride_for_count(count);
+    let sparse_background_evidence = count >= 500_000;
+    let target_index = count / 3;
     for i in 0..count {
-        let claim_id = if i == count / 3 {
+        let claim_id = if i == target_index {
             "claim-target".to_string()
         } else {
             format!("claim-{i}")
         };
-        let claim_text = if i == count / 3 {
+        let claim_text = if i == target_index {
             "Company X acquired Company Y in 2025".to_string()
         } else if i % 50 == 0 {
             format!("Company X announced partnership program {i}")
         } else {
             format!("Unrelated operational update {i}")
+        };
+        let include_evidence = if i == target_index {
+            true
+        } else if sparse_background_evidence {
+            i % 32 == 0
+        } else {
+            true
+        };
+        let evidence = if include_evidence {
+            vec![Evidence {
+                evidence_id: format!("evidence-{i}"),
+                claim_id: claim_id.clone(),
+                source_id: format!("source://doc-{i}"),
+                stance: Stance::Supports,
+                source_quality: if i == target_index { 0.95 } else { 0.75 },
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }]
+        } else {
+            Vec::new()
         };
         store
             .ingest_bundle(
@@ -2213,7 +2299,7 @@ fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
                     claim_id: claim_id.clone(),
                     tenant_id: tenant.to_string(),
                     canonical_text: claim_text,
-                    confidence: if i == count / 3 { 0.95 } else { 0.7 },
+                    confidence: if i == target_index { 0.95 } else { 0.7 },
                     event_time_unix: Some(1735689600 + i as i64),
                     entities: vec![],
                     embedding_ids: vec![],
@@ -2223,26 +2309,14 @@ fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
                     created_at: None,
                     updated_at: None,
                 },
-                vec![Evidence {
-                    evidence_id: format!("evidence-{i}"),
-                    claim_id: claim_id.clone(),
-                    source_id: format!("source://doc-{i}"),
-                    stance: Stance::Supports,
-                    source_quality: if i == count / 3 { 0.95 } else { 0.75 },
-                    chunk_id: None,
-                    span_start: None,
-                    span_end: None,
-                    doc_id: None,
-                    extraction_model: None,
-                    ingested_at: None,
-                }],
+                evidence,
                 vec![],
             )
             .expect("fixture ingest should succeed");
 
-        let should_upsert_vector = i == count / 3 || i % vector_upsert_stride == 0;
+        let should_upsert_vector = i == target_index || i % vector_upsert_stride == 0;
         if should_upsert_vector {
-            let vector = if i == count / 3 {
+            let vector = if i == target_index {
                 benchmark_query_embedding()
             } else {
                 fixture_vector_for_index(i)
@@ -2261,18 +2335,44 @@ fn seed_fixture_persistent(
     count: usize,
 ) -> Result<(), String> {
     let vector_upsert_stride = vector_upsert_stride_for_count(count);
+    let sparse_background_evidence = count >= 500_000;
+    let target_index = count / 3;
     for i in 0..count {
-        let claim_id = if i == count / 3 {
+        let claim_id = if i == target_index {
             "claim-target".to_string()
         } else {
             format!("claim-{i}")
         };
-        let claim_text = if i == count / 3 {
+        let claim_text = if i == target_index {
             "Company X acquired Company Y in 2025".to_string()
         } else if i % 50 == 0 {
             format!("Company X announced partnership program {i}")
         } else {
             format!("Unrelated operational update {i}")
+        };
+        let include_evidence = if i == target_index {
+            true
+        } else if sparse_background_evidence {
+            i % 32 == 0
+        } else {
+            true
+        };
+        let evidence = if include_evidence {
+            vec![Evidence {
+                evidence_id: format!("evidence-{i}"),
+                claim_id: claim_id.clone(),
+                source_id: format!("source://doc-{i}"),
+                stance: Stance::Supports,
+                source_quality: if i == target_index { 0.95 } else { 0.75 },
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }]
+        } else {
+            Vec::new()
         };
         store
             .ingest_bundle_persistent(
@@ -2281,7 +2381,7 @@ fn seed_fixture_persistent(
                     claim_id: claim_id.clone(),
                     tenant_id: tenant.to_string(),
                     canonical_text: claim_text,
-                    confidence: if i == count / 3 { 0.95 } else { 0.7 },
+                    confidence: if i == target_index { 0.95 } else { 0.7 },
                     event_time_unix: Some(1735689600 + i as i64),
                     entities: vec![],
                     embedding_ids: vec![],
@@ -2291,26 +2391,14 @@ fn seed_fixture_persistent(
                     created_at: None,
                     updated_at: None,
                 },
-                vec![Evidence {
-                    evidence_id: format!("evidence-{i}"),
-                    claim_id: claim_id.clone(),
-                    source_id: format!("source://doc-{i}"),
-                    stance: Stance::Supports,
-                    source_quality: if i == count / 3 { 0.95 } else { 0.75 },
-                    chunk_id: None,
-                    span_start: None,
-                    span_end: None,
-                    doc_id: None,
-                    extraction_model: None,
-                    ingested_at: None,
-                }],
+                evidence,
                 vec![],
             )
             .map_err(|err| format!("persistent fixture ingest failed at index {i}: {err:?}"))?;
 
-        let should_upsert_vector = i == count / 3 || i % vector_upsert_stride == 0;
+        let should_upsert_vector = i == target_index || i % vector_upsert_stride == 0;
         if should_upsert_vector {
-            let vector = if i == count / 3 {
+            let vector = if i == target_index {
                 benchmark_query_embedding()
             } else {
                 fixture_vector_for_index(i)
@@ -2613,6 +2701,7 @@ mod tests {
     fn config_with_large_gates(min_reduction: f64, max_latency: f64) -> BenchmarkConfig {
         BenchmarkConfig {
             profile: BenchmarkProfile::Large,
+            fixture_size_override: None,
             iterations: Some(1),
             history_out: None,
             history_csv_out: None,
@@ -2749,5 +2838,62 @@ mod tests {
     fn f1_score_returns_expected_value() {
         let score = f1_score(4, 1, 1);
         assert!((score - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn append_history_inserts_row_before_secondary_sections() {
+        let root = temp_dir_for("bench-history-append");
+        let history_path = root.join("benchmark-history.md");
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let existing_row = "| 1771403814 | smoke | 2000 | 100 | claim-target | claim-target | true | true | 12.8650 | 9.5385 | 2000 | 140 | 0 | 100 | 140 | 1.0000 | 1.0000 | 10:1.0000;25:1.0000;50:1.0000;100:1.0000;200:1.0000 | 1 | 1 | 1 | 0 | 1.4660 | 0 | n/a | n/a | 0 | 0 | 0 | 0 | false | none |";
+        let initial = format!(
+            "{BENCHMARK_HISTORY_TITLE}\n\n{BENCHMARK_HISTORY_TABLE_HEADER}\n{BENCHMARK_HISTORY_TABLE_SEPARATOR}\n{existing_row}\n\n## Ingestion WAL Durability History\n\n| run_utc | run_id |\n|---|---|\n| 2026-02-19T00:00:00Z | run-1 |\n"
+        );
+        std::fs::write(&history_path, initial).expect("history fixture should be written");
+
+        let mut summary = summary_with_profile(BenchmarkProfile::Smoke, 2_000, 8.5, 2_000, 120);
+        summary.run_epoch_secs = 1_771_000_000;
+        append_history(history_path.to_str().expect("utf-8 path"), &summary)
+            .expect("history append should succeed");
+
+        let updated =
+            std::fs::read_to_string(&history_path).expect("history file should remain readable");
+        let inserted_row = render_history_row(&summary);
+        let inserted_idx = updated
+            .find(&inserted_row)
+            .expect("newly appended row should exist");
+        let secondary_section_idx = updated
+            .find("## Ingestion WAL Durability History")
+            .expect("secondary section should exist");
+        assert!(inserted_idx < secondary_section_idx);
+        assert_eq!(updated.matches(&inserted_row).count(), 1);
+
+        std::fs::remove_dir_all(&root).expect("temp root should be removable");
+    }
+
+    #[test]
+    fn read_latest_history_row_ignores_secondary_markdown_tables() {
+        let root = temp_dir_for("bench-history-read");
+        let history_path = root.join("benchmark-history.md");
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+
+        let mut benchmark_summary =
+            summary_with_profile(BenchmarkProfile::Smoke, 2_000, 9.1111, 2_000, 140);
+        benchmark_summary.run_epoch_secs = 1_771_000_001;
+        let benchmark_row = render_history_row(&benchmark_summary);
+        let initial = format!(
+            "{BENCHMARK_HISTORY_TITLE}\n\n{BENCHMARK_HISTORY_TABLE_HEADER}\n{BENCHMARK_HISTORY_TABLE_SEPARATOR}\n{benchmark_row}\n\n## Ingestion Queue-Mode Concurrency History\n\n| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms |\n|---|---|---:|---:|---|---|---|---|---:|---:|\n| 1772000000 | smoke | 2000 | 1 | claim-target | claim-target | true | true | 1.0000 | 9999.0000 |\n"
+        );
+        std::fs::write(&history_path, initial).expect("history fixture should be written");
+
+        let latest = read_latest_history_row(
+            history_path.to_str().expect("utf-8 path"),
+            BenchmarkProfile::Smoke,
+        )
+        .expect("reader should succeed")
+        .expect("row should exist");
+        assert!((latest.eme_avg_ms - benchmark_summary.eme_latency).abs() < 0.0001);
+
+        std::fs::remove_dir_all(&root).expect("temp root should be removable");
     }
 }

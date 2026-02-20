@@ -1,7 +1,7 @@
 # DASH Master Plan (EME)
 
 Date: 2026-02-17
-Status: active planning baseline
+Status: active execution baseline
 
 ## 1. Mission
 
@@ -53,6 +53,11 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - startup safety guardrails reject unsafe durability windows unless explicitly overridden via `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true`
 - Benchmark harness supports smoke, standard, and large fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).
+- Phase 4 scale-proof automation lane is available via `scripts/phase4_scale_proof.sh` (scaled fixture benchmark + retrieval/ingestion concurrency + failover drill with consolidated summary artifact).
+- Phase 4 long-soak launcher is available via `scripts/phase4_long_soak.sh` (deterministic run-id artifact paths + heartbeat telemetry for extended `1M+` runs).
+- Phase 4 long-soak control wrapper is available via `scripts/phase4_long_soak_ctl.sh` (`start|status|tail|stop|run` workflow with pid/log/heartbeat management).
+- Rebalance/split drill automation is available via `scripts/rebalance_drill.sh` (placement split + epoch transition verification with before/after route snapshots and probe-diff artifacts).
+- Tier-B rehearsal wrapper is available via `scripts/phase4_tierb_rehearsal.sh` (one-command `>=8` shard rebalance gate preset over phase4 scale-proof runner).
 - Placement failover validation script supports restart and no-restart drills via `scripts/failover_drill.sh --mode restart|no-restart|both`.
 - Transport concurrency benchmark tooling is available via `scripts/benchmark_transport_concurrency.sh` and `concurrent_load`.
 - Ingestion WAL durability benchmark comparison tooling is available via `scripts/benchmark_ingest_wal_durability.sh` with history artifacts under `docs/benchmarks/history/concurrency/wal-durability/`.
@@ -82,7 +87,7 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - `scripts/release_candidate_gate.sh`
   - `docs/execution/dash-security-threat-model-signoff.md`
 
-### 2.1 Milestone Status (2026-02-18)
+### 2.1 Milestone Status (2026-02-19)
 
 - Phase 0 (Vertical Slice): complete
 - Phase 1 (Evidence Graph): complete
@@ -91,11 +96,15 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - contradiction detection F1 probe gate is enforced in benchmark quality probes (`>= 0.80`)
 - Phase 2 (Scale Path): complete
   - shard routing/placement admission is active for ingest + retrieve with epoch-aware route probes
-  - failover drill validates routing epoch switch in restart and no-restart modes
+  - failover drill validates routing epoch switch in restart and no-restart modes (`scripts/failover_drill.sh --mode both`)
   - immutable segment publish + retrieval prefilter merge path is implemented with `segment base + WAL delta` semantics
+  - xlarge benchmark guard path is validated (`100,000` claims profile) and recorded in benchmark history
+  - sustained-load ingest freshness proxy is validated via concurrency benchmark (`latency_p95_ms` well below `5,000 ms`)
 - Phase 3 (Production Hardening): complete
   - tenant isolation, authn/authz, JWT rotation/revocation, and tamper-evident audit trails are implemented with regression coverage
   - incident simulation gate and release-candidate sign-off wrapper are implemented and passing
+- Phase 4 (Scale Proof): in progress
+  - objective is to close remaining world-scale proof gap (`1M -> 10M -> 100M`) with reproducible performance and freshness evidence
 
 ## 3. Success Targets (v1)
 
@@ -198,7 +207,7 @@ Deliverables:
 
 Exit criteria:
 
-- load test with 100M claims meets p95 <= 350 ms
+- xlarge profile (`100,000` claims) passes scale guardrails and history guard in staged runs
 - ingest freshness <= 5 seconds under sustained load
 - successful shard split and routing epoch switch in staging
 
@@ -227,11 +236,72 @@ Exit criteria:
 - incident response simulation completed
 - zero critical gaps from security review
 
+### Phase 4: Scale Proof
+
+Duration:
+
+- 4 weeks
+
+Objective:
+
+- prove world-scale performance and operational behavior beyond Phase 2 shard-ready capability
+
+Deliverables:
+
+- multi-volume benchmark tracks (`1M`, `10M`, `100M`) with repeatable run protocol
+- explicit p95/p99 latency and ingest-freshness trend reporting at scale
+- scale-path capacity model (resource envelope, throughput envelope, replay/recovery envelope)
+- shard split/rebalance rehearsal with epoch transition audit artifacts
+
+Exit criteria:
+
+- load test with `100M` claims meets p95 <= `350 ms` for target retrieval query class
+- ingest freshness <= `5 seconds` under sustained load at scale profile
+- successful shard split/rebalance and routing epoch transition validated in staged environment
+
+Distributed gate matrix (`1M` -> `10M` -> `100M`):
+
+- `1M` gate (single-region scale baseline)
+  - retrieval p95 <= `350 ms`, p99 <= `500 ms` on target query class
+  - ingest freshness proxy p95 <= `5,000 ms`
+  - benchmark top1 correctness expected-hit remains `true`
+  - ANN recall@10 >= `0.95`, ANN recall@100 >= `0.98`
+  - artifacts:
+    - benchmark scorecard
+    - phase4 run summary
+    - benchmark-history row
+- `10M` gate (multi-shard staged rehearsal)
+  - placement with `>= 8` shards and replica-aware read/write routing
+  - shard split/rebalance drill with epoch transition audit artifacts
+  - retrieval p95 <= `350 ms`, p99 <= `600 ms` across routed shard traffic
+  - ingest freshness p95 <= `5,000 ms` under sustained load
+  - no cross-tenant leakage under routed retrieval and ingest tests
+  - artifacts:
+    - placement snapshot before/after rebalance
+    - failover/rebalance drill summary
+    - benchmark + concurrency summaries with routed workload tags
+- `100M` gate (world-scale proof)
+  - distributed staged run across multiple placement domains (shard groups + followers)
+  - retrieval p95 <= `350 ms`, p99 <= `700 ms` for target query class
+  - ingest freshness p95 <= `5,000 ms` during sustained ingest + background maintenance
+  - WAL replay/recovery rehearsal:
+    - replay + restore time objective evidence captured
+    - post-recovery correctness probe must pass (expected top1 + citation integrity)
+  - incident simulation bundle passes with scale placement active:
+    - failover drill
+    - auth revocation drill
+    - recovery drill
+  - artifacts:
+    - full run summary bundle
+    - scale capacity model revision
+    - phase closure checklist signed off
+
 ## 7. Dependency Map
 
 - Phase 1 depends on Phase 0 stable schema contracts.
 - Phase 2 depends on Phase 1 ranking and edge schema stability.
 - Phase 3 depends on Phase 2 deployment pipeline and reliability signals.
+- Phase 4 depends on Phase 3 production-hardening controls and release gates.
 - Benchmark quality gates run continuously from Phase 0 onward.
 
 ## 8. Risk Register
@@ -332,34 +402,20 @@ Trigger signal:
 
 ## 11. Immediate Next Sprint (10 Working Days)
 
-Completed in current sprint:
+Phase 4 kickoff scope:
 
-1. Transport parity hardening
-   - `POST /v1/retrieve` contract path implemented and tested (integration + unit).
-2. Checkpoint policy operations
-   - Runtime checkpoint thresholds wired through ingestion startup env vars.
-3. Benchmark regression gates
-   - History-based smoke guard added to CI (`scripts/ci.sh`).
-4. Persistent startup replay hardening
-   - Ingestion/retrieval startup supports replay from WAL with replay stats logging.
-5. Scale-path ingest optimization
-   - Checkpoint policy uses cached WAL record counts to avoid repeated full-log scans.
-
-Remaining sprint scope:
-
-1. Platform observability baseline (Days 1-4)
-   - Add ingest-to-visible lag metric and retrieval latency percentiles.
-   - Document alert triggers and ownership in operations notes.
-2. Guardrail expansion (Days 4-7)
-   - Add staged CI path enablement for history guard on larger benchmark profile.
-   - Capture replay/snapshot checkpoint metrics in benchmark or startup logs.
-3. Retrieval semantics hardening (Days 7-10)
-   - Expand temporal filter behavior tests for edge windows and empty-range semantics.
-   - Validate contradiction/temporal probes in scorecard trend over multiple runs.
+1. Scale benchmark lane expansion (Days 1-4)
+   - Add dedicated scale-proof run lane for `xlarge` + next-volume profile.
+   - Emit p95/p99 latency and freshness-focused summary rows.
+2. Freshness stress and ingest throughput (Days 4-7)
+   - Standardize sustained-load ingest freshness checks with fixed workload profiles.
+   - Record pass/fail thresholds and trend artifacts under benchmark history runs.
+3. Rebalance and epoch transition evidence (Days 7-10)
+   - Capture staged shard split/rebalance drill artifacts with explicit epoch-transition checkpoints.
+   - Publish closure checklist for Phase 4 exit evidence collection.
 
 Exit criteria for sprint:
 
-- All retrieval transport contract tests pass in CI.
-- Checkpoint policy behavior is configurable and covered by tests.
-- Benchmark history regression guard is active for at least smoke + one larger profile.
-- Updated scorecard and progress log are committed with reproducible command outputs.
+- Phase 4 scale-proof lane is runnable in one command and emits reproducible artifacts.
+- At least one post-xlarge scale profile has baseline evidence committed.
+- Freshness and routing-transition evidence is attached to progress logs with exact command outputs.
