@@ -3065,20 +3065,7 @@ fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> Stri
         if idx > 0 {
             out.push(',');
         }
-        out.push('{');
-        out.push_str("\"claim_id\":\"");
-        out.push_str(&json_escape(&node.claim_id));
-        out.push_str("\",\"canonical_text\":\"");
-        out.push_str(&json_escape(&node.canonical_text));
-        out.push_str("\",\"score\":");
-        out.push_str(&format!("{:.6}", node.score));
-        out.push_str(",\"supports\":");
-        out.push_str(&node.supports.to_string());
-        out.push_str(",\"contradicts\":");
-        out.push_str(&node.contradicts.to_string());
-        out.push_str(",\"citations\":");
-        out.push_str(&render_citations_json(&node.citations));
-        out.push('}');
+        render_evidence_node_json(&mut out, node);
     }
     out.push_str("],\"graph\":");
 
@@ -3088,20 +3075,7 @@ fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> Stri
             if idx > 0 {
                 out.push(',');
             }
-            out.push('{');
-            out.push_str("\"claim_id\":\"");
-            out.push_str(&json_escape(&node.claim_id));
-            out.push_str("\",\"canonical_text\":\"");
-            out.push_str(&json_escape(&node.canonical_text));
-            out.push_str("\",\"score\":");
-            out.push_str(&format!("{:.6}", node.score));
-            out.push_str(",\"supports\":");
-            out.push_str(&node.supports.to_string());
-            out.push_str(",\"contradicts\":");
-            out.push_str(&node.contradicts.to_string());
-            out.push_str(",\"citations\":");
-            out.push_str(&render_citations_json(&node.citations));
-            out.push('}');
+            render_evidence_node_json(&mut out, node);
         }
         out.push_str("],\"edges\":[");
         for (idx, edge) in graph.edges.iter().enumerate() {
@@ -3126,6 +3100,53 @@ fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> Stri
 
     out.push('}');
     out
+}
+
+fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) {
+    out.push('{');
+    out.push_str("\"claim_id\":\"");
+    out.push_str(&json_escape(&node.claim_id));
+    out.push_str("\",\"canonical_text\":\"");
+    out.push_str(&json_escape(&node.canonical_text));
+    out.push_str("\",\"score\":");
+    out.push_str(&format!("{:.6}", node.score));
+    out.push_str(",\"supports\":");
+    out.push_str(&node.supports.to_string());
+    out.push_str(",\"contradicts\":");
+    out.push_str(&node.contradicts.to_string());
+    out.push_str(",\"citations\":");
+    out.push_str(&render_citations_json(&node.citations));
+    out.push_str(",\"event_time_unix\":");
+    render_optional_i64(out, node.event_time_unix);
+    out.push_str(",\"claim_type\":");
+    render_optional_string(out, node.claim_type.as_deref());
+    out.push_str(",\"valid_from\":");
+    render_optional_i64(out, node.valid_from);
+    out.push_str(",\"valid_to\":");
+    render_optional_i64(out, node.valid_to);
+    out.push_str(",\"created_at\":");
+    render_optional_i64(out, node.created_at);
+    out.push_str(",\"updated_at\":");
+    render_optional_i64(out, node.updated_at);
+    out.push('}');
+}
+
+fn render_optional_i64(out: &mut String, value: Option<i64>) {
+    if let Some(value) = value {
+        out.push_str(&value.to_string());
+    } else {
+        out.push_str("null");
+    }
+}
+
+fn render_optional_string(out: &mut String, value: Option<&str>) {
+    if let Some(value) = value {
+        out.push('"');
+        out.push_str(&json_escape(value));
+        out.push('"');
+    } else {
+        out.push_str("null");
+    }
 }
 
 fn render_citations_json(citations: &[CitationNode]) -> String {

@@ -1,6 +1,6 @@
 use graph::traverse_edges_multi_hop;
 use indexer::{load_manifest, load_segments_from_manifest};
-use schema::{RetrievalRequest, Stance, StanceMode};
+use schema::{Claim, ClaimType, RetrievalRequest, Stance, StanceMode};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -50,6 +50,12 @@ pub struct EvidenceNode {
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
+    pub event_time_unix: Option<i64>,
+    pub claim_type: Option<String>,
+    pub valid_from: Option<i64>,
+    pub valid_to: Option<i64>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,27 +187,36 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         planner.allowed_claim_ids.as_ref(),
     );
 
+    let tenant_claims = store.claims_for_tenant(&planner.tenant_id);
+    let tenant_claim_by_id: HashMap<String, Claim> = tenant_claims
+        .iter()
+        .cloned()
+        .map(|claim| (claim.claim_id.clone(), claim))
+        .collect();
+
     let nodes: Vec<EvidenceNode> = results
         .iter()
-        .map(|r| EvidenceNode {
-            claim_id: r.claim_id.clone(),
-            canonical_text: r.canonical_text.clone(),
-            score: r.score,
-            supports: r.supports,
-            contradicts: r.contradicts,
-            citations: r
-                .citations
-                .iter()
-                .map(|citation| CitationNode {
-                    evidence_id: citation.evidence_id.clone(),
-                    source_id: citation.source_id.clone(),
-                    stance: stance_to_str(&citation.stance).to_string(),
-                    source_quality: citation.source_quality,
-                    chunk_id: citation.chunk_id.clone(),
-                    span_start: citation.span_start,
-                    span_end: citation.span_end,
-                })
-                .collect(),
+        .map(|r| {
+            evidence_node_from_parts(
+                r.claim_id.clone(),
+                r.canonical_text.clone(),
+                r.score,
+                r.supports,
+                r.contradicts,
+                r.citations
+                    .iter()
+                    .map(|citation| CitationNode {
+                        evidence_id: citation.evidence_id.clone(),
+                        source_id: citation.source_id.clone(),
+                        stance: stance_to_str(&citation.stance).to_string(),
+                        source_quality: citation.source_quality,
+                        chunk_id: citation.chunk_id.clone(),
+                        span_start: citation.span_start,
+                        span_end: citation.span_end,
+                    })
+                    .collect(),
+                tenant_claim_by_id.get(&r.claim_id),
+            )
         })
         .collect();
 
@@ -209,7 +224,6 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         let selected: std::collections::HashSet<String> =
             nodes.iter().map(|n| n.claim_id.clone()).collect();
         let start_ids: Vec<String> = selected.iter().cloned().collect();
-        let tenant_claims = store.claims_for_tenant(&planner.tenant_id);
 
         let mut all_edges = Vec::new();
         for claim in &tenant_claims {
@@ -222,41 +236,38 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
             .cloned()
             .map(|node| (node.claim_id.clone(), node))
             .collect();
-        let claim_text_by_id: std::collections::HashMap<String, String> = tenant_claims
-            .iter()
-            .map(|claim| (claim.claim_id.clone(), claim.canonical_text.clone()))
-            .collect();
-
         let mut edges = Vec::new();
         for edge in traversed {
-            if let Some(text) = claim_text_by_id.get(&edge.from_claim_id)
+            if let Some(claim) = tenant_claim_by_id.get(&edge.from_claim_id)
                 && !node_map.contains_key(&edge.from_claim_id)
             {
                 node_map.insert(
                     edge.from_claim_id.clone(),
-                    EvidenceNode {
-                        claim_id: edge.from_claim_id.clone(),
-                        canonical_text: text.clone(),
-                        score: 0.0,
-                        supports: 0,
-                        contradicts: 0,
-                        citations: Vec::new(),
-                    },
+                    evidence_node_from_parts(
+                        edge.from_claim_id.clone(),
+                        claim.canonical_text.clone(),
+                        0.0,
+                        0,
+                        0,
+                        Vec::new(),
+                        Some(claim),
+                    ),
                 );
             }
-            if let Some(text) = claim_text_by_id.get(&edge.to_claim_id)
+            if let Some(claim) = tenant_claim_by_id.get(&edge.to_claim_id)
                 && !node_map.contains_key(&edge.to_claim_id)
             {
                 node_map.insert(
                     edge.to_claim_id.clone(),
-                    EvidenceNode {
-                        claim_id: edge.to_claim_id.clone(),
-                        canonical_text: text.clone(),
-                        score: 0.0,
-                        supports: 0,
-                        contradicts: 0,
-                        citations: Vec::new(),
-                    },
+                    evidence_node_from_parts(
+                        edge.to_claim_id.clone(),
+                        claim.canonical_text.clone(),
+                        0.0,
+                        0,
+                        0,
+                        Vec::new(),
+                        Some(claim),
+                    ),
                 );
             }
 
@@ -281,6 +292,44 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
     RetrieveApiResponse {
         results: nodes,
         graph,
+    }
+}
+
+fn evidence_node_from_parts(
+    claim_id: String,
+    canonical_text: String,
+    score: f32,
+    supports: usize,
+    contradicts: usize,
+    citations: Vec<CitationNode>,
+    claim: Option<&Claim>,
+) -> EvidenceNode {
+    EvidenceNode {
+        claim_id,
+        canonical_text,
+        score,
+        supports,
+        contradicts,
+        citations,
+        event_time_unix: claim.and_then(|value| value.event_time_unix),
+        claim_type: claim
+            .and_then(|value| value.claim_type.as_ref())
+            .map(claim_type_to_str)
+            .map(str::to_string),
+        valid_from: claim.and_then(|value| value.valid_from),
+        valid_to: claim.and_then(|value| value.valid_to),
+        created_at: claim.and_then(|value| value.created_at),
+        updated_at: claim.and_then(|value| value.updated_at),
+    }
+}
+
+fn claim_type_to_str(value: &ClaimType) -> &'static str {
+    match value {
+        ClaimType::Factual => "factual",
+        ClaimType::Opinion => "opinion",
+        ClaimType::Prediction => "prediction",
+        ClaimType::Temporal => "temporal",
+        ClaimType::Causal => "causal",
     }
 }
 
@@ -632,7 +681,7 @@ fn stance_mode_to_str(mode: StanceMode) -> &'static str {
 mod tests {
     use super::*;
     use indexer::{Segment, Tier, persist_segments_atomic};
-    use schema::{Claim, ClaimEdge, Evidence, Relation, Stance};
+    use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -803,6 +852,106 @@ mod tests {
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].relation, "supports");
+    }
+
+    #[test]
+    fn execute_api_query_surfaces_temporal_claim_metadata_on_results_and_graph_nodes() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c1".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Launch window for Mission Aurora remains open".into(),
+                    confidence: 0.91,
+                    event_time_unix: Some(1_735_689_600),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Temporal),
+                    valid_from: Some(1_735_603_200),
+                    valid_to: Some(1_735_776_000),
+                    created_at: Some(1_735_603_200_000),
+                    updated_at: Some(1_735_689_600_000),
+                },
+                vec![Evidence {
+                    evidence_id: "e1".into(),
+                    claim_id: "c1".into(),
+                    source_id: "source://doc-1".into(),
+                    stance: Stance::Supports,
+                    source_quality: 0.92,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![ClaimEdge {
+                    edge_id: "edge1".into(),
+                    from_claim_id: "c1".into(),
+                    to_claim_id: "c2".into(),
+                    relation: Relation::Supports,
+                    strength: 0.8,
+                    reason_codes: vec![],
+                    created_at: None,
+                }],
+            )
+            .expect("ingest c1 should succeed");
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c2".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Mission Aurora weather constraints are improving".into(),
+                    confidence: 0.86,
+                    event_time_unix: Some(1_735_692_000),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: Some(ClaimType::Factual),
+                    valid_from: Some(1_735_603_200),
+                    valid_to: Some(1_735_862_400),
+                    created_at: Some(1_735_603_200_000),
+                    updated_at: Some(1_735_692_000_000),
+                },
+                vec![],
+                vec![],
+            )
+            .expect("ingest c2 should succeed");
+
+        let response = execute_api_query(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "mission aurora launch window".into(),
+                query_embedding: None,
+                entity_filters: vec![],
+                embedding_id_filters: vec![],
+                top_k: 1,
+                stance_mode: StanceMode::Balanced,
+                return_graph: true,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(response.results.len(), 1);
+        let node = &response.results[0];
+        assert_eq!(node.claim_id, "c1");
+        assert_eq!(node.event_time_unix, Some(1_735_689_600));
+        assert_eq!(node.claim_type.as_deref(), Some("temporal"));
+        assert_eq!(node.valid_from, Some(1_735_603_200));
+        assert_eq!(node.valid_to, Some(1_735_776_000));
+        assert_eq!(node.created_at, Some(1_735_603_200_000));
+        assert_eq!(node.updated_at, Some(1_735_689_600_000));
+
+        let graph = response.graph.expect("graph should be present");
+        let c2_graph_node = graph
+            .nodes
+            .iter()
+            .find(|entry| entry.claim_id == "c2")
+            .expect("graph should include connected c2 node");
+        assert_eq!(c2_graph_node.claim_type.as_deref(), Some("factual"));
+        assert_eq!(c2_graph_node.valid_to, Some(1_735_862_400));
+        assert_eq!(c2_graph_node.updated_at, Some(1_735_692_000_000));
     }
 
     #[test]

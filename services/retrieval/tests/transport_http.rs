@@ -8,7 +8,7 @@ use std::{
 };
 
 use auth::{encode_hs256_token, encode_hs256_token_with_kid};
-use schema::{Claim, Evidence, Stance};
+use schema::{Claim, ClaimType, Evidence, Stance};
 use store::InMemoryStore;
 
 fn sample_store() -> InMemoryStore {
@@ -20,14 +20,14 @@ fn sample_store() -> InMemoryStore {
                 tenant_id: "tenant-http".into(),
                 canonical_text: "Company X acquired Company Y".into(),
                 confidence: 0.95,
-                event_time_unix: None,
+                event_time_unix: Some(1_735_689_600),
                 entities: vec![],
                 embedding_ids: vec![],
-                claim_type: None,
-                valid_from: None,
-                valid_to: None,
-                created_at: None,
-                updated_at: None,
+                claim_type: Some(ClaimType::Factual),
+                valid_from: Some(1_735_603_200),
+                valid_to: Some(1_735_862_400),
+                created_at: Some(1_735_603_200_000),
+                updated_at: Some(1_735_689_600_000),
             },
             vec![Evidence {
                 evidence_id: "ev-http".into(),
@@ -129,6 +129,12 @@ fn transport_get_request_parses_and_returns_json_response() {
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
     assert!(response.contains("\"source_id\":\"source://transport-http\""));
+    assert!(response.contains("\"event_time_unix\":1735689600"));
+    assert!(response.contains("\"claim_type\":\"factual\""));
+    assert!(response.contains("\"valid_from\":1735603200"));
+    assert!(response.contains("\"valid_to\":1735862400"));
+    assert!(response.contains("\"created_at\":1735603200000"));
+    assert!(response.contains("\"updated_at\":1735689600000"));
 }
 
 #[test]
@@ -149,6 +155,8 @@ fn transport_post_request_parses_json_body_and_returns_json_response() {
     assert!(response.contains("\"results\""));
     assert!(response.contains("\"claim_id\":\"claim-http\""));
     assert!(response.contains("\"evidence_id\":\"ev-http\""));
+    assert!(response.contains("\"claim_type\":\"factual\""));
+    assert!(response.contains("\"event_time_unix\":1735689600"));
 }
 
 #[test]
