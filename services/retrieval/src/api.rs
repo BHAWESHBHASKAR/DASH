@@ -164,6 +164,7 @@ pub struct SegmentPrefilterCacheMetrics {
     pub refresh_successes: u64,
     pub refresh_failures: u64,
     pub refresh_load_micros: u64,
+    pub fallback_activations: u64,
 }
 
 #[derive(Debug, Default)]
@@ -173,6 +174,7 @@ struct SegmentPrefilterCacheMetricAtoms {
     refresh_successes: AtomicU64,
     refresh_failures: AtomicU64,
     refresh_load_micros: AtomicU64,
+    fallback_activations: AtomicU64,
 }
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
@@ -654,6 +656,11 @@ fn build_segment_prefilter_claim_ids_from_root(
         segment_prefilter_cache_metric_atoms()
             .cache_hits
             .fetch_add(1, Ordering::Relaxed);
+        if entry.claim_ids.is_none() {
+            segment_prefilter_cache_metric_atoms()
+                .fallback_activations
+                .fetch_add(1, Ordering::Relaxed);
+        }
         return entry.claim_ids.clone();
     }
 
@@ -678,6 +685,9 @@ fn build_segment_prefilter_claim_ids_from_root(
     } else {
         segment_prefilter_cache_metric_atoms()
             .refresh_failures
+            .fetch_add(1, Ordering::Relaxed);
+        segment_prefilter_cache_metric_atoms()
+            .fallback_activations
             .fetch_add(1, Ordering::Relaxed);
     }
     let next_refresh_instant = now + segment_prefilter_refresh_interval();
@@ -799,6 +809,7 @@ pub fn segment_prefilter_cache_metrics_snapshot() -> SegmentPrefilterCacheMetric
         refresh_successes: metrics.refresh_successes.load(Ordering::Relaxed),
         refresh_failures: metrics.refresh_failures.load(Ordering::Relaxed),
         refresh_load_micros: metrics.refresh_load_micros.load(Ordering::Relaxed),
+        fallback_activations: metrics.fallback_activations.load(Ordering::Relaxed),
     }
 }
 
@@ -809,6 +820,7 @@ pub fn reset_segment_prefilter_cache_metrics() {
     metrics.refresh_successes.store(0, Ordering::Relaxed);
     metrics.refresh_failures.store(0, Ordering::Relaxed);
     metrics.refresh_load_micros.store(0, Ordering::Relaxed);
+    metrics.fallback_activations.store(0, Ordering::Relaxed);
 }
 
 fn stance_to_str(stance: &Stance) -> &'static str {
@@ -1919,8 +1931,63 @@ mod tests {
         assert!(metrics.refresh_attempts >= 1);
         assert!(metrics.refresh_successes >= 1);
         assert_eq!(metrics.refresh_failures, 0);
+        assert_eq!(metrics.fallback_activations, 0);
         assert!(metrics.cache_hits >= 1);
         assert!(metrics.refresh_load_micros > 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn segment_prefilter_cache_metrics_track_fallback_activations() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-fallback");
+        let tenant_root = root.join("tenant-a");
+        std::fs::create_dir_all(&tenant_root).expect("tenant root should exist");
+
+        let first = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone());
+        assert!(first.is_none());
+        let second = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone());
+        assert!(second.is_none());
+
+        let metrics = segment_prefilter_cache_metrics_snapshot();
+        assert_eq!(metrics.refresh_attempts, 1);
+        assert_eq!(metrics.refresh_successes, 0);
+        assert_eq!(metrics.refresh_failures, 1);
+        assert_eq!(metrics.cache_hits, 1);
+        assert_eq!(metrics.fallback_activations, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn segment_prefilter_cache_falls_back_when_manifest_is_invalid() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-invalid-manifest");
+        let tenant_root = root.join("tenant-a");
+        std::fs::create_dir_all(&tenant_root).expect("tenant root should exist");
+        std::fs::write(
+            tenant_root.join("segments.manifest"),
+            "DASHSEG-MANIFEST\t0\ninvalid\n",
+        )
+        .expect("invalid manifest should be written");
+
+        let ids = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone());
+        assert!(ids.is_none());
+
+        let metrics = segment_prefilter_cache_metrics_snapshot();
+        assert_eq!(metrics.refresh_attempts, 1);
+        assert_eq!(metrics.refresh_successes, 0);
+        assert_eq!(metrics.refresh_failures, 1);
+        assert_eq!(metrics.fallback_activations, 1);
 
         let _ = std::fs::remove_dir_all(root);
         clear_segment_cache_for_tests();

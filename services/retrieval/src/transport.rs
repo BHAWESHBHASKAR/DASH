@@ -24,6 +24,7 @@ use store::InMemoryStore;
 use crate::api::{
     CitationNode, EvidenceNode, RetrieveApiRequest, RetrievePlannerDebugSnapshot, TimeRange,
     build_retrieve_planner_debug_snapshot, execute_api_query,
+    segment_prefilter_cache_metrics_snapshot,
 };
 
 const METRICS_WINDOW_SIZE: usize = 2048;
@@ -340,6 +341,7 @@ impl TransportMetrics {
         let retrieve_latency_p99 = Self::quantile(&self.retrieve_latency_ms_window, 0.99);
         let visibility_lag_p50 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.50);
         let visibility_lag_p95 = Self::quantile(&self.ingest_to_visible_lag_ms_window, 0.95);
+        let segment_cache_metrics = segment_prefilter_cache_metrics_snapshot();
         let uptime_seconds = self.started_at.elapsed().as_secs_f64();
         let placement_enabled = placement_routing.map(|_| 1).unwrap_or(0);
         let placement_snapshot = placement_routing
@@ -460,6 +462,18 @@ dash_retrieve_storage_last_divergence_ratio {:.6}\n\
 dash_retrieve_storage_last_divergence_warn {}\n\
 # TYPE dash_retrieve_storage_divergence_warn_total counter\n\
 dash_retrieve_storage_divergence_warn_total {}\n\
+# TYPE dash_retrieve_segment_cache_hits_total counter\n\
+dash_retrieve_segment_cache_hits_total {}\n\
+# TYPE dash_retrieve_segment_refresh_attempt_total counter\n\
+dash_retrieve_segment_refresh_attempt_total {}\n\
+# TYPE dash_retrieve_segment_refresh_success_total counter\n\
+dash_retrieve_segment_refresh_success_total {}\n\
+# TYPE dash_retrieve_segment_refresh_failure_total counter\n\
+dash_retrieve_segment_refresh_failure_total {}\n\
+# TYPE dash_retrieve_segment_refresh_load_micros_total counter\n\
+dash_retrieve_segment_refresh_load_micros_total {}\n\
+# TYPE dash_retrieve_segment_fallback_activation_total counter\n\
+dash_retrieve_segment_fallback_activation_total {}\n\
 # TYPE dash_transport_uptime_seconds gauge\n\
 dash_transport_uptime_seconds {:.4}\n",
             self.http_requests_total,
@@ -506,6 +520,12 @@ dash_transport_uptime_seconds {:.4}\n",
             self.storage_last_divergence_ratio,
             self.storage_last_divergence_warn as usize,
             self.storage_divergence_warn_total,
+            segment_cache_metrics.cache_hits,
+            segment_cache_metrics.refresh_attempts,
+            segment_cache_metrics.refresh_successes,
+            segment_cache_metrics.refresh_failures,
+            segment_cache_metrics.refresh_load_micros,
+            segment_cache_metrics.fallback_activations,
             uptime_seconds
         )
     }
@@ -4203,6 +4223,11 @@ tenant-a,0,12,node-a,follower,healthy\n",
             metrics_response
                 .body
                 .contains("dash_retrieve_client_error_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_segment_fallback_activation_total")
         );
     }
 
