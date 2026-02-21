@@ -275,6 +275,7 @@ Optional overrides:
   - segment prefilter cache observability:
     - refresh attempts/successes/failures
     - cache hits
+    - fallback activations (`missing_manifest`, `manifest_error`, `segment_error`)
     - refresh average load time
   - WAL checkpoint/snapshot scale slice:
     - profile-scoped claim volume used
@@ -303,6 +304,17 @@ Optional overrides:
 - Supported targets:
   - `--target retrieval` (default): benchmarks `GET /v1/retrieve?...`
   - `--target ingestion`: benchmarks `POST /v1/ingest` in persistent WAL mode
+
+### 16.1 Segment Fallback Runtime Metrics (Phase 6)
+
+- Retrieval `/metrics` now exports segment lifecycle fallback counters:
+  - `dash_retrieve_segment_fallback_activation_total`
+  - `dash_retrieve_segment_fallback_missing_manifest_total`
+  - `dash_retrieve_segment_fallback_manifest_error_total`
+  - `dash_retrieve_segment_fallback_segment_error_total`
+- Interpretation:
+  - these counters should remain near zero in healthy steady-state runs.
+  - non-zero growth indicates retrieval is in safety fallback mode because segment state is missing or invalid.
 - Output artifact path:
   - `docs/benchmarks/history/concurrency/*.md`
 - Ingestion WAL mode:

@@ -125,7 +125,21 @@ impl SegmentCacheKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentCacheEntry {
     claim_ids: Option<HashSet<String>>,
+    fallback_reason: Option<SegmentFallbackReason>,
     next_refresh_instant: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentFallbackReason {
+    MissingManifest,
+    ManifestError,
+    SegmentError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentPrefilterLoadResult {
+    claim_ids: Option<HashSet<String>>,
+    fallback_reason: Option<SegmentFallbackReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +179,9 @@ pub struct SegmentPrefilterCacheMetrics {
     pub refresh_failures: u64,
     pub refresh_load_micros: u64,
     pub fallback_activations: u64,
+    pub fallback_missing_manifest: u64,
+    pub fallback_manifest_errors: u64,
+    pub fallback_segment_errors: u64,
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +192,9 @@ struct SegmentPrefilterCacheMetricAtoms {
     refresh_failures: AtomicU64,
     refresh_load_micros: AtomicU64,
     fallback_activations: AtomicU64,
+    fallback_missing_manifest: AtomicU64,
+    fallback_manifest_errors: AtomicU64,
+    fallback_segment_errors: AtomicU64,
 }
 
 pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
@@ -657,9 +677,7 @@ fn build_segment_prefilter_claim_ids_from_root(
             .cache_hits
             .fetch_add(1, Ordering::Relaxed);
         if entry.claim_ids.is_none() {
-            segment_prefilter_cache_metric_atoms()
-                .fallback_activations
-                .fetch_add(1, Ordering::Relaxed);
+            observe_segment_fallback_activation(entry.fallback_reason);
         }
         return entry.claim_ids.clone();
     }
@@ -668,7 +686,7 @@ fn build_segment_prefilter_claim_ids_from_root(
         .refresh_attempts
         .fetch_add(1, Ordering::Relaxed);
     let refresh_start = std::time::Instant::now();
-    let claim_ids = load_segment_prefilter_claim_ids(&segment_tenant_path);
+    let load_result = load_segment_prefilter_claim_ids(&segment_tenant_path);
     let elapsed_micros = refresh_start.elapsed().as_micros();
     let elapsed_micros_u64 = if elapsed_micros > u64::MAX as u128 {
         u64::MAX
@@ -678,7 +696,7 @@ fn build_segment_prefilter_claim_ids_from_root(
     segment_prefilter_cache_metric_atoms()
         .refresh_load_micros
         .fetch_add(elapsed_micros_u64, Ordering::Relaxed);
-    if claim_ids.is_some() {
+    if load_result.claim_ids.is_some() {
         segment_prefilter_cache_metric_atoms()
             .refresh_successes
             .fetch_add(1, Ordering::Relaxed);
@@ -686,37 +704,78 @@ fn build_segment_prefilter_claim_ids_from_root(
         segment_prefilter_cache_metric_atoms()
             .refresh_failures
             .fetch_add(1, Ordering::Relaxed);
-        segment_prefilter_cache_metric_atoms()
-            .fallback_activations
-            .fetch_add(1, Ordering::Relaxed);
+        observe_segment_fallback_activation(load_result.fallback_reason);
     }
     let next_refresh_instant = now + segment_prefilter_refresh_interval();
     if let Ok(mut cache) = segment_prefilter_cache().write() {
         cache.insert(
             cache_key,
             SegmentCacheEntry {
-                claim_ids: claim_ids.clone(),
+                claim_ids: load_result.claim_ids.clone(),
+                fallback_reason: load_result.fallback_reason,
                 next_refresh_instant,
             },
         );
     }
-    claim_ids
+    load_result.claim_ids
 }
 
-fn load_segment_prefilter_claim_ids(segment_tenant_path: &Path) -> Option<HashSet<String>> {
+fn load_segment_prefilter_claim_ids(segment_tenant_path: &Path) -> SegmentPrefilterLoadResult {
     let manifest = match load_manifest(segment_tenant_path) {
         Ok(Some(value)) => value,
-        _ => return None,
+        Ok(None) => {
+            return SegmentPrefilterLoadResult {
+                claim_ids: None,
+                fallback_reason: Some(SegmentFallbackReason::MissingManifest),
+            };
+        }
+        Err(_) => {
+            return SegmentPrefilterLoadResult {
+                claim_ids: None,
+                fallback_reason: Some(SegmentFallbackReason::ManifestError),
+            };
+        }
     };
     let segments = match load_segments_from_manifest(segment_tenant_path, &manifest) {
         Ok(value) => value,
-        Err(_) => return None,
+        Err(_) => {
+            return SegmentPrefilterLoadResult {
+                claim_ids: None,
+                fallback_reason: Some(SegmentFallbackReason::SegmentError),
+            };
+        }
     };
     let mut ids = HashSet::new();
     for segment in segments {
         ids.extend(segment.claim_ids);
     }
-    Some(ids)
+    SegmentPrefilterLoadResult {
+        claim_ids: Some(ids),
+        fallback_reason: None,
+    }
+}
+
+fn observe_segment_fallback_activation(reason: Option<SegmentFallbackReason>) {
+    let metrics = segment_prefilter_cache_metric_atoms();
+    metrics.fallback_activations.fetch_add(1, Ordering::Relaxed);
+    match reason {
+        Some(SegmentFallbackReason::MissingManifest) => {
+            metrics
+                .fallback_missing_manifest
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SegmentFallbackReason::ManifestError) => {
+            metrics
+                .fallback_manifest_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(SegmentFallbackReason::SegmentError) => {
+            metrics
+                .fallback_segment_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {}
+    }
 }
 
 fn build_wal_delta_claim_ids(
@@ -810,6 +869,9 @@ pub fn segment_prefilter_cache_metrics_snapshot() -> SegmentPrefilterCacheMetric
         refresh_failures: metrics.refresh_failures.load(Ordering::Relaxed),
         refresh_load_micros: metrics.refresh_load_micros.load(Ordering::Relaxed),
         fallback_activations: metrics.fallback_activations.load(Ordering::Relaxed),
+        fallback_missing_manifest: metrics.fallback_missing_manifest.load(Ordering::Relaxed),
+        fallback_manifest_errors: metrics.fallback_manifest_errors.load(Ordering::Relaxed),
+        fallback_segment_errors: metrics.fallback_segment_errors.load(Ordering::Relaxed),
     }
 }
 
@@ -821,6 +883,11 @@ pub fn reset_segment_prefilter_cache_metrics() {
     metrics.refresh_failures.store(0, Ordering::Relaxed);
     metrics.refresh_load_micros.store(0, Ordering::Relaxed);
     metrics.fallback_activations.store(0, Ordering::Relaxed);
+    metrics
+        .fallback_missing_manifest
+        .store(0, Ordering::Relaxed);
+    metrics.fallback_manifest_errors.store(0, Ordering::Relaxed);
+    metrics.fallback_segment_errors.store(0, Ordering::Relaxed);
 }
 
 fn stance_to_str(stance: &Stance) -> &'static str {
@@ -1698,6 +1765,113 @@ mod tests {
     }
 
     #[test]
+    fn execute_api_query_segment_assisted_matches_replay_only_logical_set() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("segment-assisted-equivalence");
+        let tenant = "tenant-a";
+        let tenant_root = root.join(tenant);
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-segment".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let mut store = InMemoryStore::new();
+        for (claim_id, canonical_text, embedding_id) in [
+            (
+                "claim-segment",
+                "Company X acquisition of Company Y was approved",
+                "emb://segment",
+            ),
+            (
+                "claim-wal-delta",
+                "Company X acquisition of Startup Nova closed",
+                "emb://wal-delta",
+            ),
+        ] {
+            store
+                .ingest_bundle(
+                    Claim {
+                        claim_id: claim_id.into(),
+                        tenant_id: tenant.into(),
+                        canonical_text: canonical_text.into(),
+                        confidence: 0.9,
+                        event_time_unix: None,
+                        entities: vec!["Company X".into()],
+                        embedding_ids: vec![embedding_id.into()],
+                        claim_type: None,
+                        valid_from: None,
+                        valid_to: None,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                    vec![Evidence {
+                        evidence_id: format!("e-{claim_id}"),
+                        claim_id: claim_id.into(),
+                        source_id: format!("source://{claim_id}"),
+                        stance: Stance::Supports,
+                        source_quality: 0.9,
+                        chunk_id: None,
+                        span_start: None,
+                        span_end: None,
+                        doc_id: None,
+                        extraction_model: None,
+                        ingested_at: None,
+                    }],
+                    vec![],
+                )
+                .expect("ingest should succeed");
+        }
+
+        let request = RetrieveApiRequest {
+            tenant_id: tenant.into(),
+            query: "company x acquisition".into(),
+            query_embedding: None,
+            entity_filters: vec!["company x".into()],
+            embedding_id_filters: vec![],
+            top_k: 10,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        };
+
+        let segment_assisted_response = {
+            let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+            let _segment_refresh_env = EnvVarGuard::set(
+                "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+                OsStr::new("600000"),
+            );
+            execute_api_query(&store, request.clone())
+        };
+        let replay_only_response = execute_api_query(&store, request);
+
+        let segment_assisted_ids: std::collections::HashSet<String> = segment_assisted_response
+            .results
+            .iter()
+            .map(|node| node.claim_id.clone())
+            .collect();
+        let replay_only_ids: std::collections::HashSet<String> = replay_only_response
+            .results
+            .iter()
+            .map(|node| node.claim_id.clone())
+            .collect();
+
+        assert_eq!(segment_assisted_ids, replay_only_ids);
+        assert!(segment_assisted_ids.contains("claim-segment"));
+        assert!(segment_assisted_ids.contains("claim-wal-delta"));
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
     fn execute_api_query_ignores_foreign_claim_ids_in_segment_allowlist() {
         let _lock = segment_cache_test_lock()
             .lock()
@@ -1932,6 +2106,9 @@ mod tests {
         assert!(metrics.refresh_successes >= 1);
         assert_eq!(metrics.refresh_failures, 0);
         assert_eq!(metrics.fallback_activations, 0);
+        assert_eq!(metrics.fallback_missing_manifest, 0);
+        assert_eq!(metrics.fallback_manifest_errors, 0);
+        assert_eq!(metrics.fallback_segment_errors, 0);
         assert!(metrics.cache_hits >= 1);
         assert!(metrics.refresh_load_micros > 0);
 
@@ -1960,6 +2137,9 @@ mod tests {
         assert_eq!(metrics.refresh_failures, 1);
         assert_eq!(metrics.cache_hits, 1);
         assert_eq!(metrics.fallback_activations, 2);
+        assert_eq!(metrics.fallback_missing_manifest, 2);
+        assert_eq!(metrics.fallback_manifest_errors, 0);
+        assert_eq!(metrics.fallback_segment_errors, 0);
 
         let _ = std::fs::remove_dir_all(root);
         clear_segment_cache_for_tests();
@@ -1988,6 +2168,46 @@ mod tests {
         assert_eq!(metrics.refresh_successes, 0);
         assert_eq!(metrics.refresh_failures, 1);
         assert_eq!(metrics.fallback_activations, 1);
+        assert_eq!(metrics.fallback_missing_manifest, 0);
+        assert_eq!(metrics.fallback_manifest_errors, 1);
+        assert_eq!(metrics.fallback_segment_errors, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn segment_prefilter_cache_falls_back_when_segment_file_is_missing() {
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("prefilter-missing-segment-file");
+        let tenant_root = root.join("tenant-a");
+
+        let manifest = persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-1".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+        let segment_file = tenant_root.join(&manifest.entries[0].file_name);
+        std::fs::remove_file(segment_file).expect("segment file should be removed");
+
+        let ids = build_segment_prefilter_claim_ids_from_root("tenant-a", root.clone());
+        assert!(ids.is_none());
+
+        let metrics = segment_prefilter_cache_metrics_snapshot();
+        assert_eq!(metrics.refresh_attempts, 1);
+        assert_eq!(metrics.refresh_successes, 0);
+        assert_eq!(metrics.refresh_failures, 1);
+        assert_eq!(metrics.fallback_activations, 1);
+        assert_eq!(metrics.fallback_missing_manifest, 0);
+        assert_eq!(metrics.fallback_manifest_errors, 0);
+        assert_eq!(metrics.fallback_segment_errors, 1);
 
         let _ = std::fs::remove_dir_all(root);
         clear_segment_cache_for_tests();

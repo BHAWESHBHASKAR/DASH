@@ -116,6 +116,18 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - this closure snapshot applies to the detailed retrieval/planner phase-doc set.
   - master-plan Phase 4 scale-proof (`1M -> 10M -> 100M`) remains in progress and is intentionally not promoted here.
 
+### 2.3 Detailed Phase 06 Closure Snapshot (2026-02-21)
+
+- Detailed phase document `phase-06-segment-lifecycle-and-merge-semantics.md`: complete.
+- Closure evidence highlights:
+  - merge semantics remain `segment base UNION WAL delta` in retrieval planner path.
+  - replay-only and segment-assisted logical read-set equivalence is covered by retrieval tests (`execute_api_query_segment_assisted_matches_replay_only_logical_set`).
+  - stale/missing/invalid segment states safely fall back without data loss, with explicit reason coverage in tests.
+  - runtime observability now includes segment fallback activation counters and reason-classified counters in retrieval `/metrics`.
+- Scope note:
+  - this snapshot closes the detailed Phase 06 lifecycle hardening track.
+  - master-plan Phase 4 scale-proof (`1M -> 10M -> 100M`) remains in progress.
+
 ## 3. Success Targets (v1)
 
 - retrieval API returns claim-level results with machine-readable citations.

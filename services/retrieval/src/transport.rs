@@ -474,6 +474,12 @@ dash_retrieve_segment_refresh_failure_total {}\n\
 dash_retrieve_segment_refresh_load_micros_total {}\n\
 # TYPE dash_retrieve_segment_fallback_activation_total counter\n\
 dash_retrieve_segment_fallback_activation_total {}\n\
+# TYPE dash_retrieve_segment_fallback_missing_manifest_total counter\n\
+dash_retrieve_segment_fallback_missing_manifest_total {}\n\
+# TYPE dash_retrieve_segment_fallback_manifest_error_total counter\n\
+dash_retrieve_segment_fallback_manifest_error_total {}\n\
+# TYPE dash_retrieve_segment_fallback_segment_error_total counter\n\
+dash_retrieve_segment_fallback_segment_error_total {}\n\
 # TYPE dash_transport_uptime_seconds gauge\n\
 dash_transport_uptime_seconds {:.4}\n",
             self.http_requests_total,
@@ -526,6 +532,9 @@ dash_transport_uptime_seconds {:.4}\n",
             segment_cache_metrics.refresh_failures,
             segment_cache_metrics.refresh_load_micros,
             segment_cache_metrics.fallback_activations,
+            segment_cache_metrics.fallback_missing_manifest,
+            segment_cache_metrics.fallback_manifest_errors,
+            segment_cache_metrics.fallback_segment_errors,
             uptime_seconds
         )
     }
@@ -4228,6 +4237,11 @@ tenant-a,0,12,node-a,follower,healthy\n",
             metrics_response
                 .body
                 .contains("dash_retrieve_segment_fallback_activation_total")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_segment_fallback_manifest_error_total")
         );
     }
 
