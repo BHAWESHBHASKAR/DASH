@@ -108,6 +108,14 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Phase 4 (Scale Proof): in progress
   - objective is to close remaining world-scale proof gap (`1M -> 10M -> 100M`) with reproducible performance and freshness evidence
 
+### 2.2 Detailed Phase-Doc Closure Snapshot (2026-02-21)
+
+- Detailed phase document `phase-04-retrieval-semantics-and-citations.md`: complete (exit-gate evidence mapped to existing retrieval tests plus Tier-B staged artifacts).
+- Detailed phase document `phase-05-hybrid-candidate-planner.md`: complete (exit-gate evidence mapped to existing planner-stage metrics, recall gates, and Tier-B/Tier-C closure artifacts).
+- Scope note:
+  - this closure snapshot applies to the detailed retrieval/planner phase-doc set.
+  - master-plan Phase 4 scale-proof (`1M -> 10M -> 100M`) remains in progress and is intentionally not promoted here.
+
 ## 3. Success Targets (v1)
 
 - retrieval API returns claim-level results with machine-readable citations.
