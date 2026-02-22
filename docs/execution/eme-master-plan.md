@@ -15,9 +15,16 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Rust workspace implementation is active across schema, ranking, graph, store, ingestion, retrieval, indexer, and metadata-router crates.
 - Persistent WAL replay is implemented with snapshot checkpoint compaction in `pkg/store`.
 - Retrieval API contracts are implemented with optional graph payload and transport layer support.
+- Retrieval transport payload parsing/JSON serialization is now modularized under `services/retrieval/src/transport/payload.rs`.
+- Retrieval API result-projection helpers are now modularized under `services/retrieval/src/api/result_projection.rs`.
+- Retrieval graph payloads now project node-level reasoning signals (`graph_score`, `support_path_count`, `contradiction_chain_depth`) from configurable graph-reasoning v2 traversal/scoring.
 - Retrieval transport now includes an authenticated planner-debug endpoint (`GET /debug/planner`) for stage-wise candidate observability.
-- Retrieval transport now includes an authenticated storage-visibility endpoint (`GET /debug/storage-visibility`) with segment/WAL divergence warning evaluation and metrics.
+- Retrieval transport now includes an authenticated storage-visibility endpoint (`GET /debug/storage-visibility`) with segment/WAL divergence warning evaluation, explicit execution-time source attribution (`segment_base` vs `wal_delta`), and metrics.
 - Ingestion API transport is implemented (`POST /v1/ingest`, `GET /health`, `GET /metrics`) with persistent-policy wiring.
+- Ingestion raw-text bootstrap API is implemented (`POST /v1/ingest/raw`) with deterministic sentence-based claim/evidence extraction and idempotent batch commit semantics.
+- Raw extraction provider path now supports env-driven adapter selection:
+  - `DASH_INGEST_RAW_EXTRACTION_PROVIDER=rule_sentence|adapter_command`
+  - `DASH_INGEST_RAW_ADAPTER_CMD` (feature-gated by `model-extraction-adapter`)
 - Ingestion batch API transport is implemented (`POST /v1/ingest/batch`) with durable WAL batch commit metadata records, strict atomic rollback semantics, and `commit_id` idempotent replay/conflict enforcement.
 - Ingestion now supports leader/follower pull replication v1 via internal replication endpoints (`GET /internal/replication/wal`, `GET /internal/replication/export`) plus optional follower loop (`DASH_INGEST_REPLICATION_SOURCE_URL`).
 - Retrieval transport exposes runtime metrics at `/metrics` including DASH latency percentiles and visibility-lag estimates.
@@ -37,13 +44,17 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Indexer includes immutable segment lifecycle primitives (atomic segment+manifest persistence, checksum-verified load, compaction scheduler hook).
 - Metadata router now includes placement-aware routing primitives (leader/follower health policies, read preferences, and failover promotion with epoch bump).
 - Ingestion/retrieval transports now support placement-aware request admission gates (write-leader enforcement on ingest and read-replica preference enforcement on retrieve) using shared placement CSV metadata.
+- Retrieval transport now supports explicit read consistency admission policy (`read_consistency=one|quorum|all`) for placement-routed requests.
 - Ingestion/retrieval transports now expose placement-debug snapshots and route probe context at `GET /debug/placement`.
 - Ingestion/retrieval transports support optional in-process placement live reload (`DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS`) with reload observability metrics.
 - Ingestion can publish tenant-scoped segment snapshots (`DASH_INGEST_SEGMENT_DIR`) and retrieval can apply segment-backed prefiltering (`DASH_RETRIEVAL_SEGMENT_DIR`).
 - Ingestion segment publish now enforces on-disk stale segment GC with one-generation safety retention (`active manifest + previous manifest`) to bound disk growth without breaking in-flight readers.
 - Ingestion transport now includes a scheduled in-process segment lifecycle maintenance worker (`DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS`) with stale-age policy control (`DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS`) and maintenance metrics.
 - Standalone segment lifecycle daemon binary (`segment-maintenance-daemon`) is now available for out-of-process maintenance loops and one-shot maintenance verification.
-- Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters.
+- Retrieval segment read semantics explicitly merge `immutable segment base + mutable WAL delta` before applying metadata prefilters, and now expose per-query merge accounting in debug/metrics surfaces.
+- Retrieval execution now supports disk-native segment-base candidate scoring (`segment_disk_base_with_wal_overlay`) with explicit fallback to `memory_index` mode when segment base is unavailable, and exports per-mode execution counters.
+- Retrieval storage snapshots now expose explicit promotion-boundary semantics (`replay_only`, `segment_base_plus_wal_delta`, `segment_base_fully_promoted`) with transition flags and per-state metrics counters.
+- Store WAL durability now exposes explicit replay-boundary snapshots (`snapshot_record_count`, `wal_delta_record_count`) for checkpoint/compaction transition verification.
 - Ingestion WAL durability now supports configurable batching controls with strict defaults:
   - sync batch threshold: `DASH_INGEST_WAL_SYNC_EVERY_RECORDS`
   - append buffer threshold: `DASH_INGEST_WAL_APPEND_BUFFER_RECORDS`
@@ -51,20 +62,30 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - async flush worker: `DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS` (auto-enabled when batching is active)
   - optional queue-mode write path: `DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY=true` (flush/sync deferred to async worker)
   - startup safety guardrails reject unsafe durability windows unless explicitly overridden via `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true`
-- Benchmark harness supports smoke, standard, and large fixture profiles with history output.
+- Benchmark harness supports smoke, standard, large, xlarge, and xxlarge fixture profiles with history output.
 - Benchmark trend automation is available via `scripts/benchmark_trend.sh` (smoke + large guard/history/scorecard outputs).
-- Phase 4 scale-proof automation lane is available via `scripts/phase4_scale_proof.sh` (scaled fixture benchmark + retrieval/ingestion concurrency + failover drill with consolidated summary artifact).
+- Phase 4 scale-proof automation lane is available via `scripts/phase4_scale_proof.sh` (scaled fixture benchmark + retrieval/ingestion concurrency + failover drill + optional storage promotion-boundary/trend gating with consolidated summary artifact).
 - Phase 4 long-soak launcher is available via `scripts/phase4_long_soak.sh` (deterministic run-id artifact paths + heartbeat telemetry for extended `1M+` runs).
 - Phase 4 long-soak control wrapper is available via `scripts/phase4_long_soak_ctl.sh` (`start|status|tail|stop|run` workflow with pid/log/heartbeat management).
 - Rebalance/split drill automation is available via `scripts/rebalance_drill.sh` (placement split + epoch transition verification with before/after route snapshots and probe-diff artifacts).
-- Tier-B rehearsal wrapper is available via `scripts/phase4_tierb_rehearsal.sh` (one-command `>=8` shard rebalance gate preset over phase4 scale-proof runner).
-- Tier-C rehearsal wrapper is available via `scripts/phase4_tierc_rehearsal.sh` (phase4 scale-proof + recovery drill + incident simulation + tier-c closure checklist orchestration, with optional dev-mode reuse of existing scale-proof summaries).
+- Tier-B rehearsal wrapper is available via `scripts/phase4_tierb_rehearsal.sh` (one-command `>=8` shard rebalance gate preset over phase4 scale-proof runner, including staged default promotion-boundary guard execution).
+- Tier-C rehearsal wrapper is available via `scripts/phase4_tierc_rehearsal.sh` (phase4 scale-proof + recovery drill + incident simulation + tier-c closure checklist orchestration, with optional dev-mode reuse of existing scale-proof summaries and staged default promotion-boundary guard execution).
+- Tier-D rehearsal wrapper is available via `scripts/phase4_tierd_rehearsal.sh` (post-xlarge `xxlarge` preset with `1,000,000` fixture defaults over Tier-C orchestration, including staged default promotion-boundary guard execution).
 - Phase 4 closure checklist gate is available via `scripts/phase4_closure_checklist.sh` (tier-aware PASS/FAIL checklist from scale-proof summary artifacts).
 - Placement failover validation script supports restart and no-restart drills via `scripts/failover_drill.sh --mode restart|no-restart|both`.
+- Failover chaos-loop script supports repeated failover convergence gating via `scripts/failover_chaos_loop.sh`.
+- Retrieval latency guard script supports staged p95/p99 envelope and success-rate gating via `scripts/retrieval_latency_guard.sh`.
+- Read-consistency policy guard script supports policy-specific PASS/FAIL evidence via `scripts/read_consistency_policy_guard.sh`.
+- Storage promotion-boundary guard script supports replay-only / segment+delta / fully-promoted under-load state gating via `scripts/storage_promotion_boundary_guard.sh`, and phase4 can persist trend history/regression thresholds via `--storage-promotion-boundary-history-path`.
+- Capacity model report script supports automated sizing-envelope generation via `scripts/capacity_model_report.sh`.
+- Phase 11 production signoff bundle automation is available via `scripts/phase11_production_signoff_bundle.sh` (requires incident/recovery/lag/throughput/SLO artifacts, emits promotion+rollback rehearsal artifacts, and enforces zero-manual-workaround path).
 - Transport concurrency benchmark tooling is available via `scripts/benchmark_transport_concurrency.sh` and `concurrent_load`.
 - Ingestion WAL durability benchmark comparison tooling is available via `scripts/benchmark_ingest_wal_durability.sh` with history artifacts under `docs/benchmarks/history/concurrency/wal-durability/`.
 - CI supports optional staged trend execution via `DASH_CI_RUN_BENCH_TREND=true`.
 - SLO/error-budget gate automation is available via `scripts/slo_guard.sh` (benchmark SLI checks + rolling failed-run budget + optional recovery drill signal).
+- Replication lag guard automation is available via `scripts/replication_lag_guard.sh` (leader/follower claim-lag and replication-error SLO checks from metrics).
+- Phase 11 distributed staging gate wrapper is available via `scripts/phase11_core_staging_gate.sh` (one-command core-production release gating with optional replication lag, failover chaos-loop, and retrieval latency envelope checks).
+- Phase 11 staged wrapper can emit the Week 6 signoff bundle via `--run-production-signoff-bundle true`.
 - Consolidated release-candidate gate automation is available via `scripts/release_candidate_gate.sh` (fmt/clippy/tests/ci + SLO + recovery + ingestion throughput floor + optional audit-chain and benchmark trend gates).
 - Incident simulation gate automation is available via `scripts/incident_simulation_gate.sh` (failover + auth revocation + recovery drills) with `scripts/auth_revocation_drill.sh` for focused auth-failure drills.
 - CI pipeline (`scripts/ci.sh`) runs fmt, clippy, workspace tests, and smoke benchmark.
@@ -95,7 +116,9 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Phase 1 (Evidence Graph): complete
   - contradiction-aware retrieval behavior is enforced
   - graph expansion is bounded in retrieval graph payload assembly
+  - graph reasoning v1 node signals are exposed in retrieval responses when `return_graph=true`
   - contradiction detection F1 probe gate is enforced in benchmark quality probes (`>= 0.80`)
+  - citation coverage probe gate is enforced in benchmark quality probes (`>= 0.95`)
 - Phase 2 (Scale Path): complete
   - shard routing/placement admission is active for ingest + retrieve with epoch-aware route probes
   - failover drill validates routing epoch switch in restart and no-restart modes (`scripts/failover_drill.sh --mode both`)
@@ -107,6 +130,8 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
   - incident simulation gate and release-candidate sign-off wrapper are implemented and passing
 - Phase 4 (Scale Proof): in progress
   - objective is to close remaining world-scale proof gap (`1M -> 10M -> 100M`) with reproducible performance and freshness evidence
+  - Tier-D quick bootstrap run is passing with closure evidence (`phase4-next-tierd-quick`) and establishes `xxlarge` lane orchestration for post-xlarge execution.
+  - Tier-D staged-lite rehearsal is passing with closure evidence (`phase4-next-tierd-staged-lite`, `xxlarge`, fixture `200,000`, shard gate `>=12`).
 
 ### 2.2 Detailed Phase-Doc Closure Snapshot (2026-02-21)
 
@@ -127,6 +152,15 @@ Build and ship an evidence-first memory engine for RAG where claims, evidence, p
 - Scope note:
   - this snapshot closes the detailed Phase 06 lifecycle hardening track.
   - master-plan Phase 4 scale-proof (`1M -> 10M -> 100M`) remains in progress.
+
+### 2.4 Phase 11 Pivot Track (2026-02-22)
+
+- Detailed phase document `phase-11-core-production-and-billion-scale-readiness.md`: active.
+- Focus:
+  - prioritize core production maturity and competitive parity work while temporarily de-emphasizing additional `10M/100M` benchmark closure attempts.
+  - harden distributed operational behavior (replication lag SLO guard, control-plane maturity, release evidence discipline).
+- Execution board:
+  - 6-week week-by-week implementation board is maintained in `phase-11-core-production-and-billion-scale-readiness.md` and is the active core-development plan of record.
 
 ## 3. Success Targets (v1)
 

@@ -11,7 +11,7 @@ RUN_TAG="${DASH_PHASE4_RUN_TAG:-phase4-scale-proof}"
 RUN_ID_OVERRIDE="${DASH_PHASE4_RUN_ID:-}"
 PROFILE="${DASH_PHASE4_PROFILE:-xlarge}"
 FIXTURE_SIZE="${DASH_PHASE4_FIXTURE_SIZE:-150000}"
-ITERATIONS="${DASH_PHASE4_ITERATIONS:-1}"
+ITERATIONS="${DASH_PHASE4_ITERATIONS:-5}"
 WAL_SCALE_CLAIMS="${DASH_PHASE4_WAL_SCALE_CLAIMS:-5000}"
 BENCH_RELEASE="${DASH_PHASE4_BENCH_RELEASE:-true}"
 RETRIEVAL_WORKERS_LIST="${DASH_PHASE4_RETRIEVAL_WORKERS_LIST:-4}"
@@ -33,6 +33,20 @@ REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_REBALANCE_PROBE_KEYS_COUNT:-128}"
 REBALANCE_MAX_WAIT_SECONDS="${DASH_PHASE4_REBALANCE_MAX_WAIT_SECONDS:-30}"
 REBALANCE_TARGET_SHARDS="${DASH_PHASE4_REBALANCE_TARGET_SHARDS:-8}"
 REBALANCE_MIN_SHARDS_GATE="${DASH_PHASE4_REBALANCE_MIN_SHARDS_GATE:-8}"
+RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
+STORAGE_PROMOTION_BOUNDARY_BIND_ADDR="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_BIND_ADDR:-127.0.0.1:18080}"
+STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR:-127.0.0.1:18081}"
+STORAGE_PROMOTION_BOUNDARY_WORKERS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_WORKERS:-4}"
+STORAGE_PROMOTION_BOUNDARY_CLIENTS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_CLIENTS:-16}"
+STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER:-20}"
+STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS:-5}"
+STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS:-2000}"
+STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS:-5000}"
+STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS:-10}"
+STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR:-${SUMMARY_DIR}}"
+STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH:-docs/benchmarks/history/runs/storage-promotion-boundary-history.csv}"
+STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS:-10}"
+STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT:-50}"
 
 usage() {
   cat <<'USAGE'
@@ -68,6 +82,32 @@ Options:
   --rebalance-max-wait-seconds N          max wait per rebalance probe
   --rebalance-target-shards N             rebalance drill target shard count (default: 8)
   --rebalance-min-shards-gate N           minimum shard_count_after required by phase gate (default: 8)
+  --run-storage-promotion-boundary-guard true|false
+                                          run under-load promotion-boundary guard (default: false)
+  --storage-promotion-boundary-bind-addr HOST:PORT
+                                          retrieval bind address for promotion-boundary guard
+  --storage-promotion-boundary-ingest-bind-addr HOST:PORT
+                                          ingestion bind address for promotion-boundary bootstrap
+  --storage-promotion-boundary-workers N  retrieval workers for promotion-boundary guard
+  --storage-promotion-boundary-clients N  concurrent clients for promotion-boundary guard
+  --storage-promotion-boundary-requests-per-worker N
+                                          requests per worker for promotion-boundary guard
+  --storage-promotion-boundary-warmup-requests N
+                                          warmup requests for promotion-boundary guard
+  --storage-promotion-boundary-connect-timeout-ms N
+                                          connect timeout for promotion-boundary guard
+  --storage-promotion-boundary-read-timeout-ms N
+                                          read timeout for promotion-boundary guard
+  --storage-promotion-boundary-curl-timeout-seconds N
+                                          curl timeout for promotion-boundary guard
+  --storage-promotion-boundary-summary-dir DIR
+                                          output dir for promotion-boundary guard summaries
+  --storage-promotion-boundary-history-path PATH
+                                          CSV path for promotion-boundary trend history
+  --storage-promotion-boundary-trend-window-runs N
+                                          lookback window for trend regression checks
+  --storage-promotion-boundary-max-counter-regression-pct N
+                                          max allowed scenario counter regression percentage
   -h, --help                              Show help
 USAGE
 }
@@ -103,6 +143,20 @@ while [[ $# -gt 0 ]]; do
     --rebalance-max-wait-seconds) REBALANCE_MAX_WAIT_SECONDS="$2"; shift 2 ;;
     --rebalance-target-shards) REBALANCE_TARGET_SHARDS="$2"; shift 2 ;;
     --rebalance-min-shards-gate) REBALANCE_MIN_SHARDS_GATE="$2"; shift 2 ;;
+    --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
+    --storage-promotion-boundary-bind-addr) STORAGE_PROMOTION_BOUNDARY_BIND_ADDR="$2"; shift 2 ;;
+    --storage-promotion-boundary-ingest-bind-addr) STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR="$2"; shift 2 ;;
+    --storage-promotion-boundary-workers) STORAGE_PROMOTION_BOUNDARY_WORKERS="$2"; shift 2 ;;
+    --storage-promotion-boundary-clients) STORAGE_PROMOTION_BOUNDARY_CLIENTS="$2"; shift 2 ;;
+    --storage-promotion-boundary-requests-per-worker) STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER="$2"; shift 2 ;;
+    --storage-promotion-boundary-warmup-requests) STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS="$2"; shift 2 ;;
+    --storage-promotion-boundary-connect-timeout-ms) STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS="$2"; shift 2 ;;
+    --storage-promotion-boundary-read-timeout-ms) STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS="$2"; shift 2 ;;
+    --storage-promotion-boundary-curl-timeout-seconds) STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --storage-promotion-boundary-summary-dir) STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR="$2"; shift 2 ;;
+    --storage-promotion-boundary-history-path) STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH="$2"; shift 2 ;;
+    --storage-promotion-boundary-trend-window-runs) STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS="$2"; shift 2 ;;
+    --storage-promotion-boundary-max-counter-regression-pct) STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -112,12 +166,21 @@ for required in "${FIXTURE_SIZE}" "${ITERATIONS}" "${WAL_SCALE_CLAIMS}" "${RETRI
   "${RETRIEVAL_REQUESTS_PER_WORKER}" "${INGESTION_CLIENTS}" "${INGESTION_REQUESTS_PER_WORKER}" \
   "${INGEST_FRESHNESS_P95_SLO_MS}" "${PLACEMENT_RELOAD_INTERVAL_MS}" "${FAILOVER_MAX_WAIT_SECONDS}" \
   "${REBALANCE_REQUIRE_MOVED_KEYS}" "${REBALANCE_PROBE_KEYS_COUNT}" "${REBALANCE_MAX_WAIT_SECONDS}" \
-  "${REBALANCE_TARGET_SHARDS}" "${REBALANCE_MIN_SHARDS_GATE}"; do
+  "${REBALANCE_TARGET_SHARDS}" "${REBALANCE_MIN_SHARDS_GATE}" \
+  "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}" "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}" "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS}"; do
   if [[ ! "${required}" =~ ^[0-9]+$ ]] || [[ "${required}" -eq 0 ]]; then
     echo "all numeric options must be positive integers" >&2
     exit 2
   fi
 done
+
+if [[ ! "${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}" =~ ^[0-9]+$ ]]; then
+  echo "--storage-promotion-boundary-warmup-requests must be a non-negative integer" >&2
+  exit 2
+fi
 
 if [[ "${REBALANCE_TARGET_SHARDS}" -lt 2 ]]; then
   echo "--rebalance-target-shards must be >= 2" >&2
@@ -153,7 +216,22 @@ case "${RUN_REBALANCE_DRILL}" in
     ;;
 esac
 
-mkdir -p "$(dirname "${HISTORY_PATH}")" "${SUMMARY_DIR}" "${SCORECARD_DIR}"
+case "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}" in
+  true|false) ;;
+  *)
+    echo "--run-storage-promotion-boundary-guard must be true or false" >&2
+    exit 2
+    ;;
+esac
+
+if ! awk -v v="${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" \
+  'BEGIN { exit !(v ~ /^[0-9]+([.][0-9]+)?$/) }'; then
+  echo "--storage-promotion-boundary-max-counter-regression-pct must be a non-negative number" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "${HISTORY_PATH}")" "${SUMMARY_DIR}" "${SCORECARD_DIR}" \
+  "${STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR}" "$(dirname "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}")"
 
 RUN_STAMP="$(date -u +%Y%m%d-%H%M%S)"
 RUN_ID="${RUN_STAMP}-${RUN_TAG}"
@@ -168,9 +246,12 @@ RETR_TMP="$(mktemp)"
 INGEST_TMP="$(mktemp)"
 FAILOVER_TMP="$(mktemp)"
 REBALANCE_TMP="$(mktemp)"
+STORAGE_PROMOTION_BOUNDARY_TMP="$(mktemp)"
+STORAGE_PROMOTION_TREND_TMP="$(mktemp)"
 
 cleanup() {
-  rm -f "${BENCH_TMP}" "${RETR_TMP}" "${INGEST_TMP}" "${FAILOVER_TMP}" "${REBALANCE_TMP}"
+  rm -f "${BENCH_TMP}" "${RETR_TMP}" "${INGEST_TMP}" "${FAILOVER_TMP}" "${REBALANCE_TMP}" \
+    "${STORAGE_PROMOTION_BOUNDARY_TMP}" "${STORAGE_PROMOTION_TREND_TMP}"
 }
 trap cleanup EXIT
 
@@ -179,6 +260,8 @@ status_retrieval="FAIL"
 status_ingestion="FAIL"
 status_failover="FAIL"
 status_rebalance="FAIL"
+status_storage_promotion_boundary="SKIP"
+status_storage_promotion_boundary_trend="SKIP"
 overall_status="PASS"
 
 baseline_avg_ms="n/a"
@@ -202,6 +285,17 @@ rebalance_summary_path="n/a"
 rebalance_target_shards="n/a"
 rebalance_shard_count_after="n/a"
 rebalance_shard_gate_pass="n/a"
+storage_promotion_boundary_summary_path="n/a"
+storage_promotion_boundary_history_path="${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}"
+storage_promotion_boundary_replay_counter="n/a"
+storage_promotion_boundary_segment_plus_wal_delta_counter="n/a"
+storage_promotion_boundary_segment_fully_promoted_counter="n/a"
+storage_promotion_boundary_trend_window_samples="0"
+storage_promotion_boundary_replay_regression_pct="n/a"
+storage_promotion_boundary_segment_plus_wal_delta_regression_pct="n/a"
+storage_promotion_boundary_segment_fully_promoted_regression_pct="n/a"
+storage_promotion_boundary_max_regression_pct_observed="n/a"
+storage_promotion_boundary_trend_pass="n/a"
 
 metric_value_from_markdown_table() {
   local path="$1"
@@ -228,6 +322,61 @@ table_col() {
   local row="$1"
   local col="$2"
   printf '%s\n' "${row}" | awk -F'|' -v idx="${col}" '{value=$idx; gsub(/^[ \t]+|[ \t]+$/, "", value); print value}'
+}
+
+promotion_guard_table_col() {
+  local path="$1"
+  local scenario="$2"
+  local column="$3"
+  awk -F'|' -v scenario="${scenario}" -v column="${column}" '
+    {
+      key=$2
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      if (key == scenario) {
+        value=$column
+        gsub(/^[ \t]+|[ \t]+$/, "", value)
+        print value
+        exit
+      }
+    }
+  ' "${path}"
+}
+
+is_non_negative_number() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+average_recent_history_counter() {
+  local column="$1"
+  local status_column="$2"
+  local workload_key="$3"
+  awk -F',' -v workload_key="${workload_key}" -v value_col="${column}" -v status_col="${status_column}" '
+    NR > 1 && $4 == workload_key && $3 == "PASS" && $status_col == "PASS" {
+      value=$value_col
+      if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+        print value
+      }
+    }
+  ' "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" \
+    | tail -n "${STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS}" \
+    | awk '{sum+=$1; n++} END {if (n > 0) printf "%.4f", sum/n}'
+}
+
+recent_history_counter_samples() {
+  local column="$1"
+  local status_column="$2"
+  local workload_key="$3"
+  awk -F',' -v workload_key="${workload_key}" -v value_col="${column}" -v status_col="${status_column}" '
+    NR > 1 && $4 == workload_key && $3 == "PASS" && $status_col == "PASS" {
+      value=$value_col
+      if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+        print value
+      }
+    }
+  ' "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" \
+    | tail -n "${STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS}" \
+    | awk 'END {print NR+0}'
 }
 
 bench_cmd=(cargo run -p benchmark-smoke --bin benchmark-smoke --)
@@ -366,6 +515,175 @@ else
   printf '[rebalance-drill] skipped (run_rebalance_drill=false)\n' > "${REBALANCE_TMP}"
 fi
 
+storage_workload_key="${STORAGE_PROMOTION_BOUNDARY_WORKERS}_${STORAGE_PROMOTION_BOUNDARY_CLIENTS}_${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}_${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}"
+if [[ "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}" == "true" ]]; then
+  status_storage_promotion_boundary="FAIL"
+  status_storage_promotion_boundary_trend="FAIL"
+  if scripts/storage_promotion_boundary_guard.sh \
+    --bind-addr "${STORAGE_PROMOTION_BOUNDARY_BIND_ADDR}" \
+    --ingest-bind-addr "${STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR}" \
+    --workers "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" \
+    --clients "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}" \
+    --requests-per-worker "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}" \
+    --warmup-requests "${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}" \
+    --connect-timeout-ms "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}" \
+    --read-timeout-ms "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}" \
+    --curl-timeout-seconds "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}" \
+    --summary-dir "${STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR}" \
+    --run-tag "${RUN_ID}-phase4" >"${STORAGE_PROMOTION_BOUNDARY_TMP}" 2>&1; then
+    status_storage_promotion_boundary="PASS"
+    storage_promotion_boundary_summary_path="$(awk -F': ' '/\[promotion-boundary-guard\] summary:/{print $2; exit}' "${STORAGE_PROMOTION_BOUNDARY_TMP}")"
+    if [[ -z "${storage_promotion_boundary_summary_path}" || ! -f "${storage_promotion_boundary_summary_path}" ]]; then
+      status_storage_promotion_boundary="FAIL"
+      status_storage_promotion_boundary_trend="FAIL"
+      overall_status="FAIL"
+      printf '[phase4-scale-proof] storage promotion boundary guard summary not found\n' >> "${STORAGE_PROMOTION_TREND_TMP}"
+    else
+      replay_status="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "replay_only" 3)"
+      segment_plus_wal_status="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "segment_base_plus_wal_delta" 3)"
+      segment_fully_promoted_status="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "segment_base_fully_promoted" 3)"
+
+      replay_counter="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "replay_only" 9)"
+      segment_plus_wal_counter="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "segment_base_plus_wal_delta" 9)"
+      segment_fully_promoted_counter="$(promotion_guard_table_col "${storage_promotion_boundary_summary_path}" "segment_base_fully_promoted" 9)"
+
+      if [[ "${replay_status}" != "PASS" || "${segment_plus_wal_status}" != "PASS" || "${segment_fully_promoted_status}" != "PASS" ]]; then
+        status_storage_promotion_boundary="FAIL"
+        status_storage_promotion_boundary_trend="FAIL"
+        overall_status="FAIL"
+        printf '[phase4-scale-proof] storage promotion boundary guard scenario status is not PASS\n' >> "${STORAGE_PROMOTION_TREND_TMP}"
+      elif ! is_non_negative_number "${replay_counter}" || ! is_non_negative_number "${segment_plus_wal_counter}" || ! is_non_negative_number "${segment_fully_promoted_counter}"; then
+        status_storage_promotion_boundary="FAIL"
+        status_storage_promotion_boundary_trend="FAIL"
+        overall_status="FAIL"
+        printf '[phase4-scale-proof] storage promotion boundary counters are not numeric\n' >> "${STORAGE_PROMOTION_TREND_TMP}"
+      else
+        storage_promotion_boundary_replay_counter="${replay_counter}"
+        storage_promotion_boundary_segment_plus_wal_delta_counter="${segment_plus_wal_counter}"
+        storage_promotion_boundary_segment_fully_promoted_counter="${segment_fully_promoted_counter}"
+
+        if [[ ! -f "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" ]]; then
+          cat > "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" <<'EOF_PROMOTION_HISTORY'
+run_utc,run_id,decision,workload_key,workers,clients,requests_per_worker,warmup_requests,replay_status,replay_counter,segment_plus_wal_delta_status,segment_plus_wal_delta_counter,segment_fully_promoted_status,segment_fully_promoted_counter,trend_pass,max_regression_pct_observed,max_regression_pct_threshold
+EOF_PROMOTION_HISTORY
+        fi
+
+        replay_baseline_avg="$(average_recent_history_counter 10 9 "${storage_workload_key}")"
+        segment_plus_wal_baseline_avg="$(average_recent_history_counter 12 11 "${storage_workload_key}")"
+        segment_fully_promoted_baseline_avg="$(average_recent_history_counter 14 13 "${storage_workload_key}")"
+
+        replay_samples="$(recent_history_counter_samples 10 9 "${storage_workload_key}")"
+        segment_plus_wal_samples="$(recent_history_counter_samples 12 11 "${storage_workload_key}")"
+        segment_fully_promoted_samples="$(recent_history_counter_samples 14 13 "${storage_workload_key}")"
+
+        storage_promotion_boundary_trend_window_samples="$(( replay_samples ))"
+        if (( segment_plus_wal_samples < storage_promotion_boundary_trend_window_samples )); then
+          storage_promotion_boundary_trend_window_samples="${segment_plus_wal_samples}"
+        fi
+        if (( segment_fully_promoted_samples < storage_promotion_boundary_trend_window_samples )); then
+          storage_promotion_boundary_trend_window_samples="${segment_fully_promoted_samples}"
+        fi
+
+        trend_baseline_count=0
+        trend_fail=false
+        max_regression_pct=0
+        storage_promotion_boundary_replay_regression_pct="n/a"
+        storage_promotion_boundary_segment_plus_wal_delta_regression_pct="n/a"
+        storage_promotion_boundary_segment_fully_promoted_regression_pct="n/a"
+
+        if is_non_negative_number "${replay_baseline_avg}"; then
+          trend_baseline_count=$((trend_baseline_count + 1))
+          storage_promotion_boundary_replay_regression_pct="$(awk -v current="${replay_counter}" -v baseline="${replay_baseline_avg}" 'BEGIN { if (baseline <= 0 || current >= baseline) { printf "0.00" } else { printf "%.2f", ((baseline - current) * 100.0) / baseline } }')"
+          if awk -v actual="${storage_promotion_boundary_replay_regression_pct}" -v max="${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" 'BEGIN { exit !(actual > max) }'; then
+            trend_fail=true
+          fi
+          max_regression_pct="$(awk -v current_max="${max_regression_pct}" -v candidate="${storage_promotion_boundary_replay_regression_pct}" 'BEGIN { if (candidate > current_max) printf "%.2f", candidate; else printf "%.2f", current_max }')"
+        fi
+
+        if is_non_negative_number "${segment_plus_wal_baseline_avg}"; then
+          trend_baseline_count=$((trend_baseline_count + 1))
+          storage_promotion_boundary_segment_plus_wal_delta_regression_pct="$(awk -v current="${segment_plus_wal_counter}" -v baseline="${segment_plus_wal_baseline_avg}" 'BEGIN { if (baseline <= 0 || current >= baseline) { printf "0.00" } else { printf "%.2f", ((baseline - current) * 100.0) / baseline } }')"
+          if awk -v actual="${storage_promotion_boundary_segment_plus_wal_delta_regression_pct}" -v max="${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" 'BEGIN { exit !(actual > max) }'; then
+            trend_fail=true
+          fi
+          max_regression_pct="$(awk -v current_max="${max_regression_pct}" -v candidate="${storage_promotion_boundary_segment_plus_wal_delta_regression_pct}" 'BEGIN { if (candidate > current_max) printf "%.2f", candidate; else printf "%.2f", current_max }')"
+        fi
+
+        if is_non_negative_number "${segment_fully_promoted_baseline_avg}"; then
+          trend_baseline_count=$((trend_baseline_count + 1))
+          storage_promotion_boundary_segment_fully_promoted_regression_pct="$(awk -v current="${segment_fully_promoted_counter}" -v baseline="${segment_fully_promoted_baseline_avg}" 'BEGIN { if (baseline <= 0 || current >= baseline) { printf "0.00" } else { printf "%.2f", ((baseline - current) * 100.0) / baseline } }')"
+          if awk -v actual="${storage_promotion_boundary_segment_fully_promoted_regression_pct}" -v max="${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" 'BEGIN { exit !(actual > max) }'; then
+            trend_fail=true
+          fi
+          max_regression_pct="$(awk -v current_max="${max_regression_pct}" -v candidate="${storage_promotion_boundary_segment_fully_promoted_regression_pct}" 'BEGIN { if (candidate > current_max) printf "%.2f", candidate; else printf "%.2f", current_max }')"
+        fi
+
+        if (( trend_baseline_count == 0 )); then
+          status_storage_promotion_boundary_trend="PASS"
+          storage_promotion_boundary_trend_pass="true"
+          storage_promotion_boundary_max_regression_pct_observed="0.00"
+          printf '[phase4-scale-proof] storage promotion boundary trend baseline unavailable (bootstrap run)\n' >> "${STORAGE_PROMOTION_TREND_TMP}"
+        elif [[ "${trend_fail}" == "true" ]]; then
+          status_storage_promotion_boundary_trend="FAIL"
+          storage_promotion_boundary_trend_pass="false"
+          storage_promotion_boundary_max_regression_pct_observed="${max_regression_pct}"
+          overall_status="FAIL"
+          printf '[phase4-scale-proof] storage promotion boundary trend regression exceeded threshold\n' >> "${STORAGE_PROMOTION_TREND_TMP}"
+        else
+          status_storage_promotion_boundary_trend="PASS"
+          storage_promotion_boundary_trend_pass="true"
+          storage_promotion_boundary_max_regression_pct_observed="${max_regression_pct}"
+        fi
+
+        {
+          echo "[phase4-scale-proof] storage_workload_key=${storage_workload_key}"
+          echo "[phase4-scale-proof] replay_baseline_avg=${replay_baseline_avg:-n/a} replay_counter=${replay_counter} replay_regression_pct=${storage_promotion_boundary_replay_regression_pct}"
+          echo "[phase4-scale-proof] segment_plus_wal_baseline_avg=${segment_plus_wal_baseline_avg:-n/a} segment_plus_wal_counter=${segment_plus_wal_counter} segment_plus_wal_regression_pct=${storage_promotion_boundary_segment_plus_wal_delta_regression_pct}"
+          echo "[phase4-scale-proof] segment_fully_promoted_baseline_avg=${segment_fully_promoted_baseline_avg:-n/a} segment_fully_promoted_counter=${segment_fully_promoted_counter} segment_fully_promoted_regression_pct=${storage_promotion_boundary_segment_fully_promoted_regression_pct}"
+          echo "[phase4-scale-proof] trend_window_samples=${storage_promotion_boundary_trend_window_samples}"
+          echo "[phase4-scale-proof] max_allowed_regression_pct=${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}"
+          echo "[phase4-scale-proof] max_observed_regression_pct=${storage_promotion_boundary_max_regression_pct_observed}"
+          echo "[phase4-scale-proof] trend_pass=${storage_promotion_boundary_trend_pass}"
+        } >> "${STORAGE_PROMOTION_TREND_TMP}"
+      fi
+    fi
+  else
+    status_storage_promotion_boundary="FAIL"
+    status_storage_promotion_boundary_trend="FAIL"
+    storage_promotion_boundary_trend_pass="false"
+    overall_status="FAIL"
+  fi
+
+  if [[ ! -f "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" ]]; then
+    cat > "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}" <<'EOF_PROMOTION_HISTORY'
+run_utc,run_id,decision,workload_key,workers,clients,requests_per_worker,warmup_requests,replay_status,replay_counter,segment_plus_wal_delta_status,segment_plus_wal_delta_counter,segment_fully_promoted_status,segment_fully_promoted_counter,trend_pass,max_regression_pct_observed,max_regression_pct_threshold
+EOF_PROMOTION_HISTORY
+  fi
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${RUN_ID}" \
+    "${status_storage_promotion_boundary}" \
+    "${storage_workload_key}" \
+    "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" \
+    "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}" \
+    "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}" \
+    "${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}" \
+    "${replay_status:-n/a}" \
+    "${storage_promotion_boundary_replay_counter}" \
+    "${segment_plus_wal_status:-n/a}" \
+    "${storage_promotion_boundary_segment_plus_wal_delta_counter}" \
+    "${segment_fully_promoted_status:-n/a}" \
+    "${storage_promotion_boundary_segment_fully_promoted_counter}" \
+    "${storage_promotion_boundary_trend_pass}" \
+    "${storage_promotion_boundary_max_regression_pct_observed}" \
+    "${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" >> "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}"
+else
+  status_storage_promotion_boundary="SKIP"
+  status_storage_promotion_boundary_trend="SKIP"
+  printf '[storage-promotion-boundary] skipped (run_storage_promotion_boundary_guard=false)\n' > "${STORAGE_PROMOTION_BOUNDARY_TMP}"
+  printf '[storage-promotion-boundary-trend] skipped (run_storage_promotion_boundary_guard=false)\n' > "${STORAGE_PROMOTION_TREND_TMP}"
+fi
+
 cat > "${SUMMARY_PATH}" <<EOF_SUMMARY
 # DASH Phase 4 Scale Proof Run
 
@@ -385,6 +703,8 @@ cat > "${SUMMARY_PATH}" <<EOF_SUMMARY
 | ingestion transport concurrency | ${status_ingestion} |
 | failover drill (${FAILOVER_MODE}) | ${status_failover} |
 | rebalance drill (split + epoch transition) | ${status_rebalance} |
+| storage promotion-boundary guard | ${status_storage_promotion_boundary} |
+| storage promotion-boundary trend | ${status_storage_promotion_boundary_trend} |
 
 ## Scale Metrics
 
@@ -407,12 +727,24 @@ cat > "${SUMMARY_PATH}" <<EOF_SUMMARY
 | rebalance_shard_count_after | ${rebalance_shard_count_after} |
 | rebalance_min_shards_gate | ${REBALANCE_MIN_SHARDS_GATE} |
 | rebalance_shard_gate_pass | ${rebalance_shard_gate_pass} |
+| storage_promotion_boundary_replay_counter | ${storage_promotion_boundary_replay_counter} |
+| storage_promotion_boundary_segment_plus_wal_delta_counter | ${storage_promotion_boundary_segment_plus_wal_delta_counter} |
+| storage_promotion_boundary_segment_fully_promoted_counter | ${storage_promotion_boundary_segment_fully_promoted_counter} |
+| storage_promotion_boundary_trend_window_samples | ${storage_promotion_boundary_trend_window_samples} |
+| storage_promotion_boundary_replay_regression_pct | ${storage_promotion_boundary_replay_regression_pct} |
+| storage_promotion_boundary_segment_plus_wal_delta_regression_pct | ${storage_promotion_boundary_segment_plus_wal_delta_regression_pct} |
+| storage_promotion_boundary_segment_fully_promoted_regression_pct | ${storage_promotion_boundary_segment_fully_promoted_regression_pct} |
+| storage_promotion_boundary_max_regression_pct_observed | ${storage_promotion_boundary_max_regression_pct_observed} |
+| storage_promotion_boundary_max_counter_regression_pct | ${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT} |
+| storage_promotion_boundary_trend_pass | ${storage_promotion_boundary_trend_pass} |
 
 ## Artifacts
 
 - retrieval_concurrency_summary: ${retrieval_summary_path}
 - ingestion_concurrency_summary: ${ingestion_summary_path}
 - rebalance_summary: ${rebalance_summary_path}
+- storage_promotion_boundary_summary: ${storage_promotion_boundary_summary_path}
+- storage_promotion_boundary_history: ${storage_promotion_boundary_history_path}
 
 ## Command Output: Benchmark
 
@@ -442,6 +774,18 @@ $(cat "${FAILOVER_TMP}")
 
 \`\`\`text
 $(cat "${REBALANCE_TMP}")
+\`\`\`
+
+## Command Output: Storage Promotion Boundary Guard
+
+\`\`\`text
+$(cat "${STORAGE_PROMOTION_BOUNDARY_TMP}")
+\`\`\`
+
+## Command Output: Storage Promotion Boundary Trend
+
+\`\`\`text
+$(cat "${STORAGE_PROMOTION_TREND_TMP}")
 \`\`\`
 EOF_SUMMARY
 

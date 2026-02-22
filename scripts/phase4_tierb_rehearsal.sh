@@ -39,7 +39,7 @@ RUN_CLOSURE_CHECKLIST="${DASH_PHASE4_TIERB_RUN_CLOSURE_CHECKLIST:-true}"
 if [[ "${MODE}" == "staged" ]]; then
   PROFILE="${DASH_PHASE4_TIERB_PROFILE:-xlarge}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERB_FIXTURE_SIZE:-150000}"
-  ITERATIONS="${DASH_PHASE4_TIERB_ITERATIONS:-1}"
+  ITERATIONS="${DASH_PHASE4_TIERB_ITERATIONS:-5}"
   BENCH_RELEASE="${DASH_PHASE4_TIERB_BENCH_RELEASE:-true}"
   FAILOVER_MODE="${DASH_PHASE4_TIERB_FAILOVER_MODE:-both}"
   RETRIEVAL_WORKERS_LIST="${DASH_PHASE4_TIERB_RETRIEVAL_WORKERS_LIST:-4}"
@@ -51,10 +51,11 @@ if [[ "${MODE}" == "staged" ]]; then
   RETRIEVAL_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_RETRIEVAL_WARMUP_REQUESTS:-4}"
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_INGESTION_WARMUP_REQUESTS:-4}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERB_REBALANCE_PROBE_KEYS_COUNT:-256}"
+  RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERB_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-true}"
 else
   PROFILE="${DASH_PHASE4_TIERB_PROFILE:-smoke}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERB_FIXTURE_SIZE:-4000}"
-  ITERATIONS="${DASH_PHASE4_TIERB_ITERATIONS:-1}"
+  ITERATIONS="${DASH_PHASE4_TIERB_ITERATIONS:-5}"
   BENCH_RELEASE="${DASH_PHASE4_TIERB_BENCH_RELEASE:-false}"
   FAILOVER_MODE="${DASH_PHASE4_TIERB_FAILOVER_MODE:-no-restart}"
   RETRIEVAL_WORKERS_LIST="${DASH_PHASE4_TIERB_RETRIEVAL_WORKERS_LIST:-2}"
@@ -66,6 +67,7 @@ else
   RETRIEVAL_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_RETRIEVAL_WARMUP_REQUESTS:-1}"
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_INGESTION_WARMUP_REQUESTS:-1}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERB_REBALANCE_PROBE_KEYS_COUNT:-64}"
+  RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERB_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
 fi
 
 usage() {
@@ -98,6 +100,8 @@ Options:
   --placement-reload-interval-ms N       Placement reload interval (default: 200)
   --failover-max-wait-seconds N          Failover max wait (default: 30)
   --run-closure-checklist true|false     Run closure checklist gate (default: true)
+  --run-storage-promotion-boundary-guard true|false
+                                         Enable promotion-boundary guard inside scale proof
   -h, --help                             Show help
 
 Any extra args after `--` are forwarded to `phase4_scale_proof.sh`.
@@ -130,6 +134,7 @@ while [[ $# -gt 0 ]]; do
     --placement-reload-interval-ms) PLACEMENT_RELOAD_INTERVAL_MS="$2"; shift 2 ;;
     --failover-max-wait-seconds) FAILOVER_MAX_WAIT_SECONDS="$2"; shift 2 ;;
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
+    --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --)
       shift
@@ -160,6 +165,14 @@ case "${RUN_CLOSURE_CHECKLIST}" in
     ;;
 esac
 
+case "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}" in
+  true|false) ;;
+  *)
+    echo "--run-storage-promotion-boundary-guard must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 for numeric in "${FIXTURE_SIZE}" "${ITERATIONS}" "${TARGET_SHARDS}" "${MIN_SHARDS_GATE}" \
   "${RETRIEVAL_CLIENTS}" "${INGESTION_CLIENTS}" "${RETRIEVAL_REQUESTS_PER_WORKER}" \
   "${INGESTION_REQUESTS_PER_WORKER}" "${RETRIEVAL_WARMUP_REQUESTS}" "${INGESTION_WARMUP_REQUESTS}" \
@@ -185,6 +198,7 @@ echo "[phase4-tierb] run_id=${RUN_ID}"
 echo "[phase4-tierb] mode=${MODE}"
 echo "[phase4-tierb] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=${ITERATIONS}"
 echo "[phase4-tierb] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
+echo "[phase4-tierb] storage_promotion_boundary_guard=${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
 
 cmd=(
   scripts/phase4_scale_proof.sh
@@ -210,6 +224,7 @@ cmd=(
   --rebalance-probe-keys-count "${REBALANCE_PROBE_KEYS_COUNT}"
   --rebalance-require-moved-keys "${REBALANCE_REQUIRE_MOVED_KEYS}"
   --rebalance-max-wait-seconds "${REBALANCE_MAX_WAIT_SECONDS}"
+  --run-storage-promotion-boundary-guard "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
 )
 
 if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then

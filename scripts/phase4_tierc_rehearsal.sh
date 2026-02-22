@@ -38,6 +38,7 @@ RUN_RECOVERY_DRILL="${DASH_PHASE4_TIERC_RUN_RECOVERY_DRILL:-true}"
 RUN_INCIDENT_GATE="${DASH_PHASE4_TIERC_RUN_INCIDENT_GATE:-true}"
 RUN_CLOSURE_CHECKLIST="${DASH_PHASE4_TIERC_RUN_CLOSURE_CHECKLIST:-true}"
 RUN_SCALE_PROOF="${DASH_PHASE4_TIERC_RUN_SCALE_PROOF:-true}"
+RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERC_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
 RECOVERY_MAX_RTO_SECONDS="${DASH_PHASE4_TIERC_RECOVERY_MAX_RTO_SECONDS:-120}"
 INCIDENT_FAILOVER_MODE="${DASH_PHASE4_TIERC_INCIDENT_FAILOVER_MODE:-both}"
 INCIDENT_FAILOVER_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERC_INCIDENT_FAILOVER_MAX_WAIT_SECONDS:-30}"
@@ -52,7 +53,7 @@ SUMMARY_PATH_OVERRIDE="${DASH_PHASE4_TIERC_SUMMARY_PATH:-}"
 if [[ "${MODE}" == "staged" ]]; then
   PROFILE="${DASH_PHASE4_TIERC_PROFILE:-xlarge}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERC_FIXTURE_SIZE:-150000}"
-  ITERATIONS="${DASH_PHASE4_TIERC_ITERATIONS:-1}"
+  ITERATIONS="${DASH_PHASE4_TIERC_ITERATIONS:-5}"
   BENCH_RELEASE="${DASH_PHASE4_TIERC_BENCH_RELEASE:-true}"
   FAILOVER_MODE="${DASH_PHASE4_TIERC_FAILOVER_MODE:-both}"
   RETRIEVAL_WORKERS_LIST="${DASH_PHASE4_TIERC_RETRIEVAL_WORKERS_LIST:-4}"
@@ -64,10 +65,11 @@ if [[ "${MODE}" == "staged" ]]; then
   RETRIEVAL_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_RETRIEVAL_WARMUP_REQUESTS:-4}"
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_INGESTION_WARMUP_REQUESTS:-4}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERC_REBALANCE_PROBE_KEYS_COUNT:-256}"
+  RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERC_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-true}"
 else
   PROFILE="${DASH_PHASE4_TIERC_PROFILE:-smoke}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERC_FIXTURE_SIZE:-6000}"
-  ITERATIONS="${DASH_PHASE4_TIERC_ITERATIONS:-1}"
+  ITERATIONS="${DASH_PHASE4_TIERC_ITERATIONS:-5}"
   BENCH_RELEASE="${DASH_PHASE4_TIERC_BENCH_RELEASE:-false}"
   FAILOVER_MODE="${DASH_PHASE4_TIERC_FAILOVER_MODE:-both}"
   RETRIEVAL_WORKERS_LIST="${DASH_PHASE4_TIERC_RETRIEVAL_WORKERS_LIST:-2}"
@@ -79,6 +81,7 @@ else
   RETRIEVAL_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_RETRIEVAL_WARMUP_REQUESTS:-1}"
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_INGESTION_WARMUP_REQUESTS:-1}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERC_REBALANCE_PROBE_KEYS_COUNT:-96}"
+  RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERC_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
 fi
 
 usage() {
@@ -115,6 +118,8 @@ Options:
   --run-incident-gate true|false         Run incident simulation gate step (default: true)
   --run-closure-checklist true|false     Run tier-c closure checklist (default: true)
   --run-scale-proof true|false           Run phase4_scale_proof step (default: true)
+  --run-storage-promotion-boundary-guard true|false
+                                         Enable promotion-boundary guard inside scale proof
   --summary-path PATH                    Existing scale-proof summary path to reuse when
                                          --run-scale-proof=false (or to force closure input)
   --recovery-max-rto-seconds N           Recovery drill max RTO (default: 120)
@@ -163,6 +168,7 @@ while [[ $# -gt 0 ]]; do
     --run-incident-gate) RUN_INCIDENT_GATE="$2"; shift 2 ;;
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
     --run-scale-proof) RUN_SCALE_PROOF="$2"; shift 2 ;;
+    --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
     --summary-path) SUMMARY_PATH_OVERRIDE="$2"; shift 2 ;;
     --recovery-max-rto-seconds) RECOVERY_MAX_RTO_SECONDS="$2"; shift 2 ;;
     --recovery-artifact-dir) RECOVERY_ARTIFACT_DIR="$2"; shift 2 ;;
@@ -196,7 +202,7 @@ case "${MODE}" in
 esac
 
 for bool_opt in "${RUN_RECOVERY_DRILL}" "${RUN_INCIDENT_GATE}" "${RUN_CLOSURE_CHECKLIST}" \
-  "${RUN_SCALE_PROOF}" "${BENCH_RELEASE}"; do
+  "${RUN_SCALE_PROOF}" "${BENCH_RELEASE}" "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"; do
   case "${bool_opt}" in
     true|false) ;;
     *)
@@ -250,6 +256,7 @@ echo "[phase4-tierc] mode=${MODE}"
 echo "[phase4-tierc] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=${ITERATIONS}"
 echo "[phase4-tierc] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
 echo "[phase4-tierc] scale_proof=${RUN_SCALE_PROOF} recovery=${RUN_RECOVERY_DRILL} incident=${RUN_INCIDENT_GATE} closure=${RUN_CLOSURE_CHECKLIST}"
+echo "[phase4-tierc] storage_promotion_boundary_guard=${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
 
 cmd=(
   scripts/phase4_scale_proof.sh
@@ -270,6 +277,7 @@ cmd=(
   --retrieval-warmup-requests "${RETRIEVAL_WARMUP_REQUESTS}"
   --ingestion-warmup-requests "${INGESTION_WARMUP_REQUESTS}"
   --run-rebalance-drill true
+  --run-storage-promotion-boundary-guard "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
   --rebalance-target-shards "${TARGET_SHARDS}"
   --rebalance-min-shards-gate "${MIN_SHARDS_GATE}"
   --rebalance-probe-keys-count "${REBALANCE_PROBE_KEYS_COUNT}"
