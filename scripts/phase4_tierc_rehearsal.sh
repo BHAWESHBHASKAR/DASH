@@ -66,6 +66,7 @@ if [[ "${MODE}" == "staged" ]]; then
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_INGESTION_WARMUP_REQUESTS:-4}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERC_REBALANCE_PROBE_KEYS_COUNT:-256}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERC_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-true}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERC_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-3}"
 else
   PROFILE="${DASH_PHASE4_TIERC_PROFILE:-smoke}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERC_FIXTURE_SIZE:-6000}"
@@ -82,6 +83,7 @@ else
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERC_INGESTION_WARMUP_REQUESTS:-1}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERC_REBALANCE_PROBE_KEYS_COUNT:-96}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERC_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERC_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-0}"
 fi
 
 usage() {
@@ -120,6 +122,8 @@ Options:
   --run-scale-proof true|false           Run phase4_scale_proof step (default: true)
   --run-storage-promotion-boundary-guard true|false
                                          Enable promotion-boundary guard inside scale proof
+  --storage-promotion-boundary-min-trend-samples N
+                                         Minimum required promotion-boundary trend samples
   --summary-path PATH                    Existing scale-proof summary path to reuse when
                                          --run-scale-proof=false (or to force closure input)
   --recovery-max-rto-seconds N           Recovery drill max RTO (default: 120)
@@ -169,6 +173,7 @@ while [[ $# -gt 0 ]]; do
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
     --run-scale-proof) RUN_SCALE_PROOF="$2"; shift 2 ;;
     --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
+    --storage-promotion-boundary-min-trend-samples) STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="$2"; shift 2 ;;
     --summary-path) SUMMARY_PATH_OVERRIDE="$2"; shift 2 ;;
     --recovery-max-rto-seconds) RECOVERY_MAX_RTO_SECONDS="$2"; shift 2 ;;
     --recovery-artifact-dir) RECOVERY_ARTIFACT_DIR="$2"; shift 2 ;;
@@ -241,6 +246,11 @@ for numeric in "${FIXTURE_SIZE}" "${ITERATIONS}" "${TARGET_SHARDS}" "${MIN_SHARD
   fi
 done
 
+if [[ ! "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}" =~ ^[0-9]+$ ]]; then
+  echo "--storage-promotion-boundary-min-trend-samples must be a non-negative integer" >&2
+  exit 2
+fi
+
 if [[ "${TARGET_SHARDS}" -lt 8 ]]; then
   echo "--target-shards must be >= 8 for Tier-C rehearsal" >&2
   exit 2
@@ -257,6 +267,7 @@ echo "[phase4-tierc] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=
 echo "[phase4-tierc] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
 echo "[phase4-tierc] scale_proof=${RUN_SCALE_PROOF} recovery=${RUN_RECOVERY_DRILL} incident=${RUN_INCIDENT_GATE} closure=${RUN_CLOSURE_CHECKLIST}"
 echo "[phase4-tierc] storage_promotion_boundary_guard=${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+echo "[phase4-tierc] storage_promotion_boundary_min_trend_samples=${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
 
 cmd=(
   scripts/phase4_scale_proof.sh
@@ -278,6 +289,7 @@ cmd=(
   --ingestion-warmup-requests "${INGESTION_WARMUP_REQUESTS}"
   --run-rebalance-drill true
   --run-storage-promotion-boundary-guard "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+  --storage-promotion-boundary-min-trend-samples "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
   --rebalance-target-shards "${TARGET_SHARDS}"
   --rebalance-min-shards-gate "${MIN_SHARDS_GATE}"
   --rebalance-probe-keys-count "${REBALANCE_PROBE_KEYS_COUNT}"
@@ -292,7 +304,21 @@ if [[ "${RUN_SCALE_PROOF}" == "true" ]]; then
     cmd+=("${EXTRA_ARGS[@]}")
   fi
 
-  "${cmd[@]}"
+  scale_output=""
+  scale_status=0
+  set +e
+  scale_output="$("${cmd[@]}" 2>&1)"
+  scale_status=$?
+  set -e
+  printf '%s\n' "${scale_output}"
+  if [[ "${scale_status}" -ne 0 ]]; then
+    exit "${scale_status}"
+  fi
+
+  detected_summary_path="$(printf '%s\n' "${scale_output}" | sed -n 's/^\[phase4-scale-proof\] summary: //p' | tail -n 1)"
+  if [[ -z "${SUMMARY_PATH}" && -n "${detected_summary_path}" ]]; then
+    SUMMARY_PATH="${detected_summary_path}"
+  fi
 
   if [[ -z "${SUMMARY_PATH}" ]]; then
     SUMMARY_PATH="docs/benchmarks/history/runs/${RUN_ID}.md"

@@ -47,6 +47,7 @@ STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY
 STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH:-docs/benchmarks/history/runs/storage-promotion-boundary-history.csv}"
 STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS:-10}"
 STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT:-50}"
+STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -108,6 +109,8 @@ Options:
                                           lookback window for trend regression checks
   --storage-promotion-boundary-max-counter-regression-pct N
                                           max allowed scenario counter regression percentage
+  --storage-promotion-boundary-min-trend-samples N
+                                          minimum historical trend samples required before PASS
   -h, --help                              Show help
 USAGE
 }
@@ -157,6 +160,7 @@ while [[ $# -gt 0 ]]; do
     --storage-promotion-boundary-history-path) STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH="$2"; shift 2 ;;
     --storage-promotion-boundary-trend-window-runs) STORAGE_PROMOTION_BOUNDARY_TREND_WINDOW_RUNS="$2"; shift 2 ;;
     --storage-promotion-boundary-max-counter-regression-pct) STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT="$2"; shift 2 ;;
+    --storage-promotion-boundary-min-trend-samples) STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -230,6 +234,11 @@ if ! awk -v v="${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}" \
   exit 2
 fi
 
+if [[ ! "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}" =~ ^[0-9]+$ ]]; then
+  echo "--storage-promotion-boundary-min-trend-samples must be a non-negative integer" >&2
+  exit 2
+fi
+
 mkdir -p "$(dirname "${HISTORY_PATH}")" "${SUMMARY_DIR}" "${SCORECARD_DIR}" \
   "${STORAGE_PROMOTION_BOUNDARY_SUMMARY_DIR}" "$(dirname "${STORAGE_PROMOTION_BOUNDARY_HISTORY_PATH}")"
 
@@ -296,6 +305,7 @@ storage_promotion_boundary_segment_plus_wal_delta_regression_pct="n/a"
 storage_promotion_boundary_segment_fully_promoted_regression_pct="n/a"
 storage_promotion_boundary_max_regression_pct_observed="n/a"
 storage_promotion_boundary_trend_pass="n/a"
+storage_promotion_boundary_trend_sample_gate_pass="n/a"
 
 metric_value_from_markdown_table() {
   local path="$1"
@@ -635,6 +645,18 @@ EOF_PROMOTION_HISTORY
           storage_promotion_boundary_max_regression_pct_observed="${max_regression_pct}"
         fi
 
+        if (( storage_promotion_boundary_trend_window_samples < STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES )); then
+          storage_promotion_boundary_trend_sample_gate_pass="false"
+          status_storage_promotion_boundary_trend="FAIL"
+          storage_promotion_boundary_trend_pass="false"
+          overall_status="FAIL"
+          printf '[phase4-scale-proof] storage promotion boundary trend sample gate failed: samples=%s min_required=%s\n' \
+            "${storage_promotion_boundary_trend_window_samples}" \
+            "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}" >> "${STORAGE_PROMOTION_TREND_TMP}"
+        else
+          storage_promotion_boundary_trend_sample_gate_pass="true"
+        fi
+
         {
           echo "[phase4-scale-proof] storage_workload_key=${storage_workload_key}"
           echo "[phase4-scale-proof] replay_baseline_avg=${replay_baseline_avg:-n/a} replay_counter=${replay_counter} replay_regression_pct=${storage_promotion_boundary_replay_regression_pct}"
@@ -643,6 +665,8 @@ EOF_PROMOTION_HISTORY
           echo "[phase4-scale-proof] trend_window_samples=${storage_promotion_boundary_trend_window_samples}"
           echo "[phase4-scale-proof] max_allowed_regression_pct=${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT}"
           echo "[phase4-scale-proof] max_observed_regression_pct=${storage_promotion_boundary_max_regression_pct_observed}"
+          echo "[phase4-scale-proof] min_trend_samples_required=${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
+          echo "[phase4-scale-proof] trend_sample_gate_pass=${storage_promotion_boundary_trend_sample_gate_pass}"
           echo "[phase4-scale-proof] trend_pass=${storage_promotion_boundary_trend_pass}"
         } >> "${STORAGE_PROMOTION_TREND_TMP}"
       fi
@@ -680,6 +704,7 @@ EOF_PROMOTION_HISTORY
 else
   status_storage_promotion_boundary="SKIP"
   status_storage_promotion_boundary_trend="SKIP"
+  storage_promotion_boundary_trend_sample_gate_pass="n/a"
   printf '[storage-promotion-boundary] skipped (run_storage_promotion_boundary_guard=false)\n' > "${STORAGE_PROMOTION_BOUNDARY_TMP}"
   printf '[storage-promotion-boundary-trend] skipped (run_storage_promotion_boundary_guard=false)\n' > "${STORAGE_PROMOTION_TREND_TMP}"
 fi
@@ -736,6 +761,8 @@ cat > "${SUMMARY_PATH}" <<EOF_SUMMARY
 | storage_promotion_boundary_segment_fully_promoted_regression_pct | ${storage_promotion_boundary_segment_fully_promoted_regression_pct} |
 | storage_promotion_boundary_max_regression_pct_observed | ${storage_promotion_boundary_max_regression_pct_observed} |
 | storage_promotion_boundary_max_counter_regression_pct | ${STORAGE_PROMOTION_BOUNDARY_MAX_COUNTER_REGRESSION_PCT} |
+| storage_promotion_boundary_min_trend_samples | ${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES} |
+| storage_promotion_boundary_trend_sample_gate_pass | ${storage_promotion_boundary_trend_sample_gate_pass} |
 | storage_promotion_boundary_trend_pass | ${storage_promotion_boundary_trend_pass} |
 
 ## Artifacts

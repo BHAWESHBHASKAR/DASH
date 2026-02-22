@@ -36,6 +36,24 @@ INGEST_THROUGHPUT_WAL_SYNC_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_SYNC_INTE
 INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS="${DASH_RELEASE_GATE_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS:-auto}"
 INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY="${DASH_RELEASE_GATE_INGEST_WAL_BACKGROUND_FLUSH_ONLY:-false}"
 INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="${DASH_RELEASE_GATE_INGEST_ALLOW_UNSAFE_WAL_DURABILITY:-false}"
+RUN_REPLICATION_LAG_GUARD="${DASH_RELEASE_GATE_RUN_REPLICATION_LAG_GUARD:-false}"
+REPLICATION_LAG_LEADER_METRICS_URL="${DASH_RELEASE_GATE_REPLICATION_LAG_LEADER_METRICS_URL:-}"
+REPLICATION_LAG_FOLLOWER_METRICS_URL="${DASH_RELEASE_GATE_REPLICATION_LAG_FOLLOWER_METRICS_URL:-}"
+REPLICATION_LAG_MAX_CLAIM_LAG="${DASH_RELEASE_GATE_REPLICATION_LAG_MAX_CLAIM_LAG:-0}"
+REPLICATION_LAG_MAX_PULL_FAILURES="${DASH_RELEASE_GATE_REPLICATION_LAG_MAX_PULL_FAILURES:-0}"
+REPLICATION_LAG_MIN_PULL_SUCCESSES="${DASH_RELEASE_GATE_REPLICATION_LAG_MIN_PULL_SUCCESSES:-1}"
+REPLICATION_LAG_REQUIRE_NO_LAST_ERROR="${DASH_RELEASE_GATE_REPLICATION_LAG_REQUIRE_NO_LAST_ERROR:-true}"
+RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_RELEASE_GATE_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
+STORAGE_PROMOTION_BOUNDARY_BIND_ADDR="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_BIND_ADDR:-127.0.0.1:18080}"
+STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR:-127.0.0.1:18081}"
+STORAGE_PROMOTION_BOUNDARY_WORKERS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_WORKERS:-4}"
+STORAGE_PROMOTION_BOUNDARY_CLIENTS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_CLIENTS:-16}"
+STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER:-20}"
+STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS:-5}"
+STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS:-2000}"
+STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS:-5000}"
+STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS:-10}"
+STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -84,6 +102,41 @@ Options:
                                        Ingestion benchmark background-only WAL flush mode
   --ingest-allow-unsafe-wal-durability true|false
                                        Ingestion benchmark unsafe WAL durability override
+  --run-replication-lag-guard true|false
+                                       Enable follower replication lag guard
+  --replication-lag-leader-metrics-url URL
+                                       Leader ingestion metrics URL
+  --replication-lag-follower-metrics-url URL
+                                       Follower ingestion metrics URL
+  --replication-lag-max-claim-lag N    Max allowed leader-follower claim lag
+  --replication-lag-max-pull-failures N
+                                       Max allowed follower replication pull failures
+  --replication-lag-min-pull-successes N
+                                       Min required follower replication pull successes
+  --replication-lag-require-no-last-error true|false
+                                       Require follower replication_last_error == 0
+  --run-storage-promotion-boundary-guard true|false
+                                       Enable retrieval promotion-boundary under-load gate
+  --storage-promotion-boundary-bind-addr HOST:PORT
+                                       Retrieval bind address for promotion-boundary guard
+  --storage-promotion-boundary-ingest-bind-addr HOST:PORT
+                                       Ingestion bind address for promotion-boundary bootstrap
+  --storage-promotion-boundary-workers N
+                                       Retrieval workers for promotion-boundary guard
+  --storage-promotion-boundary-clients N
+                                       Concurrent clients for promotion-boundary guard
+  --storage-promotion-boundary-requests-per-worker N
+                                       Requests per worker for promotion-boundary guard
+  --storage-promotion-boundary-warmup-requests N
+                                       Warmup requests for promotion-boundary guard
+  --storage-promotion-boundary-connect-timeout-ms N
+                                       Connect timeout for promotion-boundary guard
+  --storage-promotion-boundary-read-timeout-ms N
+                                       Read timeout for promotion-boundary guard
+  --storage-promotion-boundary-curl-timeout-seconds N
+                                       Curl timeout for promotion-boundary guard
+  --storage-promotion-boundary-min-pass-count N
+                                       Require at least N promotion-boundary scenarios to pass
   -h, --help                           Show help
 
 Environment:
@@ -221,6 +274,78 @@ while [[ $# -gt 0 ]]; do
       INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY="$2"
       shift 2
       ;;
+    --run-replication-lag-guard)
+      RUN_REPLICATION_LAG_GUARD="$2"
+      shift 2
+      ;;
+    --run-storage-promotion-boundary-guard)
+      RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-bind-addr)
+      STORAGE_PROMOTION_BOUNDARY_BIND_ADDR="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-ingest-bind-addr)
+      STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-workers)
+      STORAGE_PROMOTION_BOUNDARY_WORKERS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-clients)
+      STORAGE_PROMOTION_BOUNDARY_CLIENTS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-requests-per-worker)
+      STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-warmup-requests)
+      STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-connect-timeout-ms)
+      STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-read-timeout-ms)
+      STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-curl-timeout-seconds)
+      STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --storage-promotion-boundary-min-pass-count)
+      STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT="$2"
+      shift 2
+      ;;
+    --replication-lag-leader-metrics-url)
+      REPLICATION_LAG_LEADER_METRICS_URL="$2"
+      shift 2
+      ;;
+    --replication-lag-follower-metrics-url)
+      REPLICATION_LAG_FOLLOWER_METRICS_URL="$2"
+      shift 2
+      ;;
+    --replication-lag-max-claim-lag)
+      REPLICATION_LAG_MAX_CLAIM_LAG="$2"
+      shift 2
+      ;;
+    --replication-lag-max-pull-failures)
+      REPLICATION_LAG_MAX_PULL_FAILURES="$2"
+      shift 2
+      ;;
+    --replication-lag-min-pull-successes)
+      REPLICATION_LAG_MIN_PULL_SUCCESSES="$2"
+      shift 2
+      ;;
+    --replication-lag-require-no-last-error)
+      REPLICATION_LAG_REQUIRE_NO_LAST_ERROR="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -254,6 +379,9 @@ validate_bool "--bench-include-hybrid" "${BENCH_INCLUDE_HYBRID}"
 validate_bool "--run-ingest-throughput-guard" "${RUN_INGEST_THROUGHPUT_GUARD}"
 validate_bool "--ingest-wal-background-flush-only" "${INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY}"
 validate_bool "--ingest-allow-unsafe-wal-durability" "${INGEST_THROUGHPUT_ALLOW_UNSAFE_WAL_DURABILITY}"
+validate_bool "--run-replication-lag-guard" "${RUN_REPLICATION_LAG_GUARD}"
+validate_bool "--replication-lag-require-no-last-error" "${REPLICATION_LAG_REQUIRE_NO_LAST_ERROR}"
+validate_bool "--run-storage-promotion-boundary-guard" "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
 
 if [[ -n "${SLO_ITERATIONS}" && ! "${SLO_ITERATIONS}" =~ ^[0-9]+$ ]]; then
   echo "[release-gate] --slo-iterations must be a non-negative integer" >&2
@@ -289,14 +417,33 @@ for int_opt in \
   "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" \
   "${INGEST_THROUGHPUT_WARMUP_REQUESTS}" \
   "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" \
-  "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}"; do
+  "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}" \
+  "${REPLICATION_LAG_MAX_CLAIM_LAG}" \
+  "${REPLICATION_LAG_MAX_PULL_FAILURES}" \
+  "${REPLICATION_LAG_MIN_PULL_SUCCESSES}" \
+  "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}" \
+  "${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}" \
+  "${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}"; do
   if [[ ! "${int_opt}" =~ ^[0-9]+$ ]]; then
-    echo "[release-gate] ingestion throughput options must be non-negative integers" >&2
+    echo "[release-gate] ingestion throughput/replication lag options must be non-negative integers" >&2
     exit 2
   fi
 done
 if [[ "${INGEST_THROUGHPUT_MIN_RPS}" -le 0 ]]; then
   echo "[release-gate] --ingest-min-rps must be > 0" >&2
+  exit 2
+fi
+if [[ "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" -eq 0 || "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}" -eq 0 || "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}" -eq 0 || "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}" -eq 0 || "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}" -eq 0 || "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}" -eq 0 ]]; then
+  echo "[release-gate] storage promotion boundary guard workers/clients/requests/timeouts must be > 0" >&2
+  exit 2
+fi
+if [[ "${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}" -gt 3 ]]; then
+  echo "[release-gate] --storage-promotion-boundary-min-pass-count must be <= 3 (guard has 3 scenarios)" >&2
   exit 2
 fi
 if [[ "${INGEST_THROUGHPUT_WORKERS}" -eq 0 || "${INGEST_THROUGHPUT_CLIENTS}" -eq 0 || "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" -eq 0 || "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" -eq 0 || "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}" -eq 0 ]]; then
@@ -325,6 +472,12 @@ esac
 if [[ "${INGEST_THROUGHPUT_WAL_BACKGROUND_FLUSH_ONLY}" == "true" && "${INGEST_THROUGHPUT_WAL_ASYNC_FLUSH_INTERVAL_MS}" == "off" ]]; then
   echo "[release-gate] --ingest-wal-background-flush-only=true requires async flush worker (set --ingest-wal-async-flush-interval-ms to auto or a positive integer)" >&2
   exit 2
+fi
+if [[ "${RUN_REPLICATION_LAG_GUARD}" == "true" ]]; then
+  if [[ -z "${REPLICATION_LAG_LEADER_METRICS_URL}" || -z "${REPLICATION_LAG_FOLLOWER_METRICS_URL}" ]]; then
+    echo "[release-gate] replication lag guard enabled but leader/follower metrics URLs are missing" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "${SUMMARY_DIR}" "$(dirname "${SLO_HISTORY_PATH}")"
@@ -453,6 +606,90 @@ run_step "slo guard" "${SLO_CMD[*]}" "${SLO_CMD[@]}"
 
 run_step "recovery drill" "scripts/recovery_drill.sh --max-rto-seconds ${RECOVERY_MAX_RTO_SECONDS}" \
   scripts/recovery_drill.sh --max-rto-seconds "${RECOVERY_MAX_RTO_SECONDS}"
+
+if [[ "${RUN_REPLICATION_LAG_GUARD}" == "true" ]]; then
+  REPL_GUARD_CMD=(
+    scripts/replication_lag_guard.sh
+    --leader-metrics-url "${REPLICATION_LAG_LEADER_METRICS_URL}"
+    --follower-metrics-url "${REPLICATION_LAG_FOLLOWER_METRICS_URL}"
+    --max-claim-lag "${REPLICATION_LAG_MAX_CLAIM_LAG}"
+    --max-pull-failures "${REPLICATION_LAG_MAX_PULL_FAILURES}"
+    --min-pull-successes "${REPLICATION_LAG_MIN_PULL_SUCCESSES}"
+    --require-no-last-error "${REPLICATION_LAG_REQUIRE_NO_LAST_ERROR}"
+    --summary-dir "${SUMMARY_DIR}"
+    --run-tag "${RUN_TAG}"
+  )
+  run_step "replication lag guard" "${REPL_GUARD_CMD[*]}" "${REPL_GUARD_CMD[@]}"
+else
+  skip_step "replication lag guard" "scripts/replication_lag_guard.sh --leader-metrics-url <leader> --follower-metrics-url <follower>" "disabled"
+fi
+
+if [[ "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}" == "true" ]]; then
+  STORAGE_PROMOTION_CMD=(
+    scripts/storage_promotion_boundary_guard.sh
+    --bind-addr "${STORAGE_PROMOTION_BOUNDARY_BIND_ADDR}"
+    --ingest-bind-addr "${STORAGE_PROMOTION_BOUNDARY_INGEST_BIND_ADDR}"
+    --workers "${STORAGE_PROMOTION_BOUNDARY_WORKERS}"
+    --clients "${STORAGE_PROMOTION_BOUNDARY_CLIENTS}"
+    --requests-per-worker "${STORAGE_PROMOTION_BOUNDARY_REQUESTS_PER_WORKER}"
+    --warmup-requests "${STORAGE_PROMOTION_BOUNDARY_WARMUP_REQUESTS}"
+    --connect-timeout-ms "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}"
+    --read-timeout-ms "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}"
+    --curl-timeout-seconds "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}"
+    --summary-dir "${SUMMARY_DIR}"
+    --run-tag "${RUN_TAG}"
+  )
+  step="storage promotion boundary guard"
+  safe_step="${step// /-}"
+  log_path="${LOG_DIR}/${safe_step}.log"
+  started="$(date -u +%s)"
+  echo "[release-gate] ${step}"
+  echo "[release-gate] command: ${STORAGE_PROMOTION_CMD[*]} (min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT})"
+
+  output=""
+  if output="$("${STORAGE_PROMOTION_CMD[@]}" 2>&1)"; then
+    exit_code=0
+  else
+    exit_code=$?
+  fi
+  printf '%s\n' "${output}" | tee "${log_path}"
+
+  promotion_summary_path=""
+  promotion_pass_count=""
+  if [[ ${exit_code} -eq 0 ]]; then
+    promotion_summary_path="$(printf '%s\n' "${output}" | sed -n 's/^\[promotion-boundary-guard\] summary: //p' | tail -n 1)"
+    if [[ -z "${promotion_summary_path}" || ! -f "${promotion_summary_path}" ]]; then
+      printf '%s\n' "[release-gate] storage promotion boundary guard failed: missing summary path" | tee -a "${log_path}" >&2
+      exit_code=1
+    else
+      promotion_pass_count="$(awk -F': ' '/^- pass_count:/ { print $2; exit }' "${promotion_summary_path}" | tr -d '[:space:]')"
+      if [[ -z "${promotion_pass_count}" || ! "${promotion_pass_count}" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "[release-gate] storage promotion boundary guard failed: unable to parse pass_count from ${promotion_summary_path}" | tee -a "${log_path}" >&2
+        exit_code=1
+      elif (( promotion_pass_count < STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT )); then
+        printf '%s\n' "[release-gate] storage promotion boundary guard failed: pass_count=${promotion_pass_count} < min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}" | tee -a "${log_path}" >&2
+        exit_code=1
+      else
+        printf '%s\n' "[release-gate] storage promotion boundary guard passed: pass_count=${promotion_pass_count} >= min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}" | tee -a "${log_path}"
+      fi
+    fi
+  fi
+
+  finished="$(date -u +%s)"
+  duration=$((finished - started))
+  if [[ ${exit_code} -eq 0 ]]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    printf '| %s | PASS | %s | `%s` |\n' "${step}" "${duration}" "${STORAGE_PROMOTION_CMD[*]} (min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT})" >> "${ROWS_TMP}"
+    append_detail "${step}" "PASS" "${STORAGE_PROMOTION_CMD[*]} (min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT})" "${duration}" "${log_path}"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    FAILED=true
+    printf '| %s | FAIL | %s | `%s` |\n' "${step}" "${duration}" "${STORAGE_PROMOTION_CMD[*]} (min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT})" >> "${ROWS_TMP}"
+    append_detail "${step}" "FAIL (exit ${exit_code})" "${STORAGE_PROMOTION_CMD[*]} (min_pass_count=${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT})" "${duration}" "${log_path}"
+  fi
+else
+  skip_step "storage promotion boundary guard" "scripts/storage_promotion_boundary_guard.sh --bind-addr <addr>" "disabled"
+fi
 
 if [[ "${RUN_INCIDENT_SIMULATION_GUARD}" == "true" ]]; then
   INCIDENT_CMD=(

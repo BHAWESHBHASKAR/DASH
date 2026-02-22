@@ -175,16 +175,22 @@ ann_recall_100="$(markdown_table_value "${SUMMARY_PATH}" "ann_recall_at_100")"
 freshness_guard="$(awk -F'|' '/\| ingestion_freshness_guard/{value=$3; gsub(/^[ \t]+|[ \t]+$/, "", value); print value; exit}' "${SUMMARY_PATH}")"
 rebalance_shard_count_after="$(markdown_table_value "${SUMMARY_PATH}" "rebalance_shard_count_after")"
 rebalance_shard_gate_pass="$(markdown_table_value "${SUMMARY_PATH}" "rebalance_shard_gate_pass")"
+storage_promotion_boundary_trend_window_samples="$(markdown_table_value "${SUMMARY_PATH}" "storage_promotion_boundary_trend_window_samples")"
+storage_promotion_boundary_min_trend_samples="$(markdown_table_value "${SUMMARY_PATH}" "storage_promotion_boundary_min_trend_samples")"
+storage_promotion_boundary_trend_sample_gate_pass="$(markdown_table_value "${SUMMARY_PATH}" "storage_promotion_boundary_trend_sample_gate_pass")"
 
 retrieval_artifact="$(artifact_path_value "${SUMMARY_PATH}" "retrieval_concurrency_summary")"
 ingestion_artifact="$(artifact_path_value "${SUMMARY_PATH}" "ingestion_concurrency_summary")"
 rebalance_artifact="$(artifact_path_value "${SUMMARY_PATH}" "rebalance_summary")"
+storage_promotion_boundary_artifact="$(artifact_path_value "${SUMMARY_PATH}" "storage_promotion_boundary_summary")"
 
 benchmark_step="$(step_status_value "${SUMMARY_PATH}" "benchmark (")"
 retrieval_step="$(step_status_value "${SUMMARY_PATH}" "retrieval transport concurrency")"
 ingestion_step="$(step_status_value "${SUMMARY_PATH}" "ingestion transport concurrency")"
 failover_step="$(step_status_value "${SUMMARY_PATH}" "failover drill")"
 rebalance_step="$(step_status_value "${SUMMARY_PATH}" "rebalance drill")"
+storage_promotion_boundary_guard_step="$(step_status_value "${SUMMARY_PATH}" "storage promotion-boundary guard")"
+storage_promotion_boundary_trend_step="$(step_status_value "${SUMMARY_PATH}" "storage promotion-boundary trend")"
 
 if [[ "${overall_status}" == "PASS" ]]; then
   add_check "summary overall_status == PASS" "PASS" "overall_status=${overall_status}"
@@ -246,6 +252,30 @@ if [[ "${TIER}" == "tier-b" || "${TIER}" == "tier-c" ]]; then
     add_check "rebalance_shard_count_after >= ${MIN_SHARDS}" "FAIL" "actual=${rebalance_shard_count_after:-missing}"
   fi
   require_file_check "rebalance summary artifact exists" "${rebalance_artifact}"
+
+  if [[ "${storage_promotion_boundary_guard_step}" == "PASS" ]]; then
+    add_check "storage promotion-boundary guard step" "PASS" "${storage_promotion_boundary_guard_step}"
+  else
+    add_check "storage promotion-boundary guard step" "FAIL" "${storage_promotion_boundary_guard_step:-missing}"
+  fi
+  if [[ "${storage_promotion_boundary_trend_step}" == "PASS" ]]; then
+    add_check "storage promotion-boundary trend step" "PASS" "${storage_promotion_boundary_trend_step}"
+  else
+    add_check "storage promotion-boundary trend step" "FAIL" "${storage_promotion_boundary_trend_step:-missing}"
+  fi
+  if [[ "${storage_promotion_boundary_trend_sample_gate_pass}" == "true" ]]; then
+    add_check "storage promotion-boundary trend sample gate" "PASS" "${storage_promotion_boundary_trend_sample_gate_pass}"
+  else
+    add_check "storage promotion-boundary trend sample gate" "FAIL" "${storage_promotion_boundary_trend_sample_gate_pass:-missing}"
+  fi
+  if [[ "${storage_promotion_boundary_min_trend_samples}" =~ ^[0-9]+$ ]] && \
+    [[ "${storage_promotion_boundary_trend_window_samples}" =~ ^[0-9]+$ ]] && \
+    (( storage_promotion_boundary_trend_window_samples >= storage_promotion_boundary_min_trend_samples )); then
+    add_check "storage trend samples >= required minimum" "PASS" "actual=${storage_promotion_boundary_trend_window_samples}, required=${storage_promotion_boundary_min_trend_samples}"
+  else
+    add_check "storage trend samples >= required minimum" "FAIL" "actual=${storage_promotion_boundary_trend_window_samples:-missing}, required=${storage_promotion_boundary_min_trend_samples:-missing}"
+  fi
+  require_file_check "storage promotion-boundary summary artifact exists" "${storage_promotion_boundary_artifact}"
 fi
 
 if [[ "${TIER}" == "tier-c" ]]; then

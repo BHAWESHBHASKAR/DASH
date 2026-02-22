@@ -56,6 +56,7 @@ if [[ "${MODE}" == "staged" ]]; then
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERD_REBALANCE_PROBE_KEYS_COUNT:-512}"
   REBALANCE_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERD_REBALANCE_MAX_WAIT_SECONDS:-180}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERD_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-true}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERD_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-3}"
 else
   PROFILE="${DASH_PHASE4_TIERD_PROFILE:-smoke}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERD_FIXTURE_SIZE:-8000}"
@@ -75,6 +76,7 @@ else
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERD_REBALANCE_PROBE_KEYS_COUNT:-128}"
   REBALANCE_MAX_WAIT_SECONDS="${DASH_PHASE4_TIERD_REBALANCE_MAX_WAIT_SECONDS:-90}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERD_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERD_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-0}"
 fi
 
 usage() {
@@ -110,6 +112,8 @@ Options:
   --run-scale-proof true|false           Run phase4_scale_proof step (default: true)
   --run-storage-promotion-boundary-guard true|false
                                          Enable promotion-boundary guard inside scale proof
+  --storage-promotion-boundary-min-trend-samples N
+                                         Minimum required promotion-boundary trend samples
   --summary-path PATH                    Existing scale-proof summary path
   --recovery-artifact PATH               Existing recovery artifact path
   --incident-artifact PATH               Existing incident artifact path
@@ -146,6 +150,7 @@ while [[ $# -gt 0 ]]; do
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
     --run-scale-proof) RUN_SCALE_PROOF="$2"; shift 2 ;;
     --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
+    --storage-promotion-boundary-min-trend-samples) STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="$2"; shift 2 ;;
     --summary-path) SUMMARY_PATH="$2"; shift 2 ;;
     --recovery-artifact) RECOVERY_ARTIFACT="$2"; shift 2 ;;
     --incident-artifact) INCIDENT_ARTIFACT="$2"; shift 2 ;;
@@ -182,11 +187,17 @@ for bool_opt in "${RUN_RECOVERY_DRILL}" "${RUN_INCIDENT_GATE}" "${RUN_CLOSURE_CH
   esac
 done
 
+if [[ ! "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}" =~ ^[0-9]+$ ]]; then
+  echo "--storage-promotion-boundary-min-trend-samples must be a non-negative integer" >&2
+  exit 2
+fi
+
 echo "[phase4-tierd] run_id=${RUN_ID}"
 echo "[phase4-tierd] mode=${MODE}"
 echo "[phase4-tierd] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=${ITERATIONS}"
 echo "[phase4-tierd] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
 echo "[phase4-tierd] storage_promotion_boundary_guard=${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+echo "[phase4-tierd] storage_promotion_boundary_min_trend_samples=${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
 
 cmd=(
   scripts/phase4_tierc_rehearsal.sh
@@ -214,6 +225,7 @@ cmd=(
   --run-closure-checklist "${RUN_CLOSURE_CHECKLIST}"
   --run-scale-proof "${RUN_SCALE_PROOF}"
   --run-storage-promotion-boundary-guard "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+  --storage-promotion-boundary-min-trend-samples "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
 )
 
 if [[ -n "${SUMMARY_PATH}" ]]; then

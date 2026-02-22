@@ -52,6 +52,7 @@ if [[ "${MODE}" == "staged" ]]; then
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_INGESTION_WARMUP_REQUESTS:-4}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERB_REBALANCE_PROBE_KEYS_COUNT:-256}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERB_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-true}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERB_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-3}"
 else
   PROFILE="${DASH_PHASE4_TIERB_PROFILE:-smoke}"
   FIXTURE_SIZE="${DASH_PHASE4_TIERB_FIXTURE_SIZE:-4000}"
@@ -68,6 +69,7 @@ else
   INGESTION_WARMUP_REQUESTS="${DASH_PHASE4_TIERB_INGESTION_WARMUP_REQUESTS:-1}"
   REBALANCE_PROBE_KEYS_COUNT="${DASH_PHASE4_TIERB_REBALANCE_PROBE_KEYS_COUNT:-64}"
   RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="${DASH_PHASE4_TIERB_RUN_STORAGE_PROMOTION_BOUNDARY_GUARD:-false}"
+  STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="${DASH_PHASE4_TIERB_STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES:-0}"
 fi
 
 usage() {
@@ -102,6 +104,8 @@ Options:
   --run-closure-checklist true|false     Run closure checklist gate (default: true)
   --run-storage-promotion-boundary-guard true|false
                                          Enable promotion-boundary guard inside scale proof
+  --storage-promotion-boundary-min-trend-samples N
+                                         Minimum required trend samples for promotion-boundary gate
   -h, --help                             Show help
 
 Any extra args after `--` are forwarded to `phase4_scale_proof.sh`.
@@ -135,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     --failover-max-wait-seconds) FAILOVER_MAX_WAIT_SECONDS="$2"; shift 2 ;;
     --run-closure-checklist) RUN_CLOSURE_CHECKLIST="$2"; shift 2 ;;
     --run-storage-promotion-boundary-guard) RUN_STORAGE_PROMOTION_BOUNDARY_GUARD="$2"; shift 2 ;;
+    --storage-promotion-boundary-min-trend-samples) STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --)
       shift
@@ -184,6 +189,11 @@ for numeric in "${FIXTURE_SIZE}" "${ITERATIONS}" "${TARGET_SHARDS}" "${MIN_SHARD
   fi
 done
 
+if [[ ! "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}" =~ ^[0-9]+$ ]]; then
+  echo "--storage-promotion-boundary-min-trend-samples must be a non-negative integer" >&2
+  exit 2
+fi
+
 if [[ "${TARGET_SHARDS}" -lt 8 ]]; then
   echo "--target-shards must be >= 8 for Tier-B rehearsal" >&2
   exit 2
@@ -199,6 +209,7 @@ echo "[phase4-tierb] mode=${MODE}"
 echo "[phase4-tierb] profile=${PROFILE} fixture_size=${FIXTURE_SIZE} iterations=${ITERATIONS}"
 echo "[phase4-tierb] shard_target=${TARGET_SHARDS} shard_gate=${MIN_SHARDS_GATE}"
 echo "[phase4-tierb] storage_promotion_boundary_guard=${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+echo "[phase4-tierb] storage_promotion_boundary_min_trend_samples=${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
 
 cmd=(
   scripts/phase4_scale_proof.sh
@@ -225,6 +236,7 @@ cmd=(
   --rebalance-require-moved-keys "${REBALANCE_REQUIRE_MOVED_KEYS}"
   --rebalance-max-wait-seconds "${REBALANCE_MAX_WAIT_SECONDS}"
   --run-storage-promotion-boundary-guard "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+  --storage-promotion-boundary-min-trend-samples "${STORAGE_PROMOTION_BOUNDARY_MIN_TREND_SAMPLES}"
 )
 
 if [[ "${#EXTRA_ARGS[@]}" -gt 0 ]]; then
