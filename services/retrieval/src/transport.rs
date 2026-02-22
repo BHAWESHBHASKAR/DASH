@@ -1,18 +1,16 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    fs::{OpenOptions, create_dir_all},
-    io::{BufRead, BufReader, Read, Write},
+    collections::{HashMap, VecDeque},
+    io::Write,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use auth::{JwtValidationConfig, JwtValidationError, sha256_hex, verify_hs256_token_for_tenant};
 use metadata_router::{
     PlacementRouteError, ReadPreference, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig,
     ShardPlacement, load_shard_placements_csv, route_read_with_placement,
@@ -21,10 +19,42 @@ use metadata_router::{
 use schema::StanceMode;
 use store::InMemoryStore;
 
+#[cfg(test)]
+use crate::api::STORAGE_MERGE_MODEL;
+#[cfg(test)]
+use crate::api::STORAGE_SOURCE_OF_TRUTH_MODEL;
 use crate::api::{
-    CitationNode, EvidenceNode, RetrieveApiRequest, RetrievePlannerDebugSnapshot, TimeRange,
-    build_retrieve_planner_debug_snapshot, execute_api_query,
+    CitationNode, EvidenceNode, RetrieveApiRequest, RetrievePlannerDebugSnapshot,
+    RetrieveStorageMergeSnapshot, STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE,
+    STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY, STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED,
+    STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA, TimeRange,
+    build_retrieve_planner_debug_snapshot, execute_api_query_with_storage_snapshot,
     segment_prefilter_cache_metrics_snapshot,
+};
+mod audit;
+mod authz;
+mod debug_render;
+mod http;
+mod payload;
+use audit::{AuditEvent, append_audit_record};
+#[cfg(test)]
+use audit::{audit_chain_states, is_sha256_hex};
+use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
+use debug_render::{
+    evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
+    render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
+    resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
+};
+use http::{
+    parse_request_line, read_http_request, render_response_text, split_target, write_response,
+};
+#[cfg(test)]
+use payload::build_retrieve_request_from_json;
+#[cfg(test)]
+use payload::{JsonValue, parse_json};
+use payload::{
+    build_retrieve_request_from_query, build_retrieve_transport_request_from_json,
+    build_retrieve_transport_request_from_query, json_escape, render_retrieve_response_json,
 };
 
 const METRICS_WINDOW_SIZE: usize = 2048;
@@ -113,6 +143,55 @@ enum ReadRouteError {
         epoch: u64,
         role: ReplicaRole,
     },
+    ConsistencyUnavailable {
+        policy: ReadConsistencyPolicy,
+        shard_id: u32,
+        readable_replicas: usize,
+        required_replicas: usize,
+        total_replicas: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadConsistencyPolicy {
+    One,
+    Quorum,
+    All,
+}
+
+impl ReadConsistencyPolicy {
+    fn from_raw(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(|value| value.trim().to_ascii_lowercase()) {
+            None => Ok(Self::One),
+            Some(value) if value.is_empty() || value == "one" => Ok(Self::One),
+            Some(value) if value == "quorum" => Ok(Self::Quorum),
+            Some(value) if value == "all" => Ok(Self::All),
+            Some(_) => Err("read_consistency must be one, quorum, or all".to_string()),
+        }
+    }
+
+    fn required_replicas(self, total_replicas: usize) -> usize {
+        let total_replicas = total_replicas.max(1);
+        match self {
+            Self::One => 1,
+            Self::Quorum => total_replicas / 2 + 1,
+            Self::All => total_replicas,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Quorum => "quorum",
+            Self::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RetrieveTransportRequest {
+    request: RetrieveApiRequest,
+    read_consistency: ReadConsistencyPolicy,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -166,9 +245,26 @@ pub(crate) struct TransportMetrics {
     storage_last_wal_delta_count: usize,
     storage_last_storage_visible_count: usize,
     storage_last_allowed_claim_ids_count: usize,
+    storage_last_result_from_segment_base_count: usize,
+    storage_last_result_from_wal_delta_count: usize,
+    storage_last_result_source_unknown_count: usize,
+    storage_last_result_outside_storage_visible_count: usize,
+    storage_last_execution_candidate_count: usize,
+    storage_last_execution_mode_disk_native: bool,
+    storage_last_promotion_boundary_state: usize,
+    storage_last_promotion_boundary_in_transition: bool,
     storage_last_divergence_ratio: f64,
     storage_last_divergence_warn: bool,
     storage_divergence_warn_total: u64,
+    storage_result_from_segment_base_total: u64,
+    storage_result_from_wal_delta_total: u64,
+    storage_result_source_unknown_total: u64,
+    storage_result_outside_storage_visible_total: u64,
+    storage_execution_mode_disk_native_total: u64,
+    storage_execution_mode_memory_index_total: u64,
+    storage_promotion_boundary_replay_only_total: u64,
+    storage_promotion_boundary_segment_plus_wal_delta_total: u64,
+    storage_promotion_boundary_segment_fully_promoted_total: u64,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
 }
 
@@ -205,9 +301,26 @@ impl Default for TransportMetrics {
             storage_last_wal_delta_count: 0,
             storage_last_storage_visible_count: 0,
             storage_last_allowed_claim_ids_count: 0,
+            storage_last_result_from_segment_base_count: 0,
+            storage_last_result_from_wal_delta_count: 0,
+            storage_last_result_source_unknown_count: 0,
+            storage_last_result_outside_storage_visible_count: 0,
+            storage_last_execution_candidate_count: 0,
+            storage_last_execution_mode_disk_native: false,
+            storage_last_promotion_boundary_state: 0,
+            storage_last_promotion_boundary_in_transition: false,
             storage_last_divergence_ratio: 0.0,
             storage_last_divergence_warn: false,
             storage_divergence_warn_total: 0,
+            storage_result_from_segment_base_total: 0,
+            storage_result_from_wal_delta_total: 0,
+            storage_result_source_unknown_total: 0,
+            storage_result_outside_storage_visible_total: 0,
+            storage_execution_mode_disk_native_total: 0,
+            storage_execution_mode_memory_index_total: 0,
+            storage_promotion_boundary_replay_only_total: 0,
+            storage_promotion_boundary_segment_plus_wal_delta_total: 0,
+            storage_promotion_boundary_segment_fully_promoted_total: 0,
             transport_backpressure: None,
         }
     }
@@ -285,16 +398,21 @@ impl TransportMetrics {
 
     fn observe_read_route_rejection(&mut self, error: &ReadRouteError) {
         self.placement_route_reject_total += 1;
-        if let ReadRouteError::WrongNode {
-            shard_id,
-            epoch,
-            role,
-            ..
-        } = error
-        {
-            self.placement_last_shard_id = Some(*shard_id);
-            self.placement_last_epoch = Some(*epoch);
-            self.placement_last_role = Some(*role);
+        match error {
+            ReadRouteError::WrongNode {
+                shard_id,
+                epoch,
+                role,
+                ..
+            } => {
+                self.placement_last_shard_id = Some(*shard_id);
+                self.placement_last_epoch = Some(*epoch);
+                self.placement_last_role = Some(*role);
+            }
+            ReadRouteError::ConsistencyUnavailable { shard_id, .. } => {
+                self.placement_last_shard_id = Some(*shard_id);
+            }
+            ReadRouteError::Placement(_) => {}
         }
     }
 
@@ -322,6 +440,64 @@ impl TransportMetrics {
         if divergence_warn {
             self.storage_divergence_warn_total =
                 self.storage_divergence_warn_total.saturating_add(1);
+        }
+    }
+
+    fn observe_storage_merge_execution(&mut self, snapshot: &RetrieveStorageMergeSnapshot) {
+        self.storage_last_segment_base_count = snapshot.segment_base_count;
+        self.storage_last_wal_delta_count = snapshot.wal_delta_count;
+        self.storage_last_storage_visible_count = snapshot.storage_visible_count;
+        self.storage_last_allowed_claim_ids_count = snapshot.allowed_claim_ids_count;
+        self.storage_last_result_from_segment_base_count = snapshot.result_from_segment_base_count;
+        self.storage_last_result_from_wal_delta_count = snapshot.result_from_wal_delta_count;
+        self.storage_last_result_source_unknown_count = snapshot.result_source_unknown_count;
+        self.storage_last_result_outside_storage_visible_count =
+            snapshot.result_outside_storage_visible_count;
+        self.storage_last_execution_candidate_count = snapshot.execution_candidate_count;
+        self.storage_last_execution_mode_disk_native =
+            snapshot.execution_mode == STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE;
+        self.storage_last_promotion_boundary_state =
+            promotion_boundary_state_metric_value(&snapshot.promotion_boundary_state);
+        self.storage_last_promotion_boundary_in_transition =
+            snapshot.promotion_boundary_in_transition;
+        self.storage_result_from_segment_base_total = self
+            .storage_result_from_segment_base_total
+            .saturating_add(snapshot.result_from_segment_base_count as u64);
+        self.storage_result_from_wal_delta_total = self
+            .storage_result_from_wal_delta_total
+            .saturating_add(snapshot.result_from_wal_delta_count as u64);
+        self.storage_result_source_unknown_total = self
+            .storage_result_source_unknown_total
+            .saturating_add(snapshot.result_source_unknown_count as u64);
+        self.storage_result_outside_storage_visible_total = self
+            .storage_result_outside_storage_visible_total
+            .saturating_add(snapshot.result_outside_storage_visible_count as u64);
+        if self.storage_last_execution_mode_disk_native {
+            self.storage_execution_mode_disk_native_total = self
+                .storage_execution_mode_disk_native_total
+                .saturating_add(1);
+        } else {
+            self.storage_execution_mode_memory_index_total = self
+                .storage_execution_mode_memory_index_total
+                .saturating_add(1);
+        }
+        match snapshot.promotion_boundary_state.as_str() {
+            STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY => {
+                self.storage_promotion_boundary_replay_only_total = self
+                    .storage_promotion_boundary_replay_only_total
+                    .saturating_add(1);
+            }
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA => {
+                self.storage_promotion_boundary_segment_plus_wal_delta_total = self
+                    .storage_promotion_boundary_segment_plus_wal_delta_total
+                    .saturating_add(1);
+            }
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED => {
+                self.storage_promotion_boundary_segment_fully_promoted_total = self
+                    .storage_promotion_boundary_segment_fully_promoted_total
+                    .saturating_add(1);
+            }
+            _ => {}
         }
     }
 
@@ -456,12 +632,46 @@ dash_retrieve_storage_last_wal_delta_count {}\n\
 dash_retrieve_storage_last_storage_visible_count {}\n\
 # TYPE dash_retrieve_storage_last_allowed_claim_ids_count gauge\n\
 dash_retrieve_storage_last_allowed_claim_ids_count {}\n\
+# TYPE dash_retrieve_storage_last_result_from_segment_base_count gauge\n\
+dash_retrieve_storage_last_result_from_segment_base_count {}\n\
+# TYPE dash_retrieve_storage_last_result_from_wal_delta_count gauge\n\
+dash_retrieve_storage_last_result_from_wal_delta_count {}\n\
+# TYPE dash_retrieve_storage_last_result_source_unknown_count gauge\n\
+dash_retrieve_storage_last_result_source_unknown_count {}\n\
+# TYPE dash_retrieve_storage_last_result_outside_storage_visible_count gauge\n\
+dash_retrieve_storage_last_result_outside_storage_visible_count {}\n\
+# TYPE dash_retrieve_storage_last_execution_candidate_count gauge\n\
+dash_retrieve_storage_last_execution_candidate_count {}\n\
+# TYPE dash_retrieve_storage_last_execution_mode_disk_native gauge\n\
+dash_retrieve_storage_last_execution_mode_disk_native {}\n\
+# TYPE dash_retrieve_storage_last_promotion_boundary_state gauge\n\
+dash_retrieve_storage_last_promotion_boundary_state {}\n\
+# TYPE dash_retrieve_storage_last_promotion_boundary_in_transition gauge\n\
+dash_retrieve_storage_last_promotion_boundary_in_transition {}\n\
 # TYPE dash_retrieve_storage_last_divergence_ratio gauge\n\
 dash_retrieve_storage_last_divergence_ratio {:.6}\n\
 # TYPE dash_retrieve_storage_last_divergence_warn gauge\n\
 dash_retrieve_storage_last_divergence_warn {}\n\
 # TYPE dash_retrieve_storage_divergence_warn_total counter\n\
 dash_retrieve_storage_divergence_warn_total {}\n\
+# TYPE dash_retrieve_storage_result_from_segment_base_total counter\n\
+dash_retrieve_storage_result_from_segment_base_total {}\n\
+# TYPE dash_retrieve_storage_result_from_wal_delta_total counter\n\
+dash_retrieve_storage_result_from_wal_delta_total {}\n\
+# TYPE dash_retrieve_storage_result_source_unknown_total counter\n\
+dash_retrieve_storage_result_source_unknown_total {}\n\
+# TYPE dash_retrieve_storage_result_outside_storage_visible_total counter\n\
+dash_retrieve_storage_result_outside_storage_visible_total {}\n\
+# TYPE dash_retrieve_storage_execution_mode_disk_native_total counter\n\
+dash_retrieve_storage_execution_mode_disk_native_total {}\n\
+# TYPE dash_retrieve_storage_execution_mode_memory_index_total counter\n\
+dash_retrieve_storage_execution_mode_memory_index_total {}\n\
+# TYPE dash_retrieve_storage_promotion_boundary_replay_only_total counter\n\
+dash_retrieve_storage_promotion_boundary_replay_only_total {}\n\
+# TYPE dash_retrieve_storage_promotion_boundary_segment_plus_wal_delta_total counter\n\
+dash_retrieve_storage_promotion_boundary_segment_plus_wal_delta_total {}\n\
+# TYPE dash_retrieve_storage_promotion_boundary_segment_fully_promoted_total counter\n\
+dash_retrieve_storage_promotion_boundary_segment_fully_promoted_total {}\n\
 # TYPE dash_retrieve_segment_cache_hits_total counter\n\
 dash_retrieve_segment_cache_hits_total {}\n\
 # TYPE dash_retrieve_segment_refresh_attempt_total counter\n\
@@ -523,9 +733,26 @@ dash_transport_uptime_seconds {:.4}\n",
             self.storage_last_wal_delta_count,
             self.storage_last_storage_visible_count,
             self.storage_last_allowed_claim_ids_count,
+            self.storage_last_result_from_segment_base_count,
+            self.storage_last_result_from_wal_delta_count,
+            self.storage_last_result_source_unknown_count,
+            self.storage_last_result_outside_storage_visible_count,
+            self.storage_last_execution_candidate_count,
+            self.storage_last_execution_mode_disk_native as usize,
+            self.storage_last_promotion_boundary_state,
+            self.storage_last_promotion_boundary_in_transition as usize,
             self.storage_last_divergence_ratio,
             self.storage_last_divergence_warn as usize,
             self.storage_divergence_warn_total,
+            self.storage_result_from_segment_base_total,
+            self.storage_result_from_wal_delta_total,
+            self.storage_result_source_unknown_total,
+            self.storage_result_outside_storage_visible_total,
+            self.storage_execution_mode_disk_native_total,
+            self.storage_execution_mode_memory_index_total,
+            self.storage_promotion_boundary_replay_only_total,
+            self.storage_promotion_boundary_segment_plus_wal_delta_total,
+            self.storage_promotion_boundary_segment_fully_promoted_total,
             segment_cache_metrics.cache_hits,
             segment_cache_metrics.refresh_attempts,
             segment_cache_metrics.refresh_successes,
@@ -797,78 +1024,6 @@ fn handle_connection(
     write_response(&mut stream, response)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
-    let mut reader = BufReader::new(stream);
-
-    let mut request_line = String::new();
-    let bytes = reader
-        .read_line(&mut request_line)
-        .map_err(|e| e.to_string())?;
-    if bytes == 0 {
-        return Ok(None);
-    }
-
-    let (method, target) = parse_request_line(&request_line)?;
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut header_line = String::new();
-        let bytes = reader
-            .read_line(&mut header_line)
-            .map_err(|e| e.to_string())?;
-        if bytes == 0 || header_line == "\r\n" {
-            break;
-        }
-
-        let (name, value) = header_line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
-    };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
-        ));
-    }
-
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
-    }
-
-    Ok(Some(HttpRequest {
-        method,
-        target,
-        headers,
-        body,
-    }))
-}
-
-fn parse_request_line(line: &str) -> Result<(String, String), String> {
-    let line = line.trim();
-    let mut parts = line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| "missing HTTP method".to_string())?;
-    let target = parts
-        .next()
-        .ok_or_else(|| "missing HTTP target".to_string())?;
-    let version = parts
-        .next()
-        .ok_or_else(|| "missing HTTP version".to_string())?;
-    if !version.starts_with("HTTP/1.") {
-        return Err("unsupported HTTP version".to_string());
-    }
-    Ok((method.to_string(), target.to_string()))
-}
-
 #[cfg(test)]
 fn handle_request(store: &InMemoryStore, request: &HttpRequest) -> HttpResponse {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -1045,6 +1200,8 @@ fn handle_request_with_metrics_and_reload(
                     AuthDecision::Allowed => {
                         observe_auth_success(metrics);
                         let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                        let (_, merge_snapshot) =
+                            execute_api_query_with_storage_snapshot(store, req.clone());
                         let warn_delta_count = resolve_storage_divergence_warn_delta_count();
                         let warn_ratio = resolve_storage_divergence_warn_ratio();
                         let (warn, reason, ratio) = evaluate_storage_divergence_warning(
@@ -1054,6 +1211,7 @@ fn handle_request_with_metrics_and_reload(
                         );
                         if let Ok(mut guard) = metrics.lock() {
                             guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
+                            guard.observe_storage_merge_execution(&merge_snapshot);
                         }
                         emit_audit_event(
                             metrics,
@@ -1068,6 +1226,7 @@ fn handle_request_with_metrics_and_reload(
                         );
                         HttpResponse::ok_json(render_storage_visibility_debug_json(
                             &snapshot,
+                            &merge_snapshot,
                             warn_delta_count,
                             warn_ratio,
                             warn,
@@ -1079,8 +1238,9 @@ fn handle_request_with_metrics_and_reload(
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
-        ("GET", "/v1/retrieve") => match build_retrieve_request_from_query(&query) {
-            Ok(req) => {
+        ("GET", "/v1/retrieve") => match build_retrieve_transport_request_from_query(&query) {
+            Ok(transport_req) => {
+                let req = transport_req.request;
                 let tenant_id = req.tenant_id.clone();
                 match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
                     AuthDecision::Unauthorized(reason) => {
@@ -1117,8 +1277,13 @@ fn handle_request_with_metrics_and_reload(
                     }
                     AuthDecision::Allowed => {
                         observe_auth_success(metrics);
-                        let response =
-                            execute_retrieve_and_observe(store, req, metrics, placement_routing);
+                        let response = execute_retrieve_and_observe(
+                            store,
+                            req,
+                            transport_req.read_consistency,
+                            metrics,
+                            placement_routing,
+                        );
                         let (outcome, reason) = if response.status < 400 {
                             ("success", "retrieve accepted")
                         } else {
@@ -1167,8 +1332,9 @@ fn handle_request_with_metrics_and_reload(
                     return HttpResponse::bad_request("request body must be valid UTF-8");
                 }
             };
-            match build_retrieve_request_from_json(body) {
-                Ok(req) => {
+            match build_retrieve_transport_request_from_json(body) {
+                Ok(transport_req) => {
+                    let req = transport_req.request;
                     let tenant_id = req.tenant_id.clone();
                     match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
                         AuthDecision::Unauthorized(reason) => {
@@ -1208,6 +1374,7 @@ fn handle_request_with_metrics_and_reload(
                             let response = execute_retrieve_and_observe(
                                 store,
                                 req,
+                                transport_req.read_consistency,
                                 metrics,
                                 placement_routing,
                             );
@@ -1249,611 +1416,10 @@ fn handle_request_with_metrics_and_reload(
     }
 }
 
-fn render_planner_debug_json(snapshot: &RetrievePlannerDebugSnapshot) -> String {
-    format!(
-        "{{\"tenant_id\":\"{}\",\"top_k\":{},\"stance_mode\":\"{}\",\"has_query_embedding\":{},\"entity_filter_count\":{},\"embedding_filter_count\":{},\"has_filtering\":{},\"metadata_prefilter_count\":{},\"segment_base_count\":{},\"wal_delta_count\":{},\"storage_visible_count\":{},\"allowed_claim_ids_active\":{},\"allowed_claim_ids_count\":{},\"short_circuit_empty\":{},\"ann_candidate_count\":{},\"planner_candidate_count\":{}}}",
-        json_escape(&snapshot.tenant_id),
-        snapshot.top_k,
-        snapshot.stance_mode,
-        snapshot.has_query_embedding,
-        snapshot.entity_filter_count,
-        snapshot.embedding_filter_count,
-        snapshot.has_filtering,
-        snapshot.metadata_prefilter_count,
-        snapshot.segment_base_count,
-        snapshot.wal_delta_count,
-        snapshot.storage_visible_count,
-        snapshot.allowed_claim_ids_active,
-        snapshot.allowed_claim_ids_count,
-        snapshot.short_circuit_empty,
-        snapshot.ann_candidate_count,
-        snapshot.planner_candidate_count,
-    )
-}
-
-fn storage_divergence_ratio(snapshot: &RetrievePlannerDebugSnapshot) -> f64 {
-    if snapshot.storage_visible_count == 0 {
-        0.0
-    } else {
-        snapshot.wal_delta_count as f64 / snapshot.storage_visible_count as f64
-    }
-}
-
-fn resolve_storage_divergence_warn_delta_count() -> usize {
-    parse_env_first_usize(&[
-        "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT",
-        "EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_DELTA_COUNT",
-    ])
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT)
-}
-
-fn resolve_storage_divergence_warn_ratio() -> f64 {
-    parse_env_first_f64(&[
-        "DASH_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO",
-        "EME_RETRIEVAL_STORAGE_DIVERGENCE_WARN_RATIO",
-    ])
-    .filter(|value| value.is_finite() && *value >= 0.0)
-    .unwrap_or(DEFAULT_STORAGE_DIVERGENCE_WARN_RATIO)
-}
-
-fn evaluate_storage_divergence_warning(
-    snapshot: &RetrievePlannerDebugSnapshot,
-    warn_delta_count: usize,
-    warn_ratio: f64,
-) -> (bool, Option<String>, f64) {
-    let ratio = storage_divergence_ratio(snapshot);
-    let delta_exceeded = snapshot.wal_delta_count >= warn_delta_count;
-    let ratio_exceeded = ratio >= warn_ratio;
-    let warn = snapshot.wal_delta_count > 0 && (delta_exceeded || ratio_exceeded);
-    let reason = if !warn {
-        None
-    } else if delta_exceeded && ratio_exceeded {
-        Some(format!(
-            "wal_delta_count={} exceeds {} and divergence_ratio={:.6} exceeds {:.6}",
-            snapshot.wal_delta_count, warn_delta_count, ratio, warn_ratio
-        ))
-    } else if delta_exceeded {
-        Some(format!(
-            "wal_delta_count={} exceeds {}",
-            snapshot.wal_delta_count, warn_delta_count
-        ))
-    } else {
-        Some(format!(
-            "divergence_ratio={:.6} exceeds {:.6}",
-            ratio, warn_ratio
-        ))
-    };
-    (warn, reason, ratio)
-}
-
-fn render_storage_visibility_debug_json(
-    snapshot: &RetrievePlannerDebugSnapshot,
-    warn_delta_count: usize,
-    warn_ratio: f64,
-    warn: bool,
-    reason: Option<&str>,
-    ratio: f64,
-) -> String {
-    let reason_json = reason
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .unwrap_or_else(|| "null".to_string());
-    format!(
-        "{{\"tenant_id\":\"{}\",\"segment_base_count\":{},\"wal_delta_count\":{},\"storage_visible_count\":{},\"metadata_prefilter_count\":{},\"allowed_claim_ids_count\":{},\"has_filtering\":{},\"short_circuit_empty\":{},\"divergence_ratio\":{:.6},\"divergence_active\":{},\"divergence_warn\":{},\"warn_delta_count\":{},\"warn_ratio\":{:.6},\"warn_reason\":{}}}",
-        json_escape(&snapshot.tenant_id),
-        snapshot.segment_base_count,
-        snapshot.wal_delta_count,
-        snapshot.storage_visible_count,
-        snapshot.metadata_prefilter_count,
-        snapshot.allowed_claim_ids_count,
-        snapshot.has_filtering,
-        snapshot.short_circuit_empty,
-        ratio,
-        snapshot.wal_delta_count > 0,
-        warn,
-        warn_delta_count,
-        warn_ratio,
-        reason_json
-    )
-}
-
-fn render_placement_debug_json(
-    placement_routing: Option<&PlacementRoutingRuntime>,
-    placement_reload: Option<&PlacementReloadSnapshot>,
-    query: &HashMap<String, String>,
-) -> String {
-    let route_probe = build_read_route_probe_json(placement_routing, query);
-    let (enabled, local_node_id, read_preference, shard_count, placements) =
-        if let Some(routing) = placement_routing {
-            (
-                true,
-                Some(routing.local_node_id.as_str()),
-                Some(read_preference_str(routing.read_preference)),
-                routing.router_config.shard_ids.len(),
-                routing.placements.as_slice(),
-            )
-        } else {
-            (false, None, None, 0, &[][..])
-        };
-    format!(
-        "{{\"enabled\":{},\"local_node_id\":{},\"read_preference\":{},\"shard_count\":{},\"placements\":{},\"route_probe\":{},\"reload\":{}}}",
-        enabled,
-        local_node_id
-            .map(|value| format!("\"{}\"", json_escape(value)))
-            .unwrap_or_else(|| "null".to_string()),
-        read_preference
-            .map(|value| format!("\"{}\"", value))
-            .unwrap_or_else(|| "null".to_string()),
-        shard_count,
-        render_placements_json(placements),
-        route_probe,
-        render_placement_reload_json(placement_reload),
-    )
-}
-
-fn render_placement_reload_json(snapshot: Option<&PlacementReloadSnapshot>) -> String {
-    let snapshot = snapshot.cloned().unwrap_or_default();
-    format!(
-        "{{\"enabled\":{},\"interval_ms\":{},\"attempt_total\":{},\"success_total\":{},\"failure_total\":{},\"last_error\":{}}}",
-        snapshot.enabled,
-        snapshot
-            .interval_ms
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-        snapshot.attempt_total,
-        snapshot.success_total,
-        snapshot.failure_total,
-        snapshot
-            .last_error
-            .as_ref()
-            .map(|value| format!("\"{}\"", json_escape(value)))
-            .unwrap_or_else(|| "null".to_string()),
-    )
-}
-
-fn build_read_route_probe_json(
-    placement_routing: Option<&PlacementRoutingRuntime>,
-    query: &HashMap<String, String>,
-) -> String {
-    let Some(tenant_id) = query.get("tenant_id").map(String::as_str) else {
-        return "null".to_string();
-    };
-    let tenant_id = tenant_id.trim();
-    if tenant_id.is_empty() {
-        return "{\"status\":\"invalid\",\"reason\":\"tenant_id must not be empty\"}".to_string();
-    }
-    let entity_key = query
-        .get("entity_key")
-        .or_else(|| query.get("query"))
-        .map(String::as_str)
-        .unwrap_or_default()
-        .trim();
-    if entity_key.is_empty() {
-        return "{\"status\":\"invalid\",\"reason\":\"entity_key (or query) is required for route probe\"}".to_string();
-    }
-    let Some(routing) = placement_routing else {
-        return "{\"status\":\"unconfigured\",\"reason\":\"placement routing is disabled\"}"
-            .to_string();
-    };
-
-    match route_read_with_placement(
-        tenant_id,
-        entity_key,
-        &routing.router_config,
-        &routing.placements,
-        routing.read_preference,
-    ) {
-        Ok(routed) => {
-            let local_admission = routed.node_id == routing.local_node_id;
-            let reason = if local_admission {
-                "local node is selected replica"
-            } else {
-                "request would be rejected: local node is not selected replica"
-            };
-            format!(
-                "{{\"status\":\"{}\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"local_node_id\":\"{}\",\"target_node_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"role\":\"{}\",\"read_preference\":\"{}\",\"local_admission\":{},\"reason\":\"{}\"}}",
-                if local_admission {
-                    "routable"
-                } else {
-                    "rejected"
-                },
-                json_escape(tenant_id),
-                json_escape(entity_key),
-                json_escape(&routing.local_node_id),
-                json_escape(&routed.node_id),
-                routed.shard_id,
-                routed.epoch,
-                replica_role_str(routed.role),
-                read_preference_str(routing.read_preference),
-                local_admission,
-                json_escape(reason),
-            )
-        }
-        Err(err) => format!(
-            "{{\"status\":\"rejected\",\"tenant_id\":\"{}\",\"entity_key\":\"{}\",\"reason\":\"{}\"}}",
-            json_escape(tenant_id),
-            json_escape(entity_key),
-            json_escape(&format!("placement route error: {err:?}"))
-        ),
-    }
-}
-
-fn render_placements_json(placements: &[ShardPlacement]) -> String {
-    let body = placements
-        .iter()
-        .map(|placement| {
-            let replicas = placement
-                .replicas
-                .iter()
-                .map(|replica| {
-                    format!(
-                        "{{\"node_id\":\"{}\",\"role\":\"{}\",\"health\":\"{}\"}}",
-                        json_escape(&replica.node_id),
-                        replica_role_str(replica.role),
-                        replica_health_str(replica.health),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{{\"tenant_id\":\"{}\",\"shard_id\":{},\"epoch\":{},\"replicas\":[{}]}}",
-                json_escape(&placement.tenant_id),
-                placement.shard_id,
-                placement.epoch,
-                replicas
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{body}]")
-}
-
-fn replica_role_str(role: ReplicaRole) -> &'static str {
-    match role {
-        ReplicaRole::Leader => "leader",
-        ReplicaRole::Follower => "follower",
-    }
-}
-
-fn replica_health_str(health: ReplicaHealth) -> &'static str {
-    match health {
-        ReplicaHealth::Healthy => "healthy",
-        ReplicaHealth::Degraded => "degraded",
-        ReplicaHealth::Unavailable => "unavailable",
-    }
-}
-
-fn read_preference_str(value: ReadPreference) -> &'static str {
-    match value {
-        ReadPreference::LeaderOnly => "leader_only",
-        ReadPreference::PreferFollower => "prefer_follower",
-        ReadPreference::AnyHealthy => "any_healthy",
-    }
-}
-
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AuthDecision {
-    Allowed,
-    Unauthorized(&'static str),
-    Forbidden(&'static str),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AuthPolicy {
-    required_api_keys: HashSet<String>,
-    revoked_api_keys: HashSet<String>,
-    allowed_tenants: TenantScope,
-    scoped_api_keys: HashMap<String, TenantScope>,
-    jwt_validation: Option<JwtValidationConfig>,
-}
-
-impl AuthPolicy {
-    fn from_env(
-        required_api_key: Option<String>,
-        required_api_keys_raw: Option<String>,
-        revoked_api_keys_raw: Option<String>,
-        allowed_tenants_raw: Option<String>,
-        scoped_api_keys_raw: Option<String>,
-    ) -> Self {
-        Self {
-            required_api_keys: parse_api_key_set(
-                required_api_key.as_deref(),
-                required_api_keys_raw.as_deref(),
-            ),
-            revoked_api_keys: parse_api_key_set(None, revoked_api_keys_raw.as_deref()),
-            allowed_tenants: parse_tenant_scope(allowed_tenants_raw.as_deref(), true),
-            scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref()),
-            jwt_validation: parse_jwt_validation_config(
-                env_with_fallback(
-                    "DASH_RETRIEVAL_JWT_HS256_SECRET",
-                    "EME_RETRIEVAL_JWT_HS256_SECRET",
-                ),
-                env_with_fallback(
-                    "DASH_RETRIEVAL_JWT_HS256_SECRETS",
-                    "EME_RETRIEVAL_JWT_HS256_SECRETS",
-                ),
-                env_with_fallback(
-                    "DASH_RETRIEVAL_JWT_HS256_SECRETS_BY_KID",
-                    "EME_RETRIEVAL_JWT_HS256_SECRETS_BY_KID",
-                ),
-                env_with_fallback("DASH_RETRIEVAL_JWT_ISSUER", "EME_RETRIEVAL_JWT_ISSUER"),
-                env_with_fallback("DASH_RETRIEVAL_JWT_AUDIENCE", "EME_RETRIEVAL_JWT_AUDIENCE"),
-                env_with_fallback(
-                    "DASH_RETRIEVAL_JWT_LEEWAY_SECS",
-                    "EME_RETRIEVAL_JWT_LEEWAY_SECS",
-                ),
-                env_with_fallback(
-                    "DASH_RETRIEVAL_JWT_REQUIRE_EXP",
-                    "EME_RETRIEVAL_JWT_REQUIRE_EXP",
-                ),
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TenantScope {
-    Any,
-    Set(HashSet<String>),
-}
-
-impl TenantScope {
-    fn allows(&self, tenant_id: &str) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Set(tenants) => tenants.contains(tenant_id),
-        }
-    }
-}
-
-fn authorize_request_for_tenant(
-    request: &HttpRequest,
-    tenant_id: &str,
-    policy: &AuthPolicy,
-) -> AuthDecision {
-    if let Some(jwt_config) = policy.jwt_validation.as_ref()
-        && let Some(token) = presented_bearer_token(request)
-        && bearer_looks_like_jwt(token)
-    {
-        return match verify_hs256_token_for_tenant(token, tenant_id, jwt_config, unix_now_secs()) {
-            Ok(()) => {
-                if !policy.allowed_tenants.allows(tenant_id) {
-                    AuthDecision::Forbidden("tenant is not allowed by service policy")
-                } else {
-                    AuthDecision::Allowed
-                }
-            }
-            Err(JwtValidationError::TenantNotAllowed) => {
-                AuthDecision::Forbidden("tenant is not allowed for this JWT")
-            }
-            Err(JwtValidationError::Expired) => AuthDecision::Unauthorized("JWT expired"),
-            Err(_) => AuthDecision::Unauthorized("invalid JWT"),
-        };
-    }
-
-    let maybe_api_key = presented_api_key(request);
-    if let Some(api_key) = maybe_api_key
-        && policy.revoked_api_keys.contains(api_key)
-    {
-        return AuthDecision::Unauthorized("API key revoked");
-    }
-
-    if !policy.scoped_api_keys.is_empty() {
-        let Some(api_key) = maybe_api_key else {
-            return AuthDecision::Unauthorized("missing or invalid API key");
-        };
-        if let Some(scope) = policy.scoped_api_keys.get(api_key) {
-            if !scope.allows(tenant_id) {
-                return AuthDecision::Forbidden("tenant is not allowed for this API key");
-            }
-        } else if !policy.required_api_keys.is_empty()
-            && !policy.required_api_keys.contains(api_key)
-        {
-            return AuthDecision::Unauthorized("missing or invalid API key");
-        }
-    } else if !policy.required_api_keys.is_empty()
-        && !matches!(maybe_api_key, Some(key) if policy.required_api_keys.contains(key))
-    {
-        return AuthDecision::Unauthorized("missing or invalid API key");
-    }
-
-    if !policy.allowed_tenants.allows(tenant_id) {
-        return AuthDecision::Forbidden("tenant is not allowed by service policy");
-    }
-    AuthDecision::Allowed
-}
-
-fn presented_api_key(request: &HttpRequest) -> Option<&str> {
-    if let Some(value) = request.headers.get("x-api-key") {
-        return Some(value.as_str());
-    }
-    presented_bearer_token(request)
-}
-
-fn presented_bearer_token(request: &HttpRequest) -> Option<&str> {
-    let value = request.headers.get("authorization")?;
-    value.strip_prefix("Bearer ").map(str::trim)
-}
-
-fn bearer_looks_like_jwt(token: &str) -> bool {
-    let mut parts = token.split('.');
-    let first = parts.next().unwrap_or_default();
-    let second = parts.next().unwrap_or_default();
-    let third = parts.next().unwrap_or_default();
-    parts.next().is_none() && !first.is_empty() && !second.is_empty() && !third.is_empty()
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default()
-}
-
-fn parse_tenant_scope(raw: Option<&str>, empty_means_any: bool) -> TenantScope {
-    let Some(raw) = raw else {
-        return TenantScope::Any;
-    };
-    let mut tenants = HashSet::new();
-    for value in raw.split(',') {
-        let tenant = value.trim();
-        if tenant.is_empty() {
-            continue;
-        }
-        if tenant == "*" {
-            return TenantScope::Any;
-        }
-        tenants.insert(tenant.to_string());
-    }
-    if tenants.is_empty() && empty_means_any {
-        TenantScope::Any
-    } else {
-        TenantScope::Set(tenants)
-    }
-}
-
-fn parse_scoped_api_keys(raw: Option<&str>) -> HashMap<String, TenantScope> {
-    let mut scoped = HashMap::new();
-    let Some(raw) = raw else {
-        return scoped;
-    };
-
-    for entry in raw.split(';') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let Some((raw_key, raw_scope)) = entry.split_once(':') else {
-            continue;
-        };
-        let key = raw_key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        scoped.insert(
-            key.to_string(),
-            parse_tenant_scope(Some(raw_scope.trim()), false),
-        );
-    }
-    scoped
-}
-
-fn parse_api_key_set(single_key: Option<&str>, raw: Option<&str>) -> HashSet<String> {
-    let mut keys = HashSet::new();
-    if let Some(single_key) = single_key {
-        let key = single_key.trim();
-        if !key.is_empty() {
-            keys.insert(key.to_string());
-        }
-    }
-    if let Some(raw) = raw {
-        for key in raw.split(',') {
-            let key = key.trim();
-            if key.is_empty() {
-                continue;
-            }
-            keys.insert(key.to_string());
-        }
-    }
-    keys
-}
-
-fn parse_jwt_validation_config(
-    secret_raw: Option<String>,
-    secret_set_raw: Option<String>,
-    secrets_by_kid_raw: Option<String>,
-    issuer_raw: Option<String>,
-    audience_raw: Option<String>,
-    leeway_secs_raw: Option<String>,
-    require_exp_raw: Option<String>,
-) -> Option<JwtValidationConfig> {
-    let secret = secret_raw?.trim().to_string();
-    if secret.is_empty() {
-        return None;
-    }
-    let leeway_secs = leeway_secs_raw
-        .as_deref()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let require_exp = parse_bool_env_default(require_exp_raw.as_deref(), true);
-    let mut fallback_secrets = parse_secret_list(secret_set_raw.as_deref());
-    fallback_secrets.retain(|value| value != &secret);
-    let mut seen = HashSet::new();
-    fallback_secrets.retain(|value| seen.insert(value.clone()));
-    Some(JwtValidationConfig {
-        hs256_secret: secret,
-        hs256_fallback_secrets: fallback_secrets,
-        hs256_secrets_by_kid: parse_jwt_secrets_by_kid(secrets_by_kid_raw.as_deref()),
-        issuer: issuer_raw.and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }),
-        audience: audience_raw.and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }),
-        leeway_secs,
-        require_exp,
-    })
-}
-
-fn parse_bool_env_default(raw: Option<&str>, default: bool) -> bool {
-    let Some(raw) = raw else {
-        return default;
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => default,
-    }
-}
-
-fn parse_secret_list(raw: Option<&str>) -> Vec<String> {
-    let Some(raw) = raw else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn parse_jwt_secrets_by_kid(raw: Option<&str>) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(raw) = raw else {
-        return out;
-    };
-    for entry in raw.split(';') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let Some((kid_raw, secret_raw)) = entry.split_once(':') else {
-            continue;
-        };
-        let kid = kid_raw.trim();
-        let secret = secret_raw.trim();
-        if kid.is_empty() || secret.is_empty() {
-            continue;
-        }
-        out.insert(kid.to_string(), secret.to_string());
-    }
-    out
 }
 
 fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {
@@ -1911,183 +1477,15 @@ fn emit_audit_event(
     }
 }
 
-const AUDIT_CHAIN_GENESIS_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AuditChainState {
-    next_seq: u64,
-    last_hash: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AuditEvent<'a> {
-    action: &'a str,
-    tenant_id: Option<&'a str>,
-    status: u16,
-    outcome: &'a str,
-    reason: &'a str,
-}
-
-fn append_audit_record(path: &str, timestamp_ms: u64, event: AuditEvent<'_>) -> Result<(), String> {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_dir_all(parent).map_err(|e| format!("creating audit directory failed: {e}"))?;
-    }
-    let mut chain_states = audit_chain_states()
-        .lock()
-        .map_err(|_| "acquiring audit chain lock failed".to_string())?;
-    let state = if let Some(existing) = chain_states.get(path).cloned() {
-        existing
-    } else {
-        let loaded = load_audit_chain_state(path)?;
-        chain_states.insert(path.to_string(), loaded.clone());
-        loaded
-    };
-    let (payload, next_state) = render_chained_audit_payload(timestamp_ms, event, &state);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("opening audit file failed: {e}"))?;
-    writeln!(file, "{payload}").map_err(|e| format!("appending audit file failed: {e}"))?;
-    chain_states.insert(path.to_string(), next_state);
-    Ok(())
-}
-
-fn render_chained_audit_payload(
-    timestamp_ms: u64,
-    event: AuditEvent<'_>,
-    state: &AuditChainState,
-) -> (String, AuditChainState) {
-    let seq = state.next_seq;
-    let prev_hash = state.last_hash.as_str();
-    let canonical = canonical_audit_payload(seq, timestamp_ms, event, prev_hash);
-    let hash = sha256_hex(canonical.as_bytes());
-    let payload = format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\",\"hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-        hash,
-    );
-    (
-        payload,
-        AuditChainState {
-            next_seq: seq.saturating_add(1),
-            last_hash: hash,
-        },
-    )
-}
-
-fn canonical_audit_payload(
-    seq: u64,
-    timestamp_ms: u64,
-    event: AuditEvent<'_>,
-    prev_hash: &str,
-) -> String {
-    format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-    )
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value
-        .map(|raw| format!("\"{}\"", json_escape(raw)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn audit_chain_states() -> &'static Mutex<HashMap<String, AuditChainState>> {
-    static STATES: OnceLock<Mutex<HashMap<String, AuditChainState>>> = OnceLock::new();
-    STATES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn load_audit_chain_state(path: &str) -> Result<AuditChainState, String> {
-    if !Path::new(path).exists() {
-        return Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        });
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| format!("opening audit file failed: {e}"))?;
-    let reader = BufReader::new(file);
-    let mut last_line: Option<String> = None;
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("reading audit file failed: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        last_line = Some(line);
-    }
-    let Some(last_line) = last_line else {
-        return Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        });
-    };
-    match parse_audit_chain_state_from_line(&last_line)? {
-        Some(state) => Ok(state),
-        None => Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        }),
-    }
-}
-
-fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainState>, String> {
-    let value = parse_json(line)?;
-    let object = match value {
-        JsonValue::Object(object) => object,
-        _ => return Ok(None),
-    };
-
-    let seq_value = object.get("seq");
-    let hash_value = object.get("hash");
-    if seq_value.is_none() && hash_value.is_none() {
-        return Ok(None);
-    }
-    let seq = match seq_value {
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<u64>()
-            .map_err(|_| "audit seq must be u64".to_string())?,
-        _ => return Err("audit seq is missing or invalid".to_string()),
-    };
-    let hash = match hash_value {
-        Some(JsonValue::String(raw)) if is_sha256_hex(raw) => raw.clone(),
-        _ => return Err("audit hash is missing or invalid".to_string()),
-    };
-
-    Ok(Some(AuditChainState {
-        next_seq: seq.saturating_add(1),
-        last_hash: hash,
-    }))
-}
-
-fn is_sha256_hex(raw: &str) -> bool {
-    raw.len() == 64 && raw.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
 fn execute_retrieve_and_observe(
     store: &InMemoryStore,
     req: RetrieveApiRequest,
+    read_consistency: ReadConsistencyPolicy,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
 ) -> HttpResponse {
     if let Some(routing) = placement_routing {
-        match ensure_local_read_route(routing, &req) {
+        match ensure_local_read_route(routing, &req, read_consistency) {
             Ok(routed) => {
                 if let Ok(mut guard) = metrics.lock() {
                     guard.observe_read_route_resolution(&routed);
@@ -2106,7 +1504,7 @@ fn execute_retrieve_and_observe(
 
     let started_at = Instant::now();
     let tenant_id = req.tenant_id.clone();
-    let response = execute_api_query(store, req);
+    let (response, merge_snapshot) = execute_api_query_with_storage_snapshot(store, req);
     let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let result_count = response.results.len();
     let ingest_to_visible_lag_ms =
@@ -2114,6 +1512,7 @@ fn execute_retrieve_and_observe(
 
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_retrieve(200, latency_ms, result_count, ingest_to_visible_lag_ms);
+        guard.observe_storage_merge_execution(&merge_snapshot);
     }
 
     HttpResponse::ok_json(render_retrieve_response_json(&response))
@@ -2381,6 +1780,7 @@ fn read_entity_key_for_request(req: &RetrieveApiRequest) -> &str {
 fn ensure_local_read_route(
     routing: &PlacementRoutingRuntime,
     req: &RetrieveApiRequest,
+    read_consistency: ReadConsistencyPolicy,
 ) -> Result<RoutedReplica, ReadRouteError> {
     let entity_key = read_entity_key_for_request(req);
     let routed = route_read_with_placement(
@@ -2399,6 +1799,32 @@ fn ensure_local_read_route(
             epoch: routed.epoch,
             role: routed.role,
         });
+    }
+
+    if let Some(placement) = routing.placements.iter().find(|placement| {
+        placement.tenant_id == req.tenant_id && placement.shard_id == routed.shard_id
+    }) {
+        let total_replicas = placement.replicas.len();
+        let readable_replicas = placement
+            .replicas
+            .iter()
+            .filter(|replica| {
+                matches!(
+                    replica.health,
+                    ReplicaHealth::Healthy | ReplicaHealth::Degraded
+                )
+            })
+            .count();
+        let required_replicas = read_consistency.required_replicas(total_replicas);
+        if readable_replicas < required_replicas {
+            return Err(ReadRouteError::ConsistencyUnavailable {
+                policy: read_consistency,
+                shard_id: routed.shard_id,
+                readable_replicas,
+                required_replicas,
+                total_replicas,
+            });
+        }
     }
     Ok(routed)
 }
@@ -2419,6 +1845,19 @@ fn map_read_route_error(error: &ReadRouteError) -> (u16, String) {
             503,
             format!(
                 "placement route rejected read request: local node '{local_node_id}' is not selected for shard {shard_id} at epoch {epoch} (target replica: '{target_node_id}')"
+            ),
+        ),
+        ReadRouteError::ConsistencyUnavailable {
+            policy,
+            shard_id,
+            readable_replicas,
+            required_replicas,
+            total_replicas,
+        } => (
+            503,
+            format!(
+                "placement route rejected read request: read_consistency={} requires {required_replicas} readable replicas for shard {shard_id}, but observed {readable_replicas}/{total_replicas}",
+                policy.as_str()
             ),
         ),
     }
@@ -2451,845 +1890,6 @@ fn estimate_ingest_to_visible_lag_ms(
         return None;
     }
     Some(lag_values.iter().sum::<f64>() / lag_values.len() as f64)
-}
-
-fn split_target(target: &str) -> (String, HashMap<String, String>) {
-    let (path, query_str) = target
-        .split_once('?')
-        .map(|(path, query)| (path, Some(query)))
-        .unwrap_or((target, None));
-
-    let mut query = HashMap::new();
-    if let Some(query_str) = query_str {
-        for pair in query_str.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = match url_decode(raw_key) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let value = match url_decode(raw_value) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            query.insert(key, value);
-        }
-    }
-    (path.to_string(), query)
-}
-
-fn url_decode(raw: &str) -> Result<String, String> {
-    let bytes = raw.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' => {
-                if i + 2 >= bytes.len() {
-                    return Err("incomplete percent escape".to_string());
-                }
-                let hi = decode_hex(bytes[i + 1])?;
-                let lo = decode_hex(bytes[i + 2])?;
-                out.push((hi << 4) | lo);
-                i += 3;
-            }
-            other => {
-                out.push(other);
-                i += 1;
-            }
-        }
-    }
-
-    String::from_utf8(out).map_err(|_| "invalid UTF-8 in URL field".to_string())
-}
-
-fn decode_hex(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("invalid hex digit".to_string()),
-    }
-}
-
-fn build_retrieve_request_from_query(
-    query: &HashMap<String, String>,
-) -> Result<RetrieveApiRequest, String> {
-    let tenant_id = query
-        .get("tenant_id")
-        .ok_or_else(|| "tenant_id is required".to_string())?
-        .trim()
-        .to_string();
-    if tenant_id.is_empty() {
-        return Err("tenant_id cannot be empty".to_string());
-    }
-
-    let request_query = query
-        .get("query")
-        .ok_or_else(|| "query is required".to_string())?
-        .trim()
-        .to_string();
-    if request_query.is_empty() {
-        return Err("query cannot be empty".to_string());
-    }
-
-    let query_embedding = query
-        .get("query_embedding")
-        .map(|value| parse_query_embedding_csv(value, "query_embedding"))
-        .transpose()?;
-    let entity_filters = query
-        .get("entity_filters")
-        .map(|value| parse_csv_string_list(value, "entity_filters"))
-        .transpose()?
-        .unwrap_or_default();
-    let embedding_id_filters = query
-        .get("embedding_id_filters")
-        .map(|value| parse_csv_string_list(value, "embedding_id_filters"))
-        .transpose()?
-        .unwrap_or_default();
-
-    let top_k = match query.get("top_k") {
-        Some(value) => parse_positive_usize(value, "top_k")?,
-        None => 5,
-    };
-
-    let stance_mode = match query.get("stance_mode").map(|s| s.as_str()) {
-        Some("balanced") | None => StanceMode::Balanced,
-        Some("support_only") => StanceMode::SupportOnly,
-        Some(_) => return Err("stance_mode must be balanced or support_only".to_string()),
-    };
-
-    let return_graph = match query.get("return_graph").map(|s| s.as_str()) {
-        Some("true") => true,
-        Some("false") | None => false,
-        Some(_) => return Err("return_graph must be true or false".to_string()),
-    };
-
-    let from_unix = query
-        .get("from_unix")
-        .map(|value| parse_i64(value, "from_unix"))
-        .transpose()?;
-    let to_unix = query
-        .get("to_unix")
-        .map(|value| parse_i64(value, "to_unix"))
-        .transpose()?;
-    let time_range = if from_unix.is_some() || to_unix.is_some() {
-        Some(TimeRange { from_unix, to_unix })
-    } else {
-        None
-    };
-    if let Some(TimeRange {
-        from_unix: Some(from),
-        to_unix: Some(to),
-    }) = &time_range
-        && from > to
-    {
-        return Err("time range is invalid: from_unix must be <= to_unix".to_string());
-    }
-
-    Ok(RetrieveApiRequest {
-        tenant_id,
-        query: request_query,
-        query_embedding,
-        entity_filters,
-        embedding_id_filters,
-        top_k,
-        stance_mode,
-        return_graph,
-        time_range,
-    })
-}
-
-fn build_retrieve_request_from_json(body: &str) -> Result<RetrieveApiRequest, String> {
-    let value = parse_json(body)?;
-    let object = match value {
-        JsonValue::Object(map) => map,
-        _ => return Err("request body must be a JSON object".to_string()),
-    };
-
-    let tenant_id = require_string(&object, "tenant_id")?;
-    if tenant_id.trim().is_empty() {
-        return Err("tenant_id cannot be empty".to_string());
-    }
-
-    let query = require_string(&object, "query")?;
-    if query.trim().is_empty() {
-        return Err("query cannot be empty".to_string());
-    }
-
-    let query_embedding =
-        parse_optional_f32_array(object.get("query_embedding"), "query_embedding")?;
-    let entity_filters =
-        parse_optional_string_array(object.get("entity_filters"), "entity_filters")?
-            .unwrap_or_default();
-    let embedding_id_filters =
-        parse_optional_string_array(object.get("embedding_id_filters"), "embedding_id_filters")?
-            .unwrap_or_default();
-
-    let top_k = match object.get("top_k") {
-        Some(JsonValue::Number(raw)) => parse_positive_usize(raw, "top_k")?,
-        Some(_) => return Err("top_k must be a positive integer".to_string()),
-        None => 5,
-    };
-
-    let stance_mode = match object.get("stance_mode") {
-        Some(JsonValue::String(mode)) => parse_stance_mode(mode)?,
-        Some(_) => return Err("stance_mode must be a string".to_string()),
-        None => StanceMode::Balanced,
-    };
-
-    let return_graph = match object.get("return_graph") {
-        Some(JsonValue::Bool(flag)) => *flag,
-        Some(_) => return Err("return_graph must be a boolean".to_string()),
-        None => false,
-    };
-
-    let time_range = match object.get("time_range") {
-        Some(JsonValue::Object(range_obj)) => {
-            let from_unix = match range_obj.get("from_unix") {
-                Some(JsonValue::Number(raw)) => Some(parse_i64(raw, "time_range.from_unix")?),
-                Some(JsonValue::Null) | None => None,
-                Some(_) => {
-                    return Err("time_range.from_unix must be an i64 timestamp".to_string());
-                }
-            };
-            let to_unix = match range_obj.get("to_unix") {
-                Some(JsonValue::Number(raw)) => Some(parse_i64(raw, "time_range.to_unix")?),
-                Some(JsonValue::Null) | None => None,
-                Some(_) => {
-                    return Err("time_range.to_unix must be an i64 timestamp".to_string());
-                }
-            };
-
-            if from_unix.is_some() || to_unix.is_some() {
-                Some(TimeRange { from_unix, to_unix })
-            } else {
-                None
-            }
-        }
-        Some(JsonValue::Null) | None => None,
-        Some(_) => return Err("time_range must be an object or null".to_string()),
-    };
-    if let Some(TimeRange {
-        from_unix: Some(from),
-        to_unix: Some(to),
-    }) = &time_range
-        && from > to
-    {
-        return Err("time range is invalid: from_unix must be <= to_unix".to_string());
-    }
-
-    Ok(RetrieveApiRequest {
-        tenant_id,
-        query,
-        query_embedding,
-        entity_filters,
-        embedding_id_filters,
-        top_k,
-        stance_mode,
-        return_graph,
-        time_range,
-    })
-}
-
-fn parse_stance_mode(raw: &str) -> Result<StanceMode, String> {
-    match raw {
-        "balanced" => Ok(StanceMode::Balanced),
-        "support_only" => Ok(StanceMode::SupportOnly),
-        _ => Err("stance_mode must be balanced or support_only".to_string()),
-    }
-}
-
-fn require_string(map: &HashMap<String, JsonValue>, key: &str) -> Result<String, String> {
-    match map.get(key) {
-        Some(JsonValue::String(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("{key} must be a string")),
-        None => Err(format!("{key} is required")),
-    }
-}
-
-fn parse_positive_usize(raw: &str, field_name: &str) -> Result<usize, String> {
-    if raw.contains('.') || raw.contains('e') || raw.contains('E') || raw.starts_with('-') {
-        return Err(format!("{field_name} must be a positive integer"));
-    }
-    let parsed = raw
-        .parse::<usize>()
-        .map_err(|_| format!("{field_name} must be a positive integer"))?;
-    if parsed == 0 {
-        return Err(format!("{field_name} must be > 0"));
-    }
-    Ok(parsed)
-}
-
-fn parse_i64(raw: &str, field_name: &str) -> Result<i64, String> {
-    if raw.contains('.') || raw.contains('e') || raw.contains('E') {
-        return Err(format!("{field_name} must be an i64 timestamp"));
-    }
-    raw.parse::<i64>()
-        .map_err(|_| format!("{field_name} must be an i64 timestamp"))
-}
-
-fn parse_query_embedding_csv(raw: &str, field_name: &str) -> Result<Vec<f32>, String> {
-    let values: Vec<&str> = raw
-        .split(',')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .collect();
-    if values.is_empty() {
-        return Err(format!("{field_name} must not be empty"));
-    }
-    let mut out = Vec::with_capacity(values.len());
-    for part in values {
-        let parsed = part
-            .parse::<f32>()
-            .map_err(|_| format!("{field_name} must contain only numbers"))?;
-        if !parsed.is_finite() {
-            return Err(format!("{field_name} values must be finite"));
-        }
-        out.push(parsed);
-    }
-    Ok(out)
-}
-
-fn parse_csv_string_list(raw: &str, field_name: &str) -> Result<Vec<String>, String> {
-    let out: Vec<String> = raw
-        .split(',')
-        .map(|part| part.trim())
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    if out.is_empty() {
-        return Err(format!("{field_name} must not be empty"));
-    }
-    Ok(out)
-}
-
-fn parse_optional_f32_array(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<Vec<f32>>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                let raw = match item {
-                    JsonValue::Number(raw) => raw,
-                    _ => return Err(format!("{field_name} must be an array of numbers")),
-                };
-                let parsed = raw
-                    .parse::<f32>()
-                    .map_err(|_| format!("{field_name} must be an array of numbers"))?;
-                if !parsed.is_finite() {
-                    return Err(format!("{field_name} values must be finite"));
-                }
-                out.push(parsed);
-            }
-            if out.is_empty() {
-                return Err(format!("{field_name} must not be empty when provided"));
-            }
-            Ok(Some(out))
-        }
-        Some(_) => Err(format!("{field_name} must be an array or null")),
-    }
-}
-
-fn parse_optional_string_array(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<Vec<String>>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                let value = match item {
-                    JsonValue::String(value) => value,
-                    _ => return Err(format!("{field_name} must be an array of strings")),
-                };
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    return Err(format!("{field_name} must not contain empty strings"));
-                }
-                out.push(trimmed.to_string());
-            }
-            Ok(Some(out))
-        }
-        Some(_) => Err(format!("{field_name} must be an array or null")),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum JsonValue {
-    Object(HashMap<String, JsonValue>),
-    Array(Vec<JsonValue>),
-    String(String),
-    Number(String),
-    Bool(bool),
-    Null,
-}
-
-fn parse_json(input: &str) -> Result<JsonValue, String> {
-    let mut parser = JsonParser::new(input);
-    let value = parser.parse_value()?;
-    parser.skip_whitespace();
-    if !parser.is_eof() {
-        return Err("unexpected trailing JSON content".to_string());
-    }
-    Ok(value)
-}
-
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            bytes: input.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn parse_value(&mut self) -> Result<JsonValue, String> {
-        self.skip_whitespace();
-        match self.peek_byte() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') => {
-                self.expect_literal("true")?;
-                Ok(JsonValue::Bool(true))
-            }
-            Some(b'f') => {
-                self.expect_literal("false")?;
-                Ok(JsonValue::Bool(false))
-            }
-            Some(b'n') => {
-                self.expect_literal("null")?;
-                Ok(JsonValue::Null)
-            }
-            Some(b'-' | b'0'..=b'9') => self.parse_number().map(JsonValue::Number),
-            Some(_) => Err("unsupported JSON token".to_string()),
-            None => Err("empty JSON payload".to_string()),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<JsonValue, String> {
-        self.expect_byte(b'{')?;
-        self.skip_whitespace();
-
-        let mut map = HashMap::new();
-        if self.peek_byte() == Some(b'}') {
-            self.pos += 1;
-            return Ok(JsonValue::Object(map));
-        }
-
-        loop {
-            self.skip_whitespace();
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            self.expect_byte(b':')?;
-            let value = self.parse_value()?;
-            map.insert(key, value);
-            self.skip_whitespace();
-
-            match self.peek_byte() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err("invalid JSON object".to_string()),
-            }
-        }
-
-        Ok(JsonValue::Object(map))
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, String> {
-        self.expect_byte(b'[')?;
-        self.skip_whitespace();
-
-        let mut items = Vec::new();
-        if self.peek_byte() == Some(b']') {
-            self.pos += 1;
-            return Ok(JsonValue::Array(items));
-        }
-
-        loop {
-            let value = self.parse_value()?;
-            items.push(value);
-            self.skip_whitespace();
-            match self.peek_byte() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err("invalid JSON array".to_string()),
-            }
-        }
-
-        Ok(JsonValue::Array(items))
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect_byte(b'"')?;
-        let mut out = String::new();
-
-        while let Some(byte) = self.next_byte() {
-            match byte {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let escaped = self
-                        .next_byte()
-                        .ok_or_else(|| "unterminated JSON escape".to_string())?;
-                    match escaped {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let code = self.parse_hex4()?;
-                            let ch = char::from_u32(code)
-                                .ok_or_else(|| "invalid unicode escape".to_string())?;
-                            out.push(ch);
-                        }
-                        _ => return Err("invalid JSON escape sequence".to_string()),
-                    }
-                }
-                b if b.is_ascii_control() => {
-                    return Err("unescaped control character in JSON string".to_string());
-                }
-                b => out.push(b as char),
-            }
-        }
-
-        Err("unterminated JSON string".to_string())
-    }
-
-    fn parse_number(&mut self) -> Result<String, String> {
-        let start = self.pos;
-
-        if self.peek_byte() == Some(b'-') {
-            self.pos += 1;
-        }
-
-        match self.peek_byte() {
-            Some(b'0') => {
-                self.pos += 1;
-            }
-            Some(b'1'..=b'9') => {
-                self.pos += 1;
-                while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err("invalid JSON number".to_string()),
-        }
-
-        if self.peek_byte() == Some(b'.') {
-            self.pos += 1;
-            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                return Err("invalid JSON number".to_string());
-            }
-            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-
-        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                return Err("invalid JSON number".to_string());
-            }
-            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-
-        let raw = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| "invalid JSON number".to_string())?;
-        Ok(raw.to_string())
-    }
-
-    fn parse_hex4(&mut self) -> Result<u32, String> {
-        let mut value: u32 = 0;
-        for _ in 0..4 {
-            let byte = self
-                .next_byte()
-                .ok_or_else(|| "incomplete unicode escape".to_string())?;
-            value = (value << 4)
-                + match byte {
-                    b'0'..=b'9' => (byte - b'0') as u32,
-                    b'a'..=b'f' => (byte - b'a' + 10) as u32,
-                    b'A'..=b'F' => (byte - b'A' + 10) as u32,
-                    _ => return Err("invalid unicode escape".to_string()),
-                };
-        }
-        Ok(value)
-    }
-
-    fn expect_literal(&mut self, literal: &str) -> Result<(), String> {
-        let bytes = literal.as_bytes();
-        if self.bytes.get(self.pos..self.pos + bytes.len()) == Some(bytes) {
-            self.pos += bytes.len();
-            Ok(())
-        } else {
-            Err("invalid JSON literal".to_string())
-        }
-    }
-
-    fn expect_byte(&mut self, expected: u8) -> Result<(), String> {
-        match self.next_byte() {
-            Some(byte) if byte == expected => Ok(()),
-            _ => Err("invalid JSON syntax".to_string()),
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek_byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
-            self.pos += 1;
-        }
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.bytes.len()
-    }
-
-    fn peek_byte(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn next_byte(&mut self) -> Option<u8> {
-        let out = self.peek_byte()?;
-        self.pos += 1;
-        Some(out)
-    }
-}
-
-fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> String {
-    let mut out = String::new();
-    out.push_str("{\"results\":[");
-    for (idx, node) in resp.results.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        render_evidence_node_json(&mut out, node);
-    }
-    out.push_str("],\"graph\":");
-
-    if let Some(graph) = &resp.graph {
-        out.push_str("{\"nodes\":[");
-        for (idx, node) in graph.nodes.iter().enumerate() {
-            if idx > 0 {
-                out.push(',');
-            }
-            render_evidence_node_json(&mut out, node);
-        }
-        out.push_str("],\"edges\":[");
-        for (idx, edge) in graph.edges.iter().enumerate() {
-            if idx > 0 {
-                out.push(',');
-            }
-            out.push('{');
-            out.push_str("\"from_claim_id\":\"");
-            out.push_str(&json_escape(&edge.from_claim_id));
-            out.push_str("\",\"to_claim_id\":\"");
-            out.push_str(&json_escape(&edge.to_claim_id));
-            out.push_str("\",\"relation\":\"");
-            out.push_str(&json_escape(&edge.relation));
-            out.push_str("\",\"strength\":");
-            out.push_str(&format!("{:.6}", edge.strength));
-            out.push('}');
-        }
-        out.push_str("]}");
-    } else {
-        out.push_str("null");
-    }
-
-    out.push('}');
-    out
-}
-
-fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) {
-    out.push('{');
-    out.push_str("\"claim_id\":\"");
-    out.push_str(&json_escape(&node.claim_id));
-    out.push_str("\",\"canonical_text\":\"");
-    out.push_str(&json_escape(&node.canonical_text));
-    out.push_str("\",\"score\":");
-    out.push_str(&format!("{:.6}", node.score));
-    out.push_str(",\"claim_confidence\":");
-    render_optional_f32(out, node.claim_confidence);
-    out.push_str(",\"confidence_band\":");
-    render_optional_string(out, node.confidence_band.as_deref());
-    out.push_str(",\"dominant_stance\":");
-    render_optional_string(out, node.dominant_stance.as_deref());
-    out.push_str(",\"contradiction_risk\":");
-    render_optional_f32(out, node.contradiction_risk);
-    out.push_str(",\"supports\":");
-    out.push_str(&node.supports.to_string());
-    out.push_str(",\"contradicts\":");
-    out.push_str(&node.contradicts.to_string());
-    out.push_str(",\"citations\":");
-    out.push_str(&render_citations_json(&node.citations));
-    out.push_str(",\"event_time_unix\":");
-    render_optional_i64(out, node.event_time_unix);
-    out.push_str(",\"temporal_match_mode\":");
-    render_optional_string(out, node.temporal_match_mode.as_deref());
-    out.push_str(",\"temporal_in_range\":");
-    render_optional_bool(out, node.temporal_in_range);
-    out.push_str(",\"claim_type\":");
-    render_optional_string(out, node.claim_type.as_deref());
-    out.push_str(",\"valid_from\":");
-    render_optional_i64(out, node.valid_from);
-    out.push_str(",\"valid_to\":");
-    render_optional_i64(out, node.valid_to);
-    out.push_str(",\"created_at\":");
-    render_optional_i64(out, node.created_at);
-    out.push_str(",\"updated_at\":");
-    render_optional_i64(out, node.updated_at);
-    out.push('}');
-}
-
-fn render_optional_i64(out: &mut String, value: Option<i64>) {
-    if let Some(value) = value {
-        out.push_str(&value.to_string());
-    } else {
-        out.push_str("null");
-    }
-}
-
-fn render_optional_f32(out: &mut String, value: Option<f32>) {
-    if let Some(value) = value {
-        out.push_str(&format!("{:.6}", value));
-    } else {
-        out.push_str("null");
-    }
-}
-
-fn render_optional_bool(out: &mut String, value: Option<bool>) {
-    if let Some(value) = value {
-        out.push_str(if value { "true" } else { "false" });
-    } else {
-        out.push_str("null");
-    }
-}
-
-fn render_optional_string(out: &mut String, value: Option<&str>) {
-    if let Some(value) = value {
-        out.push('"');
-        out.push_str(&json_escape(value));
-        out.push('"');
-    } else {
-        out.push_str("null");
-    }
-}
-
-fn render_citations_json(citations: &[CitationNode]) -> String {
-    let mut out = String::new();
-    out.push('[');
-    for (idx, citation) in citations.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push('{');
-        out.push_str("\"evidence_id\":\"");
-        out.push_str(&json_escape(&citation.evidence_id));
-        out.push_str("\",\"source_id\":\"");
-        out.push_str(&json_escape(&citation.source_id));
-        out.push_str("\",\"stance\":\"");
-        out.push_str(&json_escape(&citation.stance));
-        out.push_str("\",\"source_quality\":");
-        out.push_str(&format!("{:.6}", citation.source_quality));
-        out.push_str(",\"chunk_id\":");
-        if let Some(chunk_id) = &citation.chunk_id {
-            out.push('"');
-            out.push_str(&json_escape(chunk_id));
-            out.push('"');
-        } else {
-            out.push_str("null");
-        }
-        out.push_str(",\"span_start\":");
-        if let Some(span_start) = citation.span_start {
-            out.push_str(&span_start.to_string());
-        } else {
-            out.push_str("null");
-        }
-        out.push_str(",\"span_end\":");
-        if let Some(span_end) = citation.span_end {
-            out.push_str(&span_end.to_string());
-        } else {
-            out.push_str("null");
-        }
-        out.push_str(",\"doc_id\":");
-        render_optional_string(&mut out, citation.doc_id.as_deref());
-        out.push_str(",\"extraction_model\":");
-        render_optional_string(&mut out, citation.extraction_model.as_deref());
-        out.push_str(",\"ingested_at\":");
-        render_optional_i64(&mut out, citation.ingested_at);
-        out.push('}');
-    }
-    out.push(']');
-    out
-}
-
-fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn write_response(stream: &mut TcpStream, response: HttpResponse) -> std::io::Result<()> {
-    stream.write_all(render_response_text(&response).as_bytes())?;
-    stream.flush()
-}
-
-fn render_response_text(response: &HttpResponse) -> String {
-    let status_text = match response.status {
-        200 => "200 OK",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        503 => "503 Service Unavailable",
-        _ => "500 Internal Server Error",
-    };
-    let body_len = response.body.len();
-    format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
-        response.content_type, response.body
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3566,6 +2166,40 @@ mod tests {
     }
 
     #[test]
+    fn build_retrieve_transport_request_from_query_accepts_read_consistency() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".into(), "tenant-a".into());
+        params.insert("query".into(), "company x".into());
+        params.insert("read_consistency".into(), "quorum".into());
+
+        let req = build_retrieve_transport_request_from_query(&params).unwrap();
+        assert_eq!(req.read_consistency, ReadConsistencyPolicy::Quorum);
+    }
+
+    #[test]
+    fn build_retrieve_transport_request_from_json_accepts_read_consistency() {
+        let body = r#"{
+            "tenant_id": "tenant-a",
+            "query": "company x",
+            "read_consistency": "all"
+        }"#;
+
+        let req = build_retrieve_transport_request_from_json(body).unwrap();
+        assert_eq!(req.read_consistency, ReadConsistencyPolicy::All);
+    }
+
+    #[test]
+    fn build_retrieve_transport_request_rejects_invalid_read_consistency() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".into(), "tenant-a".into());
+        params.insert("query".into(), "company x".into());
+        params.insert("read_consistency".into(), "strong".into());
+
+        let err = build_retrieve_transport_request_from_query(&params).unwrap_err();
+        assert!(err.contains("read_consistency must be one, quorum, or all"));
+    }
+
+    #[test]
     fn split_target_decodes_query_parameters() {
         let (path, query) =
             split_target("/v1/retrieve?tenant_id=tenant-a&query=company+x&return_graph=true");
@@ -3677,6 +2311,144 @@ mod tests {
                 .body
                 .contains("dash_retrieve_placement_last_epoch 11")
         );
+    }
+
+    #[test]
+    fn handle_request_rejects_when_quorum_read_consistency_is_unavailable() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let routing = PlacementRoutingRuntime {
+            local_node_id: "node-a".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 3,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Unavailable,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-c".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Unavailable,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target:
+                "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1&read_consistency=quorum"
+                    .to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response =
+            handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("read_consistency=quorum"));
+    }
+
+    #[test]
+    fn handle_request_rejects_when_all_read_consistency_is_unavailable() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let routing = PlacementRoutingRuntime {
+            local_node_id: "node-a".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 2,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Unavailable,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1&read_consistency=all"
+                .to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response =
+            handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
+        assert_eq!(response.status, 503);
+        assert!(response.body.contains("read_consistency=all"));
+    }
+
+    #[test]
+    fn handle_request_accepts_when_one_read_consistency_is_met() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let routing = PlacementRoutingRuntime {
+            local_node_id: "node-a".to_string(),
+            router_config: RouterConfig {
+                shard_ids: vec![0],
+                virtual_nodes_per_shard: 16,
+                replica_count: 2,
+            },
+            placements: vec![ShardPlacement {
+                tenant_id: "tenant-a".to_string(),
+                shard_id: 0,
+                epoch: 11,
+                replicas: vec![
+                    ReplicaPlacement {
+                        node_id: "node-a".to_string(),
+                        role: ReplicaRole::Leader,
+                        health: ReplicaHealth::Healthy,
+                    },
+                    ReplicaPlacement {
+                        node_id: "node-b".to_string(),
+                        role: ReplicaRole::Follower,
+                        health: ReplicaHealth::Unavailable,
+                    },
+                ],
+            }],
+            read_preference: ReadPreference::LeaderOnly,
+        };
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1&read_consistency=one"
+                .to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        let response =
+            handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"results\""));
     }
 
     #[test]
@@ -4016,9 +2788,61 @@ tenant-a,0,12,node-a,follower,healthy\n",
         let debug_response = handle_request_with_metrics(&store, &debug_request, &metrics);
         assert_eq!(debug_response.status, 200);
         assert!(debug_response.body.contains("\"tenant_id\":\"tenant-a\""));
+        assert!(debug_response.body.contains(&format!(
+            "\"storage_merge_model\":\"{}\"",
+            STORAGE_MERGE_MODEL
+        )));
+        assert!(debug_response.body.contains(&format!(
+            "\"source_of_truth_model\":\"{}\"",
+            STORAGE_SOURCE_OF_TRUTH_MODEL
+        )));
+        assert!(debug_response.body.contains(&format!(
+            "\"execution_mode\":\"{}\"",
+            STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE
+        )));
+        assert!(
+            debug_response
+                .body
+                .contains("\"disk_native_segment_execution_active\":true")
+        );
+        assert!(
+            debug_response
+                .body
+                .contains("\"execution_candidate_count\":2")
+        );
+        assert!(debug_response.body.contains(&format!(
+            "\"promotion_boundary_state\":\"{}\"",
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA
+        )));
+        assert!(
+            debug_response
+                .body
+                .contains("\"promotion_boundary_in_transition\":true")
+        );
         assert!(debug_response.body.contains("\"segment_base_count\":1"));
         assert!(debug_response.body.contains("\"wal_delta_count\":1"));
         assert!(debug_response.body.contains("\"storage_visible_count\":2"));
+        assert!(debug_response.body.contains("\"result_count\":2"));
+        assert!(
+            debug_response
+                .body
+                .contains("\"result_from_segment_base_count\":1")
+        );
+        assert!(
+            debug_response
+                .body
+                .contains("\"result_from_wal_delta_count\":1")
+        );
+        assert!(
+            debug_response
+                .body
+                .contains("\"result_source_unknown_count\":0")
+        );
+        assert!(
+            debug_response
+                .body
+                .contains("\"result_outside_storage_visible_count\":0")
+        );
         assert!(debug_response.body.contains("\"divergence_warn\":true"));
 
         let metrics_request = HttpRequest {
@@ -4037,12 +2861,77 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert!(
             metrics_response
                 .body
+                .contains("dash_retrieve_storage_last_result_from_segment_base_count 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_result_from_wal_delta_count 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_result_from_segment_base_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_result_from_wal_delta_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
                 .contains("dash_retrieve_storage_last_divergence_warn 1")
         );
         assert!(
             metrics_response
                 .body
                 .contains("dash_retrieve_storage_divergence_warn_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_execution_candidate_count 2")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_execution_mode_disk_native 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_execution_mode_disk_native_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_execution_mode_memory_index_total 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_promotion_boundary_state 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_promotion_boundary_in_transition 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_promotion_boundary_replay_only_total 0")
+        );
+        assert!(
+            metrics_response.body.contains(
+                "dash_retrieve_storage_promotion_boundary_segment_plus_wal_delta_total 1"
+            )
+        );
+        assert!(
+            metrics_response.body.contains(
+                "dash_retrieve_storage_promotion_boundary_segment_fully_promoted_total 0"
+            )
         );
 
         restore_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", prev_segment_dir.as_deref());
@@ -4078,6 +2967,21 @@ tenant-a,0,12,node-a,follower,healthy\n",
 
     #[test]
     fn metrics_endpoint_reports_retrieve_counters() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let prev_segment_dir = std::env::var_os("DASH_RETRIEVAL_SEGMENT_DIR");
+        let prev_refresh_ms = std::env::var_os("DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic")
+            .as_nanos();
+        let isolated_segment_root =
+            std::env::temp_dir().join(format!("dash-retrieve-metrics-empty-segments-{nanos}"));
+        set_env_var_for_tests(
+            "DASH_RETRIEVAL_SEGMENT_DIR",
+            isolated_segment_root.to_string_lossy().as_ref(),
+        );
+        set_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS", "600000");
+
         let store = sample_store();
         let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
 
@@ -4117,6 +3021,56 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert!(
             metrics_response
                 .body
+                .contains("dash_retrieve_storage_last_result_source_unknown_count 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_result_source_unknown_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_execution_mode_disk_native 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_execution_mode_disk_native_total 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_execution_mode_memory_index_total 1")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_promotion_boundary_state 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_last_promotion_boundary_in_transition 0")
+        );
+        assert!(
+            metrics_response
+                .body
+                .contains("dash_retrieve_storage_promotion_boundary_replay_only_total 1")
+        );
+        assert!(
+            metrics_response.body.contains(
+                "dash_retrieve_storage_promotion_boundary_segment_plus_wal_delta_total 0"
+            )
+        );
+        assert!(
+            metrics_response.body.contains(
+                "dash_retrieve_storage_promotion_boundary_segment_fully_promoted_total 0"
+            )
+        );
+        assert!(
+            metrics_response
+                .body
                 .contains("dash_retrieve_placement_enabled 0")
         );
         assert!(
@@ -4144,6 +3098,13 @@ tenant-a,0,12,node-a,follower,healthy\n",
                 .body
                 .contains("dash_retrieve_latency_ms_p95")
         );
+
+        restore_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", prev_segment_dir.as_deref());
+        restore_env_var_for_tests(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            prev_refresh_ms.as_deref(),
+        );
+        let _ = std::fs::remove_dir_all(isolated_segment_root);
     }
 
     #[test]
@@ -4279,6 +3240,27 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-z", &policy),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
+        );
+    }
+
+    #[test]
+    fn auth_policy_scoped_key_rejects_unknown_key_when_required_keys_are_unset() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x".to_string(),
+            headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
+            body: Vec::new(),
+        };
+        let policy = AuthPolicy::from_env(
+            None,
+            None,
+            None,
+            None,
+            Some("scope-a:tenant-a,tenant-b".to_string()),
+        );
+        assert_eq!(
+            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            AuthDecision::Unauthorized("missing or invalid API key")
         );
     }
 

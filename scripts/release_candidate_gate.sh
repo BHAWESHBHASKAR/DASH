@@ -54,6 +54,10 @@ STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS="${DASH_RELEASE_GATE_STORAGE_PROMO
 STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS:-5000}"
 STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS:-10}"
 STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT="${DASH_RELEASE_GATE_STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT:-0}"
+RUN_SEGMENT_WAL_PARITY_GUARD="${DASH_RELEASE_GATE_RUN_SEGMENT_WAL_PARITY_GUARD:-false}"
+SEGMENT_WAL_PARITY_INGEST_BIND_ADDR="${DASH_RELEASE_GATE_SEGMENT_WAL_PARITY_INGEST_BIND_ADDR:-127.0.0.1:18281}"
+SEGMENT_WAL_PARITY_RETRIEVE_BIND_ADDR="${DASH_RELEASE_GATE_SEGMENT_WAL_PARITY_RETRIEVE_BIND_ADDR:-127.0.0.1:18280}"
+SEGMENT_WAL_PARITY_TOP_K="${DASH_RELEASE_GATE_SEGMENT_WAL_PARITY_TOP_K:-5}"
 
 usage() {
   cat <<'USAGE'
@@ -137,6 +141,14 @@ Options:
                                        Curl timeout for promotion-boundary guard
   --storage-promotion-boundary-min-pass-count N
                                        Require at least N promotion-boundary scenarios to pass
+  --run-segment-wal-parity-guard true|false
+                                       Enable deterministic replay-vs-segment parity gate
+  --segment-wal-parity-ingest-bind-addr HOST:PORT
+                                       Ingestion bind address for parity gate
+  --segment-wal-parity-retrieve-bind-addr HOST:PORT
+                                       Retrieval bind address for parity gate
+  --segment-wal-parity-top-k N
+                                       top_k value for parity gate queries
   -h, --help                           Show help
 
 Environment:
@@ -322,6 +334,22 @@ while [[ $# -gt 0 ]]; do
       STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT="$2"
       shift 2
       ;;
+    --run-segment-wal-parity-guard)
+      RUN_SEGMENT_WAL_PARITY_GUARD="$2"
+      shift 2
+      ;;
+    --segment-wal-parity-ingest-bind-addr)
+      SEGMENT_WAL_PARITY_INGEST_BIND_ADDR="$2"
+      shift 2
+      ;;
+    --segment-wal-parity-retrieve-bind-addr)
+      SEGMENT_WAL_PARITY_RETRIEVE_BIND_ADDR="$2"
+      shift 2
+      ;;
+    --segment-wal-parity-top-k)
+      SEGMENT_WAL_PARITY_TOP_K="$2"
+      shift 2
+      ;;
     --replication-lag-leader-metrics-url)
       REPLICATION_LAG_LEADER_METRICS_URL="$2"
       shift 2
@@ -382,6 +410,7 @@ validate_bool "--ingest-allow-unsafe-wal-durability" "${INGEST_THROUGHPUT_ALLOW_
 validate_bool "--run-replication-lag-guard" "${RUN_REPLICATION_LAG_GUARD}"
 validate_bool "--replication-lag-require-no-last-error" "${REPLICATION_LAG_REQUIRE_NO_LAST_ERROR}"
 validate_bool "--run-storage-promotion-boundary-guard" "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}"
+validate_bool "--run-segment-wal-parity-guard" "${RUN_SEGMENT_WAL_PARITY_GUARD}"
 
 if [[ -n "${SLO_ITERATIONS}" && ! "${SLO_ITERATIONS}" =~ ^[0-9]+$ ]]; then
   echo "[release-gate] --slo-iterations must be a non-negative integer" >&2
@@ -428,7 +457,8 @@ for int_opt in \
   "${STORAGE_PROMOTION_BOUNDARY_CONNECT_TIMEOUT_MS}" \
   "${STORAGE_PROMOTION_BOUNDARY_READ_TIMEOUT_MS}" \
   "${STORAGE_PROMOTION_BOUNDARY_CURL_TIMEOUT_SECONDS}" \
-  "${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}"; do
+  "${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}" \
+  "${SEGMENT_WAL_PARITY_TOP_K}"; do
   if [[ ! "${int_opt}" =~ ^[0-9]+$ ]]; then
     echo "[release-gate] ingestion throughput/replication lag options must be non-negative integers" >&2
     exit 2
@@ -444,6 +474,10 @@ if [[ "${STORAGE_PROMOTION_BOUNDARY_WORKERS}" -eq 0 || "${STORAGE_PROMOTION_BOUN
 fi
 if [[ "${STORAGE_PROMOTION_BOUNDARY_MIN_PASS_COUNT}" -gt 3 ]]; then
   echo "[release-gate] --storage-promotion-boundary-min-pass-count must be <= 3 (guard has 3 scenarios)" >&2
+  exit 2
+fi
+if [[ "${SEGMENT_WAL_PARITY_TOP_K}" -eq 0 ]]; then
+  echo "[release-gate] --segment-wal-parity-top-k must be > 0" >&2
   exit 2
 fi
 if [[ "${INGEST_THROUGHPUT_WORKERS}" -eq 0 || "${INGEST_THROUGHPUT_CLIENTS}" -eq 0 || "${INGEST_THROUGHPUT_REQUESTS_PER_WORKER}" -eq 0 || "${INGEST_THROUGHPUT_WAL_SYNC_EVERY_RECORDS}" -eq 0 || "${INGEST_THROUGHPUT_WAL_APPEND_BUFFER_RECORDS}" -eq 0 ]]; then
@@ -689,6 +723,20 @@ if [[ "${RUN_STORAGE_PROMOTION_BOUNDARY_GUARD}" == "true" ]]; then
   fi
 else
   skip_step "storage promotion boundary guard" "scripts/storage_promotion_boundary_guard.sh --bind-addr <addr>" "disabled"
+fi
+
+if [[ "${RUN_SEGMENT_WAL_PARITY_GUARD}" == "true" ]]; then
+  SEGMENT_WAL_PARITY_CMD=(
+    scripts/segment_wal_parity_gate.sh
+    --run-tag "${RUN_TAG}-segment-wal-parity"
+    --summary-dir "${SUMMARY_DIR}"
+    --ingest-bind-addr "${SEGMENT_WAL_PARITY_INGEST_BIND_ADDR}"
+    --retrieve-bind-addr "${SEGMENT_WAL_PARITY_RETRIEVE_BIND_ADDR}"
+    --top-k "${SEGMENT_WAL_PARITY_TOP_K}"
+  )
+  run_step "segment wal parity guard" "${SEGMENT_WAL_PARITY_CMD[*]}" "${SEGMENT_WAL_PARITY_CMD[@]}"
+else
+  skip_step "segment wal parity guard" "scripts/segment_wal_parity_gate.sh --run-tag ${RUN_TAG}-segment-wal-parity" "disabled"
 fi
 
 if [[ "${RUN_INCIDENT_SIMULATION_GUARD}" == "true" ]]; then

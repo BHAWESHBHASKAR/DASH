@@ -1,15 +1,18 @@
-use graph::traverse_edges_multi_hop;
-use indexer::{load_manifest, load_segments_from_manifest};
-use schema::{Claim, ClaimType, RetrievalRequest, Stance, StanceMode};
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{
-        OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use graph::{
+    GraphReasoningConfig, NodeReasoningSignals, compute_node_reasoning_with_config,
+    traverse_edges_multi_hop,
 };
+use schema::{Claim, ClaimType, RetrievalRequest, Stance, StanceMode};
+mod result_projection;
+mod segment_storage;
+#[cfg(test)]
+use result_projection::TemporalAnnotation;
+use result_projection::evidence_node_from_parts;
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
+use std::time::Duration;
 use store::InMemoryStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +57,9 @@ pub struct EvidenceNode {
     pub confidence_band: Option<String>,
     pub dominant_stance: Option<String>,
     pub contradiction_risk: Option<f32>,
+    pub graph_score: Option<f32>,
+    pub support_path_count: Option<usize>,
+    pub contradiction_chain_depth: Option<usize>,
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
@@ -87,6 +93,37 @@ pub struct RetrieveApiResponse {
     pub graph: Option<EvidenceGraph>,
 }
 
+pub const STORAGE_MERGE_MODEL: &str = "immutable_segment_base_plus_mutable_wal_delta";
+pub const STORAGE_EXECUTION_MODE_MEMORY_INDEX: &str = "memory_index_candidates";
+pub const STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE: &str = "segment_disk_base_with_wal_overlay";
+pub const STORAGE_SOURCE_OF_TRUTH_MODEL: &str = "wal_replay_state_with_segment_projection";
+pub const STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY: &str = "replay_only";
+pub const STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA: &str = "segment_base_plus_wal_delta";
+pub const STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED: &str = "segment_base_fully_promoted";
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetrieveStorageMergeSnapshot {
+    pub source_of_truth_model: String,
+    pub execution_mode: String,
+    pub disk_native_segment_execution_active: bool,
+    pub execution_candidate_count: usize,
+    pub promotion_boundary_state: String,
+    pub promotion_boundary_in_transition: bool,
+    pub segment_base_active: bool,
+    pub wal_delta_active: bool,
+    pub storage_visible_active: bool,
+    pub metadata_prefilter_count: usize,
+    pub segment_base_count: usize,
+    pub wal_delta_count: usize,
+    pub storage_visible_count: usize,
+    pub allowed_claim_ids_count: usize,
+    pub result_count: usize,
+    pub result_from_segment_base_count: usize,
+    pub result_from_wal_delta_count: usize,
+    pub result_source_unknown_count: usize,
+    pub result_outside_storage_visible_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievePlannerDebugSnapshot {
     pub tenant_id: String,
@@ -105,41 +142,6 @@ pub struct RetrievePlannerDebugSnapshot {
     pub short_circuit_empty: bool,
     pub ann_candidate_count: usize,
     pub planner_candidate_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SegmentCacheKey {
-    root_dir: String,
-    tenant_id: String,
-}
-
-impl SegmentCacheKey {
-    fn new(root_dir: &Path, tenant_id: &str) -> Self {
-        Self {
-            root_dir: root_dir.to_string_lossy().to_string(),
-            tenant_id: tenant_id.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SegmentCacheEntry {
-    claim_ids: Option<HashSet<String>>,
-    fallback_reason: Option<SegmentFallbackReason>,
-    next_refresh_instant: std::time::Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentFallbackReason {
-    MissingManifest,
-    ManifestError,
-    SegmentError,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SegmentPrefilterLoadResult {
-    claim_ids: Option<HashSet<String>>,
-    fallback_reason: Option<SegmentFallbackReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,10 +168,7 @@ struct EvidenceNodeSignals {
     citations: Vec<CitationNode>,
 }
 
-static SEGMENT_PREFILTER_CACHE: OnceLock<RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>>> =
-    OnceLock::new();
-static SEGMENT_PREFILTER_CACHE_METRICS: OnceLock<SegmentPrefilterCacheMetricAtoms> =
-    OnceLock::new();
+const DEFAULT_GRAPH_REASONING_MAX_HOPS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SegmentPrefilterCacheMetrics {
@@ -184,47 +183,81 @@ pub struct SegmentPrefilterCacheMetrics {
     pub fallback_segment_errors: u64,
 }
 
-#[derive(Debug, Default)]
-struct SegmentPrefilterCacheMetricAtoms {
-    cache_hits: AtomicU64,
-    refresh_attempts: AtomicU64,
-    refresh_successes: AtomicU64,
-    refresh_failures: AtomicU64,
-    refresh_load_micros: AtomicU64,
-    fallback_activations: AtomicU64,
-    fallback_missing_manifest: AtomicU64,
-    fallback_manifest_errors: AtomicU64,
-    fallback_segment_errors: AtomicU64,
+pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
+    execute_api_query_with_storage_snapshot(store, req).0
 }
 
-pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> RetrieveApiResponse {
+pub fn execute_api_query_with_storage_snapshot(
+    store: &InMemoryStore,
+    req: RetrieveApiRequest,
+) -> (RetrieveApiResponse, RetrieveStorageMergeSnapshot) {
     let planner = build_planner_context(store, &req);
+    let mut merge_snapshot =
+        build_storage_merge_snapshot(&planner, &[], STORAGE_EXECUTION_MODE_MEMORY_INDEX, 0);
     if planner.short_circuit_empty {
-        return RetrieveApiResponse {
-            results: Vec::new(),
-            graph: if req.return_graph {
-                Some(EvidenceGraph {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                })
-            } else {
-                None
+        return (
+            RetrieveApiResponse {
+                results: Vec::new(),
+                graph: if req.return_graph {
+                    Some(EvidenceGraph {
+                        nodes: Vec::new(),
+                        edges: Vec::new(),
+                    })
+                } else {
+                    None
+                },
             },
-        };
+            merge_snapshot,
+        );
     }
 
-    let results = store.retrieve_with_time_range_query_vector_and_allowed_claim_ids(
-        &RetrievalRequest {
-            tenant_id: planner.tenant_id.clone(),
-            query: req.query,
-            top_k: req.top_k,
-            stance_mode: req.stance_mode,
-        },
-        planner.from_unix,
-        planner.to_unix,
-        req.query_embedding.as_deref(),
-        planner.allowed_claim_ids.as_ref(),
-    );
+    let retrieval_request = RetrievalRequest {
+        tenant_id: planner.tenant_id.clone(),
+        query: req.query,
+        top_k: req.top_k,
+        stance_mode: req.stance_mode,
+    };
+    let disk_native_segment_execution_active = resolve_disk_native_segment_execution_enabled()
+        && planner.segment_base_claim_ids.is_some()
+        && planner.storage_visible_claim_ids.is_some();
+    let (results, execution_mode, execution_candidate_count) =
+        if disk_native_segment_execution_active {
+            let candidate_claim_ids = planner
+                .storage_visible_claim_ids
+                .clone()
+                .unwrap_or_default();
+            let candidate_count = candidate_claim_ids.len();
+            (
+                store.retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
+                    &retrieval_request,
+                    planner.from_unix,
+                    planner.to_unix,
+                    req.query_embedding.as_deref(),
+                    &candidate_claim_ids,
+                    planner.allowed_claim_ids.as_ref(),
+                ),
+                STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE,
+                candidate_count,
+            )
+        } else {
+            let candidate_count = store.candidate_count_with_query_vector_and_allowed_claim_ids(
+                &retrieval_request,
+                req.query_embedding.as_deref(),
+                (planner.from_unix, planner.to_unix),
+                planner.allowed_claim_ids.as_ref(),
+            );
+            (
+                store.retrieve_with_time_range_query_vector_and_allowed_claim_ids(
+                    &retrieval_request,
+                    planner.from_unix,
+                    planner.to_unix,
+                    req.query_embedding.as_deref(),
+                    planner.allowed_claim_ids.as_ref(),
+                ),
+                STORAGE_EXECUTION_MODE_MEMORY_INDEX,
+                candidate_count,
+            )
+        };
 
     let tenant_claims = store.claims_for_tenant(&planner.tenant_id);
     let tenant_claim_by_id: HashMap<String, Claim> = tenant_claims
@@ -233,7 +266,7 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         .map(|claim| (claim.claim_id.clone(), claim))
         .collect();
 
-    let nodes: Vec<EvidenceNode> = results
+    let mut nodes: Vec<EvidenceNode> = results
         .iter()
         .map(|r| {
             evidence_node_from_parts(
@@ -268,6 +301,7 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         .collect();
 
     let graph = if req.return_graph {
+        let graph_reasoning_config = graph_reasoning_config_from_env();
         let selected: std::collections::HashSet<String> =
             nodes.iter().map(|n| n.claim_id.clone()).collect();
         let start_ids: Vec<String> = selected.iter().cloned().collect();
@@ -277,7 +311,13 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
             all_edges.extend(store.edges_for_claim(&claim.claim_id));
         }
 
-        let traversed = traverse_edges_multi_hop(&start_ids, &all_edges, 2);
+        let traversed =
+            traverse_edges_multi_hop(&start_ids, &all_edges, graph_reasoning_config.max_hops);
+        let reasoning_by_claim =
+            compute_node_reasoning_with_config(&start_ids, &traversed, graph_reasoning_config);
+        for node in &mut nodes {
+            apply_graph_reasoning(node, reasoning_by_claim.get(&node.claim_id));
+        }
         let mut node_map: std::collections::HashMap<String, EvidenceNode> = nodes
             .iter()
             .cloned()
@@ -333,6 +373,9 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
                 strength: edge.strength,
             });
         }
+        for node in node_map.values_mut() {
+            apply_graph_reasoning(node, reasoning_by_claim.get(&node.claim_id));
+        }
 
         let mut graph_nodes: Vec<EvidenceNode> = node_map.into_values().collect();
         graph_nodes.sort_by(|a, b| a.claim_id.cmp(&b.claim_id));
@@ -344,164 +387,23 @@ pub fn execute_api_query(store: &InMemoryStore, req: RetrieveApiRequest) -> Retr
         None
     };
 
-    RetrieveApiResponse {
-        results: nodes,
-        graph,
-    }
+    merge_snapshot =
+        build_storage_merge_snapshot(&planner, &nodes, execution_mode, execution_candidate_count);
+    (
+        RetrieveApiResponse {
+            results: nodes,
+            graph,
+        },
+        merge_snapshot,
+    )
 }
 
-fn evidence_node_from_parts(
-    claim_id: String,
-    canonical_text: String,
-    signals: EvidenceNodeSignals,
-    claim: Option<&Claim>,
-    query_from_unix: Option<i64>,
-    query_to_unix: Option<i64>,
-) -> EvidenceNode {
-    let temporal_annotation = temporal_annotation_for_claim(claim, query_from_unix, query_to_unix);
-    EvidenceNode {
-        claim_id,
-        canonical_text,
-        score: signals.score,
-        claim_confidence: claim.map(|value| value.confidence),
-        confidence_band: claim
-            .map(|value| confidence_band_for_claim_confidence(value.confidence).to_string()),
-        dominant_stance: dominant_stance_for_counts(signals.supports, signals.contradicts)
-            .map(str::to_string),
-        contradiction_risk: contradiction_risk_for_counts(signals.supports, signals.contradicts),
-        supports: signals.supports,
-        contradicts: signals.contradicts,
-        citations: signals.citations,
-        event_time_unix: claim.and_then(|value| value.event_time_unix),
-        temporal_match_mode: temporal_annotation.match_mode.map(str::to_string),
-        temporal_in_range: temporal_annotation.in_range,
-        claim_type: claim
-            .and_then(|value| value.claim_type.as_ref())
-            .map(claim_type_to_str)
-            .map(str::to_string),
-        valid_from: claim.and_then(|value| value.valid_from),
-        valid_to: claim.and_then(|value| value.valid_to),
-        created_at: claim.and_then(|value| value.created_at),
-        updated_at: claim.and_then(|value| value.updated_at),
+fn apply_graph_reasoning(node: &mut EvidenceNode, reasoning: Option<&NodeReasoningSignals>) {
+    if let Some(reasoning) = reasoning {
+        node.graph_score = Some(reasoning.graph_score);
+        node.support_path_count = Some(reasoning.support_path_count);
+        node.contradiction_chain_depth = Some(reasoning.contradiction_chain_depth);
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TemporalAnnotation {
-    match_mode: Option<&'static str>,
-    in_range: Option<bool>,
-}
-
-fn temporal_annotation_for_claim(
-    claim: Option<&Claim>,
-    query_from_unix: Option<i64>,
-    query_to_unix: Option<i64>,
-) -> TemporalAnnotation {
-    if query_from_unix.is_none() && query_to_unix.is_none() {
-        return TemporalAnnotation {
-            match_mode: None,
-            in_range: None,
-        };
-    }
-
-    let Some(claim) = claim else {
-        return TemporalAnnotation {
-            match_mode: Some("missing_claim"),
-            in_range: Some(false),
-        };
-    };
-
-    let has_event = claim.event_time_unix.is_some();
-    let has_validity = claim.valid_from.is_some() || claim.valid_to.is_some();
-    let event_match = claim
-        .event_time_unix
-        .is_some_and(|value| value_in_time_range(value, query_from_unix, query_to_unix));
-    let validity_match = has_validity
-        && time_windows_overlap(
-            claim.valid_from,
-            claim.valid_to,
-            query_from_unix,
-            query_to_unix,
-        );
-
-    let (mode, in_range) = match (has_event, has_validity) {
-        (true, true) => ("event_and_validity_window", event_match && validity_match),
-        (true, false) => ("event_time", event_match),
-        (false, true) => ("validity_window", validity_match),
-        (false, false) => ("no_temporal_data", false),
-    };
-    TemporalAnnotation {
-        match_mode: Some(mode),
-        in_range: Some(in_range),
-    }
-}
-
-fn claim_type_to_str(value: &ClaimType) -> &'static str {
-    match value {
-        ClaimType::Factual => "factual",
-        ClaimType::Opinion => "opinion",
-        ClaimType::Prediction => "prediction",
-        ClaimType::Temporal => "temporal",
-        ClaimType::Causal => "causal",
-    }
-}
-
-fn confidence_band_for_claim_confidence(value: f32) -> &'static str {
-    if value >= 0.8 {
-        "high"
-    } else if value >= 0.5 {
-        "medium"
-    } else {
-        "low"
-    }
-}
-
-fn dominant_stance_for_counts(supports: usize, contradicts: usize) -> Option<&'static str> {
-    if supports == 0 && contradicts == 0 {
-        None
-    } else if supports > contradicts {
-        Some("supports")
-    } else if contradicts > supports {
-        Some("contradicts")
-    } else {
-        Some("balanced")
-    }
-}
-
-fn contradiction_risk_for_counts(supports: usize, contradicts: usize) -> Option<f32> {
-    let total = supports + contradicts;
-    if total == 0 {
-        None
-    } else {
-        Some(contradicts as f32 / total as f32)
-    }
-}
-
-fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
-    if let Some(from) = from_unix
-        && value < from
-    {
-        return false;
-    }
-    if let Some(to) = to_unix
-        && value > to
-    {
-        return false;
-    }
-    true
-}
-
-fn time_windows_overlap(
-    window_start: Option<i64>,
-    window_end: Option<i64>,
-    query_from: Option<i64>,
-    query_to: Option<i64>,
-) -> bool {
-    let start = window_start.unwrap_or(i64::MIN);
-    let end = window_end.unwrap_or(i64::MAX);
-    let query_start = query_from.unwrap_or(i64::MIN);
-    let query_end = query_to.unwrap_or(i64::MAX);
-    start <= query_end && end >= query_start
 }
 
 pub fn build_retrieve_planner_debug_snapshot(
@@ -560,6 +462,30 @@ pub fn build_retrieve_planner_debug_snapshot(
         ann_candidate_count,
         planner_candidate_count,
     }
+}
+
+#[cfg(test)]
+fn temporal_annotation_for_claim(
+    claim: Option<&Claim>,
+    query_from_unix: Option<i64>,
+    query_to_unix: Option<i64>,
+) -> result_projection::TemporalAnnotation {
+    result_projection::temporal_annotation_for_claim(claim, query_from_unix, query_to_unix)
+}
+
+#[cfg(test)]
+fn confidence_band_for_claim_confidence(value: f32) -> &'static str {
+    result_projection::confidence_band_for_claim_confidence(value)
+}
+
+#[cfg(test)]
+fn dominant_stance_for_counts(supports: usize, contradicts: usize) -> Option<&'static str> {
+    result_projection::dominant_stance_for_counts(supports, contradicts)
+}
+
+#[cfg(test)]
+fn contradiction_risk_for_counts(supports: usize, contradicts: usize) -> Option<f32> {
+    result_projection::contradiction_risk_for_counts(supports, contradicts)
 }
 
 fn build_planner_context(store: &InMemoryStore, req: &RetrieveApiRequest) -> PlannerContext {
@@ -623,6 +549,89 @@ fn build_planner_context(store: &InMemoryStore, req: &RetrieveApiRequest) -> Pla
     }
 }
 
+fn build_storage_merge_snapshot(
+    planner: &PlannerContext,
+    results: &[EvidenceNode],
+    execution_mode: &str,
+    execution_candidate_count: usize,
+) -> RetrieveStorageMergeSnapshot {
+    let (promotion_boundary_state, promotion_boundary_in_transition) =
+        resolve_storage_promotion_boundary(planner);
+    let segment_base_active = planner.segment_base_claim_ids.is_some();
+    let wal_delta_active = planner.wal_delta_claim_ids.is_some();
+    let storage_visible_active = planner.storage_visible_claim_ids.is_some();
+    let segment_base = planner.segment_base_claim_ids.as_ref();
+    let wal_delta = planner.wal_delta_claim_ids.as_ref();
+    let storage_visible = planner.storage_visible_claim_ids.as_ref();
+
+    let mut result_from_segment_base_count = 0usize;
+    let mut result_from_wal_delta_count = 0usize;
+    let mut result_source_unknown_count = 0usize;
+    let mut result_outside_storage_visible_count = 0usize;
+
+    for node in results {
+        let mut classified = false;
+        if segment_base.is_some_and(|ids| ids.contains(&node.claim_id)) {
+            result_from_segment_base_count += 1;
+            classified = true;
+        }
+        if wal_delta.is_some_and(|ids| ids.contains(&node.claim_id)) {
+            result_from_wal_delta_count += 1;
+            classified = true;
+        }
+        if !classified {
+            result_source_unknown_count += 1;
+        }
+        if storage_visible.is_some_and(|ids| !ids.contains(&node.claim_id)) {
+            result_outside_storage_visible_count += 1;
+        }
+    }
+
+    RetrieveStorageMergeSnapshot {
+        source_of_truth_model: STORAGE_SOURCE_OF_TRUTH_MODEL.to_string(),
+        execution_mode: execution_mode.to_string(),
+        disk_native_segment_execution_active: execution_mode
+            == STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE,
+        execution_candidate_count,
+        promotion_boundary_state: promotion_boundary_state.to_string(),
+        promotion_boundary_in_transition,
+        segment_base_active,
+        wal_delta_active,
+        storage_visible_active,
+        metadata_prefilter_count: planner
+            .metadata_allowed_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        segment_base_count: planner
+            .segment_base_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        wal_delta_count: planner.wal_delta_claim_ids.as_ref().map_or(0, HashSet::len),
+        storage_visible_count: planner
+            .storage_visible_claim_ids
+            .as_ref()
+            .map_or(0, HashSet::len),
+        allowed_claim_ids_count: planner.allowed_claim_ids.as_ref().map_or(0, HashSet::len),
+        result_count: results.len(),
+        result_from_segment_base_count,
+        result_from_wal_delta_count,
+        result_source_unknown_count,
+        result_outside_storage_visible_count,
+    }
+}
+
+fn resolve_storage_promotion_boundary(planner: &PlannerContext) -> (&'static str, bool) {
+    if planner.segment_base_claim_ids.is_none() {
+        return (STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY, false);
+    }
+    let wal_delta_count = planner.wal_delta_claim_ids.as_ref().map_or(0, HashSet::len);
+    if wal_delta_count == 0 {
+        (STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED, false)
+    } else {
+        (STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA, true)
+    }
+}
+
 fn build_metadata_prefilter_claim_ids(
     store: &InMemoryStore,
     tenant_id: &str,
@@ -657,125 +666,15 @@ fn build_metadata_prefilter_claim_ids(
 }
 
 fn build_segment_prefilter_claim_ids(tenant_id: &str) -> Option<HashSet<String>> {
-    let segment_root =
-        env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR")?;
-    build_segment_prefilter_claim_ids_from_root(tenant_id, PathBuf::from(segment_root))
+    segment_storage::build_segment_prefilter_claim_ids(tenant_id)
 }
 
+#[cfg(test)]
 fn build_segment_prefilter_claim_ids_from_root(
     tenant_id: &str,
     segment_root: PathBuf,
 ) -> Option<HashSet<String>> {
-    let cache_key = SegmentCacheKey::new(&segment_root, tenant_id);
-    let segment_tenant_path = segment_root.join(sanitize_path_component(tenant_id));
-    let now = std::time::Instant::now();
-    if let Ok(cache) = segment_prefilter_cache().read()
-        && let Some(entry) = cache.get(&cache_key)
-        && entry.next_refresh_instant > now
-    {
-        segment_prefilter_cache_metric_atoms()
-            .cache_hits
-            .fetch_add(1, Ordering::Relaxed);
-        if entry.claim_ids.is_none() {
-            observe_segment_fallback_activation(entry.fallback_reason);
-        }
-        return entry.claim_ids.clone();
-    }
-
-    segment_prefilter_cache_metric_atoms()
-        .refresh_attempts
-        .fetch_add(1, Ordering::Relaxed);
-    let refresh_start = std::time::Instant::now();
-    let load_result = load_segment_prefilter_claim_ids(&segment_tenant_path);
-    let elapsed_micros = refresh_start.elapsed().as_micros();
-    let elapsed_micros_u64 = if elapsed_micros > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        elapsed_micros as u64
-    };
-    segment_prefilter_cache_metric_atoms()
-        .refresh_load_micros
-        .fetch_add(elapsed_micros_u64, Ordering::Relaxed);
-    if load_result.claim_ids.is_some() {
-        segment_prefilter_cache_metric_atoms()
-            .refresh_successes
-            .fetch_add(1, Ordering::Relaxed);
-    } else {
-        segment_prefilter_cache_metric_atoms()
-            .refresh_failures
-            .fetch_add(1, Ordering::Relaxed);
-        observe_segment_fallback_activation(load_result.fallback_reason);
-    }
-    let next_refresh_instant = now + segment_prefilter_refresh_interval();
-    if let Ok(mut cache) = segment_prefilter_cache().write() {
-        cache.insert(
-            cache_key,
-            SegmentCacheEntry {
-                claim_ids: load_result.claim_ids.clone(),
-                fallback_reason: load_result.fallback_reason,
-                next_refresh_instant,
-            },
-        );
-    }
-    load_result.claim_ids
-}
-
-fn load_segment_prefilter_claim_ids(segment_tenant_path: &Path) -> SegmentPrefilterLoadResult {
-    let manifest = match load_manifest(segment_tenant_path) {
-        Ok(Some(value)) => value,
-        Ok(None) => {
-            return SegmentPrefilterLoadResult {
-                claim_ids: None,
-                fallback_reason: Some(SegmentFallbackReason::MissingManifest),
-            };
-        }
-        Err(_) => {
-            return SegmentPrefilterLoadResult {
-                claim_ids: None,
-                fallback_reason: Some(SegmentFallbackReason::ManifestError),
-            };
-        }
-    };
-    let segments = match load_segments_from_manifest(segment_tenant_path, &manifest) {
-        Ok(value) => value,
-        Err(_) => {
-            return SegmentPrefilterLoadResult {
-                claim_ids: None,
-                fallback_reason: Some(SegmentFallbackReason::SegmentError),
-            };
-        }
-    };
-    let mut ids = HashSet::new();
-    for segment in segments {
-        ids.extend(segment.claim_ids);
-    }
-    SegmentPrefilterLoadResult {
-        claim_ids: Some(ids),
-        fallback_reason: None,
-    }
-}
-
-fn observe_segment_fallback_activation(reason: Option<SegmentFallbackReason>) {
-    let metrics = segment_prefilter_cache_metric_atoms();
-    metrics.fallback_activations.fetch_add(1, Ordering::Relaxed);
-    match reason {
-        Some(SegmentFallbackReason::MissingManifest) => {
-            metrics
-                .fallback_missing_manifest
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        Some(SegmentFallbackReason::ManifestError) => {
-            metrics
-                .fallback_manifest_errors
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        Some(SegmentFallbackReason::SegmentError) => {
-            metrics
-                .fallback_segment_errors
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        None => {}
-    }
+    segment_storage::build_segment_prefilter_claim_ids_from_root(tenant_id, segment_root)
 }
 
 fn build_wal_delta_claim_ids(
@@ -783,42 +682,21 @@ fn build_wal_delta_claim_ids(
     tenant_id: &str,
     segment_base_claim_ids: Option<&HashSet<String>>,
 ) -> Option<HashSet<String>> {
-    let segment_base_claim_ids = segment_base_claim_ids?;
-    let tenant_claim_ids = store.claim_ids_for_tenant(tenant_id);
-    Some(
-        tenant_claim_ids
-            .difference(segment_base_claim_ids)
-            .cloned()
-            .collect(),
-    )
+    segment_storage::build_wal_delta_claim_ids(store, tenant_id, segment_base_claim_ids)
 }
 
 fn merge_segment_base_with_wal_delta_claim_ids(
     segment_base: Option<&HashSet<String>>,
     wal_delta: Option<&HashSet<String>>,
 ) -> Option<HashSet<String>> {
-    match (segment_base, wal_delta) {
-        (None, None) => None,
-        (Some(segment_base), None) => Some(segment_base.clone()),
-        (None, Some(wal_delta)) => Some(wal_delta.clone()),
-        (Some(segment_base), Some(wal_delta)) => {
-            let mut merged = segment_base.clone();
-            merged.extend(wal_delta.iter().cloned());
-            Some(merged)
-        }
-    }
+    segment_storage::merge_segment_base_with_wal_delta_claim_ids(segment_base, wal_delta)
 }
 
 fn merge_allowed_claim_ids(
     metadata: Option<&HashSet<String>>,
     segment: Option<&HashSet<String>>,
 ) -> Option<HashSet<String>> {
-    match (metadata, segment) {
-        (None, None) => None,
-        (Some(metadata), None) => Some(metadata.clone()),
-        (None, Some(segment)) => Some(segment.clone()),
-        (Some(metadata), Some(segment)) => Some(metadata.intersection(segment).cloned().collect()),
-    }
+    segment_storage::merge_allowed_claim_ids(metadata, segment)
 }
 
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
@@ -827,67 +705,70 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
         .or_else(|| std::env::var(fallback).ok())
 }
 
-fn sanitize_path_component(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect();
-    if out.is_empty() {
-        out.push('_');
+fn env_bool_with_fallback(primary: &str, fallback: &str, default: bool) -> bool {
+    let Some(raw) = env_with_fallback(primary, fallback) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
     }
-    out
 }
 
-fn segment_prefilter_refresh_interval() -> Duration {
-    let refresh_ms = env_with_fallback(
-        "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
-        "EME_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+fn env_f32_with_fallback(primary: &str, fallback: &str) -> Option<f32> {
+    env_with_fallback(primary, fallback).and_then(|value| value.parse::<f32>().ok())
+}
+
+fn resolve_disk_native_segment_execution_enabled() -> bool {
+    env_bool_with_fallback(
+        "DASH_RETRIEVAL_DISK_NATIVE_SEGMENT_EXECUTION",
+        "EME_RETRIEVAL_DISK_NATIVE_SEGMENT_EXECUTION",
+        true,
     )
-    .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn graph_reasoning_config_from_env() -> GraphReasoningConfig {
+    let mut config = GraphReasoningConfig::default();
+    config.max_hops = env_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_MAX_HOPS",
+        "EME_RETRIEVAL_GRAPH_MAX_HOPS",
+    )
+    .and_then(|value| value.parse::<usize>().ok())
     .filter(|value| *value > 0)
-    .unwrap_or(1_000);
-    Duration::from_millis(refresh_ms)
+    .unwrap_or(DEFAULT_GRAPH_REASONING_MAX_HOPS);
+    config.edge_depth_decay = env_f32_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_EDGE_DEPTH_DECAY",
+        "EME_RETRIEVAL_GRAPH_EDGE_DEPTH_DECAY",
+    )
+    .unwrap_or(config.edge_depth_decay)
+    .clamp(0.0, 1.0);
+    config.support_path_bonus = env_f32_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_SUPPORT_PATH_BONUS",
+        "EME_RETRIEVAL_GRAPH_SUPPORT_PATH_BONUS",
+    )
+    .unwrap_or(config.support_path_bonus)
+    .max(0.0);
+    config.contradiction_depth_penalty = env_f32_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_CONTRADICTION_DEPTH_PENALTY",
+        "EME_RETRIEVAL_GRAPH_CONTRADICTION_DEPTH_PENALTY",
+    )
+    .unwrap_or(config.contradiction_depth_penalty)
+    .max(0.0);
+    config
 }
 
-fn segment_prefilter_cache() -> &'static RwLock<HashMap<SegmentCacheKey, SegmentCacheEntry>> {
-    SEGMENT_PREFILTER_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn segment_prefilter_cache_metric_atoms() -> &'static SegmentPrefilterCacheMetricAtoms {
-    SEGMENT_PREFILTER_CACHE_METRICS.get_or_init(SegmentPrefilterCacheMetricAtoms::default)
+#[cfg(test)]
+fn segment_prefilter_refresh_interval() -> Duration {
+    segment_storage::segment_prefilter_refresh_interval()
 }
 
 pub fn segment_prefilter_cache_metrics_snapshot() -> SegmentPrefilterCacheMetrics {
-    let metrics = segment_prefilter_cache_metric_atoms();
-    SegmentPrefilterCacheMetrics {
-        cache_hits: metrics.cache_hits.load(Ordering::Relaxed),
-        refresh_attempts: metrics.refresh_attempts.load(Ordering::Relaxed),
-        refresh_successes: metrics.refresh_successes.load(Ordering::Relaxed),
-        refresh_failures: metrics.refresh_failures.load(Ordering::Relaxed),
-        refresh_load_micros: metrics.refresh_load_micros.load(Ordering::Relaxed),
-        fallback_activations: metrics.fallback_activations.load(Ordering::Relaxed),
-        fallback_missing_manifest: metrics.fallback_missing_manifest.load(Ordering::Relaxed),
-        fallback_manifest_errors: metrics.fallback_manifest_errors.load(Ordering::Relaxed),
-        fallback_segment_errors: metrics.fallback_segment_errors.load(Ordering::Relaxed),
-    }
+    segment_storage::segment_prefilter_cache_metrics_snapshot()
 }
 
 pub fn reset_segment_prefilter_cache_metrics() {
-    let metrics = segment_prefilter_cache_metric_atoms();
-    metrics.cache_hits.store(0, Ordering::Relaxed);
-    metrics.refresh_attempts.store(0, Ordering::Relaxed);
-    metrics.refresh_successes.store(0, Ordering::Relaxed);
-    metrics.refresh_failures.store(0, Ordering::Relaxed);
-    metrics.refresh_load_micros.store(0, Ordering::Relaxed);
-    metrics.fallback_activations.store(0, Ordering::Relaxed);
-    metrics
-        .fallback_missing_manifest
-        .store(0, Ordering::Relaxed);
-    metrics.fallback_manifest_errors.store(0, Ordering::Relaxed);
-    metrics.fallback_segment_errors.store(0, Ordering::Relaxed);
+    segment_storage::reset_segment_prefilter_cache_metrics();
 }
 
 fn stance_to_str(stance: &Stance) -> &'static str {
@@ -930,15 +811,15 @@ mod tests {
     }
 
     fn clear_segment_cache_for_tests() {
-        if let Some(cache) = SEGMENT_PREFILTER_CACHE.get()
-            && let Ok(mut guard) = cache.write()
-        {
-            guard.clear();
-        }
-        reset_segment_prefilter_cache_metrics();
+        segment_storage::clear_segment_prefilter_cache_for_tests();
     }
 
     fn segment_cache_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -979,6 +860,27 @@ mod tests {
         fn drop(&mut self) {
             restore_env_var_for_tests(self.key, self.previous.as_deref());
         }
+    }
+
+    #[test]
+    fn graph_reasoning_config_reads_env_overrides() {
+        let _max_hops = EnvVarGuard::set("DASH_RETRIEVAL_GRAPH_MAX_HOPS", OsStr::new("5"));
+        let _depth_decay =
+            EnvVarGuard::set("DASH_RETRIEVAL_GRAPH_EDGE_DEPTH_DECAY", OsStr::new("0.45"));
+        let _support_bonus = EnvVarGuard::set(
+            "DASH_RETRIEVAL_GRAPH_SUPPORT_PATH_BONUS",
+            OsStr::new("0.25"),
+        );
+        let _contradiction_penalty = EnvVarGuard::set(
+            "DASH_RETRIEVAL_GRAPH_CONTRADICTION_DEPTH_PENALTY",
+            OsStr::new("0.30"),
+        );
+
+        let config = graph_reasoning_config_from_env();
+        assert_eq!(config.max_hops, 5);
+        assert!((config.edge_depth_decay - 0.45).abs() < 0.0001);
+        assert!((config.support_path_bonus - 0.25).abs() < 0.0001);
+        assert!((config.contradiction_depth_penalty - 0.30).abs() < 0.0001);
     }
 
     #[test]
@@ -1075,11 +977,20 @@ mod tests {
         assert_eq!(response.results.len(), 2);
         assert!(!response.results[0].citations.is_empty());
         assert_eq!(response.results[0].citations[0].stance, "supports");
+        assert!(response.results[0].graph_score.is_some());
+        assert!(response.results[0].support_path_count.is_some());
+        assert!(response.results[0].contradiction_chain_depth.is_some());
         assert!(response.graph.is_some());
         let graph = response.graph.unwrap();
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].relation, "supports");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.graph_score.is_some() && node.support_path_count.is_some())
+        );
     }
 
     #[test]
@@ -1168,6 +1079,9 @@ mod tests {
         assert_eq!(node.confidence_band.as_deref(), Some("high"));
         assert_eq!(node.dominant_stance.as_deref(), Some("supports"));
         assert_eq!(node.contradiction_risk, Some(0.0));
+        assert!(node.graph_score.is_some());
+        assert_eq!(node.support_path_count, Some(1));
+        assert_eq!(node.contradiction_chain_depth, Some(0));
         assert_eq!(node.event_time_unix, Some(1_735_689_600));
         assert_eq!(node.temporal_match_mode, None);
         assert_eq!(node.temporal_in_range, None);
@@ -1187,6 +1101,9 @@ mod tests {
         assert_eq!(c2_graph_node.confidence_band.as_deref(), Some("high"));
         assert_eq!(c2_graph_node.dominant_stance, None);
         assert_eq!(c2_graph_node.contradiction_risk, None);
+        assert!(c2_graph_node.graph_score.is_some());
+        assert_eq!(c2_graph_node.support_path_count, Some(1));
+        assert_eq!(c2_graph_node.contradiction_chain_depth, Some(0));
         assert_eq!(c2_graph_node.temporal_match_mode, None);
         assert_eq!(c2_graph_node.temporal_in_range, None);
         assert_eq!(c2_graph_node.claim_type.as_deref(), Some("factual"));
@@ -1677,6 +1594,7 @@ mod tests {
 
     #[test]
     fn execute_api_query_includes_wal_delta_when_segment_manifest_is_stale() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -1765,7 +1683,386 @@ mod tests {
     }
 
     #[test]
+    fn execute_api_query_storage_merge_snapshot_tracks_result_sources() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("storage-merge-snapshot");
+        let tenant = "tenant-a";
+        let tenant_root = root.join(tenant);
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-segment".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-segment".into(),
+                    tenant_id: tenant.into(),
+                    canonical_text: "Company X completed acquisition of Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://segment".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("segment base ingest should succeed");
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-wal-delta".into(),
+                    tenant_id: tenant.into(),
+                    canonical_text: "Company X completed acquisition of Startup Nova".into(),
+                    confidence: 0.95,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://wal-delta".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("wal delta ingest should succeed");
+
+        let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+        let _segment_refresh_env = EnvVarGuard::set(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            OsStr::new("600000"),
+        );
+
+        let (_response, snapshot) = execute_api_query_with_storage_snapshot(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: tenant.into(),
+                query: "company x acquisition".into(),
+                query_embedding: None,
+                entity_filters: vec!["company x".into()],
+                embedding_id_filters: vec![],
+                top_k: 10,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(
+            snapshot.execution_mode,
+            STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE
+        );
+        assert_eq!(
+            snapshot.source_of_truth_model,
+            STORAGE_SOURCE_OF_TRUTH_MODEL
+        );
+        assert!(snapshot.disk_native_segment_execution_active);
+        assert_eq!(snapshot.execution_candidate_count, 2);
+        assert_eq!(
+            snapshot.promotion_boundary_state,
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA
+        );
+        assert!(snapshot.promotion_boundary_in_transition);
+        assert!(snapshot.segment_base_active);
+        assert!(snapshot.wal_delta_active);
+        assert!(snapshot.storage_visible_active);
+        assert_eq!(snapshot.segment_base_count, 1);
+        assert_eq!(snapshot.wal_delta_count, 1);
+        assert_eq!(snapshot.storage_visible_count, 2);
+        assert_eq!(snapshot.result_count, 2);
+        assert_eq!(snapshot.result_from_segment_base_count, 1);
+        assert_eq!(snapshot.result_from_wal_delta_count, 1);
+        assert_eq!(snapshot.result_source_unknown_count, 0);
+        assert_eq!(snapshot.result_outside_storage_visible_count, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn execute_api_query_storage_merge_snapshot_marks_unknown_when_segment_source_is_inactive() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("storage-merge-unknown");
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "c1".into(),
+                    tenant_id: "tenant-a".into(),
+                    canonical_text: "Company X acquired Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://x".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("ingest should succeed");
+        let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+        let _segment_refresh_env = EnvVarGuard::set(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            OsStr::new("600000"),
+        );
+
+        let (_response, snapshot) = execute_api_query_with_storage_snapshot(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "company x acquired".into(),
+                query_embedding: None,
+                entity_filters: vec![],
+                embedding_id_filters: vec![],
+                top_k: 1,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+
+        assert_eq!(snapshot.execution_mode, STORAGE_EXECUTION_MODE_MEMORY_INDEX);
+        assert_eq!(
+            snapshot.source_of_truth_model,
+            STORAGE_SOURCE_OF_TRUTH_MODEL
+        );
+        assert!(!snapshot.disk_native_segment_execution_active);
+        assert_eq!(snapshot.execution_candidate_count, 1);
+        assert_eq!(
+            snapshot.promotion_boundary_state,
+            STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY
+        );
+        assert!(!snapshot.promotion_boundary_in_transition);
+        assert!(!snapshot.segment_base_active);
+        assert!(!snapshot.wal_delta_active);
+        assert!(!snapshot.storage_visible_active);
+        assert_eq!(snapshot.result_count, 1);
+        assert_eq!(snapshot.result_source_unknown_count, 1);
+        assert_eq!(snapshot.result_from_segment_base_count, 0);
+        assert_eq!(snapshot.result_from_wal_delta_count, 0);
+        assert_eq!(snapshot.result_outside_storage_visible_count, 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn execute_api_query_storage_merge_snapshot_respects_disk_native_toggle() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let root = temp_dir("storage-merge-toggle");
+        let tenant = "tenant-a";
+        let tenant_root = root.join(tenant);
+        persist_segments_atomic(
+            &tenant_root,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["claim-segment".into()],
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: "claim-segment".into(),
+                    tenant_id: tenant.into(),
+                    canonical_text: "Company X completed acquisition of Company Y".into(),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec!["Company X".into()],
+                    embedding_ids: vec!["emb://segment".into()],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+            )
+            .expect("segment base ingest should succeed");
+        let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+        let _segment_refresh_env = EnvVarGuard::set(
+            "DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS",
+            OsStr::new("600000"),
+        );
+        let _disk_native_toggle = EnvVarGuard::set(
+            "DASH_RETRIEVAL_DISK_NATIVE_SEGMENT_EXECUTION",
+            OsStr::new("false"),
+        );
+
+        let (_response, snapshot) = execute_api_query_with_storage_snapshot(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: tenant.into(),
+                query: "company x acquisition".into(),
+                query_embedding: None,
+                entity_filters: vec![],
+                embedding_id_filters: vec![],
+                top_k: 10,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        );
+        assert_eq!(snapshot.execution_mode, STORAGE_EXECUTION_MODE_MEMORY_INDEX);
+        assert!(!snapshot.disk_native_segment_execution_active);
+        assert_eq!(
+            snapshot.promotion_boundary_state,
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED
+        );
+        assert!(!snapshot.promotion_boundary_in_transition);
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
+    #[test]
+    fn execute_api_query_storage_merge_snapshot_promotion_boundary_transitions_after_refresh() {
+        let tenant = "tenant-a";
+
+        let mut store = InMemoryStore::new();
+        for (claim_id, canonical_text) in [
+            (
+                "claim-segment",
+                "Company X completed acquisition of Company Y",
+            ),
+            (
+                "claim-wal-delta",
+                "Company X completed acquisition of Startup Nova",
+            ),
+        ] {
+            store
+                .ingest_bundle(
+                    Claim {
+                        claim_id: claim_id.into(),
+                        tenant_id: tenant.into(),
+                        canonical_text: canonical_text.into(),
+                        confidence: 0.9,
+                        event_time_unix: None,
+                        entities: vec!["Company X".into()],
+                        embedding_ids: vec![],
+                        claim_type: None,
+                        valid_from: None,
+                        valid_to: None,
+                        created_at: None,
+                        updated_at: None,
+                    },
+                    vec![],
+                    vec![],
+                )
+                .expect("ingest should succeed");
+        }
+
+        let segment_base_before: HashSet<String> =
+            ["claim-segment".to_string()].into_iter().collect();
+        let wal_delta_before =
+            build_wal_delta_claim_ids(&store, tenant, Some(&segment_base_before)).unwrap();
+        let storage_visible_before = merge_segment_base_with_wal_delta_claim_ids(
+            Some(&segment_base_before),
+            Some(&wal_delta_before),
+        )
+        .unwrap();
+        let planner_before = PlannerContext {
+            tenant_id: tenant.to_string(),
+            from_unix: None,
+            to_unix: None,
+            entity_filters: vec![],
+            embedding_filters: vec![],
+            metadata_allowed_claim_ids: None,
+            segment_base_claim_ids: Some(segment_base_before),
+            wal_delta_claim_ids: Some(wal_delta_before),
+            storage_visible_claim_ids: Some(storage_visible_before),
+            allowed_claim_ids: None,
+            has_filtering: true,
+            short_circuit_empty: false,
+        };
+        let snapshot_before = build_storage_merge_snapshot(
+            &planner_before,
+            &[],
+            STORAGE_EXECUTION_MODE_MEMORY_INDEX,
+            0,
+        );
+        assert_eq!(
+            snapshot_before.promotion_boundary_state,
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA
+        );
+        assert!(snapshot_before.promotion_boundary_in_transition);
+        assert_eq!(snapshot_before.wal_delta_count, 1);
+
+        let segment_base_after: HashSet<String> =
+            ["claim-segment".to_string(), "claim-wal-delta".to_string()]
+                .into_iter()
+                .collect();
+        let wal_delta_after =
+            build_wal_delta_claim_ids(&store, tenant, Some(&segment_base_after)).unwrap();
+        let storage_visible_after = merge_segment_base_with_wal_delta_claim_ids(
+            Some(&segment_base_after),
+            Some(&wal_delta_after),
+        )
+        .unwrap();
+        let planner_after = PlannerContext {
+            tenant_id: tenant.to_string(),
+            from_unix: None,
+            to_unix: None,
+            entity_filters: vec![],
+            embedding_filters: vec![],
+            metadata_allowed_claim_ids: None,
+            segment_base_claim_ids: Some(segment_base_after),
+            wal_delta_claim_ids: Some(wal_delta_after),
+            storage_visible_claim_ids: Some(storage_visible_after),
+            allowed_claim_ids: None,
+            has_filtering: true,
+            short_circuit_empty: false,
+        };
+        let snapshot_after = build_storage_merge_snapshot(
+            &planner_after,
+            &[],
+            STORAGE_EXECUTION_MODE_MEMORY_INDEX,
+            0,
+        );
+        assert_eq!(
+            snapshot_after.promotion_boundary_state,
+            STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED
+        );
+        assert!(!snapshot_after.promotion_boundary_in_transition);
+        assert_eq!(snapshot_after.wal_delta_count, 0);
+    }
+
+    #[test]
     fn execute_api_query_segment_assisted_matches_replay_only_logical_set() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -1873,6 +2170,7 @@ mod tests {
 
     #[test]
     fn execute_api_query_ignores_foreign_claim_ids_in_segment_allowlist() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -1961,6 +2259,7 @@ mod tests {
 
     #[test]
     fn build_segment_prefilter_claim_ids_from_root_is_tenant_scoped() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2006,6 +2305,7 @@ mod tests {
 
     #[test]
     fn build_segment_prefilter_claim_ids_from_root_reads_persisted_segments() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2034,6 +2334,7 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_refreshes_after_manifest_update() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2078,6 +2379,7 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_metrics_track_refreshes_and_hits() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2118,6 +2420,7 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_metrics_track_fallback_activations() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2147,6 +2450,7 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_falls_back_when_manifest_is_invalid() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
@@ -2178,6 +2482,7 @@ mod tests {
 
     #[test]
     fn segment_prefilter_cache_falls_back_when_segment_file_is_missing() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
         let _lock = segment_cache_test_lock()
             .lock()
             .expect("segment cache test lock should be available");
