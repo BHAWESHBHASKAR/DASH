@@ -247,6 +247,35 @@ fn build_ingest_batch_request_from_json_rejects_cross_tenant_batch() {
 }
 
 #[test]
+fn build_ingest_raw_request_from_json_accepts_contract_payload() {
+    let body = r#"{
+            "tenant_id": "tenant-a",
+            "document_id": "doc-raw-1",
+            "source_id": "source://doc-raw-1",
+            "text": "Company X acquired Company Y in 2024. Revenue rose in Q4.",
+            "extraction_model": "rule-sentence-v1",
+            "claim_confidence": 0.87,
+            "source_quality": 0.9,
+            "min_sentence_chars": 10,
+            "max_claims": 8
+        }"#;
+
+    let req = build_ingest_raw_request_from_json(body).unwrap();
+    assert_eq!(req.tenant_id, "tenant-a");
+    assert_eq!(req.document_id, "doc-raw-1");
+    assert_eq!(req.source_id, "source://doc-raw-1");
+    assert_eq!(
+        req.text,
+        "Company X acquired Company Y in 2024. Revenue rose in Q4."
+    );
+    assert_eq!(req.extraction_model.as_deref(), Some("rule-sentence-v1"));
+    assert_eq!(req.claim_confidence, Some(0.87));
+    assert_eq!(req.source_quality, Some(0.9));
+    assert_eq!(req.min_sentence_chars, Some(10));
+    assert_eq!(req.max_claims, Some(8));
+}
+
+#[test]
 fn handle_request_post_ingests_claim() {
     let runtime = sample_runtime();
     let request = HttpRequest {
@@ -260,6 +289,63 @@ fn handle_request_post_ingests_claim() {
     assert_eq!(response.status, 200);
     assert!(response.body.contains("\"ingested_claim_id\":\"c1\""));
     assert!(response.body.contains("\"claims_total\":1"));
+}
+
+#[test]
+fn handle_request_post_ingest_raw_extracts_sentence_claims() {
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/raw".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-raw-http",
+                "source_id": "source://doc-raw-http",
+                "text": "Company X acquired Company Y in 2024. Revenue rose in Q4.",
+                "min_sentence_chars": 10,
+                "max_claims": 4
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"document_id\":\"doc-raw-http\""));
+    assert!(response.body.contains("\"idempotent_replay\":false"));
+    assert!(response.body.contains("\"extracted_count\":2"));
+    assert!(response.body.contains("\"claims_total\":2"));
+
+    let replay = handle_request(&runtime, &request);
+    assert_eq!(replay.status, 200);
+    assert!(replay.body.contains("\"idempotent_replay\":true"));
+    assert!(replay.body.contains("\"claims_total\":2"));
+}
+
+#[test]
+fn handle_request_post_ingest_raw_rejects_when_text_has_no_extractable_claims() {
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/raw".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-raw-too-short",
+                "source_id": "source://doc-raw-short",
+                "text": "tiny. x.",
+                "min_sentence_chars": 20
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 400);
+    assert!(
+        response
+            .body
+            .contains("did not yield any claim-sized sentences")
+    );
 }
 
 #[test]
@@ -687,6 +773,27 @@ fn auth_policy_scoped_key_rejects_other_tenants() {
 }
 
 #[test]
+fn auth_policy_scoped_key_rejects_unknown_key_when_required_keys_are_unset() {
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest".to_string(),
+        headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
+        body: Vec::new(),
+    };
+    let policy = AuthPolicy::from_env(
+        None,
+        None,
+        None,
+        None,
+        Some("scope-a:tenant-a,tenant-b".to_string()),
+    );
+    assert_eq!(
+        authorize_request_for_tenant(&request, "tenant-a", &policy),
+        AuthDecision::Unauthorized("missing or invalid API key")
+    );
+}
+
+#[test]
 fn auth_policy_required_key_rejects_missing_key() {
     let request = HttpRequest {
         method: "POST".to_string(),
@@ -788,6 +895,16 @@ fn metrics_endpoint_reports_counters() {
         metrics_response
             .body
             .contains("dash_ingest_wal_background_flush_only 0")
+    );
+    assert!(
+        metrics_response
+            .body
+            .contains("dash_ingest_wal_flush_synced_records_total 0")
+    );
+    assert!(
+        metrics_response
+            .body
+            .contains("dash_ingest_wal_flush_last_synced_records 0")
     );
     assert!(
         metrics_response
@@ -969,6 +1086,8 @@ fn background_only_mode_skips_request_thread_interval_flush() {
     runtime.flush_wal_for_async_tick();
     let flushed = runtime.metrics_text();
     assert!(flushed.contains("dash_ingest_wal_unsynced_records 0"));
+    assert!(flushed.contains("dash_ingest_wal_flush_synced_records_total 1"));
+    assert!(flushed.contains("dash_ingest_wal_flush_last_synced_records 1"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);
@@ -1006,6 +1125,8 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
     assert!(after.contains("dash_ingest_wal_unsynced_records 0"));
     assert!(after.contains("dash_ingest_wal_buffered_records 0"));
     assert!(after.contains("dash_ingest_wal_async_flush_tick_total 1"));
+    assert!(after.contains("dash_ingest_wal_flush_synced_records_total 1"));
+    assert!(after.contains("dash_ingest_wal_flush_last_synced_records 1"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);

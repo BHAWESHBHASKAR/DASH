@@ -37,8 +37,9 @@ use http::{
 };
 use metadata_router::{ReplicaRole, RoutedReplica, route_write_with_placement};
 use payload::{
-    build_ingest_batch_request_from_json, build_ingest_request_from_json,
-    render_ingest_batch_response_json, render_ingest_response_json,
+    build_ingest_batch_request_from_json, build_ingest_raw_request_from_json,
+    build_ingest_request_from_json, render_ingest_batch_response_json,
+    render_ingest_raw_response_json, render_ingest_response_json,
 };
 use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
@@ -58,7 +59,11 @@ use store::{
 
 use crate::{
     IngestInput,
-    api::{IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse},
+    api::{
+        IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse,
+        IngestRawApiResponse,
+    },
+    extraction::build_ingest_batch_from_raw_request,
     ingest_document, ingest_document_persistent_with_policy,
 };
 
@@ -109,6 +114,10 @@ pub struct IngestionRuntime {
     wal_flush_due_total: u64,
     wal_flush_success_total: u64,
     wal_flush_failure_total: u64,
+    wal_flush_synced_records_total: u64,
+    wal_flush_sync_latency_micros_total: u64,
+    wal_flush_last_synced_records: u64,
+    wal_flush_last_sync_latency_micros: u64,
     wal_async_flush_tick_total: u64,
     replication_pull_success_total: u64,
     replication_pull_failure_total: u64,
@@ -193,6 +202,10 @@ impl IngestionRuntime {
             wal_flush_due_total: 0,
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
+            wal_flush_synced_records_total: 0,
+            wal_flush_sync_latency_micros_total: 0,
+            wal_flush_last_synced_records: 0,
+            wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
@@ -250,6 +263,10 @@ impl IngestionRuntime {
             wal_flush_due_total: 0,
             wal_flush_success_total: 0,
             wal_flush_failure_total: 0,
+            wal_flush_synced_records_total: 0,
+            wal_flush_sync_latency_micros_total: 0,
+            wal_flush_last_synced_records: 0,
+            wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
@@ -571,10 +588,13 @@ impl IngestionRuntime {
         if wal.background_flush_only() {
             return;
         }
+        let unsynced_before = wal.unsynced_record_count() as u64;
+        let started = Instant::now();
         match wal.flush_pending_sync_if_interval_elapsed() {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
+                self.observe_wal_flush_success(unsynced_before, started.elapsed());
             }
             Ok(false) => {}
             Err(err) => {
@@ -590,10 +610,13 @@ impl IngestionRuntime {
             return;
         };
         self.wal_async_flush_tick_total += 1;
+        let unsynced_before = wal.unsynced_record_count() as u64;
+        let started = Instant::now();
         match wal.flush_pending_sync_if_unsynced() {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
+                self.observe_wal_flush_success(unsynced_before, started.elapsed());
             }
             Ok(false) => {}
             Err(err) => {
@@ -606,6 +629,18 @@ impl IngestionRuntime {
 
     pub(crate) fn wal_async_flush_interval(&self) -> Option<Duration> {
         self.wal_async_flush_interval
+    }
+
+    fn observe_wal_flush_success(&mut self, synced_records: u64, latency: Duration) {
+        let latency_micros = latency.as_micros().min(u64::MAX as u128) as u64;
+        self.wal_flush_synced_records_total = self
+            .wal_flush_synced_records_total
+            .saturating_add(synced_records);
+        self.wal_flush_sync_latency_micros_total = self
+            .wal_flush_sync_latency_micros_total
+            .saturating_add(latency_micros);
+        self.wal_flush_last_synced_records = synced_records;
+        self.wal_flush_last_sync_latency_micros = latency_micros;
     }
 
     pub(crate) fn set_transport_backpressure_metrics(
@@ -798,6 +833,16 @@ impl IngestionRuntime {
             .as_ref()
             .map(FileWal::background_flush_only)
             .unwrap_or(false) as usize;
+        let wal_flush_avg_synced_records = if self.wal_flush_success_total > 0 {
+            self.wal_flush_synced_records_total as f64 / self.wal_flush_success_total as f64
+        } else {
+            0.0
+        };
+        let wal_flush_avg_sync_latency_micros = if self.wal_flush_success_total > 0 {
+            self.wal_flush_sync_latency_micros_total as f64 / self.wal_flush_success_total as f64
+        } else {
+            0.0
+        };
         let transport_queue_capacity = self
             .transport_backpressure
             .as_ref()
@@ -904,6 +949,18 @@ dash_ingest_wal_flush_due_total {}\n\
 dash_ingest_wal_flush_success_total {}\n\
 # TYPE dash_ingest_wal_flush_failure_total counter\n\
 dash_ingest_wal_flush_failure_total {}\n\
+# TYPE dash_ingest_wal_flush_synced_records_total counter\n\
+dash_ingest_wal_flush_synced_records_total {}\n\
+# TYPE dash_ingest_wal_flush_sync_latency_micros_total counter\n\
+dash_ingest_wal_flush_sync_latency_micros_total {}\n\
+# TYPE dash_ingest_wal_flush_last_synced_records gauge\n\
+dash_ingest_wal_flush_last_synced_records {}\n\
+# TYPE dash_ingest_wal_flush_last_sync_latency_micros gauge\n\
+dash_ingest_wal_flush_last_sync_latency_micros {}\n\
+# TYPE dash_ingest_wal_flush_avg_synced_records gauge\n\
+dash_ingest_wal_flush_avg_synced_records {:.4}\n\
+# TYPE dash_ingest_wal_flush_avg_sync_latency_micros gauge\n\
+dash_ingest_wal_flush_avg_sync_latency_micros {:.4}\n\
 # TYPE dash_ingest_wal_async_flush_enabled gauge\n\
 dash_ingest_wal_async_flush_enabled {}\n\
 # TYPE dash_ingest_wal_async_flush_interval_ms gauge\n\
@@ -979,6 +1036,12 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.wal_flush_due_total,
             self.wal_flush_success_total,
             self.wal_flush_failure_total,
+            self.wal_flush_synced_records_total,
+            self.wal_flush_sync_latency_micros_total,
+            self.wal_flush_last_synced_records,
+            self.wal_flush_last_sync_latency_micros,
+            wal_flush_avg_synced_records,
+            wal_flush_avg_sync_latency_micros,
             wal_async_flush_enabled,
             wal_async_flush_interval_ms,
             self.wal_async_flush_tick_total,
