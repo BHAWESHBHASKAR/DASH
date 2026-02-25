@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "gpu-backend")]
+use std::sync::OnceLock;
+
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
@@ -30,6 +33,7 @@ pub struct BatchCommitMetadata {
     pub batch_size: usize,
     pub ts_unix_ms: u64,
     pub claim_ids: Vec<String>,
+    pub payload_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +44,27 @@ pub enum StoreError {
     InvalidVector(String),
     Io(String),
     Parse(String),
+}
+
+const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A_64_PRIME: u64 = 0x100000001b3;
+
+fn fnv1a64_feed(state: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *state ^= u64::from(*byte);
+        *state = state.wrapping_mul(FNV1A_64_PRIME);
+    }
+}
+
+pub fn batch_commit_payload_fingerprint(batch_size: usize, claim_ids: &[String]) -> String {
+    let mut state = FNV1A_64_OFFSET_BASIS;
+    fnv1a64_feed(&mut state, &(batch_size as u64).to_le_bytes());
+    fnv1a64_feed(&mut state, &(claim_ids.len() as u64).to_le_bytes());
+    for claim_id in claim_ids {
+        fnv1a64_feed(&mut state, &(claim_id.len() as u64).to_le_bytes());
+        fnv1a64_feed(&mut state, claim_id.as_bytes());
+    }
+    format!("{state:016x}")
 }
 
 impl From<ValidationError> for StoreError {
@@ -81,9 +106,41 @@ const SNAPSHOT_HEADER: &str = "SNAP\t1";
 const ANN_GRAPH_LEVELS: usize = 4;
 const ANN_GRAPH_MAX_NEIGHBORS_BASE_DEFAULT: usize = 12;
 const ANN_GRAPH_MAX_NEIGHBORS_UPPER_DEFAULT: usize = 6;
-const ANN_SEARCH_EXPANSION_FACTOR_DEFAULT: usize = 12;
+const ANN_SEARCH_EXPANSION_FACTOR_DEFAULT: usize = 16;
 const ANN_SEARCH_EXPANSION_MIN_DEFAULT: usize = 64;
 const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
+const VECTOR_BACKEND_ENV: &str = "DASH_VECTOR_BACKEND";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorBackendPreference {
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorBackendRuntime {
+    #[default]
+    Cpu,
+    Gpu,
+    CpuFallbackFeatureDisabled,
+    CpuFallbackUnavailable,
+}
+
+impl VectorBackendRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+            Self::CpuFallbackFeatureDisabled => "cpu (gpu-feature-disabled)",
+            Self::CpuFallbackUnavailable => "cpu (gpu-unavailable)",
+        }
+    }
+
+    pub fn is_gpu(self) -> bool {
+        matches!(self, Self::Gpu)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalCheckpointStats {
@@ -101,6 +158,14 @@ pub struct CheckpointPolicy {
 pub struct WalReplayStats {
     pub snapshot_records: usize,
     pub wal_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalReplayBoundary {
+    pub snapshot_active: bool,
+    pub snapshot_record_count: usize,
+    pub wal_delta_record_count: usize,
+    pub total_replay_record_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,6 +438,18 @@ impl FileWal {
         Ok(std::fs::metadata(&self.path)?.len())
     }
 
+    pub fn replay_boundary(&self) -> Result<WalReplayBoundary, StoreError> {
+        let snapshot_record_count = self.replay_snapshot_lines_raw()?.len();
+        let mut wal_delta_record_count = self.replay_wal_lines_raw()?.len();
+        wal_delta_record_count = wal_delta_record_count.saturating_add(self.append_buffer.len());
+        Ok(WalReplayBoundary {
+            snapshot_active: snapshot_record_count > 0,
+            snapshot_record_count,
+            wal_delta_record_count,
+            total_replay_record_count: snapshot_record_count.saturating_add(wal_delta_record_count),
+        })
+    }
+
     pub fn begin_rollback_point(&mut self) -> Result<WalRollbackPoint, StoreError> {
         self.flush_pending_sync()?;
         Ok(WalRollbackPoint {
@@ -475,14 +552,15 @@ impl FileWal {
         if self.background_flush_only {
             return Ok(());
         }
-        if self.append_buffer.len() >= self.append_buffer_max_records {
-            self.flush_append_buffer()?;
-        }
         let interval_elapsed = self
             .sync_interval
             .is_some_and(|interval| self.last_sync_at.elapsed() >= interval);
         if self.unsynced_records >= self.sync_every_records || interval_elapsed {
             self.flush_pending_sync()?;
+            return Ok(());
+        }
+        if self.append_buffer.len() >= self.append_buffer_max_records {
+            self.flush_append_buffer()?;
         }
         Ok(())
     }
@@ -521,17 +599,21 @@ impl FileWal {
     }
 
     pub fn flush_pending_sync(&mut self) -> Result<(), StoreError> {
-        self.flush_append_buffer()?;
-        if self.unsynced_records == 0 {
+        if self.unsynced_records == 0 && self.append_buffer.is_empty() {
             return Ok(());
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        file.sync_data()?;
-        self.unsynced_records = 0;
-        self.last_sync_at = Instant::now();
+        for line in self.append_buffer.drain(..) {
+            writeln!(file, "{line}")?;
+        }
+        if self.unsynced_records > 0 {
+            file.sync_data()?;
+            self.unsynced_records = 0;
+            self.last_sync_at = Instant::now();
+        }
         Ok(())
     }
 
@@ -715,17 +797,21 @@ pub struct InMemoryStore {
     batch_commits: HashMap<String, BatchCommitMetadata>,
     claim_tokens: HashMap<String, Vec<String>>,
     ann_tuning: AnnTuningConfig,
+    vector_backend_runtime: VectorBackendRuntime,
     wal: Vec<WalEvent>,
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_ann_tuning(AnnTuningConfig::default())
     }
 
     pub fn new_with_ann_tuning(ann_tuning: AnnTuningConfig) -> Self {
+        let vector_backend_runtime =
+            resolve_vector_backend_runtime(parse_vector_backend_preference());
         Self {
             ann_tuning,
+            vector_backend_runtime,
             ..Self::default()
         }
     }
@@ -736,6 +822,14 @@ impl InMemoryStore {
 
     pub fn set_ann_tuning(&mut self, ann_tuning: AnnTuningConfig) {
         self.ann_tuning = ann_tuning;
+    }
+
+    pub fn vector_backend_runtime(&self) -> VectorBackendRuntime {
+        self.vector_backend_runtime
+    }
+
+    pub fn vector_backend_label(&self) -> &'static str {
+        self.vector_backend_runtime.as_str()
     }
 
     pub fn load_from_wal(wal: &FileWal) -> Result<Self, StoreError> {
@@ -922,8 +1016,6 @@ impl InMemoryStore {
         query_vector: Option<&[f32]>,
         allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Vec<RetrievalResult> {
-        let mut ranked: Vec<RetrievalResult> = Vec::new();
-
         let candidates = self.candidate_claim_ids(
             &req.tenant_id,
             &req.query,
@@ -932,7 +1024,64 @@ impl InMemoryStore {
             req.top_k,
             allowed_claim_ids,
         );
+        self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
+    }
+
+    pub fn retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
+        &self,
+        req: &RetrievalRequest,
+        from_unix: Option<i64>,
+        to_unix: Option<i64>,
+        query_vector: Option<&[f32]>,
+        candidate_claim_ids: &HashSet<String>,
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> Vec<RetrievalResult> {
+        let mut candidates: Vec<String> = candidate_claim_ids
+            .iter()
+            .filter_map(|claim_id| {
+                let claim = self.claims.get(claim_id)?;
+                if claim.tenant_id != req.tenant_id {
+                    return None;
+                }
+                if !claim_matches_time_range(claim, from_unix, to_unix) {
+                    return None;
+                }
+                if let Some(allowed_ids) = allowed_claim_ids
+                    && !allowed_ids.contains(claim_id.as_str())
+                {
+                    return None;
+                }
+                Some(claim_id.clone())
+            })
+            .collect();
+        candidates.sort_unstable();
+        self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
+    }
+
+    fn score_and_rank_candidate_claim_ids(
+        &self,
+        req: &RetrievalRequest,
+        query_vector: Option<&[f32]>,
+        candidates: Vec<String>,
+    ) -> Vec<RetrievalResult> {
+        let mut ranked: Vec<RetrievalResult> = Vec::new();
         let bm25_context = self.bm25_context_for_tenant(&req.tenant_id, &req.query);
+        let dense_similarities = query_vector.map(|vector| {
+            let candidate_vectors: Vec<(String, &[f32])> = candidates
+                .iter()
+                .filter_map(|claim_id| {
+                    let claim = self.claims.get(claim_id)?;
+                    if claim.tenant_id != req.tenant_id {
+                        return None;
+                    }
+                    let claim_vector = self.claim_vectors.get(claim_id)?;
+                    Some((claim_id.clone(), claim_vector.as_slice()))
+                })
+                .collect();
+            self.score_query_candidate_vectors(vector, candidate_vectors)
+                .into_iter()
+                .collect::<HashMap<String, f32>>()
+        });
 
         for claim_id in candidates {
             let Some(claim) = self.claims.get(&claim_id) else {
@@ -986,14 +1135,11 @@ impl InMemoryStore {
                 })
                 .unwrap_or(0.0);
 
-            let dense_similarity = match query_vector {
-                Some(vector) => self
-                    .claim_vectors
-                    .get(&claim.claim_id)
-                    .and_then(|claim_vector| cosine_similarity(vector, claim_vector)),
-                None => None,
-            }
-            .unwrap_or(0.0);
+            let dense_similarity = dense_similarities
+                .as_ref()
+                .and_then(|scores| scores.get(&claim.claim_id))
+                .copied()
+                .unwrap_or(0.0);
 
             let score = score_claim_with_bm25(
                 &req.query,
@@ -1222,7 +1368,7 @@ impl InMemoryStore {
             return Vec::new();
         }
 
-        let mut scored: Vec<(String, f32)> = self
+        let candidate_vectors: Vec<(String, &[f32])> = self
             .claim_vectors
             .iter()
             .filter_map(|(claim_id, vector)| {
@@ -1230,10 +1376,10 @@ impl InMemoryStore {
                 if claim.tenant_id != tenant_id {
                     return None;
                 }
-                let score = cosine_similarity(query_vector, vector)?;
-                Some((claim_id.clone(), score))
+                Some((claim_id.clone(), vector.as_slice()))
             })
             .collect();
+        let mut scored = self.score_query_candidate_vectors(query_vector, candidate_vectors);
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
             .into_iter()
@@ -1350,7 +1496,7 @@ impl InMemoryStore {
                 .collect();
         }
 
-        let mut scored: Vec<(String, f32)> = scoped_ids
+        let candidate_vectors: Vec<(String, &[f32])> = scoped_ids
             .into_iter()
             .filter_map(|claim_id| {
                 let vector = self.claim_vectors.get(&claim_id)?;
@@ -1358,16 +1504,37 @@ impl InMemoryStore {
                 if claim.tenant_id != tenant_id {
                     return None;
                 }
-                let sim = cosine_similarity(query_vector, vector)?;
-                Some((claim_id, sim))
+                Some((claim_id, vector.as_slice()))
             })
             .collect();
+        let mut scored = self.score_query_candidate_vectors(query_vector, candidate_vectors);
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
             .into_iter()
             .take(top_n)
             .map(|(claim_id, _)| claim_id)
             .collect()
+    }
+
+    fn score_query_candidate_vectors(
+        &self,
+        query_vector: &[f32],
+        candidate_vectors: Vec<(String, &[f32])>,
+    ) -> Vec<(String, f32)> {
+        if candidate_vectors.is_empty() || query_vector.is_empty() {
+            return Vec::new();
+        }
+
+        if self.vector_backend_runtime.is_gpu() {
+            #[cfg(feature = "gpu-backend")]
+            if let Some(scored) =
+                gpu_score_query_candidate_vectors(query_vector, &candidate_vectors)
+            {
+                return scored;
+            }
+        }
+
+        score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
     }
 
     fn approximate_vector_candidate_ids(
@@ -1718,11 +1885,13 @@ impl InMemoryStore {
     }
 
     fn apply_batch_commit_record(&mut self, record: BatchCommitRecord) -> Result<(), StoreError> {
+        let payload_fingerprint =
+            batch_commit_payload_fingerprint(record.batch_size, &record.claim_ids);
         if let Some(existing) = self.batch_commits.get(&record.commit_id) {
-            if existing.batch_size != record.batch_size || existing.claim_ids != record.claim_ids {
+            if existing.payload_fingerprint != payload_fingerprint {
                 return Err(StoreError::Conflict(format!(
-                    "batch commit_id '{}' already exists with different payload",
-                    record.commit_id
+                    "batch commit_id '{}' already exists with different payload (existing_fingerprint={}, incoming_fingerprint={})",
+                    record.commit_id, existing.payload_fingerprint, payload_fingerprint
                 )));
             }
             return Ok(());
@@ -1735,6 +1904,7 @@ impl InMemoryStore {
                 batch_size: record.batch_size,
                 ts_unix_ms: record.ts_unix_ms,
                 claim_ids: record.claim_ids,
+                payload_fingerprint,
             },
         );
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
@@ -2137,6 +2307,59 @@ impl InMemoryStore {
     }
 }
 
+fn parse_vector_backend_preference() -> VectorBackendPreference {
+    match std::env::var(VECTOR_BACKEND_ENV)
+        .ok()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("cpu") => VectorBackendPreference::Cpu,
+        Some("gpu") => VectorBackendPreference::Gpu,
+        _ => VectorBackendPreference::Auto,
+    }
+}
+
+fn resolve_vector_backend_runtime(preference: VectorBackendPreference) -> VectorBackendRuntime {
+    match preference {
+        VectorBackendPreference::Cpu => VectorBackendRuntime::Cpu,
+        VectorBackendPreference::Gpu => resolve_gpu_backend_runtime(true),
+        VectorBackendPreference::Auto => resolve_gpu_backend_runtime(false),
+    }
+}
+
+#[cfg(feature = "gpu-backend")]
+fn resolve_gpu_backend_runtime(explicit_gpu_required: bool) -> VectorBackendRuntime {
+    if gpu_backend_engine().is_some() {
+        VectorBackendRuntime::Gpu
+    } else if explicit_gpu_required {
+        VectorBackendRuntime::CpuFallbackUnavailable
+    } else {
+        VectorBackendRuntime::Cpu
+    }
+}
+
+#[cfg(not(feature = "gpu-backend"))]
+fn resolve_gpu_backend_runtime(explicit_gpu_required: bool) -> VectorBackendRuntime {
+    if explicit_gpu_required {
+        VectorBackendRuntime::CpuFallbackFeatureDisabled
+    } else {
+        VectorBackendRuntime::Cpu
+    }
+}
+
+fn score_query_candidate_vectors_cpu(
+    query_vector: &[f32],
+    candidate_vectors: &[(String, &[f32])],
+) -> Vec<(String, f32)> {
+    candidate_vectors
+        .iter()
+        .filter_map(|(claim_id, candidate_vector)| {
+            let score = cosine_similarity(query_vector, candidate_vector)?;
+            Some((claim_id.clone(), score))
+        })
+        .collect()
+}
+
 fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
     if let Some(from) = from_unix
         && value < from
@@ -2200,6 +2423,328 @@ fn validate_vector(vector: &[f32]) -> Result<(), StoreError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "gpu-backend")]
+const GPU_COSINE_SHADER: &str = r#"
+struct CosineParams {
+    dimension: u32,
+    candidate_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0)
+var<storage, read> query: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> candidates: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> output_scores: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> params: CosineParams;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let candidate_index = gid.x;
+    if (candidate_index >= params.candidate_count) {
+        return;
+    }
+
+    let base = candidate_index * params.dimension;
+    var dot: f32 = 0.0;
+    var norm_query: f32 = 0.0;
+    var norm_candidate: f32 = 0.0;
+    var i: u32 = 0u;
+
+    loop {
+        if (i >= params.dimension) {
+            break;
+        }
+        let q = query[i];
+        let c = candidates[base + i];
+        dot = dot + (q * c);
+        norm_query = norm_query + (q * q);
+        norm_candidate = norm_candidate + (c * c);
+        i = i + 1u;
+    }
+
+    let denom = sqrt(norm_query) * sqrt(norm_candidate);
+    if (denom <= 0.0000001) {
+        output_scores[candidate_index] = 0.0;
+    } else {
+        output_scores[candidate_index] = dot / denom;
+    }
+}
+"#;
+
+#[cfg(feature = "gpu-backend")]
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuCosineParams {
+    dimension: u32,
+    candidate_count: u32,
+    pad0: u32,
+    pad1: u32,
+}
+
+#[cfg(feature = "gpu-backend")]
+struct GpuBackendEngine {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+#[cfg(feature = "gpu-backend")]
+static GPU_BACKEND_ENGINE: OnceLock<Result<GpuBackendEngine, String>> = OnceLock::new();
+
+#[cfg(feature = "gpu-backend")]
+fn gpu_backend_engine() -> Option<&'static GpuBackendEngine> {
+    GPU_BACKEND_ENGINE
+        .get_or_init(GpuBackendEngine::new)
+        .as_ref()
+        .ok()
+}
+
+#[cfg(feature = "gpu-backend")]
+fn gpu_score_query_candidate_vectors(
+    query_vector: &[f32],
+    candidate_vectors: &[(String, &[f32])],
+) -> Option<Vec<(String, f32)>> {
+    let engine = gpu_backend_engine()?;
+    engine.score(query_vector, candidate_vectors).ok()
+}
+
+#[cfg(feature = "gpu-backend")]
+impl GpuBackendEngine {
+    fn new() -> Result<Self, String> {
+        use wgpu::util::DeviceExt;
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok_or_else(|| "no GPU adapter available".to_string())?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("dash-vector-gpu-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        ))
+        .map_err(|err| format!("request_device failed: {err}"))?;
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("dash-vector-gpu-cosine-shader"),
+            source: wgpu::ShaderSource::Wgsl(GPU_COSINE_SHADER.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dash-vector-gpu-bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("dash-vector-gpu-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("dash-vector-gpu-cosine-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "main",
+        });
+
+        let _ = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("dash-vector-gpu-init-probe"),
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            bind_group_layout,
+        })
+    }
+
+    fn score(
+        &self,
+        query_vector: &[f32],
+        candidate_vectors: &[(String, &[f32])],
+    ) -> Result<Vec<(String, f32)>, String> {
+        use wgpu::util::DeviceExt;
+
+        if query_vector.is_empty() || candidate_vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidate_ids = Vec::new();
+        let mut flattened_candidates = Vec::new();
+        for (claim_id, vector) in candidate_vectors {
+            if vector.len() != query_vector.len() {
+                continue;
+            }
+            candidate_ids.push(claim_id.clone());
+            flattened_candidates.extend_from_slice(vector);
+        }
+
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dash-vector-gpu-query-buffer"),
+                contents: bytemuck::cast_slice(query_vector),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let candidate_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dash-vector-gpu-candidate-buffer"),
+                contents: bytemuck::cast_slice(flattened_candidates.as_slice()),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let output_size = (candidate_ids.len() * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dash-vector-gpu-output-buffer"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dash-vector-gpu-readback-buffer"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let params = GpuCosineParams {
+            dimension: query_vector.len() as u32,
+            candidate_count: candidate_ids.len() as u32,
+            pad0: 0,
+            pad1: 0,
+        };
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dash-vector-gpu-params-buffer"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dash-vector-gpu-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: query_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: candidate_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dash-vector-gpu-command-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dash-vector-gpu-compute-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = ((candidate_ids.len() as u32).saturating_add(63)) / 64;
+            pass.dispatch_workgroups(workgroups.max(1), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_buffer, 0, output_size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let readback_slice = readback_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| "gpu map_async channel dropped".to_string())?
+            .map_err(|err| format!("gpu map_async failed: {err}"))?;
+
+        let bytes = readback_slice.get_mapped_range();
+        let scores: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        drop(bytes);
+        readback_buffer.unmap();
+
+        Ok(candidate_ids.into_iter().zip(scores).collect())
+    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
@@ -2741,6 +3286,41 @@ mod tests {
     fn cleanup_persistence_files(wal: &FileWal) {
         let _ = remove_file(wal.path());
         let _ = remove_file(wal.snapshot_path());
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var(self.key, value);
+                    }
+                }
+                None => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3656,6 +4236,69 @@ mod tests {
     }
 
     #[test]
+    fn wal_replay_boundary_tracks_checkpoint_promotion_and_delta_transition() {
+        let wal_path = temp_wal_path();
+        let mut wal = FileWal::open(&wal_path).unwrap();
+        let mut store = InMemoryStore::new();
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c1", "Company X announced merger terms"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c2", "Company Y accepted merger terms"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let before_checkpoint = wal.replay_boundary().unwrap();
+        assert!(!before_checkpoint.snapshot_active);
+        assert_eq!(before_checkpoint.snapshot_record_count, 0);
+        assert_eq!(before_checkpoint.wal_delta_record_count, 2);
+        assert_eq!(before_checkpoint.total_replay_record_count, 2);
+
+        store.checkpoint_and_compact(&mut wal).unwrap();
+        let after_checkpoint = wal.replay_boundary().unwrap();
+        assert!(after_checkpoint.snapshot_active);
+        assert_eq!(after_checkpoint.snapshot_record_count, 2);
+        assert_eq!(after_checkpoint.wal_delta_record_count, 0);
+        assert_eq!(after_checkpoint.total_replay_record_count, 2);
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim("c3", "Company Z approved merger financing"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let after_delta_append = wal.replay_boundary().unwrap();
+        assert!(after_delta_append.snapshot_active);
+        assert_eq!(after_delta_append.snapshot_record_count, 2);
+        assert_eq!(after_delta_append.wal_delta_record_count, 1);
+        assert_eq!(after_delta_append.total_replay_record_count, 3);
+
+        store.checkpoint_and_compact(&mut wal).unwrap();
+        let after_second_checkpoint = wal.replay_boundary().unwrap();
+        assert!(after_second_checkpoint.snapshot_active);
+        assert_eq!(after_second_checkpoint.snapshot_record_count, 3);
+        assert_eq!(after_second_checkpoint.wal_delta_record_count, 0);
+        assert_eq!(after_second_checkpoint.total_replay_record_count, 3);
+
+        let replayed = InMemoryStore::load_from_wal(&wal).unwrap();
+        assert_eq!(replayed.claims_len(), 3);
+
+        cleanup_persistence_files(&wal);
+    }
+
+    #[test]
     fn checkpoint_policy_triggers_compaction_by_record_count() {
         let wal_path = temp_wal_path();
         let mut wal = FileWal::open(&wal_path).unwrap();
@@ -3860,6 +4503,60 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].claim_id, "c-allow");
+    }
+
+    #[test]
+    fn retrieve_with_explicit_candidate_claim_ids_scores_only_explicit_set() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                claim("c-segment", "Project Helios acquired Startup Nova"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(
+                claim("c-delta", "Project Helios announced expanded merger terms"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(claim("c-other", "Unrelated weather update"), vec![], vec![])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-segment", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-delta", vec![0.8, 0.2, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-other", vec![0.1, 0.9, 0.0, 0.0])
+            .unwrap();
+
+        let explicit: HashSet<String> = ["c-segment".to_string(), "c-delta".to_string()]
+            .into_iter()
+            .collect();
+        let results = store.retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
+            &RetrievalRequest {
+                tenant_id: "tenant-a".into(),
+                query: "project helios acquisition".into(),
+                top_k: 10,
+                stance_mode: StanceMode::Balanced,
+            },
+            None,
+            None,
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+            &explicit,
+            None,
+        );
+
+        let result_ids: HashSet<String> = results.into_iter().map(|row| row.claim_id).collect();
+        assert_eq!(result_ids.len(), 2);
+        assert!(result_ids.contains("c-segment"));
+        assert!(result_ids.contains("c-delta"));
+        assert!(!result_ids.contains("c-other"));
     }
 
     #[test]
@@ -4085,6 +4782,10 @@ mod tests {
             .expect("metadata should be retained");
         assert_eq!(metadata.batch_size, 2);
         assert_eq!(metadata.claim_ids, claim_ids);
+        assert_eq!(
+            metadata.payload_fingerprint,
+            batch_commit_payload_fingerprint(2, &claim_ids)
+        );
     }
 
     #[test]
@@ -4107,6 +4808,35 @@ mod tests {
             )
             .expect_err("conflicting payload should fail");
         assert!(matches!(err, StoreError::Conflict(_)));
+        let message = format!("{err:?}");
+        assert!(message.contains("existing_fingerprint="));
+        assert!(message.contains("incoming_fingerprint="));
+    }
+
+    #[test]
+    fn batch_commit_payload_fingerprint_is_deterministic_and_order_sensitive() {
+        let ordered = vec!["c1".to_string(), "c2".to_string()];
+        let swapped = vec!["c2".to_string(), "c1".to_string()];
+        let first = batch_commit_payload_fingerprint(2, &ordered);
+        let second = batch_commit_payload_fingerprint(2, &ordered);
+        let third = batch_commit_payload_fingerprint(2, &swapped);
+        assert_eq!(first, second);
+        assert_ne!(first, third);
+    }
+
+    #[test]
+    fn apply_persisted_batch_commit_line_rejects_replay_payload_divergence() {
+        let mut store = InMemoryStore::new();
+        store
+            .apply_persisted_record_line("B\tcommit-diverge-1\t1\t1700000000000\t2:c1")
+            .expect("first replayed batch commit should apply");
+        let err = store
+            .apply_persisted_record_line("B\tcommit-diverge-1\t1\t1700000000001\t2:c2")
+            .expect_err("payload divergence must be rejected");
+        assert!(matches!(err, StoreError::Conflict(_)));
+        let message = format!("{err:?}");
+        assert!(message.contains("existing_fingerprint="));
+        assert!(message.contains("incoming_fingerprint="));
     }
 
     #[test]
@@ -4219,6 +4949,37 @@ mod tests {
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);
+    }
+
+    #[test]
+    fn vector_backend_env_cpu_selects_cpu_runtime() {
+        let _guard = EnvVarGuard::set(VECTOR_BACKEND_ENV, "cpu");
+        let store = InMemoryStore::new();
+        assert_eq!(store.vector_backend_runtime(), VectorBackendRuntime::Cpu);
+        assert_eq!(store.vector_backend_label(), "cpu");
+    }
+
+    #[test]
+    #[cfg(not(feature = "gpu-backend"))]
+    fn vector_backend_env_gpu_without_feature_falls_back_to_cpu() {
+        let _guard = EnvVarGuard::set(VECTOR_BACKEND_ENV, "gpu");
+        let store = InMemoryStore::new();
+        assert_eq!(
+            store.vector_backend_runtime(),
+            VectorBackendRuntime::CpuFallbackFeatureDisabled
+        );
+        assert_eq!(store.vector_backend_label(), "cpu (gpu-feature-disabled)");
+    }
+
+    #[test]
+    #[cfg(feature = "gpu-backend")]
+    fn vector_backend_env_gpu_with_feature_is_gpu_or_runtime_fallback() {
+        let _guard = EnvVarGuard::set(VECTOR_BACKEND_ENV, "gpu");
+        let store = InMemoryStore::new();
+        assert!(matches!(
+            store.vector_backend_runtime(),
+            VectorBackendRuntime::Gpu | VectorBackendRuntime::CpuFallbackUnavailable
+        ));
     }
 
     #[test]

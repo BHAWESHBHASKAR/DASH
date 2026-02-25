@@ -595,7 +595,12 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-pub(super) fn render_retrieve_response_json(resp: &crate::api::RetrieveApiResponse) -> String {
+pub(super) fn render_retrieve_response_json(
+    resp: &crate::api::RetrieveApiResponse,
+    read_policy: &str,
+    read_quorum_met: bool,
+    serving_replica: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str("{\"results\":[");
     for (idx, node) in resp.results.iter().enumerate() {
@@ -635,6 +640,13 @@ pub(super) fn render_retrieve_response_json(resp: &crate::api::RetrieveApiRespon
         out.push_str("null");
     }
 
+    out.push_str(",\"read_policy\":\"");
+    out.push_str(&json_escape(read_policy));
+    out.push('"');
+    out.push_str(",\"read_quorum_met\":");
+    out.push_str(if read_quorum_met { "true" } else { "false" });
+    out.push_str(",\"serving_replica\":");
+    render_optional_string(&mut out, serving_replica);
     out.push('}');
     out
 }

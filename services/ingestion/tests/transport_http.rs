@@ -133,6 +133,137 @@ fn transport_post_ingest_parses_json_and_returns_response() {
 }
 
 #[test]
+fn transport_post_ingest_raw_extracts_claims_and_supports_idempotent_replay() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let body = r#"{
+      "tenant_id": "tenant-http",
+      "document_id": "doc-http-raw-1",
+      "source_id": "source://doc-http-raw-1",
+      "text": "Company X acquired Company Y in 2024. Revenue increased in Q4.",
+      "min_sentence_chars": 10,
+      "max_claims": 4
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/raw HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let first = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("first raw request should parse and return response");
+    let first = String::from_utf8(first).expect("response should be UTF-8");
+    assert!(first.starts_with("HTTP/1.1 200 OK"));
+    assert!(first.contains("\"document_id\":\"doc-http-raw-1\""));
+    assert!(first.contains("\"extracted_count\":2"));
+    assert!(first.contains("\"idempotent_replay\":false"));
+    assert!(first.contains("\"claims_total\":2"));
+
+    let replay = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("second raw request should parse and return response");
+    let replay = String::from_utf8(replay).expect("response should be UTF-8");
+    assert!(replay.starts_with("HTTP/1.1 200 OK"));
+    assert!(replay.contains("\"idempotent_replay\":true"));
+    assert!(replay.contains("\"claims_total\":2"));
+}
+
+#[test]
+fn transport_post_ingest_document_with_inline_text_extracts_claims() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    let body = r#"{
+      "tenant_id": "tenant-http",
+      "document_id": "doc-http-doc-1",
+      "source_id": "source://doc-http-doc-1",
+      "mime_type": "application/pdf",
+      "text": "Company X acquired Company Y in 2024. Revenue increased in Q4.",
+      "min_sentence_chars": 10,
+      "max_claims": 4
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/document HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("document request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"document_id\":\"doc-http-doc-1\""));
+    assert!(response.contains("\"parser_provider\":\"inline_text\""));
+    assert!(response.contains("\"extracted_count\":2"));
+}
+
+#[test]
+fn transport_post_ingest_document_accepts_pdf_bytes_with_adapter_command() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _provider = EnvVarGuard::set(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        OsStr::new("adapter_command"),
+    );
+    let _cmd = EnvVarGuard::set("DASH_INGEST_DOCUMENT_ADAPTER_CMD", OsStr::new("cat"));
+    let runtime = sample_runtime();
+    let body = r#"{
+      "tenant_id": "tenant-http",
+      "document_id": "doc-http-doc-2",
+      "source_id": "source://doc-http-doc-2",
+      "mime_type": "application/pdf",
+      "content_base64": "Q29tcGFueSBYIGFjcXVpcmVkIENvbXBhbnkgWS4gUmV2ZW51ZSByb3NlIGluIFE0Lg==",
+      "min_sentence_chars": 10,
+      "max_claims": 4
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/document HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("document request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"document_id\":\"doc-http-doc-2\""));
+    assert!(response.contains("\"parser_provider\":\"cat\""));
+    assert!(response.contains("\"extracted_count\":2"));
+}
+
+#[test]
+fn transport_post_ingest_document_generates_embeddings_when_enabled() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _embedding_provider =
+        EnvVarGuard::set("DASH_INGEST_EMBEDDING_PROVIDER", OsStr::new("hash_vector"));
+    let _embedding_dimensions =
+        EnvVarGuard::set("DASH_INGEST_EMBEDDING_DIMENSIONS", OsStr::new("8"));
+    let runtime = sample_runtime();
+    let body = r#"{
+      "tenant_id": "tenant-http",
+      "document_id": "doc-http-doc-emb",
+      "source_id": "source://doc-http-doc-emb",
+      "mime_type": "text/plain",
+      "text": "Company X acquired Company Y in 2024. Revenue increased in Q4.",
+      "min_sentence_chars": 10,
+      "max_claims": 4,
+      "generate_embeddings": true,
+      "embedding_model": "emb://hash-v1"
+    }"#;
+    let request = format!(
+        "POST /v1/ingest/document HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("document request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"document_id\":\"doc-http-doc-emb\""));
+    assert!(response.contains("\"embedding_provider\":\"hash8\""));
+    assert!(response.contains("\"embeddings_generated\":2"));
+    assert!(response.contains("\"embedding_dimensions\":8"));
+}
+
+#[test]
 fn transport_post_ingest_batch_parses_json_and_returns_commit_metadata() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let runtime = sample_runtime();
@@ -269,6 +400,8 @@ fn transport_post_ingest_batch_rejects_commit_id_reuse_with_different_payload() 
         "response was: {second_response}"
     );
     assert!(second_response.contains("state conflict"));
+    assert!(second_response.contains("existing_fingerprint="));
+    assert!(second_response.contains("incoming_fingerprint="));
 }
 
 #[test]
@@ -328,6 +461,28 @@ fn transport_metrics_endpoint_returns_prometheus_payload() {
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8"));
     assert!(response.contains("dash_ingest_success_total"));
+}
+
+#[test]
+fn transport_document_parser_debug_endpoint_returns_json_payload() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _provider = EnvVarGuard::set(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        OsStr::new("adapter_command"),
+    );
+    let _cmd = EnvVarGuard::set("DASH_INGEST_DOCUMENT_ADAPTER_CMD", OsStr::new("cat"));
+    let runtime = sample_runtime();
+    let request =
+        b"GET /debug/document-parser HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = handle_http_request_bytes(&runtime, request)
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("Content-Type: application/json"));
+    assert!(response.contains("\"parser_provider\":\"adapter_command\""));
+    assert!(response.contains("\"adapter_command_preview\":\"cat\""));
+    assert!(response.contains("\"embedding_provider\""));
 }
 
 #[test]
@@ -423,6 +578,94 @@ tenant-http,0,8,node-a,follower,healthy\n",
     assert!(debug_response.contains("\"epoch\":8"));
     assert!(debug_response.contains("\"local_admission\":true"));
     assert!(debug_response.contains("\"reload\":{\"enabled\":true"));
+
+    let _ = std::fs::remove_file(placement_file);
+}
+
+#[test]
+fn transport_write_consistency_all_rejects_when_required_acks_unavailable() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let placement_file = temp_placement_csv(
+        "tenant-http,0,9,node-a,leader,healthy\n\
+tenant-http,0,9,node-b,follower,healthy\n\
+tenant-http,0,9,node-c,follower,unavailable\n",
+    );
+    let _placement_env = EnvVarGuard::set("DASH_ROUTER_PLACEMENT_FILE", placement_file.as_os_str());
+    let _local_node_env = EnvVarGuard::set("DASH_ROUTER_LOCAL_NODE_ID", OsStr::new("node-a"));
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-all-reject","tenant_id":"tenant-http","canonical_text":"all consistency reject","confidence":0.9}}"#;
+    let request = format!(
+        "POST /v1/ingest?write_consistency=all HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = handle_http_request_bytes(&runtime, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "response was: {response}"
+    );
+    assert!(response.contains("write_consistency=all"));
+    assert!(response.contains("healthy_replicas=2"));
+    assert!(response.contains("required_acks=3"));
+
+    let _ = std::fs::remove_file(placement_file);
+}
+
+#[test]
+fn transport_write_consistency_quorum_progresses_with_replication_ack() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let placement_file = temp_placement_csv(
+        "tenant-http,0,9,node-a,leader,healthy\n\
+tenant-http,0,9,node-b,follower,healthy\n",
+    );
+    let _placement_env = EnvVarGuard::set("DASH_ROUTER_PLACEMENT_FILE", placement_file.as_os_str());
+    let _local_node_env = EnvVarGuard::set("DASH_ROUTER_LOCAL_NODE_ID", OsStr::new("node-a"));
+
+    let runtime = sample_runtime();
+    let body = r#"{"claim":{"claim_id":"claim-quorum-ack","tenant_id":"tenant-http","canonical_text":"quorum ack progression","confidence":0.9}}"#;
+    let ingest_request = format!(
+        "POST /v1/ingest?write_consistency=quorum HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let ingest_response = handle_http_request_bytes(&runtime, ingest_request.as_bytes())
+        .expect("ingest request should parse and return response");
+    let ingest_response = String::from_utf8(ingest_response).expect("response should be UTF-8");
+    assert!(
+        ingest_response.starts_with("HTTP/1.1 200 OK"),
+        "response was: {ingest_response}"
+    );
+    assert!(ingest_response.contains("\"ack_count\":1"));
+    assert!(ingest_response.contains("\"required_acks\":2"));
+    assert!(ingest_response.contains("\"commit_status\":\"replication_pending\""));
+
+    let status_before_ack = b"GET /internal/replication/commit-status?commit_id=claim-quorum-ack HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let status_before_ack = handle_http_request_bytes(&runtime, status_before_ack)
+        .expect("commit status request should parse");
+    let status_before_ack = String::from_utf8(status_before_ack).expect("response should be UTF-8");
+    assert!(status_before_ack.starts_with("HTTP/1.1 200 OK"));
+    assert!(status_before_ack.contains("\"ack_count\":1"));
+    assert!(status_before_ack.contains("\"commit_status\":\"replication_pending\""));
+
+    let ack_request = b"POST /internal/replication/ack?commit_id=claim-quorum-ack&replica_id=node-b&ack_epoch=9 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let ack_response = handle_http_request_bytes(&runtime, ack_request)
+        .expect("ack request should parse and return response");
+    let ack_response = String::from_utf8(ack_response).expect("response should be UTF-8");
+    assert!(ack_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(ack_response.contains("\"ack_count\":2"));
+    assert!(ack_response.contains("\"required_acks\":2"));
+    assert!(ack_response.contains("\"commit_status\":\"replication_quorum_met\""));
+
+    let duplicate_ack_response = handle_http_request_bytes(&runtime, ack_request)
+        .expect("duplicate ack request should parse and return response");
+    let duplicate_ack_response =
+        String::from_utf8(duplicate_ack_response).expect("response should be UTF-8");
+    assert!(duplicate_ack_response.starts_with("HTTP/1.1 200 OK"));
+    assert!(duplicate_ack_response.contains("\"ack_count\":2"));
+    assert!(!duplicate_ack_response.contains("\"ack_count\":3"));
 
     let _ = std::fs::remove_file(placement_file);
 }

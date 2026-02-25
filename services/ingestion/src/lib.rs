@@ -1,4 +1,5 @@
 pub mod api;
+pub mod extraction;
 pub mod transport;
 #[cfg(feature = "async-transport")]
 pub mod transport_axum;

@@ -105,6 +105,7 @@ fn main() {
             store.ann_tuning().search_expansion_min,
             store.ann_tuning().search_expansion_max
         );
+        println!("retrieval vector backend: {}", store.vector_backend_label());
         if let Some(segment_dir) = segment_dir.as_deref() {
             println!("retrieval segment read dir: {segment_dir}");
         }

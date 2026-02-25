@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::Path,
 };
 
@@ -281,6 +283,95 @@ pub fn load_shard_placements_csv(path: &Path) -> Result<Vec<ShardPlacement>, Str
     parse_shard_placements_csv(&raw)
 }
 
+pub fn load_shard_placements_from_source(
+    placement_file: Option<&Path>,
+    control_plane_base_url: Option<&str>,
+) -> Result<Vec<ShardPlacement>, String> {
+    let mut control_plane_error: Option<String> = None;
+    if let Some(base_url) = control_plane_base_url {
+        let trimmed = base_url.trim();
+        if !trimmed.is_empty() {
+            match load_shard_placements_from_control_plane(trimmed) {
+                Ok(placements) => return Ok(placements),
+                Err(err) => control_plane_error = Some(err),
+            }
+        }
+    }
+    if let Some(path) = placement_file {
+        return load_shard_placements_csv(path);
+    }
+    Err(control_plane_error.unwrap_or_else(|| {
+        "placement source is unconfigured: set DASH_ROUTER_CONTROL_PLANE_URL or DASH_ROUTER_PLACEMENT_FILE".to_string()
+    }))
+}
+
+pub fn load_shard_placements_from_control_plane(
+    base_url: &str,
+) -> Result<Vec<ShardPlacement>, String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("control-plane base URL must not be empty".to_string());
+    }
+    let url = format!("{base_url}/v1/control-plane/placement?format=csv");
+    let (authority, path) = parse_http_url(&url)?;
+    let mut stream = TcpStream::connect(&authority)
+        .map_err(|err| format!("failed connecting control-plane '{authority}': {err}"))?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("failed sending control-plane request: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed flushing control-plane request: {err}"))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .map_err(|err| format!("failed reading control-plane response: {err}"))?;
+    let response = String::from_utf8(response_bytes)
+        .map_err(|_| "control-plane response is not valid UTF-8".to_string())?;
+    let (header_block, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "control-plane response missing HTTP header terminator".to_string())?;
+    let status_line = header_block
+        .lines()
+        .next()
+        .ok_or_else(|| "control-plane response missing status line".to_string())?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "control-plane response status missing code".to_string())
+        .and_then(|value| {
+            value
+                .parse::<u16>()
+                .map_err(|_| "control-plane response has invalid status code".to_string())
+        })?;
+    if status != 200 {
+        return Err(format!(
+            "control-plane placement request failed with HTTP status {status}"
+        ));
+    }
+    parse_shard_placements_csv(body)
+}
+
+pub fn render_shard_placements_csv(placements: &[ShardPlacement]) -> String {
+    let mut out = String::new();
+    for placement in placements {
+        for replica in &placement.replicas {
+            out.push_str(&format!(
+                "{},{},{},{},{},{}\n",
+                placement.tenant_id,
+                placement.shard_id,
+                placement.epoch,
+                replica.node_id,
+                replica_role_str(replica.role),
+                replica_health_str(replica.health),
+            ));
+        }
+    }
+    out
+}
+
 pub fn parse_shard_placements_csv(input: &str) -> Result<Vec<ShardPlacement>, String> {
     let mut grouped: BTreeMap<(String, u32), ShardPlacement> = BTreeMap::new();
     for (line_index, line) in input.lines().enumerate() {
@@ -370,6 +461,21 @@ fn parse_replica_role(raw: &str) -> Result<ReplicaRole, &'static str> {
     }
 }
 
+fn replica_role_str(role: ReplicaRole) -> &'static str {
+    match role {
+        ReplicaRole::Leader => "leader",
+        ReplicaRole::Follower => "follower",
+    }
+}
+
+fn replica_health_str(health: ReplicaHealth) -> &'static str {
+    match health {
+        ReplicaHealth::Healthy => "healthy",
+        ReplicaHealth::Degraded => "degraded",
+        ReplicaHealth::Unavailable => "unavailable",
+    }
+}
+
 fn parse_replica_health(raw: &str) -> Result<ReplicaHealth, &'static str> {
     match raw.to_ascii_lowercase().as_str() {
         "healthy" => Ok(ReplicaHealth::Healthy),
@@ -417,6 +523,20 @@ fn hash_key(value: &str) -> u64 {
         hash = hash.wrapping_mul(1099511628211);
     }
     hash
+}
+
+fn parse_http_url(url: &str) -> Result<(String, String), String> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "control-plane URL must start with http://".to_string())?;
+    let (authority, path_and_query) = match without_scheme.split_once('/') {
+        Some((authority, suffix)) => (authority, format!("/{}", suffix)),
+        None => (without_scheme, "/".to_string()),
+    };
+    if authority.trim().is_empty() {
+        return Err("control-plane URL missing host:port authority".to_string());
+    }
+    Ok((authority.to_string(), path_and_query))
 }
 
 #[cfg(test)]
@@ -605,5 +725,28 @@ mod tests {
             },
         ];
         assert_eq!(shard_ids_from_placements(&placements), vec![2, 5]);
+    }
+
+    #[test]
+    fn render_shard_placements_csv_round_trips_with_parser() {
+        let placements = vec![sample_placement()];
+        let csv = render_shard_placements_csv(&placements);
+        let reparsed = parse_shard_placements_csv(&csv).expect("csv should parse");
+        assert_eq!(reparsed, placements);
+    }
+
+    #[test]
+    fn parse_http_url_requires_http_scheme() {
+        let err = parse_http_url("https://127.0.0.1:8090/path").expect_err("scheme should fail");
+        assert!(err.contains("must start with http://"));
+    }
+
+    #[test]
+    fn parse_http_url_extracts_authority_and_path() {
+        let (authority, path) =
+            parse_http_url("http://127.0.0.1:8090/v1/control-plane/placement?format=csv")
+                .expect("url should parse");
+        assert_eq!(authority, "127.0.0.1:8090");
+        assert_eq!(path, "/v1/control-plane/placement?format=csv");
     }
 }

@@ -6,6 +6,8 @@ members = [
   "pkg/graph",
   "pkg/store",
   "tools/buddy-chat",
+  "tools/dashctl",
+  "services/control-plane",
   "services/ingestion",
   "services/retrieval",
   "services/indexer",

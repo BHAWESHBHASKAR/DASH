@@ -5,11 +5,12 @@ use std::{
 
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RouterConfig, ShardPlacement,
-    load_shard_placements_csv, shard_ids_from_placements,
+    load_shard_placements_from_source, shard_ids_from_placements,
 };
 use schema::Claim;
 
 use super::config::{env_with_fallback, parse_env_first_u64, parse_env_first_usize};
+use crate::api::WriteConsistencyPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlacementRoutingRuntime {
@@ -36,7 +37,8 @@ struct PlacementReloadRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlacementReloadConfig {
-    placement_file: PathBuf,
+    placement_file: Option<PathBuf>,
+    control_plane_base_url: Option<String>,
     shard_ids_override: Option<Vec<u32>>,
     replica_count_override: Option<usize>,
     virtual_nodes_per_shard: u32,
@@ -66,6 +68,14 @@ pub(super) struct PlacementReloadSnapshot {
 pub(super) enum WriteRouteError {
     Config(String),
     Placement(PlacementRouteError),
+    ConsistencyUnavailable {
+        policy: WriteConsistencyPolicy,
+        shard_id: u32,
+        healthy_replicas: usize,
+        required_replicas: usize,
+        total_replicas: usize,
+        epoch: u64,
+    },
     WrongNode {
         local_node_id: String,
         target_node_id: String,
@@ -73,6 +83,15 @@ pub(super) enum WriteRouteError {
         epoch: u64,
         role: ReplicaRole,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WriteRouteResolution {
+    pub(super) shard_id: u32,
+    pub(super) epoch: u64,
+    pub(super) ack_count: usize,
+    pub(super) required_acks: usize,
+    pub(super) total_replicas: usize,
 }
 
 impl PlacementRoutingRuntime {
@@ -97,11 +116,17 @@ impl PlacementRoutingRuntime {
 
 impl PlacementRoutingState {
     pub(super) fn from_env() -> Result<Option<Self>, String> {
-        let Some(placement_file) =
-            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
-        else {
+        let placement_file =
+            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE");
+        let control_plane_base_url = env_with_fallback(
+            "DASH_ROUTER_CONTROL_PLANE_URL",
+            "EME_ROUTER_CONTROL_PLANE_URL",
+        )
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+        if placement_file.is_none() && control_plane_base_url.is_none() {
             return Ok(None);
-        };
+        }
         let local_node_id = env_with_fallback(
             "DASH_ROUTER_LOCAL_NODE_ID",
             "EME_ROUTER_LOCAL_NODE_ID",
@@ -129,7 +154,8 @@ impl PlacementRoutingState {
         .filter(|value| *value > 0)
         .unwrap_or(64) as u32;
         let runtime = load_placement_routing_runtime(
-            Path::new(&placement_file),
+            placement_file.as_deref().map(Path::new),
+            control_plane_base_url.as_deref(),
             local_node_id,
             shard_ids_override.as_deref(),
             replica_count_override,
@@ -145,7 +171,8 @@ impl PlacementRoutingState {
             let reload_interval = Duration::from_millis(interval_ms);
             PlacementReloadRuntime {
                 config: PlacementReloadConfig {
-                    placement_file: PathBuf::from(&placement_file),
+                    placement_file: placement_file.as_deref().map(PathBuf::from),
+                    control_plane_base_url: control_plane_base_url.clone(),
                     shard_ids_override: shard_ids_override.clone(),
                     replica_count_override,
                     virtual_nodes_per_shard,
@@ -202,7 +229,8 @@ impl PlacementRoutingState {
         }
         reload.attempt_total = reload.attempt_total.saturating_add(1);
         match load_placement_routing_runtime(
-            &reload.config.placement_file,
+            reload.config.placement_file.as_deref(),
+            reload.config.control_plane_base_url.as_deref(),
             &self.runtime.local_node_id,
             reload.config.shard_ids_override.as_deref(),
             reload.config.replica_count_override,
@@ -224,18 +252,20 @@ impl PlacementRoutingState {
 }
 
 fn load_placement_routing_runtime(
-    placement_file: &Path,
+    placement_file: Option<&Path>,
+    control_plane_base_url: Option<&str>,
     local_node_id: &str,
     shard_ids_override: Option<&[u32]>,
     replica_count_override: Option<usize>,
     virtual_nodes_per_shard: u32,
 ) -> Result<PlacementRoutingRuntime, String> {
-    let placements = load_shard_placements_csv(placement_file)?;
+    let placements = load_shard_placements_from_source(placement_file, control_plane_base_url)?;
     if placements.is_empty() {
-        return Err(format!(
-            "placement file '{}' has no placement records",
-            placement_file.display()
-        ));
+        let source = control_plane_base_url
+            .map(|value| format!("control-plane '{}'", value))
+            .or_else(|| placement_file.map(|value| format!("placement file '{}'", value.display())))
+            .unwrap_or_else(|| "placement source".to_string());
+        return Err(format!("{source} has no placement records"));
     }
 
     let shard_ids = shard_ids_override
@@ -302,6 +332,25 @@ pub(super) fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
         WriteRouteError::Placement(reason) => (
             503,
             format!("placement route rejected write request: {reason:?}"),
+        ),
+        WriteRouteError::ConsistencyUnavailable {
+            policy,
+            shard_id,
+            healthy_replicas,
+            required_replicas,
+            total_replicas,
+            epoch,
+        } => (
+            503,
+            format!(
+                "placement route rejected write request: write_consistency={} is unavailable for shard {} at epoch {} (healthy_replicas={}, required_acks={}, total_replicas={})",
+                policy.as_str(),
+                shard_id,
+                epoch,
+                healthy_replicas,
+                required_replicas,
+                total_replicas
+            ),
         ),
         WriteRouteError::WrongNode {
             local_node_id,

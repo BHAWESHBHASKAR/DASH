@@ -13,7 +13,7 @@ use std::{
 
 use metadata_router::{
     PlacementRouteError, ReadPreference, ReplicaHealth, ReplicaRole, RoutedReplica, RouterConfig,
-    ShardPlacement, load_shard_placements_csv, route_read_with_placement,
+    ShardPlacement, load_shard_placements_from_source, route_read_with_placement,
     shard_ids_from_placements,
 };
 use schema::StanceMode;
@@ -125,7 +125,8 @@ struct PlacementReloadRuntime {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlacementReloadConfig {
-    placement_file: PathBuf,
+    placement_file: Option<PathBuf>,
+    control_plane_base_url: Option<String>,
     shard_ids_override: Option<Vec<u32>>,
     replica_count_override: Option<usize>,
     virtual_nodes_per_shard: u32,
@@ -1484,9 +1485,11 @@ fn execute_retrieve_and_observe(
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
 ) -> HttpResponse {
+    let mut serving_replica: Option<String> = None;
     if let Some(routing) = placement_routing {
         match ensure_local_read_route(routing, &req, read_consistency) {
             Ok(routed) => {
+                serving_replica = Some(routed.node_id.clone());
                 if let Ok(mut guard) = metrics.lock() {
                     guard.observe_read_route_resolution(&routed);
                 }
@@ -1515,7 +1518,12 @@ fn execute_retrieve_and_observe(
         guard.observe_storage_merge_execution(&merge_snapshot);
     }
 
-    HttpResponse::ok_json(render_retrieve_response_json(&response))
+    HttpResponse::ok_json(render_retrieve_response_json(
+        &response,
+        read_consistency.as_str(),
+        true,
+        serving_replica.as_deref(),
+    ))
 }
 
 impl PlacementRoutingRuntime {
@@ -1540,11 +1548,17 @@ impl PlacementRoutingRuntime {
 
 impl PlacementRoutingState {
     fn from_env() -> Result<Option<Self>, String> {
-        let Some(placement_file) =
-            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
-        else {
+        let placement_file =
+            env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE");
+        let control_plane_base_url = env_with_fallback(
+            "DASH_ROUTER_CONTROL_PLANE_URL",
+            "EME_ROUTER_CONTROL_PLANE_URL",
+        )
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty());
+        if placement_file.is_none() && control_plane_base_url.is_none() {
             return Ok(None);
-        };
+        }
         let local_node_id = env_with_fallback(
             "DASH_ROUTER_LOCAL_NODE_ID",
             "EME_ROUTER_LOCAL_NODE_ID",
@@ -1574,7 +1588,8 @@ impl PlacementRoutingState {
         let read_preference =
             parse_read_preference_env("DASH_ROUTER_READ_PREFERENCE", "EME_ROUTER_READ_PREFERENCE")?;
         let runtime = load_placement_routing_runtime(
-            Path::new(&placement_file),
+            placement_file.as_deref().map(Path::new),
+            control_plane_base_url.as_deref(),
             local_node_id,
             shard_ids_override.as_deref(),
             replica_count_override,
@@ -1591,7 +1606,8 @@ impl PlacementRoutingState {
             let reload_interval = Duration::from_millis(interval_ms);
             PlacementReloadRuntime {
                 config: PlacementReloadConfig {
-                    placement_file: PathBuf::from(&placement_file),
+                    placement_file: placement_file.as_deref().map(PathBuf::from),
+                    control_plane_base_url: control_plane_base_url.clone(),
                     shard_ids_override: shard_ids_override.clone(),
                     replica_count_override,
                     virtual_nodes_per_shard,
@@ -1637,7 +1653,8 @@ impl PlacementRoutingState {
         }
         reload.attempt_total = reload.attempt_total.saturating_add(1);
         match load_placement_routing_runtime(
-            &reload.config.placement_file,
+            reload.config.placement_file.as_deref(),
+            reload.config.control_plane_base_url.as_deref(),
             &self.runtime.local_node_id,
             reload.config.shard_ids_override.as_deref(),
             reload.config.replica_count_override,
@@ -1660,19 +1677,21 @@ impl PlacementRoutingState {
 }
 
 fn load_placement_routing_runtime(
-    placement_file: &Path,
+    placement_file: Option<&Path>,
+    control_plane_base_url: Option<&str>,
     local_node_id: &str,
     shard_ids_override: Option<&[u32]>,
     replica_count_override: Option<usize>,
     virtual_nodes_per_shard: u32,
     read_preference: ReadPreference,
 ) -> Result<PlacementRoutingRuntime, String> {
-    let placements = load_shard_placements_csv(placement_file)?;
+    let placements = load_shard_placements_from_source(placement_file, control_plane_base_url)?;
     if placements.is_empty() {
-        return Err(format!(
-            "placement file '{}' has no placement records",
-            placement_file.display()
-        ));
+        let source = control_plane_base_url
+            .map(|value| format!("control-plane '{}'", value))
+            .or_else(|| placement_file.map(|value| format!("placement file '{}'", value.display())))
+            .unwrap_or_else(|| "placement source".to_string());
+        return Err(format!("{source} has no placement records"));
     }
 
     let shard_ids = shard_ids_override
@@ -2554,7 +2573,8 @@ tenant-a,0,11,node-b,follower,healthy\n",
         );
         let mut state = PlacementRoutingState {
             runtime: load_placement_routing_runtime(
-                &placement_file,
+                Some(&placement_file),
+                None,
                 "node-b",
                 Some(&[0]),
                 Some(2),
@@ -2564,7 +2584,8 @@ tenant-a,0,11,node-b,follower,healthy\n",
             .expect("initial placement should load"),
             reload: Some(PlacementReloadRuntime {
                 config: PlacementReloadConfig {
-                    placement_file: placement_file.clone(),
+                    placement_file: Some(placement_file.clone()),
+                    control_plane_base_url: None,
                     shard_ids_override: Some(vec![0]),
                     replica_count_override: Some(2),
                     virtual_nodes_per_shard: 16,

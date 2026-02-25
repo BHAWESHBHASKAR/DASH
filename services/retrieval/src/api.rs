@@ -2339,6 +2339,8 @@ mod tests {
             .lock()
             .expect("segment cache test lock should be available");
         clear_segment_cache_for_tests();
+        let _segment_refresh_env =
+            EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_CACHE_REFRESH_MS", OsStr::new("1"));
         let root = temp_dir("prefilter-refresh");
         let tenant_root = root.join("tenant-a");
 

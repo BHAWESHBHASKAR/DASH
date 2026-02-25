@@ -28,9 +28,45 @@ pub(super) fn handle_get_request(
                 HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
             }
         },
+        "/debug/document-parser" => HttpResponse::ok_json(render_document_parser_debug_json()),
         "/internal/replication/wal" => handle_replication_wal_get(runtime, request, query),
         "/internal/replication/export" => handle_replication_export_get(runtime, request),
+        "/internal/replication/commit-status" => {
+            handle_replication_commit_status_get(runtime, request, query)
+        }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+pub(super) fn handle_replication_ack_post(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    query: &HashMap<String, String>,
+) -> HttpResponse {
+    if !is_replication_request_authorized(request) {
+        return HttpResponse::forbidden("replication request is not authorized");
+    }
+    let commit_id = match query.get("commit_id") {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return HttpResponse::bad_request("commit_id query parameter is required"),
+    };
+    let replica_id = match query.get("replica_id") {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return HttpResponse::bad_request("replica_id query parameter is required"),
+    };
+    let ack_epoch = match query.get("ack_epoch") {
+        Some(value) if !value.trim().is_empty() => match value.trim().parse::<u64>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => return HttpResponse::bad_request("ack_epoch must be a valid u64"),
+        },
+        _ => None,
+    };
+    match runtime.lock() {
+        Ok(mut rt) => match rt.apply_replication_ack(commit_id, replica_id, ack_epoch) {
+            Ok(snapshot) => HttpResponse::ok_json(render_replication_commit_status_json(&snapshot)),
+            Err(reason) => HttpResponse::error_with_status(404, &reason),
+        },
+        Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
     }
 }
 
@@ -76,4 +112,52 @@ fn handle_replication_export_get(runtime: &SharedRuntime, request: &HttpRequest)
         },
         Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
     }
+}
+
+fn handle_replication_commit_status_get(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    query: &HashMap<String, String>,
+) -> HttpResponse {
+    if !is_replication_request_authorized(request) {
+        return HttpResponse::forbidden("replication request is not authorized");
+    }
+    let commit_id = match query.get("commit_id") {
+        Some(value) if !value.trim().is_empty() => value.trim(),
+        _ => return HttpResponse::bad_request("commit_id query parameter is required"),
+    };
+    match runtime.lock() {
+        Ok(rt) => match rt.replication_commit_status_snapshot(commit_id) {
+            Some(snapshot) => {
+                HttpResponse::ok_json(render_replication_commit_status_json(&snapshot))
+            }
+            None => {
+                HttpResponse::error_with_status(404, &format!("unknown commit_id '{}'", commit_id))
+            }
+        },
+        Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
+    }
+}
+
+fn render_replication_commit_status_json(snapshot: &ReplicationCommitStatusSnapshot) -> String {
+    format!(
+        "{{\"commit_id\":\"{}\",\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\"}}",
+        escape_json(&snapshot.commit_id),
+        snapshot
+            .commit_epoch
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        snapshot.ack_count,
+        snapshot.required_acks,
+        escape_json(&snapshot.commit_status)
+    )
+}
+
+fn escape_json(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }

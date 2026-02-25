@@ -4,6 +4,7 @@ use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::api::{
     IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse,
+    IngestDocumentApiRequest, IngestDocumentApiResponse, IngestRawApiRequest, IngestRawApiResponse,
 };
 
 use super::json::{JsonValue, json_escape, parse_json};
@@ -64,7 +65,123 @@ pub(super) fn build_ingest_batch_request_from_json(
     })
 }
 
+pub(super) fn build_ingest_raw_request_from_json(
+    body: &str,
+) -> Result<IngestRawApiRequest, String> {
+    let value = parse_json(body)?;
+    let object = match value {
+        JsonValue::Object(map) => map,
+        _ => return Err("request body must be a JSON object".to_string()),
+    };
+
+    let claim_confidence = parse_optional_f32(object.get("claim_confidence"), "claim_confidence")?;
+    let source_quality = parse_optional_f32(object.get("source_quality"), "source_quality")?;
+    if claim_confidence.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err("claim_confidence must be in [0, 1]".to_string());
+    }
+    if source_quality.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err("source_quality must be in [0, 1]".to_string());
+    }
+    let min_sentence_chars =
+        parse_optional_usize(object.get("min_sentence_chars"), "min_sentence_chars")?;
+    let max_claims = parse_optional_usize(object.get("max_claims"), "max_claims")?;
+    if min_sentence_chars == Some(0) {
+        return Err("min_sentence_chars must be >= 1".to_string());
+    }
+    if max_claims == Some(0) {
+        return Err("max_claims must be >= 1".to_string());
+    }
+
+    Ok(IngestRawApiRequest {
+        tenant_id: require_string(&object, "tenant_id")?,
+        document_id: require_string(&object, "document_id")?,
+        source_id: require_string(&object, "source_id")?,
+        text: require_string(&object, "text")?,
+        extraction_model: parse_optional_string(
+            object.get("extraction_model"),
+            "extraction_model",
+        )?,
+        claim_confidence,
+        source_quality,
+        min_sentence_chars,
+        max_claims,
+        generate_embeddings: parse_optional_bool(
+            object.get("generate_embeddings"),
+            "generate_embeddings",
+        )?,
+        embedding_model: parse_optional_string(object.get("embedding_model"), "embedding_model")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+pub(super) fn build_ingest_document_request_from_json(
+    body: &str,
+) -> Result<IngestDocumentApiRequest, String> {
+    let value = parse_json(body)?;
+    let object = match value {
+        JsonValue::Object(map) => map,
+        _ => return Err("request body must be a JSON object".to_string()),
+    };
+
+    let claim_confidence = parse_optional_f32(object.get("claim_confidence"), "claim_confidence")?;
+    let source_quality = parse_optional_f32(object.get("source_quality"), "source_quality")?;
+    if claim_confidence.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err("claim_confidence must be in [0, 1]".to_string());
+    }
+    if source_quality.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err("source_quality must be in [0, 1]".to_string());
+    }
+    let min_sentence_chars =
+        parse_optional_usize(object.get("min_sentence_chars"), "min_sentence_chars")?;
+    let max_claims = parse_optional_usize(object.get("max_claims"), "max_claims")?;
+    if min_sentence_chars == Some(0) {
+        return Err("min_sentence_chars must be >= 1".to_string());
+    }
+    if max_claims == Some(0) {
+        return Err("max_claims must be >= 1".to_string());
+    }
+
+    let text = parse_optional_string(object.get("text"), "text")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let content_base64 = parse_optional_string(object.get("content_base64"), "content_base64")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if text.is_none() && content_base64.is_none() {
+        return Err("either text or content_base64 is required".to_string());
+    }
+
+    Ok(IngestDocumentApiRequest {
+        tenant_id: require_string(&object, "tenant_id")?,
+        document_id: require_string(&object, "document_id")?,
+        source_id: require_string(&object, "source_id")?,
+        mime_type: require_string(&object, "mime_type")?,
+        text,
+        content_base64,
+        extraction_model: parse_optional_string(
+            object.get("extraction_model"),
+            "extraction_model",
+        )?,
+        claim_confidence,
+        source_quality,
+        min_sentence_chars,
+        max_claims,
+        generate_embeddings: parse_optional_bool(
+            object.get("generate_embeddings"),
+            "generate_embeddings",
+        )?,
+        embedding_model: parse_optional_string(object.get("embedding_model"), "embedding_model")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
 pub(super) fn render_ingest_response_json(resp: &IngestApiResponse) -> String {
+    let commit_epoch = resp
+        .commit_epoch
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
     let checkpoint_snapshot_records = resp
         .checkpoint_snapshot_records
         .map(|v| v.to_string())
@@ -74,9 +191,13 @@ pub(super) fn render_ingest_response_json(resp: &IngestApiResponse) -> String {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"ingested_claim_id\":\"{}\",\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        "{{\"ingested_claim_id\":\"{}\",\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
         json_escape(&resp.ingested_claim_id),
         resp.claims_total,
+        commit_epoch,
+        resp.ack_count,
+        resp.required_acks,
+        json_escape(&resp.commit_status),
         resp.checkpoint_triggered,
         checkpoint_snapshot_records,
         checkpoint_truncated_wal_records
@@ -84,6 +205,10 @@ pub(super) fn render_ingest_response_json(resp: &IngestApiResponse) -> String {
 }
 
 pub(super) fn render_ingest_batch_response_json(resp: &IngestBatchApiResponse) -> String {
+    let commit_epoch = resp
+        .commit_epoch
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
     let checkpoint_snapshot_records = resp
         .checkpoint_snapshot_records
         .map(|v| v.to_string())
@@ -99,12 +224,104 @@ pub(super) fn render_ingest_batch_response_json(resp: &IngestBatchApiResponse) -
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"commit_id\":\"{}\",\"idempotent_replay\":{},\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        "{{\"commit_id\":\"{}\",\"idempotent_replay\":{},\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
         json_escape(&resp.commit_id),
         resp.idempotent_replay,
         resp.batch_size,
         ingested_claim_ids,
         resp.claims_total,
+        commit_epoch,
+        resp.ack_count,
+        resp.required_acks,
+        json_escape(&resp.commit_status),
+        resp.checkpoint_triggered,
+        checkpoint_snapshot_records,
+        checkpoint_truncated_wal_records
+    )
+}
+
+pub(super) fn render_ingest_raw_response_json(resp: &IngestRawApiResponse) -> String {
+    let commit_epoch = resp
+        .commit_epoch
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let checkpoint_snapshot_records = resp
+        .checkpoint_snapshot_records
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let checkpoint_truncated_wal_records = resp
+        .checkpoint_truncated_wal_records
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let ingested_claim_ids = resp
+        .ingested_claim_ids
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"document_id\":\"{}\",\"commit_id\":\"{}\",\"idempotent_replay\":{},\"extracted_count\":{},\"embedding_provider\":\"{}\",\"embeddings_generated\":{},\"embedding_dimensions\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        json_escape(&resp.document_id),
+        json_escape(&resp.commit_id),
+        resp.idempotent_replay,
+        resp.extracted_count,
+        json_escape(&resp.embedding_provider),
+        resp.embeddings_generated,
+        resp.embedding_dimensions
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        ingested_claim_ids,
+        resp.claims_total,
+        commit_epoch,
+        resp.ack_count,
+        resp.required_acks,
+        json_escape(&resp.commit_status),
+        resp.checkpoint_triggered,
+        checkpoint_snapshot_records,
+        checkpoint_truncated_wal_records
+    )
+}
+
+pub(super) fn render_ingest_document_response_json(resp: &IngestDocumentApiResponse) -> String {
+    let commit_epoch = resp
+        .commit_epoch
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let checkpoint_snapshot_records = resp
+        .checkpoint_snapshot_records
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let checkpoint_truncated_wal_records = resp
+        .checkpoint_truncated_wal_records
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let ingested_claim_ids = resp
+        .ingested_claim_ids
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "{{\"document_id\":\"{}\",\"mime_type\":\"{}\",\"parser_provider\":\"{}\",\"commit_id\":\"{}\",\"idempotent_replay\":{},\"extracted_count\":{},\"embedding_provider\":\"{}\",\"embeddings_generated\":{},\"embedding_dimensions\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
+        json_escape(&resp.document_id),
+        json_escape(&resp.mime_type),
+        json_escape(&resp.parser_provider),
+        json_escape(&resp.commit_id),
+        resp.idempotent_replay,
+        resp.extracted_count,
+        json_escape(&resp.embedding_provider),
+        resp.embeddings_generated,
+        resp.embedding_dimensions
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+        ingested_claim_ids,
+        resp.claims_total,
+        commit_epoch,
+        resp.ack_count,
+        resp.required_acks,
+        json_escape(&resp.commit_status),
         resp.checkpoint_triggered,
         checkpoint_snapshot_records,
         checkpoint_truncated_wal_records
@@ -315,6 +532,20 @@ fn parse_optional_i64(value: Option<&JsonValue>, field_name: &str) -> Result<Opt
     }
 }
 
+fn parse_optional_usize(
+    value: Option<&JsonValue>,
+    field_name: &str,
+) -> Result<Option<usize>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Number(raw)) => raw
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("{field_name} must be an integer")),
+        _ => Err(format!("{field_name} must be an integer or null")),
+    }
+}
+
 fn parse_optional_u32(value: Option<&JsonValue>, field_name: &str) -> Result<Option<u32>, String> {
     match value {
         None | Some(JsonValue::Null) => Ok(None),
@@ -323,6 +554,28 @@ fn parse_optional_u32(value: Option<&JsonValue>, field_name: &str) -> Result<Opt
             .map(Some)
             .map_err(|_| format!("{field_name} must be a u32 offset or null")),
         _ => Err(format!("{field_name} must be a u32 offset or null")),
+    }
+}
+
+fn parse_optional_f32(value: Option<&JsonValue>, field_name: &str) -> Result<Option<f32>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Number(raw)) => raw
+            .parse::<f32>()
+            .map(Some)
+            .map_err(|_| format!("{field_name} must be a valid number")),
+        _ => Err(format!("{field_name} must be a number or null")),
+    }
+}
+
+fn parse_optional_bool(
+    value: Option<&JsonValue>,
+    field_name: &str,
+) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(raw)) => Ok(Some(*raw)),
+        _ => Err(format!("{field_name} must be a boolean or null")),
     }
 }
 

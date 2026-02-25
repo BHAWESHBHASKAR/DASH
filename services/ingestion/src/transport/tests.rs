@@ -257,7 +257,9 @@ fn build_ingest_raw_request_from_json_accepts_contract_payload() {
             "claim_confidence": 0.87,
             "source_quality": 0.9,
             "min_sentence_chars": 10,
-            "max_claims": 8
+            "max_claims": 8,
+            "generate_embeddings": true,
+            "embedding_model": "emb://hash-v1"
         }"#;
 
     let req = build_ingest_raw_request_from_json(body).unwrap();
@@ -273,6 +275,49 @@ fn build_ingest_raw_request_from_json_accepts_contract_payload() {
     assert_eq!(req.source_quality, Some(0.9));
     assert_eq!(req.min_sentence_chars, Some(10));
     assert_eq!(req.max_claims, Some(8));
+    assert_eq!(req.generate_embeddings, Some(true));
+    assert_eq!(req.embedding_model.as_deref(), Some("emb://hash-v1"));
+}
+
+#[test]
+fn build_ingest_document_request_from_json_accepts_contract_payload() {
+    let body = r#"{
+            "tenant_id": "tenant-a",
+            "document_id": "doc-pdf-1",
+            "source_id": "source://doc-pdf-1",
+            "mime_type": "application/pdf",
+            "content_base64": "JVBERi0xLjQK",
+            "extraction_model": "rule-sentence-v1",
+            "claim_confidence": 0.85,
+            "source_quality": 0.88,
+            "min_sentence_chars": 10,
+            "max_claims": 8,
+            "generate_embeddings": true,
+            "embedding_model": "emb://hash-v1"
+        }"#;
+
+    let req = build_ingest_document_request_from_json(body).unwrap();
+    assert_eq!(req.tenant_id, "tenant-a");
+    assert_eq!(req.document_id, "doc-pdf-1");
+    assert_eq!(req.source_id, "source://doc-pdf-1");
+    assert_eq!(req.mime_type, "application/pdf");
+    assert_eq!(req.content_base64.as_deref(), Some("JVBERi0xLjQK"));
+    assert_eq!(req.text, None);
+    assert_eq!(req.extraction_model.as_deref(), Some("rule-sentence-v1"));
+    assert_eq!(req.generate_embeddings, Some(true));
+    assert_eq!(req.embedding_model.as_deref(), Some("emb://hash-v1"));
+}
+
+#[test]
+fn build_ingest_document_request_from_json_requires_text_or_content() {
+    let body = r#"{
+            "tenant_id": "tenant-a",
+            "document_id": "doc-empty",
+            "source_id": "source://doc-empty",
+            "mime_type": "application/pdf"
+        }"#;
+    let err = build_ingest_document_request_from_json(body).unwrap_err();
+    assert!(err.contains("either text or content_base64 is required"));
 }
 
 #[test]
@@ -320,6 +365,194 @@ fn handle_request_post_ingest_raw_extracts_sentence_claims() {
     assert_eq!(replay.status, 200);
     assert!(replay.body.contains("\"idempotent_replay\":true"));
     assert!(replay.body.contains("\"claims_total\":2"));
+}
+
+#[test]
+fn handle_request_post_ingest_raw_generates_embeddings_when_enabled() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_provider = std::env::var_os("DASH_INGEST_EMBEDDING_PROVIDER");
+    let previous_dimensions = std::env::var_os("DASH_INGEST_EMBEDDING_DIMENSIONS");
+    set_env_var_for_tests("DASH_INGEST_EMBEDDING_PROVIDER", "hash_vector");
+    set_env_var_for_tests("DASH_INGEST_EMBEDDING_DIMENSIONS", "16");
+
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/raw".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-raw-http-emb",
+                "source_id": "source://doc-raw-http-emb",
+                "text": "Company X acquired Company Y in 2024. Revenue rose in Q4.",
+                "min_sentence_chars": 10,
+                "max_claims": 4,
+                "generate_embeddings": true,
+                "embedding_model": "emb://hash-v1"
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"embedding_provider\":\"hash16\""));
+    assert!(response.body.contains("\"embeddings_generated\":2"));
+    assert!(response.body.contains("\"embedding_dimensions\":16"));
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_EMBEDDING_PROVIDER",
+        previous_provider.as_deref(),
+    );
+    restore_env_var_for_tests(
+        "DASH_INGEST_EMBEDDING_DIMENSIONS",
+        previous_dimensions.as_deref(),
+    );
+}
+
+#[test]
+fn handle_request_post_ingest_document_with_inline_text_extracts_claims() {
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/document".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-http-1",
+                "source_id": "source://doc-http-1",
+                "mime_type": "application/pdf",
+                "text": "Company X acquired Company Y in 2024. Revenue rose in Q4.",
+                "min_sentence_chars": 10,
+                "max_claims": 4
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"document_id\":\"doc-http-1\""));
+    assert!(response.body.contains("\"mime_type\":\"application/pdf\""));
+    assert!(
+        response
+            .body
+            .contains("\"parser_provider\":\"inline_text\"")
+    );
+    assert!(response.body.contains("\"extracted_count\":2"));
+}
+
+#[test]
+fn handle_request_post_ingest_document_generates_embeddings_when_enabled() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_provider = std::env::var_os("DASH_INGEST_EMBEDDING_PROVIDER");
+    let previous_dimensions = std::env::var_os("DASH_INGEST_EMBEDDING_DIMENSIONS");
+    set_env_var_for_tests("DASH_INGEST_EMBEDDING_PROVIDER", "hash_vector");
+    set_env_var_for_tests("DASH_INGEST_EMBEDDING_DIMENSIONS", "8");
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/document".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-http-emb-1",
+                "source_id": "source://doc-http-emb-1",
+                "mime_type": "text/plain",
+                "text": "Company X acquired Company Y in 2024. Revenue rose in Q4.",
+                "min_sentence_chars": 10,
+                "max_claims": 4,
+                "generate_embeddings": true,
+                "embedding_model": "emb://hash-v1"
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"embedding_provider\":\"hash8\""));
+    assert!(response.body.contains("\"embeddings_generated\":2"));
+    assert!(response.body.contains("\"embedding_dimensions\":8"));
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_EMBEDDING_PROVIDER",
+        previous_provider.as_deref(),
+    );
+    restore_env_var_for_tests(
+        "DASH_INGEST_EMBEDDING_DIMENSIONS",
+        previous_dimensions.as_deref(),
+    );
+}
+
+#[test]
+fn handle_request_post_ingest_document_rejects_pdf_without_adapter_when_using_bytes() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_provider = std::env::var_os("DASH_INGEST_DOCUMENT_PARSER_PROVIDER");
+    let previous_cmd = std::env::var_os("DASH_INGEST_DOCUMENT_ADAPTER_CMD");
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_PARSER_PROVIDER", None);
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", None);
+
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/document".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-http-2",
+                "source_id": "source://doc-http-2",
+                "mime_type": "application/pdf",
+                "content_base64": "JVBERi0xLjQK",
+                "min_sentence_chars": 10,
+                "max_claims": 4
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 400);
+    assert!(response.body.contains("requires document parser adapter"));
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        previous_provider.as_deref(),
+    );
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", previous_cmd.as_deref());
+}
+
+#[test]
+fn handle_request_post_ingest_document_accepts_pdf_bytes_with_adapter_command() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_provider = std::env::var_os("DASH_INGEST_DOCUMENT_PARSER_PROVIDER");
+    let previous_cmd = std::env::var_os("DASH_INGEST_DOCUMENT_ADAPTER_CMD");
+    set_env_var_for_tests("DASH_INGEST_DOCUMENT_PARSER_PROVIDER", "adapter_command");
+    set_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", "cat");
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/document".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "tenant_id": "tenant-a",
+                "document_id": "doc-http-3",
+                "source_id": "source://doc-http-3",
+                "mime_type": "application/pdf",
+                "content_base64": "Q29tcGFueSBYIGFjcXVpcmVkIENvbXBhbnkgWS4gUmV2ZW51ZSByb3NlIGluIFE0Lg==",
+                "min_sentence_chars": 10,
+                "max_claims": 4
+            }"#
+        .to_vec(),
+    };
+
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("\"document_id\":\"doc-http-3\""));
+    assert!(response.body.contains("\"parser_provider\":\"cat\""));
+    assert!(response.body.contains("\"extracted_count\":2"));
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        previous_provider.as_deref(),
+    );
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", previous_cmd.as_deref());
 }
 
 #[test]
@@ -529,6 +762,8 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
     let second = handle_request(&runtime, &second_request);
     assert_eq!(second.status, 409);
     assert!(second.body.contains("state conflict"));
+    assert!(second.body.contains("existing_fingerprint="));
+    assert!(second.body.contains("incoming_fingerprint="));
 
     let metrics_request = HttpRequest {
         method: "GET".to_string(),
@@ -548,6 +783,92 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
             .body
             .contains("dash_ingest_batch_idempotent_hit_total 0")
     );
+}
+
+#[test]
+fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let mut audit_path = std::env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_nanos();
+    audit_path.push(format!(
+        "dash-ingest-batch-conflict-audit-{}-{}.jsonl",
+        std::process::id(),
+        nanos
+    ));
+    let audit_path_str = audit_path.to_string_lossy().to_string();
+    clear_cached_audit_chain_state(&audit_path_str);
+    let previous_audit_path = std::env::var_os("DASH_INGEST_AUDIT_LOG_PATH");
+    set_env_var_for_tests("DASH_INGEST_AUDIT_LOG_PATH", &audit_path_str);
+
+    let runtime = sample_runtime();
+    let first_request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/batch".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "commit_id": "commit-audit-conflict-1",
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-audit-conflict-1",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Commit conflict one",
+                            "confidence": 0.91
+                        }
+                    }
+                ]
+            }"#
+        .to_vec(),
+    };
+    let first = handle_request(&runtime, &first_request);
+    assert_eq!(first.status, 200);
+
+    let second_request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest/batch".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{
+                "commit_id": "commit-audit-conflict-1",
+                "items": [
+                    {
+                        "claim": {
+                            "claim_id": "c-audit-conflict-2",
+                            "tenant_id": "tenant-a",
+                            "canonical_text": "Commit conflict two",
+                            "confidence": 0.89
+                        }
+                    }
+                ]
+            }"#
+        .to_vec(),
+    };
+    let second = handle_request(&runtime, &second_request);
+    assert_eq!(second.status, 409);
+
+    let payload = std::fs::read_to_string(&audit_path).expect("audit file should be readable");
+    let lines: Vec<&str> = payload
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let last_line = lines.last().expect("audit should contain events");
+    let last_obj = match parse_json(last_line).expect("audit event should parse as JSON") {
+        JsonValue::Object(object) => object,
+        _ => panic!("audit event should be JSON object"),
+    };
+    assert!(
+        matches!(last_obj.get("action"), Some(JsonValue::String(raw)) if raw == "ingest_batch")
+    );
+    assert!(matches!(last_obj.get("status"), Some(JsonValue::Number(raw)) if raw == "409"));
+    assert!(matches!(last_obj.get("outcome"), Some(JsonValue::String(raw)) if raw == "denied"));
+    assert!(
+        matches!(last_obj.get("reason"), Some(JsonValue::String(raw)) if raw.contains("existing_fingerprint="))
+    );
+
+    restore_env_var_for_tests("DASH_INGEST_AUDIT_LOG_PATH", previous_audit_path.as_deref());
+    let _ = std::fs::remove_file(audit_path);
 }
 
 #[test]
@@ -1300,6 +1621,147 @@ fn handle_request_write_route_reresolves_after_leader_promotion() {
 }
 
 #[test]
+fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack() {
+    let placement = ShardPlacement {
+        tenant_id: "tenant-a".to_string(),
+        shard_id: 0,
+        epoch: 10,
+        replicas: vec![
+            ReplicaPlacement {
+                node_id: "node-a".to_string(),
+                role: ReplicaRole::Leader,
+                health: ReplicaHealth::Healthy,
+            },
+            ReplicaPlacement {
+                node_id: "node-b".to_string(),
+                role: ReplicaRole::Follower,
+                health: ReplicaHealth::Healthy,
+            },
+        ],
+    };
+    let runtime = Arc::new(Mutex::new(
+        IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+            Some(PlacementRoutingRuntime {
+                local_node_id: "node-a".to_string(),
+                router_config: RouterConfig {
+                    shard_ids: vec![0],
+                    virtual_nodes_per_shard: 16,
+                    replica_count: 2,
+                },
+                placements: vec![placement],
+            }),
+        )),
+    ));
+
+    let ingest_request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest?write_consistency=quorum".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{"claim":{"claim_id":"c-quorum","tenant_id":"tenant-a","canonical_text":"ack-driven quorum","confidence":0.9}}"#.to_vec(),
+    };
+    let ingest_response = handle_request(&runtime, &ingest_request);
+    assert_eq!(ingest_response.status, 200, "{}", ingest_response.body);
+    assert!(ingest_response.body.contains("\"ack_count\":1"));
+    assert!(ingest_response.body.contains("\"required_acks\":2"));
+    assert!(
+        ingest_response
+            .body
+            .contains("\"commit_status\":\"replication_pending\"")
+    );
+
+    let status_before_ack = HttpRequest {
+        method: "GET".to_string(),
+        target: "/internal/replication/commit-status?commit_id=c-quorum".to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let status_before_ack_response = handle_request(&runtime, &status_before_ack);
+    assert_eq!(status_before_ack_response.status, 200);
+    assert!(
+        status_before_ack_response
+            .body
+            .contains("\"commit_status\":\"replication_pending\"")
+    );
+
+    let ack_request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/internal/replication/ack?commit_id=c-quorum&replica_id=node-b&ack_epoch=10"
+            .to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let ack_response = handle_request(&runtime, &ack_request);
+    assert_eq!(ack_response.status, 200, "{}", ack_response.body);
+    assert!(ack_response.body.contains("\"ack_count\":2"));
+    assert!(ack_response.body.contains("\"required_acks\":2"));
+    assert!(
+        ack_response
+            .body
+            .contains("\"commit_status\":\"replication_quorum_met\"")
+    );
+
+    let duplicate_ack_response = handle_request(&runtime, &ack_request);
+    assert_eq!(
+        duplicate_ack_response.status, 200,
+        "{}",
+        duplicate_ack_response.body
+    );
+    assert!(duplicate_ack_response.body.contains("\"ack_count\":2"));
+    assert!(!duplicate_ack_response.body.contains("\"ack_count\":3"));
+}
+
+#[test]
+fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insufficient() {
+    let placement = ShardPlacement {
+        tenant_id: "tenant-a".to_string(),
+        shard_id: 0,
+        epoch: 10,
+        replicas: vec![
+            ReplicaPlacement {
+                node_id: "node-a".to_string(),
+                role: ReplicaRole::Leader,
+                health: ReplicaHealth::Healthy,
+            },
+            ReplicaPlacement {
+                node_id: "node-b".to_string(),
+                role: ReplicaRole::Follower,
+                health: ReplicaHealth::Healthy,
+            },
+            ReplicaPlacement {
+                node_id: "node-c".to_string(),
+                role: ReplicaRole::Follower,
+                health: ReplicaHealth::Unavailable,
+            },
+        ],
+    };
+    let runtime = Arc::new(Mutex::new(
+        IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+            Some(PlacementRoutingRuntime {
+                local_node_id: "node-a".to_string(),
+                router_config: RouterConfig {
+                    shard_ids: vec![0],
+                    virtual_nodes_per_shard: 16,
+                    replica_count: 3,
+                },
+                placements: vec![placement],
+            }),
+        )),
+    ));
+
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest?write_consistency=all".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{"claim":{"claim_id":"c-all-fail","tenant_id":"tenant-a","canonical_text":"all consistency reject","confidence":0.9}}"#.to_vec(),
+    };
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 503, "{}", response.body);
+    assert!(response.body.contains("write_consistency=all"));
+    assert!(response.body.contains("healthy_replicas=2"));
+    assert!(response.body.contains("required_acks=3"));
+}
+
+#[test]
 fn debug_placement_endpoint_returns_structured_route_probe() {
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
@@ -1345,6 +1807,103 @@ fn debug_placement_endpoint_returns_structured_route_probe() {
     assert!(response.body.contains("\"status\":\"rejected\""));
     assert!(response.body.contains("\"local_node_id\":\"node-b\""));
     assert!(response.body.contains("\"target_node_id\":\"node-a\""));
+}
+
+#[test]
+fn debug_document_parser_endpoint_reports_default_provider() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_dash_provider = std::env::var_os("DASH_INGEST_DOCUMENT_PARSER_PROVIDER");
+    let previous_eme_provider = std::env::var_os("EME_INGEST_DOCUMENT_PARSER_PROVIDER");
+    let previous_dash_cmd = std::env::var_os("DASH_INGEST_DOCUMENT_ADAPTER_CMD");
+    let previous_eme_cmd = std::env::var_os("EME_INGEST_DOCUMENT_ADAPTER_CMD");
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_PARSER_PROVIDER", None);
+    restore_env_var_for_tests("EME_INGEST_DOCUMENT_PARSER_PROVIDER", None);
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", None);
+    restore_env_var_for_tests("EME_INGEST_DOCUMENT_ADAPTER_CMD", None);
+
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        target: "/debug/document-parser".to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(
+        response
+            .body
+            .contains("\"parser_provider_raw\":\"builtin_utf8\"")
+    );
+    assert!(response.body.contains("\"embedding_provider\""));
+    assert!(
+        response
+            .body
+            .contains("\"adapter_command_configured\":false")
+    );
+    assert!(response.body.contains("\"tooling\""));
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        previous_dash_provider.as_deref(),
+    );
+    restore_env_var_for_tests(
+        "EME_INGEST_DOCUMENT_PARSER_PROVIDER",
+        previous_eme_provider.as_deref(),
+    );
+    restore_env_var_for_tests(
+        "DASH_INGEST_DOCUMENT_ADAPTER_CMD",
+        previous_dash_cmd.as_deref(),
+    );
+    restore_env_var_for_tests(
+        "EME_INGEST_DOCUMENT_ADAPTER_CMD",
+        previous_eme_cmd.as_deref(),
+    );
+}
+
+#[test]
+fn debug_document_parser_endpoint_reports_adapter_configuration() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_provider = std::env::var_os("DASH_INGEST_DOCUMENT_PARSER_PROVIDER");
+    let previous_cmd = std::env::var_os("DASH_INGEST_DOCUMENT_ADAPTER_CMD");
+    set_env_var_for_tests("DASH_INGEST_DOCUMENT_PARSER_PROVIDER", "adapter_command");
+    set_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", "cat");
+
+    let runtime = sample_runtime();
+    let request = HttpRequest {
+        method: "GET".to_string(),
+        target: "/debug/document-parser".to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let response = handle_request(&runtime, &request);
+    assert_eq!(response.status, 200);
+    assert!(
+        response
+            .body
+            .contains("\"parser_provider_raw\":\"adapter_command\"")
+    );
+    assert!(
+        response
+            .body
+            .contains("\"adapter_command_configured\":true")
+    );
+    assert!(
+        response
+            .body
+            .contains("\"adapter_command_preview\":\"cat\"")
+    );
+    assert!(
+        response
+            .body
+            .contains("\"embedding_provider\":\"hash_vector\"")
+    );
+
+    restore_env_var_for_tests(
+        "DASH_INGEST_DOCUMENT_PARSER_PROVIDER",
+        previous_provider.as_deref(),
+    );
+    restore_env_var_for_tests("DASH_INGEST_DOCUMENT_ADAPTER_CMD", previous_cmd.as_deref());
 }
 
 #[test]

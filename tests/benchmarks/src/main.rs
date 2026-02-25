@@ -8,18 +8,31 @@ use std::{
 };
 
 use indexer::{Segment, Tier, persist_segments_atomic};
+use ingestion::{api::IngestRawApiRequest, extraction::build_ingest_batch_from_raw_request};
 use ranking::lexical_overlap_score;
 use retrieval::api::{
     RetrieveApiRequest, execute_api_query, reset_segment_prefilter_cache_metrics,
     segment_prefilter_cache_metrics_snapshot,
 };
-use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
-use store::{AnnTuningConfig, FileWal, InMemoryStore, StoreIndexStats, WalCheckpointStats};
+use schema::{Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, Stance, StanceMode};
+use store::{
+    AnnTuningConfig, FileWal, InMemoryStore, StoreIndexStats, VectorBackendRuntime,
+    WalCheckpointStats,
+};
 
 const CONTRADICTION_DETECTION_F1_GATE: f64 = 0.80;
+const CITATION_COVERAGE_GATE: f64 = 0.95;
+const EXTRACTION_SPAN_COVERAGE_GATE: f64 = 0.95;
 const BENCHMARK_HISTORY_TITLE: &str = "# Benchmark History";
 const BENCHMARK_HISTORY_TABLE_HEADER: &str = "| run_epoch_secs | profile | fixture_size | iterations | baseline_top1 | eme_top1 | baseline_hit | eme_hit | baseline_avg_ms | eme_avg_ms | baseline_scan_count | dash_candidate_count | metadata_prefilter_count | ann_candidate_count | final_scored_candidate_count | ann_recall_at_10 | ann_recall_at_100 | ann_recall_curve | segment_cache_hits | segment_refresh_attempts | segment_refresh_successes | segment_refresh_failures | segment_refresh_avg_ms | wal_claims_seeded | wal_checkpoint_ms | wal_replay_ms | wal_snapshot_records | wal_truncated_wal_records | wal_replay_snapshot_records | wal_replay_wal_records | wal_replay_validation_hit | wal_replay_validation_top_claim |";
 const BENCHMARK_HISTORY_TABLE_SEPARATOR: &str = "|---|---|---:|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|";
+const DEFAULT_MIN_BENCH_ITERATIONS: usize = 5;
+const DEFAULT_LARGE_MIN_ANN_RECALL_AT_100: f64 = 0.98;
+const DEFAULT_XLARGE_MIN_ANN_RECALL_AT_100: f64 = 0.98;
+const DEFAULT_XXLARGE_MIN_ANN_RECALL_AT_100: f64 = 0.98;
+const DEFAULT_LARGE_PLUS_MIN_GRAPH_SCORE_COVERAGE: f64 = 1.0;
+const DEFAULT_LARGE_PLUS_MIN_GRAPH_SUPPORT_PATH_COUNT: usize = 1;
+const DEFAULT_LARGE_PLUS_MIN_GRAPH_CONTRADICTION_CHAIN_DEPTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkProfile {
@@ -27,6 +40,7 @@ enum BenchmarkProfile {
     Standard,
     Large,
     XLarge,
+    XXLarge,
     Hybrid,
 }
 
@@ -37,6 +51,7 @@ impl BenchmarkProfile {
             "standard" | "default" => Some(Self::Standard),
             "large" => Some(Self::Large),
             "xlarge" => Some(Self::XLarge),
+            "xxlarge" => Some(Self::XXLarge),
             "hybrid" => Some(Self::Hybrid),
             _ => None,
         }
@@ -48,6 +63,7 @@ impl BenchmarkProfile {
             Self::Standard => 10_000,
             Self::Large => 50_000,
             Self::XLarge => 100_000,
+            Self::XXLarge => 1_000_000,
             Self::Hybrid => 20_000,
         }
     }
@@ -58,6 +74,7 @@ impl BenchmarkProfile {
             Self::Standard => 300,
             Self::Large => 120,
             Self::XLarge => 80,
+            Self::XXLarge => 20,
             Self::Hybrid => 180,
         }
     }
@@ -68,7 +85,38 @@ impl BenchmarkProfile {
             Self::Standard => "standard",
             Self::Large => "large",
             Self::XLarge => "xlarge",
+            Self::XXLarge => "xxlarge",
             Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredVectorBackend {
+    Cpu,
+    Gpu,
+}
+
+impl RequiredVectorBackend {
+    fn from_arg(raw: &str) -> Option<Self> {
+        match raw {
+            "cpu" => Some(Self::Cpu),
+            "gpu" => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    fn matches_runtime(self, runtime: VectorBackendRuntime) -> bool {
+        match self {
+            Self::Cpu => !runtime.is_gpu(),
+            Self::Gpu => runtime.is_gpu(),
         }
     }
 }
@@ -78,18 +126,29 @@ struct BenchmarkConfig {
     profile: BenchmarkProfile,
     fixture_size_override: Option<usize>,
     iterations: Option<usize>,
+    min_benchmark_iterations: usize,
     history_out: Option<String>,
     history_csv_out: Option<String>,
     guard_history: Option<String>,
+    guard_min_iterations: usize,
     max_dash_latency_regression_pct: Option<f64>,
     scorecard_out: Option<String>,
     ann_tuning: AnnTuningConfig,
     large_min_candidate_reduction_pct: f64,
     large_max_dash_latency_ms: f64,
+    large_min_ann_recall_at_100: f64,
     xlarge_min_candidate_reduction_pct: f64,
     xlarge_max_dash_latency_ms: f64,
+    xlarge_min_ann_recall_at_100: f64,
+    xxlarge_min_candidate_reduction_pct: f64,
+    xxlarge_max_dash_latency_ms: f64,
+    xxlarge_min_ann_recall_at_100: f64,
+    large_plus_min_graph_score_coverage: f64,
+    large_plus_min_graph_support_path_count: usize,
+    large_plus_min_graph_contradiction_chain_depth: usize,
     min_segment_refresh_successes: usize,
     min_segment_cache_hits: usize,
+    require_vector_backend: Option<RequiredVectorBackend>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +169,10 @@ struct BenchmarkSummary {
     ann_candidate_count: usize,
     final_scored_candidate_count: usize,
     ann_recall: AnnRecallSummary,
+    graph_reasoning: GraphReasoningBenchmarkSummary,
     index_stats: StoreIndexStats,
     ann_tuning: AnnTuningConfig,
+    vector_backend: VectorBackendRuntime,
     segment_cache_probe: SegmentCacheProbeSummary,
     wal_scale: Option<WalScaleSummary>,
 }
@@ -119,6 +180,7 @@ struct BenchmarkSummary {
 #[derive(Debug, Clone)]
 struct HistoryRow {
     profile: BenchmarkProfile,
+    iterations: usize,
     eme_avg_ms: f64,
 }
 
@@ -130,6 +192,16 @@ struct QualityProbeSummary {
     temporal_window_pass: bool,
     temporal_unknown_excluded_pass: bool,
     hybrid_filter_with_embedding_pass: bool,
+    citation_coverage: f64,
+    citation_coverage_pass: bool,
+    extraction_claim_count: usize,
+    extraction_claim_count_pass: bool,
+    extraction_commit_id_stable_pass: bool,
+    extraction_span_coverage: f64,
+    extraction_span_coverage_pass: bool,
+    graph_reasoning_score_present_pass: bool,
+    graph_reasoning_path_count_pass: bool,
+    graph_reasoning_contradiction_depth_pass: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,6 +238,13 @@ struct AnnRecallPoint {
     recall: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GraphReasoningBenchmarkSummary {
+    graph_score_coverage: f64,
+    max_support_path_count: usize,
+    max_contradiction_chain_depth: usize,
+}
+
 impl QualityProbeSummary {
     fn passed_count(&self) -> usize {
         [
@@ -174,6 +253,13 @@ impl QualityProbeSummary {
             self.temporal_window_pass,
             self.temporal_unknown_excluded_pass,
             self.hybrid_filter_with_embedding_pass,
+            self.citation_coverage_pass,
+            self.extraction_claim_count_pass,
+            self.extraction_commit_id_stable_pass,
+            self.extraction_span_coverage_pass,
+            self.graph_reasoning_score_present_pass,
+            self.graph_reasoning_path_count_pass,
+            self.graph_reasoning_contradiction_depth_pass,
         ]
         .into_iter()
         .filter(|v| *v)
@@ -181,7 +267,7 @@ impl QualityProbeSummary {
     }
 
     fn total_count(&self) -> usize {
-        5
+        12
     }
 
     fn all_passed(&self) -> bool {
@@ -226,6 +312,17 @@ fn main() {
         seed_hybrid_fixture(&mut store, tenant, fixture_size);
     } else {
         seed_fixture(&mut store, tenant, fixture_size);
+    }
+    let vector_backend = store.vector_backend_runtime();
+    if let Some(required_backend) = config.require_vector_backend
+        && !required_backend.matches_runtime(vector_backend)
+    {
+        eprintln!(
+            "Benchmark failed: vector backend requirement mismatch (required={}, actual={}).",
+            required_backend.as_str(),
+            vector_backend.as_str()
+        );
+        std::process::exit(1);
     }
     let empty_filters: Vec<String> = Vec::new();
     let (probe_entity_filters, probe_embedding_filters) =
@@ -315,6 +412,28 @@ fn main() {
         );
     let dash_candidate_count = final_scored_candidate_count;
     let ann_recall = measure_ann_recall(&store, tenant, &hybrid_query_embedding);
+    let graph_reasoning = measure_fixture_graph_reasoning(
+        &store,
+        &RetrieveApiRequest {
+            tenant_id: tenant.to_string(),
+            query: query.to_string(),
+            query_embedding: Some(hybrid_query_embedding.clone()),
+            entity_filters: if config.profile == BenchmarkProfile::Hybrid {
+                hybrid_entity_filters.clone()
+            } else {
+                Vec::new()
+            },
+            embedding_id_filters: if config.profile == BenchmarkProfile::Hybrid {
+                hybrid_embedding_filters.clone()
+            } else {
+                Vec::new()
+            },
+            top_k: 1,
+            stance_mode: StanceMode::Balanced,
+            return_graph: true,
+            time_range: None,
+        },
+    );
     let index_stats = store.index_stats();
 
     let baseline_latency = if config.profile == BenchmarkProfile::Hybrid {
@@ -360,8 +479,10 @@ fn main() {
         ann_candidate_count,
         final_scored_candidate_count,
         ann_recall,
+        graph_reasoning,
         index_stats,
         ann_tuning: config.ann_tuning.clone(),
+        vector_backend,
         segment_cache_probe,
         wal_scale,
     };
@@ -378,6 +499,7 @@ fn main() {
             summary.profile,
             summary.eme_latency,
             max_regression_pct,
+            config.guard_min_iterations,
         ) {
             eprintln!("Benchmark failed: {err}");
             std::process::exit(1);
@@ -436,6 +558,13 @@ fn evaluate_profile_gates(
     summary: &BenchmarkSummary,
     config: &BenchmarkConfig,
 ) -> Result<(), String> {
+    if summary.iterations < config.min_benchmark_iterations {
+        return Err(format!(
+            "benchmark iterations {} is below minimum reliability floor {}",
+            summary.iterations, config.min_benchmark_iterations
+        ));
+    }
+
     let reduction_pct = if summary.baseline_scan_count == 0 {
         0.0
     } else {
@@ -459,6 +588,14 @@ fn evaluate_profile_gates(
             summary.eme_latency, config.large_max_dash_latency_ms
         ));
     }
+    if summary.profile == BenchmarkProfile::Large
+        && summary.ann_recall.recall_at_100 < config.large_min_ann_recall_at_100
+    {
+        return Err(format!(
+            "large profile ANN recall@100 {:.4} is below gate {:.4}",
+            summary.ann_recall.recall_at_100, config.large_min_ann_recall_at_100
+        ));
+    }
     if summary.profile == BenchmarkProfile::XLarge
         && reduction_pct < config.xlarge_min_candidate_reduction_pct
     {
@@ -473,6 +610,74 @@ fn evaluate_profile_gates(
         return Err(format!(
             "xlarge profile DASH avg latency {:.4} ms exceeds gate {:.4} ms",
             summary.eme_latency, config.xlarge_max_dash_latency_ms
+        ));
+    }
+    if summary.profile == BenchmarkProfile::XLarge
+        && summary.ann_recall.recall_at_100 < config.xlarge_min_ann_recall_at_100
+    {
+        return Err(format!(
+            "xlarge profile ANN recall@100 {:.4} is below gate {:.4}",
+            summary.ann_recall.recall_at_100, config.xlarge_min_ann_recall_at_100
+        ));
+    }
+    if summary.profile == BenchmarkProfile::XXLarge
+        && reduction_pct < config.xxlarge_min_candidate_reduction_pct
+    {
+        return Err(format!(
+            "xxlarge profile candidate reduction {:.2}% is below gate {:.2}%",
+            reduction_pct, config.xxlarge_min_candidate_reduction_pct
+        ));
+    }
+    if summary.profile == BenchmarkProfile::XXLarge
+        && summary.eme_latency > config.xxlarge_max_dash_latency_ms
+    {
+        return Err(format!(
+            "xxlarge profile DASH avg latency {:.4} ms exceeds gate {:.4} ms",
+            summary.eme_latency, config.xxlarge_max_dash_latency_ms
+        ));
+    }
+    if summary.profile == BenchmarkProfile::XXLarge
+        && summary.ann_recall.recall_at_100 < config.xxlarge_min_ann_recall_at_100
+    {
+        return Err(format!(
+            "xxlarge profile ANN recall@100 {:.4} is below gate {:.4}",
+            summary.ann_recall.recall_at_100, config.xxlarge_min_ann_recall_at_100
+        ));
+    }
+    if matches!(
+        summary.profile,
+        BenchmarkProfile::Large | BenchmarkProfile::XLarge | BenchmarkProfile::XXLarge
+    ) && summary.graph_reasoning.graph_score_coverage
+        < config.large_plus_min_graph_score_coverage
+    {
+        return Err(format!(
+            "large+ profile graph score coverage {:.4} is below gate {:.4}",
+            summary.graph_reasoning.graph_score_coverage,
+            config.large_plus_min_graph_score_coverage
+        ));
+    }
+    if matches!(
+        summary.profile,
+        BenchmarkProfile::Large | BenchmarkProfile::XLarge | BenchmarkProfile::XXLarge
+    ) && summary.graph_reasoning.max_support_path_count
+        < config.large_plus_min_graph_support_path_count
+    {
+        return Err(format!(
+            "large+ profile max support path count {} is below gate {}",
+            summary.graph_reasoning.max_support_path_count,
+            config.large_plus_min_graph_support_path_count
+        ));
+    }
+    if matches!(
+        summary.profile,
+        BenchmarkProfile::Large | BenchmarkProfile::XLarge | BenchmarkProfile::XXLarge
+    ) && summary.graph_reasoning.max_contradiction_chain_depth
+        < config.large_plus_min_graph_contradiction_chain_depth
+    {
+        return Err(format!(
+            "large+ profile max contradiction chain depth {} is below gate {}",
+            summary.graph_reasoning.max_contradiction_chain_depth,
+            config.large_plus_min_graph_contradiction_chain_depth
         ));
     }
     if summary.segment_cache_probe.refresh_successes < config.min_segment_refresh_successes as u64 {
@@ -533,9 +738,15 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0);
     let mut iterations = None;
+    let mut min_benchmark_iterations =
+        env_or_default_usize("DASH_BENCH_MIN_ITERATIONS", DEFAULT_MIN_BENCH_ITERATIONS);
     let mut history_out = None;
     let mut history_csv_out = std::env::var("DASH_BENCH_HISTORY_CSV_OUT").ok();
     let mut guard_history = None;
+    let mut guard_min_iterations = env_or_default_usize(
+        "DASH_BENCH_GUARD_MIN_ITERATIONS",
+        DEFAULT_MIN_BENCH_ITERATIONS,
+    );
     let mut max_dash_latency_regression_pct = None;
     let mut scorecard_out = None;
     let defaults = AnnTuningConfig::default();
@@ -565,13 +776,45 @@ where
         env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);
     let mut large_max_dash_latency_ms =
         env_or_default_f64("DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS", 120.0);
+    let mut large_min_ann_recall_at_100 = env_or_default_f64(
+        "DASH_BENCH_LARGE_MIN_ANN_RECALL_AT_100",
+        DEFAULT_LARGE_MIN_ANN_RECALL_AT_100,
+    );
     let mut xlarge_min_candidate_reduction_pct =
         env_or_default_f64("DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT", 96.0);
     let mut xlarge_max_dash_latency_ms =
         env_or_default_f64("DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS", 250.0);
+    let mut xlarge_min_ann_recall_at_100 = env_or_default_f64(
+        "DASH_BENCH_XLARGE_MIN_ANN_RECALL_AT_100",
+        DEFAULT_XLARGE_MIN_ANN_RECALL_AT_100,
+    );
+    let mut xxlarge_min_candidate_reduction_pct =
+        env_or_default_f64("DASH_BENCH_XXLARGE_MIN_CANDIDATE_REDUCTION_PCT", 97.0);
+    let mut xxlarge_max_dash_latency_ms =
+        env_or_default_f64("DASH_BENCH_XXLARGE_MAX_DASH_LATENCY_MS", 350.0);
+    let mut xxlarge_min_ann_recall_at_100 = env_or_default_f64(
+        "DASH_BENCH_XXLARGE_MIN_ANN_RECALL_AT_100",
+        DEFAULT_XXLARGE_MIN_ANN_RECALL_AT_100,
+    );
+    let mut large_plus_min_graph_score_coverage = env_or_default_f64(
+        "DASH_BENCH_LARGE_PLUS_MIN_GRAPH_SCORE_COVERAGE",
+        DEFAULT_LARGE_PLUS_MIN_GRAPH_SCORE_COVERAGE,
+    );
+    let mut large_plus_min_graph_support_path_count = env_or_default_usize(
+        "DASH_BENCH_LARGE_PLUS_MIN_GRAPH_SUPPORT_PATH_COUNT",
+        DEFAULT_LARGE_PLUS_MIN_GRAPH_SUPPORT_PATH_COUNT,
+    );
+    let mut large_plus_min_graph_contradiction_chain_depth = env_or_default_usize(
+        "DASH_BENCH_LARGE_PLUS_MIN_GRAPH_CONTRADICTION_CHAIN_DEPTH",
+        DEFAULT_LARGE_PLUS_MIN_GRAPH_CONTRADICTION_CHAIN_DEPTH,
+    );
     let mut min_segment_refresh_successes =
         env_or_default_usize("DASH_BENCH_MIN_SEGMENT_REFRESH_SUCCESSES", 0);
     let mut min_segment_cache_hits = env_or_default_usize("DASH_BENCH_MIN_SEGMENT_CACHE_HITS", 0);
+    let mut require_vector_backend = std::env::var("DASH_BENCH_REQUIRE_VECTOR_BACKEND")
+        .ok()
+        .as_deref()
+        .and_then(RequiredVectorBackend::from_arg);
 
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -583,7 +826,7 @@ where
                     .ok_or_else(|| "Missing value for --profile".to_string())?;
                 profile = BenchmarkProfile::from_arg(&value).ok_or_else(|| {
                     format!(
-                        "Invalid profile '{value}'. Valid values: smoke, standard, large, xlarge, hybrid."
+                        "Invalid profile '{value}'. Valid values: smoke, standard, large, xlarge, xxlarge, hybrid."
                     )
                 })?;
             }
@@ -603,6 +846,10 @@ where
                 }
                 iterations = Some(parsed);
             }
+            "--min-iterations" => {
+                min_benchmark_iterations =
+                    parse_positive_usize_arg(args.next(), "--min-iterations")?;
+            }
             "--history-out" => {
                 let value = args
                     .next()
@@ -620,6 +867,10 @@ where
                     .next()
                     .ok_or_else(|| "Missing value for --guard-history".to_string())?;
                 guard_history = Some(value);
+            }
+            "--guard-min-iterations" => {
+                guard_min_iterations =
+                    parse_positive_usize_arg(args.next(), "--guard-min-iterations")?;
             }
             "--max-dash-latency-regression-pct" | "--max-eme-latency-regression-pct" => {
                 let value = args.next().ok_or_else(|| {
@@ -667,6 +918,10 @@ where
                 large_max_dash_latency_ms =
                     parse_non_negative_f64_arg(args.next(), "--large-max-dash-latency-ms")?;
             }
+            "--large-min-ann-recall-at-100" => {
+                large_min_ann_recall_at_100 =
+                    parse_non_negative_f64_arg(args.next(), "--large-min-ann-recall-at-100")?;
+            }
             "--xlarge-min-candidate-reduction-pct" => {
                 xlarge_min_candidate_reduction_pct = parse_non_negative_f64_arg(
                     args.next(),
@@ -677,6 +932,42 @@ where
                 xlarge_max_dash_latency_ms =
                     parse_non_negative_f64_arg(args.next(), "--xlarge-max-dash-latency-ms")?;
             }
+            "--xlarge-min-ann-recall-at-100" => {
+                xlarge_min_ann_recall_at_100 =
+                    parse_non_negative_f64_arg(args.next(), "--xlarge-min-ann-recall-at-100")?;
+            }
+            "--xxlarge-min-candidate-reduction-pct" => {
+                xxlarge_min_candidate_reduction_pct = parse_non_negative_f64_arg(
+                    args.next(),
+                    "--xxlarge-min-candidate-reduction-pct",
+                )?;
+            }
+            "--xxlarge-max-dash-latency-ms" => {
+                xxlarge_max_dash_latency_ms =
+                    parse_non_negative_f64_arg(args.next(), "--xxlarge-max-dash-latency-ms")?;
+            }
+            "--xxlarge-min-ann-recall-at-100" => {
+                xxlarge_min_ann_recall_at_100 =
+                    parse_non_negative_f64_arg(args.next(), "--xxlarge-min-ann-recall-at-100")?;
+            }
+            "--large-plus-min-graph-score-coverage" => {
+                large_plus_min_graph_score_coverage = parse_non_negative_f64_arg(
+                    args.next(),
+                    "--large-plus-min-graph-score-coverage",
+                )?;
+            }
+            "--large-plus-min-graph-support-path-count" => {
+                large_plus_min_graph_support_path_count = parse_non_negative_usize_arg(
+                    args.next(),
+                    "--large-plus-min-graph-support-path-count",
+                )?;
+            }
+            "--large-plus-min-graph-contradiction-chain-depth" => {
+                large_plus_min_graph_contradiction_chain_depth = parse_non_negative_usize_arg(
+                    args.next(),
+                    "--large-plus-min-graph-contradiction-chain-depth",
+                )?;
+            }
             "--min-segment-refresh-successes" => {
                 min_segment_refresh_successes =
                     parse_non_negative_usize_arg(args.next(), "--min-segment-refresh-successes")?;
@@ -684,6 +975,17 @@ where
             "--min-segment-cache-hits" => {
                 min_segment_cache_hits =
                     parse_non_negative_usize_arg(args.next(), "--min-segment-cache-hits")?;
+            }
+            "--require-vector-backend" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --require-vector-backend".to_string())?;
+                require_vector_backend =
+                    Some(RequiredVectorBackend::from_arg(&value).ok_or_else(|| {
+                        format!(
+                            "Invalid require-vector-backend value '{value}'. Valid values: cpu, gpu."
+                        )
+                    })?);
             }
             "--help" | "-h" => return Err(usage_text().to_string()),
             _ => {
@@ -695,23 +997,54 @@ where
     if ann_tuning.search_expansion_max < ann_tuning.search_expansion_min {
         return Err("--ann-search-expansion-max must be >= --ann-search-expansion-min".to_string());
     }
+    if large_min_ann_recall_at_100 > 1.0 {
+        return Err("--large-min-ann-recall-at-100 must be <= 1".to_string());
+    }
+    if xlarge_min_ann_recall_at_100 > 1.0 {
+        return Err("--xlarge-min-ann-recall-at-100 must be <= 1".to_string());
+    }
+    if xxlarge_min_ann_recall_at_100 > 1.0 {
+        return Err("--xxlarge-min-ann-recall-at-100 must be <= 1".to_string());
+    }
+    if large_plus_min_graph_score_coverage > 1.0 {
+        return Err("--large-plus-min-graph-score-coverage must be <= 1".to_string());
+    }
+
+    let effective_iterations = iterations.unwrap_or_else(|| profile.default_iterations());
+    if effective_iterations < min_benchmark_iterations {
+        return Err(format!(
+            "effective benchmark iterations {} is below --min-iterations {}",
+            effective_iterations, min_benchmark_iterations
+        ));
+    }
 
     Ok(BenchmarkConfig {
         profile,
         fixture_size_override,
         iterations,
+        min_benchmark_iterations,
         history_out,
         history_csv_out,
         guard_history,
+        guard_min_iterations,
         max_dash_latency_regression_pct,
         scorecard_out,
         ann_tuning,
         large_min_candidate_reduction_pct,
         large_max_dash_latency_ms,
+        large_min_ann_recall_at_100,
         xlarge_min_candidate_reduction_pct,
         xlarge_max_dash_latency_ms,
+        xlarge_min_ann_recall_at_100,
+        xxlarge_min_candidate_reduction_pct,
+        xxlarge_max_dash_latency_ms,
+        xxlarge_min_ann_recall_at_100,
+        large_plus_min_graph_score_coverage,
+        large_plus_min_graph_support_path_count,
+        large_plus_min_graph_contradiction_chain_depth,
         min_segment_refresh_successes,
         min_segment_cache_hits,
+        require_vector_backend,
     })
 }
 
@@ -760,7 +1093,7 @@ fn parse_non_negative_usize_arg(value: Option<String>, flag: &str) -> Result<usi
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|hybrid] [--fixture-size N] [--iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [quality probe enforces contradiction_detection_f1 >= 0.80]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|xxlarge|hybrid] [--fixture-size N] [--iterations N] [--min-iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--guard-min-iterations N] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--large-min-ann-recall-at-100 N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--xlarge-min-ann-recall-at-100 N] [--xxlarge-min-candidate-reduction-pct N] [--xxlarge-max-dash-latency-ms N] [--xxlarge-min-ann-recall-at-100 N] [--large-plus-min-graph-score-coverage N] [--large-plus-min-graph-support-path-count N] [--large-plus-min-graph-contradiction-chain-depth N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [--require-vector-backend cpu|gpu] [quality probes enforce contradiction_detection_f1 >= 0.80, citation_coverage >= 0.95, extraction_span_coverage >= 0.95; large+ profiles enforce graph coverage/path/depth gates]"
 }
 
 #[allow(unused_unsafe)]
@@ -877,7 +1210,10 @@ fn maybe_run_wal_scale_slice(
     profile: BenchmarkProfile,
     fixture_size: usize,
 ) -> Result<Option<WalScaleSummary>, String> {
-    if !matches!(profile, BenchmarkProfile::Large | BenchmarkProfile::XLarge) {
+    if !matches!(
+        profile,
+        BenchmarkProfile::Large | BenchmarkProfile::XLarge | BenchmarkProfile::XXLarge
+    ) {
         return Ok(None);
     }
 
@@ -888,6 +1224,7 @@ fn maybe_run_wal_scale_slice(
     let default_claims = match profile {
         BenchmarkProfile::Large => 10_000,
         BenchmarkProfile::XLarge => 20_000,
+        BenchmarkProfile::XXLarge => 50_000,
         _ => 5_000,
     };
     let claims_seeded = env_or_default_usize("DASH_BENCH_WAL_SCALE_CLAIMS", default_claims)
@@ -1025,6 +1362,47 @@ fn compute_ann_recall_at_budget(
     hits as f64 / exact_set.len() as f64
 }
 
+fn measure_fixture_graph_reasoning(
+    store: &InMemoryStore,
+    request: &RetrieveApiRequest,
+) -> GraphReasoningBenchmarkSummary {
+    let response = execute_api_query(store, request.clone());
+    let mut nodes_by_claim_id = std::collections::HashMap::new();
+    for node in &response.results {
+        nodes_by_claim_id.insert(node.claim_id.clone(), node);
+    }
+    if let Some(graph) = response.graph.as_ref() {
+        for node in &graph.nodes {
+            nodes_by_claim_id.insert(node.claim_id.clone(), node);
+        }
+    }
+    if nodes_by_claim_id.is_empty() {
+        return GraphReasoningBenchmarkSummary::default();
+    }
+
+    let total_nodes = nodes_by_claim_id.len();
+    let graph_score_nodes = nodes_by_claim_id
+        .values()
+        .filter(|node| node.graph_score.is_some())
+        .count();
+    let max_support_path_count = nodes_by_claim_id
+        .values()
+        .filter_map(|node| node.support_path_count)
+        .max()
+        .unwrap_or(0);
+    let max_contradiction_chain_depth = nodes_by_claim_id
+        .values()
+        .filter_map(|node| node.contradiction_chain_depth)
+        .max()
+        .unwrap_or(0);
+
+    GraphReasoningBenchmarkSummary {
+        graph_score_coverage: graph_score_nodes as f64 / total_nodes as f64,
+        max_support_path_count,
+        max_contradiction_chain_depth,
+    }
+}
+
 fn format_ann_recall_curve(curve: &[AnnRecallPoint]) -> String {
     if curve.is_empty() {
         return "none".to_string();
@@ -1038,6 +1416,7 @@ fn format_ann_recall_curve(curve: &[AnnRecallPoint]) -> String {
 
 fn print_summary(summary: &BenchmarkSummary) {
     println!("Benchmark profile: {}", summary.profile.as_str());
+    println!("Vector backend: {}", summary.vector_backend.as_str());
     println!("Benchmark fixture size: {}", summary.fixture_size);
     println!("Iterations: {}", summary.iterations);
     println!(
@@ -1075,6 +1454,18 @@ fn print_summary(summary: &BenchmarkSummary) {
         100.0 * (1.0 - summary.dash_candidate_count as f64 / summary.baseline_scan_count as f64)
     };
     println!("Candidate reduction (%): {:.2}", reduction_pct.max(0.0));
+    println!(
+        "Graph score coverage: {:.4}",
+        summary.graph_reasoning.graph_score_coverage
+    );
+    println!(
+        "Graph max support path count: {}",
+        summary.graph_reasoning.max_support_path_count
+    );
+    println!(
+        "Graph max contradiction chain depth: {}",
+        summary.graph_reasoning.max_contradiction_chain_depth
+    );
     println!(
         "Index stats: tenants={}, claims={}, vectors={}, inverted_terms={}, entity_terms={}, temporal_buckets={}, ann_vector_buckets={}",
         summary.index_stats.tenant_count,
@@ -1143,6 +1534,46 @@ fn print_quality_summary(summary: &QualityProbeSummary) {
     println!(
         "Quality probe hybrid_filter_with_embedding: {}",
         summary.hybrid_filter_with_embedding_pass
+    );
+    println!(
+        "Quality probe citation_coverage: {:.4} (gate >= {:.2})",
+        summary.citation_coverage, CITATION_COVERAGE_GATE
+    );
+    println!(
+        "Quality probe citation_coverage_pass: {}",
+        summary.citation_coverage_pass
+    );
+    println!(
+        "Quality probe extraction_claim_count: {} (gate >= 2)",
+        summary.extraction_claim_count
+    );
+    println!(
+        "Quality probe extraction_claim_count_pass: {}",
+        summary.extraction_claim_count_pass
+    );
+    println!(
+        "Quality probe extraction_commit_id_stable_pass: {}",
+        summary.extraction_commit_id_stable_pass
+    );
+    println!(
+        "Quality probe extraction_span_coverage: {:.4} (gate >= {:.2})",
+        summary.extraction_span_coverage, EXTRACTION_SPAN_COVERAGE_GATE
+    );
+    println!(
+        "Quality probe extraction_span_coverage_pass: {}",
+        summary.extraction_span_coverage_pass
+    );
+    println!(
+        "Quality probe graph_reasoning_score_present_pass: {}",
+        summary.graph_reasoning_score_present_pass
+    );
+    println!(
+        "Quality probe graph_reasoning_path_count_pass: {}",
+        summary.graph_reasoning_path_count_pass
+    );
+    println!(
+        "Quality probe graph_reasoning_contradiction_depth_pass: {}",
+        summary.graph_reasoning_contradiction_depth_pass
     );
 }
 
@@ -1491,6 +1922,21 @@ fn write_scorecard(
         "- ann_recall_curve: {}",
         format_ann_recall_curve(&summary.ann_recall.curve)
     )?;
+    writeln!(
+        file,
+        "- graph_score_coverage: {:.4}",
+        summary.graph_reasoning.graph_score_coverage
+    )?;
+    writeln!(
+        file,
+        "- graph_max_support_path_count: {}",
+        summary.graph_reasoning.max_support_path_count
+    )?;
+    writeln!(
+        file,
+        "- graph_max_contradiction_chain_depth: {}",
+        summary.graph_reasoning.max_contradiction_chain_depth
+    )?;
     let reduction_pct = if summary.baseline_scan_count == 0 {
         0.0
     } else {
@@ -1675,6 +2121,67 @@ fn write_scorecard(
         "- hybrid_filter_with_embedding_pass: {}",
         quality.hybrid_filter_with_embedding_pass
     )?;
+    writeln!(
+        file,
+        "- citation_coverage: {:.4}",
+        quality.citation_coverage
+    )?;
+    writeln!(
+        file,
+        "- citation_coverage_gate: {:.2}",
+        CITATION_COVERAGE_GATE
+    )?;
+    writeln!(
+        file,
+        "- citation_coverage_pass: {}",
+        quality.citation_coverage_pass
+    )?;
+    writeln!(
+        file,
+        "- extraction_claim_count: {}",
+        quality.extraction_claim_count
+    )?;
+    writeln!(file, "- extraction_claim_count_gate: >= 2")?;
+    writeln!(
+        file,
+        "- extraction_claim_count_pass: {}",
+        quality.extraction_claim_count_pass
+    )?;
+    writeln!(
+        file,
+        "- extraction_commit_id_stable_pass: {}",
+        quality.extraction_commit_id_stable_pass
+    )?;
+    writeln!(
+        file,
+        "- extraction_span_coverage: {:.4}",
+        quality.extraction_span_coverage
+    )?;
+    writeln!(
+        file,
+        "- extraction_span_coverage_gate: {:.2}",
+        EXTRACTION_SPAN_COVERAGE_GATE
+    )?;
+    writeln!(
+        file,
+        "- extraction_span_coverage_pass: {}",
+        quality.extraction_span_coverage_pass
+    )?;
+    writeln!(
+        file,
+        "- graph_reasoning_score_present_pass: {}",
+        quality.graph_reasoning_score_present_pass
+    )?;
+    writeln!(
+        file,
+        "- graph_reasoning_path_count_pass: {}",
+        quality.graph_reasoning_path_count_pass
+    )?;
+    writeln!(
+        file,
+        "- graph_reasoning_contradiction_depth_pass: {}",
+        quality.graph_reasoning_contradiction_depth_pass
+    )?;
     Ok(())
 }
 
@@ -1683,8 +2190,10 @@ fn enforce_history_guard(
     profile: BenchmarkProfile,
     current_eme_avg_ms: f64,
     max_regression_pct: f64,
+    min_iterations: usize,
 ) -> Result<(), String> {
-    let previous = read_latest_history_row(path, profile)?.map(|row| row.eme_avg_ms);
+    let previous =
+        read_latest_history_row(path, profile, min_iterations)?.map(|row| row.eme_avg_ms);
     match previous {
         Some(previous_ms) if previous_ms > 0.0 => {
             let allowed = previous_ms * (1.0 + max_regression_pct / 100.0);
@@ -1721,6 +2230,7 @@ fn enforce_history_guard(
 fn read_latest_history_row(
     path: &str,
     profile: BenchmarkProfile,
+    min_iterations: usize,
 ) -> Result<Option<HistoryRow>, String> {
     let history_path = Path::new(path);
     if !history_path.exists() {
@@ -1741,6 +2251,7 @@ fn read_latest_history_row(
 
         if let Some(row) = parse_history_row(trimmed)?
             && row.profile == profile
+            && row.iterations >= min_iterations
         {
             matching_rows.push_back(row);
         }
@@ -1782,15 +2293,20 @@ fn parse_history_row(line: &str) -> Result<Option<HistoryRow>, String> {
         "standard" => BenchmarkProfile::Standard,
         "large" => BenchmarkProfile::Large,
         "xlarge" => BenchmarkProfile::XLarge,
+        "xxlarge" => BenchmarkProfile::XXLarge,
         "hybrid" => BenchmarkProfile::Hybrid,
         _ => return Ok(None),
     };
+    let iterations = cols[4]
+        .parse::<usize>()
+        .map_err(|_| "invalid iterations in benchmark history row".to_string())?;
     let eme_avg_ms = cols[10]
         .parse::<f64>()
         .map_err(|_| "invalid eme_avg_ms in benchmark history row".to_string())?;
 
     Ok(Some(HistoryRow {
         profile,
+        iterations,
         eme_avg_ms,
     }))
 }
@@ -1848,6 +2364,147 @@ fn run_quality_probes() -> QualityProbeSummary {
     let hybrid_filter_with_embedding_pass =
         hybrid_filtered.results.first().map(|r| r.claim_id.as_str()) == Some("probe-filter-match");
 
+    let citation_probe = execute_api_query(
+        &store,
+        RetrieveApiRequest {
+            tenant_id: tenant.to_string(),
+            query: "project orion launched".to_string(),
+            query_embedding: None,
+            entity_filters: Vec::new(),
+            embedding_id_filters: Vec::new(),
+            top_k: 3,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        },
+    );
+    let citation_coverage = if citation_probe.results.is_empty() {
+        0.0
+    } else {
+        citation_probe
+            .results
+            .iter()
+            .filter(|result| !result.citations.is_empty())
+            .count() as f64
+            / citation_probe.results.len() as f64
+    };
+    let citation_coverage_pass =
+        !citation_probe.results.is_empty() && citation_coverage >= CITATION_COVERAGE_GATE;
+
+    let graph_probe = execute_api_query(
+        &store,
+        RetrieveApiRequest {
+            tenant_id: tenant.to_string(),
+            query: "project atlas evidence chain".to_string(),
+            query_embedding: None,
+            entity_filters: Vec::new(),
+            embedding_id_filters: Vec::new(),
+            top_k: 1,
+            stance_mode: StanceMode::Balanced,
+            return_graph: true,
+            time_range: None,
+        },
+    );
+    let graph_reasoning_score_present_pass = !graph_probe.results.is_empty()
+        && graph_probe.results.iter().all(|r| r.graph_score.is_some());
+    let graph_nodes = graph_probe
+        .graph
+        .as_ref()
+        .map(|graph| graph.nodes.as_slice())
+        .unwrap_or(&[]);
+    let graph_reasoning_path_count_pass = graph_nodes
+        .iter()
+        .find(|node| node.claim_id == "probe-graph-support-2")
+        .and_then(|node| node.support_path_count)
+        .is_some_and(|count| count >= 1);
+    let graph_reasoning_contradiction_depth_pass = graph_nodes
+        .iter()
+        .find(|node| node.claim_id == "probe-graph-contradict-2")
+        .and_then(|node| node.contradiction_chain_depth)
+        .is_some_and(|depth| depth >= 2);
+
+    let extraction_tenant = "tenant-quality-probe-raw";
+    let _extract_provider = EnvVarGuard::set(
+        "DASH_INGEST_RAW_EXTRACTION_PROVIDER",
+        OsStr::new("rule_sentence"),
+    );
+    let raw_request = IngestRawApiRequest {
+        tenant_id: extraction_tenant.to_string(),
+        document_id: "doc-quality-raw-1".to_string(),
+        source_id: "source://quality/raw/1".to_string(),
+        text: "Company X acquired Company Y in 2024. Revenue rose in Q4 with strong guidance."
+            .to_string(),
+        extraction_model: Some("rule-sentence-v1".to_string()),
+        claim_confidence: Some(0.86),
+        source_quality: Some(0.91),
+        min_sentence_chars: Some(10),
+        max_claims: Some(8),
+        generate_embeddings: None,
+        embedding_model: None,
+    };
+    let extraction_batch = build_ingest_batch_from_raw_request(&raw_request)
+        .expect("raw extraction quality probe should produce claims");
+    let extraction_batch_replay = build_ingest_batch_from_raw_request(&raw_request)
+        .expect("raw extraction quality probe replay should produce claims");
+    let extraction_claim_count = extraction_batch.items.len();
+    let extraction_claim_count_pass = extraction_claim_count >= 2;
+    let extraction_commit_id_stable_pass = extraction_batch.commit_id
+        == extraction_batch_replay.commit_id
+        && extraction_batch
+            .items
+            .iter()
+            .map(|item| item.claim.claim_id.as_str())
+            .eq(extraction_batch_replay
+                .items
+                .iter()
+                .map(|item| item.claim.claim_id.as_str()));
+    let extraction_claim_ids: HashSet<String> = extraction_batch
+        .items
+        .iter()
+        .map(|item| item.claim.claim_id.clone())
+        .collect();
+    for item in extraction_batch.items {
+        store
+            .ingest_bundle(item.claim, item.evidence, item.edges)
+            .expect("raw extraction quality probe ingest should succeed");
+    }
+    let extraction_probe = execute_api_query(
+        &store,
+        RetrieveApiRequest {
+            tenant_id: extraction_tenant.to_string(),
+            query: "Did company x acquire company y in 2024?".to_string(),
+            query_embedding: None,
+            entity_filters: Vec::new(),
+            embedding_id_filters: Vec::new(),
+            top_k: extraction_claim_ids.len().max(1),
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        },
+    );
+    let extraction_results: Vec<_> = extraction_probe
+        .results
+        .iter()
+        .filter(|result| extraction_claim_ids.contains(&result.claim_id))
+        .collect();
+    let extraction_span_coverage = if extraction_results.is_empty() {
+        0.0
+    } else {
+        extraction_results
+            .iter()
+            .filter(|result| {
+                result.citations.iter().any(|citation| {
+                    citation.doc_id.is_some()
+                        && citation.span_start.is_some()
+                        && citation.span_end.is_some()
+                })
+            })
+            .count() as f64
+            / extraction_results.len() as f64
+    };
+    let extraction_span_coverage_pass =
+        !extraction_results.is_empty() && extraction_span_coverage >= EXTRACTION_SPAN_COVERAGE_GATE;
+
     QualityProbeSummary {
         contradiction_support_only_pass,
         contradiction_detection_f1,
@@ -1855,6 +2512,16 @@ fn run_quality_probes() -> QualityProbeSummary {
         temporal_window_pass,
         temporal_unknown_excluded_pass,
         hybrid_filter_with_embedding_pass,
+        citation_coverage,
+        citation_coverage_pass,
+        extraction_claim_count,
+        extraction_claim_count_pass,
+        extraction_commit_id_stable_pass,
+        extraction_span_coverage,
+        extraction_span_coverage_pass,
+        graph_reasoning_score_present_pass,
+        graph_reasoning_path_count_pass,
+        graph_reasoning_contradiction_depth_pass,
     }
 }
 
@@ -2139,6 +2806,206 @@ fn seed_quality_probe_fixture(store: &mut InMemoryStore, tenant: &str) {
         .upsert_claim_vector("probe-filter-other", fixture_vector_for_index(999_991))
         .expect("quality probe vector upsert should succeed");
 
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-graph-root".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Atlas evidence chain baseline claim".to_string(),
+                confidence: 0.94,
+                event_time_unix: Some(2_026),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-graph-root-s1".to_string(),
+                claim_id: "probe-graph-root".to_string(),
+                source_id: "source://probe/graph/root".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.93,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![
+                ClaimEdge {
+                    edge_id: "probe-graph-edge-root-support".to_string(),
+                    from_claim_id: "probe-graph-root".to_string(),
+                    to_claim_id: "probe-graph-support-1".to_string(),
+                    relation: Relation::Supports,
+                    strength: 0.9,
+                    reason_codes: vec![],
+                    created_at: None,
+                },
+                ClaimEdge {
+                    edge_id: "probe-graph-edge-root-contradict".to_string(),
+                    from_claim_id: "probe-graph-root".to_string(),
+                    to_claim_id: "probe-graph-contradict-1".to_string(),
+                    relation: Relation::Contradicts,
+                    strength: 0.88,
+                    reason_codes: vec![],
+                    created_at: None,
+                },
+            ],
+        )
+        .expect("quality probe graph root ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-graph-support-1".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Atlas evidence chain supporting layer one".to_string(),
+                confidence: 0.9,
+                event_time_unix: Some(2_026),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-graph-support-1-s1".to_string(),
+                claim_id: "probe-graph-support-1".to_string(),
+                source_id: "source://probe/graph/support-1".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![ClaimEdge {
+                edge_id: "probe-graph-edge-support-chain".to_string(),
+                from_claim_id: "probe-graph-support-1".to_string(),
+                to_claim_id: "probe-graph-support-2".to_string(),
+                relation: Relation::Supports,
+                strength: 0.84,
+                reason_codes: vec![],
+                created_at: None,
+            }],
+        )
+        .expect("quality probe graph support ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-graph-support-2".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Atlas evidence chain supporting layer two".to_string(),
+                confidence: 0.88,
+                event_time_unix: Some(2_026),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-graph-support-2-s1".to_string(),
+                claim_id: "probe-graph-support-2".to_string(),
+                source_id: "source://probe/graph/support-2".to_string(),
+                stance: Stance::Supports,
+                source_quality: 0.9,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe graph support leaf ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-graph-contradict-1".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Atlas evidence chain contradicting branch one".to_string(),
+                confidence: 0.86,
+                event_time_unix: Some(2_026),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-graph-contradict-1-c1".to_string(),
+                claim_id: "probe-graph-contradict-1".to_string(),
+                source_id: "source://probe/graph/contradict-1".to_string(),
+                stance: Stance::Contradicts,
+                source_quality: 0.86,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![ClaimEdge {
+                edge_id: "probe-graph-edge-contradict-chain".to_string(),
+                from_claim_id: "probe-graph-contradict-1".to_string(),
+                to_claim_id: "probe-graph-contradict-2".to_string(),
+                relation: Relation::Contradicts,
+                strength: 0.81,
+                reason_codes: vec![],
+                created_at: None,
+            }],
+        )
+        .expect("quality probe graph contradiction ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "probe-graph-contradict-2".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Project Atlas evidence chain contradicting branch two".to_string(),
+                confidence: 0.82,
+                event_time_unix: Some(2_026),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            vec![Evidence {
+                evidence_id: "probe-graph-contradict-2-c1".to_string(),
+                claim_id: "probe-graph-contradict-2".to_string(),
+                source_id: "source://probe/graph/contradict-2".to_string(),
+                stance: Stance::Contradicts,
+                source_quality: 0.84,
+                chunk_id: None,
+                span_start: None,
+                span_end: None,
+                doc_id: None,
+                extraction_model: None,
+                ingested_at: None,
+            }],
+            vec![],
+        )
+        .expect("quality probe graph contradiction leaf ingest should succeed");
+
     seed_contradiction_f1_fixture(store, tenant);
 }
 
@@ -2326,6 +3193,169 @@ fn seed_fixture(store: &mut InMemoryStore, tenant: &str, count: usize) {
                 .expect("fixture vector upsert should succeed");
         }
     }
+    seed_fixture_graph_reasoning_edges(store, tenant, "claim-target");
+}
+
+fn seed_fixture_graph_reasoning_edges(
+    store: &mut InMemoryStore,
+    tenant: &str,
+    target_claim_id: &str,
+) {
+    let graph_nodes = [
+        (
+            "claim-graph-support-1",
+            "Graph support branch node one",
+            Stance::Supports,
+        ),
+        (
+            "claim-graph-support-2",
+            "Graph support branch node two",
+            Stance::Supports,
+        ),
+        (
+            "claim-graph-contradict-1",
+            "Graph contradiction branch node one",
+            Stance::Contradicts,
+        ),
+        (
+            "claim-graph-contradict-2",
+            "Graph contradiction branch node two",
+            Stance::Contradicts,
+        ),
+    ];
+
+    for (claim_id, canonical_text, stance) in graph_nodes {
+        store
+            .ingest_bundle(
+                Claim {
+                    claim_id: claim_id.to_string(),
+                    tenant_id: tenant.to_string(),
+                    canonical_text: canonical_text.to_string(),
+                    confidence: 0.8,
+                    event_time_unix: Some(1_735_689_600),
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![Evidence {
+                    evidence_id: format!("evidence-{claim_id}"),
+                    claim_id: claim_id.to_string(),
+                    source_id: format!("source://graph/{claim_id}"),
+                    stance: stance.clone(),
+                    source_quality: 0.8,
+                    chunk_id: None,
+                    span_start: None,
+                    span_end: None,
+                    doc_id: None,
+                    extraction_model: None,
+                    ingested_at: None,
+                }],
+                vec![],
+            )
+            .expect("graph fixture ingest should succeed");
+    }
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: target_claim_id.to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Company X acquired Company Y in 2025".to_string(),
+                confidence: 0.95,
+                event_time_unix: Some(1_735_689_600),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            Vec::new(),
+            vec![
+                ClaimEdge {
+                    edge_id: "edge-graph-target-support".to_string(),
+                    from_claim_id: target_claim_id.to_string(),
+                    to_claim_id: "claim-graph-support-1".to_string(),
+                    relation: Relation::Supports,
+                    strength: 0.9,
+                    reason_codes: vec![],
+                    created_at: None,
+                },
+                ClaimEdge {
+                    edge_id: "edge-graph-target-contradict".to_string(),
+                    from_claim_id: target_claim_id.to_string(),
+                    to_claim_id: "claim-graph-contradict-1".to_string(),
+                    relation: Relation::Contradicts,
+                    strength: 0.88,
+                    reason_codes: vec![],
+                    created_at: None,
+                },
+            ],
+        )
+        .expect("graph fixture target edge ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "claim-graph-support-1".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Graph support branch node one".to_string(),
+                confidence: 0.8,
+                event_time_unix: Some(1_735_689_600),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            Vec::new(),
+            vec![ClaimEdge {
+                edge_id: "edge-graph-support-chain".to_string(),
+                from_claim_id: "claim-graph-support-1".to_string(),
+                to_claim_id: "claim-graph-support-2".to_string(),
+                relation: Relation::Supports,
+                strength: 0.84,
+                reason_codes: vec![],
+                created_at: None,
+            }],
+        )
+        .expect("graph fixture support chain ingest should succeed");
+
+    store
+        .ingest_bundle(
+            Claim {
+                claim_id: "claim-graph-contradict-1".to_string(),
+                tenant_id: tenant.to_string(),
+                canonical_text: "Graph contradiction branch node one".to_string(),
+                confidence: 0.8,
+                event_time_unix: Some(1_735_689_600),
+                entities: vec![],
+                embedding_ids: vec![],
+                claim_type: None,
+                valid_from: None,
+                valid_to: None,
+                created_at: None,
+                updated_at: None,
+            },
+            Vec::new(),
+            vec![ClaimEdge {
+                edge_id: "edge-graph-contradiction-chain".to_string(),
+                from_claim_id: "claim-graph-contradict-1".to_string(),
+                to_claim_id: "claim-graph-contradict-2".to_string(),
+                relation: Relation::Contradicts,
+                strength: 0.82,
+                reason_codes: vec![],
+                created_at: None,
+            }],
+        )
+        .expect("graph fixture contradiction chain ingest should succeed");
 }
 
 fn seed_fixture_persistent(
@@ -2703,18 +3733,29 @@ mod tests {
             profile: BenchmarkProfile::Large,
             fixture_size_override: None,
             iterations: Some(1),
+            min_benchmark_iterations: 1,
             history_out: None,
             history_csv_out: None,
             guard_history: None,
+            guard_min_iterations: 1,
             max_dash_latency_regression_pct: None,
             scorecard_out: None,
             ann_tuning: AnnTuningConfig::default(),
             large_min_candidate_reduction_pct: min_reduction,
             large_max_dash_latency_ms: max_latency,
+            large_min_ann_recall_at_100: 0.95,
             xlarge_min_candidate_reduction_pct: 96.0,
             xlarge_max_dash_latency_ms: 250.0,
+            xlarge_min_ann_recall_at_100: 0.95,
+            xxlarge_min_candidate_reduction_pct: 97.0,
+            xxlarge_max_dash_latency_ms: 350.0,
+            xxlarge_min_ann_recall_at_100: 0.95,
+            large_plus_min_graph_score_coverage: 1.0,
+            large_plus_min_graph_support_path_count: 1,
+            large_plus_min_graph_contradiction_chain_depth: 2,
             min_segment_refresh_successes: 0,
             min_segment_cache_hits: 0,
+            require_vector_backend: None,
         }
     }
 
@@ -2741,9 +3782,19 @@ mod tests {
             metadata_prefilter_count: 0,
             ann_candidate_count: dash_candidates,
             final_scored_candidate_count: dash_candidates,
-            ann_recall: AnnRecallSummary::default(),
+            ann_recall: AnnRecallSummary {
+                recall_at_10: 1.0,
+                recall_at_100: 1.0,
+                curve: Vec::new(),
+            },
+            graph_reasoning: GraphReasoningBenchmarkSummary {
+                graph_score_coverage: 1.0,
+                max_support_path_count: 1,
+                max_contradiction_chain_depth: 2,
+            },
             index_stats: StoreIndexStats::default(),
             ann_tuning: AnnTuningConfig::default(),
+            vector_backend: VectorBackendRuntime::Cpu,
             segment_cache_probe: SegmentCacheProbeSummary::default(),
             wal_scale: None,
         }
@@ -2773,6 +3824,17 @@ mod tests {
     }
 
     #[test]
+    fn large_gate_rejects_low_ann_recall() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.large_min_ann_recall_at_100 = 0.99;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.ann_recall.recall_at_100 = 0.95;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("ANN recall@100"));
+    }
+
+    #[test]
     fn xlarge_gate_rejects_low_candidate_reduction() {
         let mut config = config_with_large_gates(90.0, 80.0);
         config.xlarge_min_candidate_reduction_pct = 98.0;
@@ -2799,6 +3861,96 @@ mod tests {
         let summary =
             summary_with_profile(BenchmarkProfile::XLarge, 100_000, 140.0, 100_000, 2_500);
         assert!(evaluate_profile_gates(&summary, &config).is_ok());
+    }
+
+    #[test]
+    fn xlarge_gate_rejects_low_ann_recall() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xlarge_min_ann_recall_at_100 = 0.99;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::XLarge, 100_000, 140.0, 100_000, 2_500);
+        summary.ann_recall.recall_at_100 = 0.95;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("ANN recall@100"));
+    }
+
+    #[test]
+    fn xxlarge_gate_rejects_low_candidate_reduction() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xxlarge_min_candidate_reduction_pct = 98.5;
+        let summary = summary_with_profile(
+            BenchmarkProfile::XXLarge,
+            1_000_000,
+            180.0,
+            1_000_000,
+            20_000,
+        );
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("xxlarge profile candidate reduction"));
+    }
+
+    #[test]
+    fn xxlarge_gate_rejects_high_dash_latency() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xxlarge_max_dash_latency_ms = 120.0;
+        let summary = summary_with_profile(
+            BenchmarkProfile::XXLarge,
+            1_000_000,
+            180.0,
+            1_000_000,
+            10_000,
+        );
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("xxlarge profile DASH avg latency"));
+    }
+
+    #[test]
+    fn xxlarge_gate_rejects_low_ann_recall() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.xxlarge_min_ann_recall_at_100 = 0.995;
+        let mut summary = summary_with_profile(
+            BenchmarkProfile::XXLarge,
+            1_000_000,
+            180.0,
+            1_000_000,
+            10_000,
+        );
+        summary.ann_recall.recall_at_100 = 0.99;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("xxlarge profile ANN recall@100"));
+    }
+
+    #[test]
+    fn large_plus_gate_rejects_low_graph_score_coverage() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.large_plus_min_graph_score_coverage = 1.0;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.graph_reasoning.graph_score_coverage = 0.9;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("graph score coverage"));
+    }
+
+    #[test]
+    fn large_plus_gate_rejects_low_support_path_count() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.large_plus_min_graph_support_path_count = 2;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.graph_reasoning.max_support_path_count = 1;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("support path count"));
+    }
+
+    #[test]
+    fn large_plus_gate_rejects_low_contradiction_chain_depth() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.large_plus_min_graph_contradiction_chain_depth = 3;
+        let mut summary =
+            summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        summary.graph_reasoning.max_contradiction_chain_depth = 2;
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("contradiction chain depth"));
     }
 
     #[test]
@@ -2835,9 +3987,43 @@ mod tests {
     }
 
     #[test]
+    fn gate_rejects_low_iteration_runs() {
+        let mut config = config_with_large_gates(90.0, 80.0);
+        config.min_benchmark_iterations = 10;
+        let summary = summary_with_profile(BenchmarkProfile::Large, 50_000, 40.0, 50_000, 2_000);
+        let err = evaluate_profile_gates(&summary, &config).expect_err("gate should fail");
+        assert!(err.contains("minimum reliability floor"));
+    }
+
+    #[test]
     fn f1_score_returns_expected_value() {
         let score = f1_score(4, 1, 1);
         assert!((score - 0.8).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parse_args_accepts_require_vector_backend_gpu() {
+        let config = parse_args(
+            ["--profile", "smoke", "--require-vector-backend", "gpu"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect("parse should succeed");
+        assert_eq!(
+            config.require_vector_backend,
+            Some(RequiredVectorBackend::Gpu)
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_require_vector_backend_value() {
+        let err = parse_args(
+            ["--profile", "smoke", "--require-vector-backend", "tpu"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .expect_err("parse should fail");
+        assert!(err.contains("require-vector-backend"));
     }
 
     #[test]
@@ -2889,10 +4075,37 @@ mod tests {
         let latest = read_latest_history_row(
             history_path.to_str().expect("utf-8 path"),
             BenchmarkProfile::Smoke,
+            1,
         )
         .expect("reader should succeed")
         .expect("row should exist");
         assert!((latest.eme_avg_ms - benchmark_summary.eme_latency).abs() < 0.0001);
+
+        std::fs::remove_dir_all(&root).expect("temp root should be removable");
+    }
+
+    #[test]
+    fn read_latest_history_row_skips_rows_below_min_iterations() {
+        let root = temp_dir_for("bench-history-min-iterations");
+        let history_path = root.join("benchmark-history.md");
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+
+        let low_iteration_row = "| 1771000000 | smoke | 2000 | 1 | claim-target | claim-target | true | true | 12.0000 | 100.0000 | 2000 | 140 | 0 | 100 | 140 | 1.0000 | 1.0000 | 10:1.0000 | 1 | 1 | 1 | 0 | 1.0000 | 0 | n/a | n/a | 0 | 0 | 0 | 0 | false | none |";
+        let reliable_row = "| 1771000001 | smoke | 2000 | 100 | claim-target | claim-target | true | true | 12.0000 | 9.0000 | 2000 | 140 | 0 | 100 | 140 | 1.0000 | 1.0000 | 10:1.0000 | 1 | 1 | 1 | 0 | 1.0000 | 0 | n/a | n/a | 0 | 0 | 0 | 0 | false | none |";
+        let initial = format!(
+            "{BENCHMARK_HISTORY_TITLE}\n\n{BENCHMARK_HISTORY_TABLE_HEADER}\n{BENCHMARK_HISTORY_TABLE_SEPARATOR}\n{low_iteration_row}\n{reliable_row}\n"
+        );
+        std::fs::write(&history_path, initial).expect("history fixture should be written");
+
+        let latest = read_latest_history_row(
+            history_path.to_str().expect("utf-8 path"),
+            BenchmarkProfile::Smoke,
+            10,
+        )
+        .expect("reader should succeed")
+        .expect("row should exist");
+        assert!((latest.eme_avg_ms - 9.0).abs() < 0.0001);
+        assert_eq!(latest.iterations, 100);
 
         std::fs::remove_dir_all(&root).expect("temp root should be removable");
     }

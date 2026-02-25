@@ -3,7 +3,14 @@ name = "store"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gpu-backend = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+
 [dependencies]
 schema = { path = "../schema" }
 ranking = { path = "../ranking" }
 graph = { path = "../graph" }
+bytemuck = { version = "1.18", optional = true, features = ["derive"] }
+pollster = { version = "0.3", optional = true }
+wgpu = { version = "0.19", optional = true }

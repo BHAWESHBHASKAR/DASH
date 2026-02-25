@@ -12,6 +12,7 @@ use std::{
 mod audit;
 mod authz;
 mod config;
+mod document_parser_debug;
 mod http;
 mod ingest_routes;
 mod json;
@@ -32,19 +33,24 @@ use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
 };
+use document_parser_debug::render_document_parser_debug_json;
 use http::{
     HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,
 };
-use metadata_router::{ReplicaRole, RoutedReplica, route_write_with_placement};
+use metadata_router::{
+    PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, route_write_with_placement,
+};
 use payload::{
-    build_ingest_batch_request_from_json, build_ingest_raw_request_from_json,
-    build_ingest_request_from_json, render_ingest_batch_response_json,
+    build_ingest_batch_request_from_json, build_ingest_document_request_from_json,
+    build_ingest_raw_request_from_json, build_ingest_request_from_json,
+    render_ingest_batch_response_json, render_ingest_document_response_json,
     render_ingest_raw_response_json, render_ingest_response_json,
 };
 use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
-    PlacementRoutingState, WriteRouteError, map_write_route_error, write_entity_key_for_claim,
+    PlacementRoutingState, WriteRouteError, WriteRouteResolution, map_write_route_error,
+    write_entity_key_for_claim,
 };
 use replication::{
     ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
@@ -54,16 +60,17 @@ use request::{parse_query_usize, parse_request_line, read_http_request, split_ta
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta, WalReplicationExport,
+    CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
+    WalReplicationExport, batch_commit_payload_fingerprint,
 };
 
 use crate::{
     IngestInput,
     api::{
         IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse,
-        IngestRawApiResponse,
+        IngestDocumentApiResponse, IngestRawApiResponse, WriteConsistencyPolicy,
     },
-    extraction::build_ingest_batch_from_raw_request,
+    extraction::{build_ingest_batch_from_document_request, build_ingest_raw_output_from_request},
     ingest_document, ingest_document_persistent_with_policy,
 };
 
@@ -125,6 +132,7 @@ pub struct IngestionRuntime {
     replication_resync_total: u64,
     replication_last_offset: usize,
     replication_last_error: Option<String>,
+    replication_commit_status: HashMap<String, ReplicationCommitStatus>,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
 }
@@ -134,6 +142,24 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicationCommitStatus {
+    commit_epoch: Option<u64>,
+    ack_count: usize,
+    required_acks: usize,
+    commit_status: String,
+    acknowledged_replicas: HashSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicationCommitStatusSnapshot {
+    commit_id: String,
+    commit_epoch: Option<u64>,
+    ack_count: usize,
+    required_acks: usize,
+    commit_status: String,
 }
 
 impl TransportBackpressureMetrics {
@@ -213,6 +239,7 @@ impl IngestionRuntime {
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
+            replication_commit_status: HashMap::new(),
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -274,6 +301,7 @@ impl IngestionRuntime {
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
+            replication_commit_status: HashMap::new(),
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -315,14 +343,25 @@ impl IngestionRuntime {
         self
     }
 
-    fn ensure_local_write_route_for_claim(&mut self, claim: &Claim) -> Result<(), WriteRouteError> {
+    fn ensure_local_write_route_for_claim(
+        &mut self,
+        claim: &Claim,
+        write_consistency: WriteConsistencyPolicy,
+    ) -> Result<WriteRouteResolution, WriteRouteError> {
         let Some(routing_state) = self
             .placement_routing
             .as_mut()
             .map_err(|reason| WriteRouteError::Config(reason.clone()))?
             .as_mut()
         else {
-            return Ok(());
+            let required_acks = write_consistency.required_acks(1);
+            return Ok(WriteRouteResolution {
+                shard_id: 0,
+                epoch: 0,
+                ack_count: required_acks,
+                required_acks,
+                total_replicas: 1,
+            });
         };
         routing_state.maybe_refresh();
         let routing = routing_state.runtime();
@@ -334,6 +373,35 @@ impl IngestionRuntime {
             &routing.placements,
         )
         .map_err(WriteRouteError::Placement)?;
+        let placement = routing
+            .placements
+            .iter()
+            .find(|placement| {
+                placement.tenant_id == claim.tenant_id && placement.shard_id == routed.shard_id
+            })
+            .ok_or_else(|| {
+                WriteRouteError::Placement(PlacementRouteError::PlacementNotFound {
+                    tenant_id: claim.tenant_id.clone(),
+                    shard_id: routed.shard_id,
+                })
+            })?;
+        let total_replicas = placement.replicas.len().max(1);
+        let required_acks = write_consistency.required_acks(total_replicas);
+        let healthy_replicas = placement
+            .replicas
+            .iter()
+            .filter(|replica| replica.health == ReplicaHealth::Healthy)
+            .count();
+        if healthy_replicas < required_acks {
+            return Err(WriteRouteError::ConsistencyUnavailable {
+                policy: write_consistency,
+                shard_id: routed.shard_id,
+                healthy_replicas,
+                required_replicas: required_acks,
+                total_replicas,
+                epoch: routed.epoch,
+            });
+        }
         let local_node_id = routing.local_node_id.clone();
         self.observe_write_route_resolution(&routed);
         if routed.node_id != local_node_id {
@@ -345,7 +413,13 @@ impl IngestionRuntime {
                 role: routed.role,
             });
         }
-        Ok(())
+        Ok(WriteRouteResolution {
+            shard_id: routed.shard_id,
+            epoch: routed.epoch,
+            ack_count: 1,
+            required_acks,
+            total_replicas,
+        })
     }
 
     fn ingest(&mut self, request: IngestApiRequest) -> Result<IngestApiResponse, StoreError> {
@@ -364,6 +438,10 @@ impl IngestionRuntime {
         Ok(IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
+            commit_epoch: None,
+            ack_count: 1,
+            required_acks: 1,
+            commit_status: "accepted".to_string(),
             checkpoint_triggered: checkpoint_stats.is_some(),
             checkpoint_snapshot_records: checkpoint_stats.as_ref().map(|s| s.snapshot_records),
             checkpoint_truncated_wal_records: checkpoint_stats
@@ -395,12 +473,12 @@ impl IngestionRuntime {
         }
 
         if let Some(existing) = self.store.batch_commit_metadata(&commit_id) {
-            if existing.batch_size != ingested_claim_ids.len()
-                || existing.claim_ids != ingested_claim_ids
-            {
+            let incoming_fingerprint =
+                batch_commit_payload_fingerprint(ingested_claim_ids.len(), &ingested_claim_ids);
+            if existing.payload_fingerprint != incoming_fingerprint {
                 return Err(StoreError::Conflict(format!(
-                    "batch commit_id '{}' already exists with different payload",
-                    commit_id
+                    "batch commit_id '{}' already exists with different payload (existing_fingerprint={}, incoming_fingerprint={})",
+                    commit_id, existing.payload_fingerprint, incoming_fingerprint
                 )));
             }
 
@@ -413,6 +491,10 @@ impl IngestionRuntime {
                 batch_size: ingested_claim_ids.len(),
                 ingested_claim_ids,
                 claims_total: self.store.claims_len(),
+                commit_epoch: None,
+                ack_count: 1,
+                required_acks: 1,
+                commit_status: "accepted".to_string(),
                 checkpoint_triggered: false,
                 checkpoint_snapshot_records: None,
                 checkpoint_truncated_wal_records: None,
@@ -483,6 +565,10 @@ impl IngestionRuntime {
             batch_size: ingested_claim_ids.len(),
             ingested_claim_ids,
             claims_total: self.store.claims_len(),
+            commit_epoch: None,
+            ack_count: 1,
+            required_acks: 1,
+            commit_status: "accepted".to_string(),
             checkpoint_triggered: checkpoint_stats.is_some(),
             checkpoint_snapshot_records: checkpoint_stats.as_ref().map(|s| s.snapshot_records),
             checkpoint_truncated_wal_records: checkpoint_stats
@@ -530,6 +616,92 @@ impl IngestionRuntime {
                 }
             }
         }
+    }
+
+    fn record_commit_status(
+        &mut self,
+        commit_id: &str,
+        commit_epoch: Option<u64>,
+        ack_count: usize,
+        required_acks: usize,
+    ) {
+        let required_acks = required_acks.max(1);
+        let ack_count = ack_count.max(1);
+        let mut acknowledged_replicas = HashSet::new();
+        if let Some(local_replica_id) = self.local_replica_ack_seed() {
+            acknowledged_replicas.insert(local_replica_id);
+        }
+        let commit_status = if ack_count >= required_acks {
+            "replication_quorum_met"
+        } else {
+            "replication_pending"
+        };
+        self.replication_commit_status.insert(
+            commit_id.to_string(),
+            ReplicationCommitStatus {
+                commit_epoch,
+                ack_count,
+                required_acks,
+                commit_status: commit_status.to_string(),
+                acknowledged_replicas,
+            },
+        );
+    }
+
+    fn local_replica_ack_seed(&self) -> Option<String> {
+        self.placement_routing
+            .as_ref()
+            .ok()
+            .and_then(|state| state.as_ref())
+            .map(|state| state.runtime().local_node_id.clone())
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn replication_commit_status_snapshot(
+        &self,
+        commit_id: &str,
+    ) -> Option<ReplicationCommitStatusSnapshot> {
+        let status = self.replication_commit_status.get(commit_id)?;
+        Some(ReplicationCommitStatusSnapshot {
+            commit_id: commit_id.to_string(),
+            commit_epoch: status.commit_epoch,
+            ack_count: status.ack_count,
+            required_acks: status.required_acks,
+            commit_status: status.commit_status.clone(),
+        })
+    }
+
+    fn apply_replication_ack(
+        &mut self,
+        commit_id: &str,
+        replica_id: &str,
+        ack_epoch: Option<u64>,
+    ) -> Result<ReplicationCommitStatusSnapshot, String> {
+        let status = self
+            .replication_commit_status
+            .get_mut(commit_id)
+            .ok_or_else(|| format!("unknown commit_id '{}'", commit_id))?;
+        if status
+            .acknowledged_replicas
+            .insert(replica_id.trim().to_string())
+        {
+            status.ack_count = status.ack_count.saturating_add(1);
+        }
+        if let Some(epoch) = ack_epoch {
+            status.commit_epoch = Some(status.commit_epoch.unwrap_or(epoch).max(epoch));
+        }
+        if status.ack_count >= status.required_acks {
+            status.commit_status = "replication_quorum_met".to_string();
+        } else {
+            status.commit_status = "replication_pending".to_string();
+        }
+        Ok(ReplicationCommitStatusSnapshot {
+            commit_id: commit_id.to_string(),
+            commit_epoch: status.commit_epoch,
+            ack_count: status.ack_count,
+            required_acks: status.required_acks,
+            commit_status: status.commit_status.clone(),
+        })
     }
 
     fn observe_failure(&mut self) {

@@ -116,8 +116,7 @@ pub(super) fn authorize_request_for_tenant(
             if !scope.allows(tenant_id) {
                 return AuthDecision::Forbidden("tenant is not allowed for this API key");
             }
-        } else if !policy.required_api_keys.is_empty()
-            && !policy.required_api_keys.contains(api_key)
+        } else if policy.required_api_keys.is_empty() || !policy.required_api_keys.contains(api_key)
         {
             return AuthDecision::Unauthorized("missing or invalid API key");
         }

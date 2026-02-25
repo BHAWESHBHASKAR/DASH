@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 async-transport = ["dep:axum", "dep:tokio"]
+model-extraction-adapter = []
 
 [dependencies]
 auth = { path = "../../pkg/auth" }
