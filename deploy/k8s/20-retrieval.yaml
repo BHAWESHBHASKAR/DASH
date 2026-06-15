@@ -1,0 +1,169 @@
+---
+# Retrieval service: serves the OpenAI-compatible /v1/embeddings API
+# and forwards/coordinates reads. A StatefulSet is used (despite the
+# workload being called "deployment" in the design notes) because the
+# per-pod redb store requires a per-pod RWO PVC, and a Deployment with
+# two replicas sharing a RWO volume cannot be scheduled.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dash-retrieval
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: retrieval
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dash-retrieval
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: retrieval
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: retrieval
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+    appProtocol: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dash-retrieval
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: retrieval
+spec:
+  serviceName: dash-retrieval
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: retrieval
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: dash
+        app.kubernetes.io/name: dash
+        app.kubernetes.io/component: retrieval
+    spec:
+      serviceAccountName: dash-retrieval
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: dash
+                  app.kubernetes.io/component: retrieval
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: retrieval
+        image: ghcr.io/bhaweshbhaskar/dash/retrieval:0.2.0
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/dash/bin/dash-entrypoint"]
+        args: ["--serve"]
+        env:
+        - name: DASH_BIN
+          value: "retrieval"
+        - name: DASH_HEALTHCHECK_URL
+          value: "http://127.0.0.1:8080/v1/health"
+        envFrom:
+        - configMapRef:
+            name: dash-config
+        - secretRef:
+            name: dash-retrieval-secrets
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+            ephemeral-storage: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+            ephemeral-storage: 512Mi
+        startupProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 30
+        livenessProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          privileged: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/dash
+        - name: tmp
+          mountPath: /tmp
+        - name: home
+          mountPath: /opt/dash
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Mi
+      - name: home
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Mi
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app.kubernetes.io/part-of: dash
+        app.kubernetes.io/component: retrieval
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard
+      resources:
+        requests:
+          storage: 10Gi

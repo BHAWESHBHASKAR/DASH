@@ -1,0 +1,157 @@
+{{- /*
+Retrieval workload. Renders Service + StatefulSet. The StatefulSet
+(vs Deployment) is required because redb persistence is per-pod
+RWO; a Deployment with a shared RWO PVC cannot schedule >1 replica.
+*/ -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dash.componentName" (list . "retrieval") }}
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: retrieval
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "dash.retrievalSelectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: {{ .Values.service.ports.http }}
+    targetPort: http
+    protocol: TCP
+    appProtocol: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "dash.componentName" (list . "retrieval") }}
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: retrieval
+spec:
+  serviceName: {{ include "dash.componentName" (list . "retrieval") }}
+  replicas: {{ .Values.replicas.retrieval }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "dash.retrievalSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dash.retrievalSelectorLabels" . | nindent 8 }}
+      {{- with .Values.podLabels }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "dash.retrievalServiceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- include "dash.imagePullSecrets" . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+      - name: retrieval
+        image: {{ include "dash.retrievalImage" . | quote }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/opt/dash/bin/dash-entrypoint"]
+        args: ["--serve"]
+        env:
+        - name: DASH_BIN
+          value: "retrieval"
+        - name: DASH_HEALTHCHECK_URL
+          value: "http://127.0.0.1:8080{{ .Values.probes.liveness.path }}"
+        envFrom:
+        - configMapRef:
+            name: {{ include "dash.fullname" . }}-config
+        - secretRef:
+            name: {{ include "dash.fullname" . }}-retrieval-secrets
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        resources:
+          {{- $r := merge (deepCopy .Values.resources) (default (dict) .Values.resources.retrieval) }}
+          {{- $req := dig "requests" (dict) $r }}
+          {{- $lim := dig "limits" (dict) $r }}
+          requests:
+            {{- toYaml $req | nindent 12 }}
+          limits:
+            {{- toYaml $lim | nindent 12 }}
+        startupProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.startup.path }}"]
+          initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+          periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+          timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+        livenessProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.liveness.path }}"]
+          periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          successThreshold: 1
+          failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+        readinessProbe:
+          exec:
+            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.readiness.path }}"]
+          periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          successThreshold: 1
+          failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+        securityContext:
+          {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+        volumeMounts:
+        - name: data
+          mountPath: {{ .Values.config.persistencePath }}
+        - name: tmp
+          mountPath: /tmp
+        - name: home
+          mountPath: /opt/dash
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Mi
+      - name: home
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Mi
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app.kubernetes.io/part-of: dash
+        app.kubernetes.io/component: retrieval
+    spec:
+      accessModes:
+        {{- toYaml .Values.persistence.accessModes | nindent 8 }}
+      {{- if .Values.persistence.storageClassName }}
+      storageClassName: {{ .Values.persistence.storageClassName | quote }}
+      {{- end }}
+      resources:
+        requests:
+          storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

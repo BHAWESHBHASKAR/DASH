@@ -1,0 +1,30 @@
+apiVersion: v2
+name: dash
+version: 0.1.0
+appVersion: "0.2.0"
+type: application
+description: |
+  DASH - Declarative Augmented-memory for State and History. A vector
+  store with an OpenAI-compatible /v1/embeddings surface, supporting
+  ingestion of vectors, claims, and evidence, and retrieval with
+  multi-tenant isolation.
+home: https://github.com/bhaweshbhaskar/dash
+sources:
+  - https://github.com/bhaweshbhaskar/dash
+icon: https://raw.githubusercontent.com/bhaweshbhaskar/dash/main/docs/assets/dash-icon.png
+keywords:
+  - vector-database
+  - embeddings
+  - retrieval-augmented-generation
+  - rag
+  - rust
+  - redb
+  - openai-compatible
+maintainers:
+  - name: Bhawesh Bhaskar
+    email: bhawesh@example.com
+    url: https://github.com/bhaweshbhaskar
+kubeVersion: ">=1.25.0-0"
+annotations:
+  category: Database
+  licenses: Apache-2.0

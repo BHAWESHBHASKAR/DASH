@@ -1,0 +1,313 @@
+# Default values for the DASH Helm chart.
+# This is a YAML-formatted file. Override individual values with
+# `helm install ... --set key=value` or via a custom values.yaml:
+#   helm install dash ./deploy/helm/dash -f my-values.yaml
+#
+# Full reference is generated from this file by `helm-docs` if
+# available, and is mirrored in README.md.
+
+# -----------------------------------------------------------------------------
+# Image / registry
+# -----------------------------------------------------------------------------
+image:
+  # Registry shared by both services. Override per service if you
+  # need to mirror to a private registry.
+  registry: ghcr.io
+  repository: bhaweshbhaskar/dash
+  # Tag is intentionally pinned to chart appVersion; bump together.
+  tag: "0.2.0"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+  # Per-service image overrides (rarely needed; default derives from
+  # image.registry / image.repository).
+  retrieval:
+    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/retrieval"
+    tag: ""         # empty -> image.tag
+  ingestion:
+    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/ingestion"
+    tag: ""         # empty -> image.tag
+
+# -----------------------------------------------------------------------------
+# Names
+# -----------------------------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# -----------------------------------------------------------------------------
+# Namespace handling. The chart does NOT create the namespace by
+# default - `helm install --create-namespace` is the recommended
+# path on production clusters (it preserves any pre-existing RBAC,
+# NetworkPolicies, or labels in the namespace). Set
+# `namespace.create: true` to let the chart render the Namespace
+# resource.
+# -----------------------------------------------------------------------------
+namespace:
+  name: dash-system
+  create: false
+
+# -----------------------------------------------------------------------------
+# Replica counts (also drive the HPA lower bound)
+# -----------------------------------------------------------------------------
+replicas:
+  retrieval: 2
+  ingestion: 2
+
+# -----------------------------------------------------------------------------
+# Common image-pull / runtime labels
+# -----------------------------------------------------------------------------
+podLabels: {}
+podAnnotations: {}
+
+# -----------------------------------------------------------------------------
+# ServiceAccounts
+# -----------------------------------------------------------------------------
+serviceAccount:
+  # When true, a ServiceAccount is created for each component with
+  # automountServiceAccountToken=false (PSP / PSS-friendly).
+  create: true
+  # Annotations applied to each created ServiceAccount (e.g. for
+  # IRSA on EKS, Workload Identity on GKE).
+  annotations: {}
+  # Name overrides; empty -> "<fullname>-<component>".
+  retrieval:
+    name: ""
+  ingestion:
+    name: ""
+
+# -----------------------------------------------------------------------------
+# Runtime configuration (DASH_*_PERSISTENCE_PATH, embedding provider, etc.)
+# Inlined as a ConfigMap and consumed via envFrom. All keys are
+# optional; remove a key to fall back to the binary's built-in default.
+# -----------------------------------------------------------------------------
+config:
+  logLevel: info
+  embeddingProvider: hash   # one of: hash | openai | ollama
+  persistencePath: /var/lib/dash
+  wal:
+    ingestSyncEveryRecords: 1
+    ingestAppendBufferRecords: 1
+    ingestAsyncFlushIntervalMs: 250
+    ingestBackgroundFlushOnly: false
+    ingestSyncIntervalMs: 1000
+  segment:
+    ingestMaintenanceIntervalMs: 0   # 0 = disabled; standalone daemon
+  http:
+    ingestWorkers: 8
+    ingestQueueCapacity: 512
+    ingestTransportRuntime: std
+    retrievalWorkers: 8
+    retrievalTransportRuntime: std
+  bind:
+    ingestion: "0.0.0.0:8081"
+    retrieval: "0.0.0.0:8080"
+  checkpoint:
+    maxWalRecords: 50000
+    maxWalBytes: 52428800
+
+# -----------------------------------------------------------------------------
+# Secrets. Values marked `null` MUST be supplied at install time via
+# `--set secret.openaiApiKey=...` (or a sealed/external secret).
+# -----------------------------------------------------------------------------
+secret:
+  # JWT public key (PEM). Used to verify RS256/ES256 tokens. Leave
+  # null if you only use HS256 with the hs256Secret fields below.
+  jwtPublicKey: null
+  openaiApiKey: null
+  ollamaBaseUrl: "http://ollama.ollama.svc.cluster.local:11434"
+  retrieval:
+    apiKey: null
+    hs256Secret: null
+  ingestion:
+    apiKey: null
+    hs256Secret: null
+  # If true, render an *empty* Secret scaffold (key names only). The
+  # operator is then expected to populate it out-of-band. Useful when
+  # integrating with External Secrets / Vault Agent sidecars.
+  create: true
+
+# -----------------------------------------------------------------------------
+# Persistent storage (redb). Per-pod PVCs are created via
+# StatefulSet volumeClaimTemplates, so each replica gets its own
+# RWO volume.
+# -----------------------------------------------------------------------------
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClassName: ""        # empty -> cluster default
+  accessModes:
+    - ReadWriteOnce
+
+# -----------------------------------------------------------------------------
+# Workload resources. CPU/Memory are applied to BOTH services unless
+# overridden under `.resources.retrieval` / `.resources.ingestion`.
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+    ephemeralStorage: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+    ephemeralStorage: 512Mi
+  retrieval: {}
+  ingestion: {}
+
+# -----------------------------------------------------------------------------
+# Workload identity / scheduling
+# -----------------------------------------------------------------------------
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: dash
+nodeSelector: {}
+tolerations: []
+
+# -----------------------------------------------------------------------------
+# Probes. Defaults match the raw manifests. The probe URL is /v1/health
+# by convention; override only if you've added a route prefix.
+# -----------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /v1/health
+    initialDelaySeconds: 0
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /v1/health
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startup:
+    path: /v1/health
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30
+
+# -----------------------------------------------------------------------------
+# Service
+# -----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  ports:
+    http: 80
+  # If you change `service.ports.http`, you must also update
+  # ingress.rules[].http.paths[].backend.service.port.number.
+
+# -----------------------------------------------------------------------------
+# Ingress (retrieval only)
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-rps-burst: "200"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: dash.example.com
+      paths:
+        - path: /v1
+          pathType: Prefix
+        - path: /health
+          pathType: Exact
+  tls:
+    - hosts:
+        - dash.example.com
+      secretName: dash-retrieval-tls
+
+# -----------------------------------------------------------------------------
+# NetworkPolicy
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # CIDRs that are considered "in-cluster" and excluded from the
+  # external egress rule. Override for clusters with non-RFC1918
+  # pod/service CIDRs.
+  internalCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  externalEgressPorts:
+    - port: 443
+      protocol: TCP
+    - port: 11434
+      protocol: TCP
+  ingressNamespace: ingress-nginx
+  ingressPodSelector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+
+# -----------------------------------------------------------------------------
+# PodDisruptionBudget
+# -----------------------------------------------------------------------------
+pdb:
+  enabled: true
+  minAvailable: 1
+  # Alternative: maxUnavailable: 1
+  maxUnavailable: null
+
+# -----------------------------------------------------------------------------
+# HorizontalPodAutoscaler
+# -----------------------------------------------------------------------------
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+
+# -----------------------------------------------------------------------------
+# Security context. Charts shipped as-is satisfy the Kubernetes
+# "restricted" pod security standard.
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+
+# -----------------------------------------------------------------------------
+# Termination
+# -----------------------------------------------------------------------------
+terminationGracePeriodSeconds: 30

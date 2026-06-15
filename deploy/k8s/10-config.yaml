@@ -1,0 +1,51 @@
+---
+# Non-sensitive runtime configuration shared by both DASH services.
+# Everything that is not a secret lives here. Secret material lives in
+# 11-secrets.yaml. Values can be overridden per environment with
+# `kubectl create configmap ... --from-literal=...` or via Kustomize
+# patches.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dash-config
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: config
+data:
+  # ----- shared tunables (consumed by ingestion AND retrieval) -----
+  DASH_LOG_LEVEL: "info"
+  DASH_EMBEDDING_PROVIDER: "hash"
+  # When set, the binary uses this as the redb persistence root.
+  # The PVC is mounted at this path, so keep the two in sync.
+  DASH_RETRIEVAL_PERSISTENCE_PATH: "/var/lib/dash"
+  DASH_INGESTION_PERSISTENCE_PATH: "/var/lib/dash"
+  # HTTP worker / queue knobs (mirror docker-compose defaults).
+  DASH_INGEST_HTTP_WORKERS: "8"
+  DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
+  DASH_INGEST_TRANSPORT_RUNTIME: "std"
+  DASH_RETRIEVAL_HTTP_WORKERS: "8"
+  DASH_RETRIEVAL_TRANSPORT_RUNTIME: "std"
+  # WAL durability knobs honored by both services.
+  DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
+  DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
+  DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
+  DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
+  DASH_INGEST_WAL_SYNC_INTERVAL_MS: "1000"
+  # WAL file paths inside the persisted volume. Distinct filenames so
+  # the two services can share a single PVC namespace cleanly.
+  DASH_INGEST_WAL_PATH: "/var/lib/dash/wal/ingestion.wal"
+  DASH_RETRIEVAL_WAL_PATH: "/var/lib/dash/wal/retrieval.wal"
+  DASH_INGEST_SEGMENT_DIR: "/var/lib/dash/segments/ingestion"
+  DASH_RETRIEVAL_SEGMENT_DIR: "/var/lib/dash/segments/retrieval"
+  # Segment maintenance is driven by the ingestion service when this
+  # interval is non-zero. Disabled (0) by default; the standalone
+  # segment-maintenance-daemon is not shipped in this chart.
+  DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
+  # Checkpoint thresholds.
+  DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
+  DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
+  # Bind addresses. 0.0.0.0 inside the pod; the Service fronts the port.
+  DASH_INGEST_BIND: "0.0.0.0:8081"
+  DASH_RETRIEVAL_BIND: "0.0.0.0:8080"

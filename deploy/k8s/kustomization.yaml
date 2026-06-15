@@ -1,0 +1,36 @@
+---
+# Kustomize entry point for the raw manifests.
+#
+# Apply with:
+#   kubectl apply -k deploy/k8s
+#
+# This sets a common owner label, pins every resource to the
+# dash-system namespace, and pulls the ordered list of files in the
+# sequence required by Kubernetes admission (Namespace first, then
+# ConfigMap/Secrets, then workloads, then network/ingress policies,
+# then autoscaling).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dash-system
+# `labels:` is the Kustomize 5+ replacement for the deprecated
+# `commonLabels:` key. `includeSelectors: true` propagates the
+# labels into matchLabels/selector fields automatically.
+labels:
+- includeSelectors: true
+  pairs:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/managed-by: kustomize
+resources:
+  - 00-namespace.yaml
+  - 10-config.yaml
+  - 11-secrets.yaml
+  - 20-retrieval.yaml
+  - 30-ingestion.yaml
+  - 40-ingress.yaml
+  - 50-networkpolicy.yaml
+  - 60-pdb.yaml
+  - 70-hpa.yaml
+# Apply the namespace manifest first so subsequent resources can
+# reference it; this is implicit on `kustomize build` but explicit
+# here to make the intent visible in code review.
+components: []

@@ -1,0 +1,78 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dash.fullname" . }}-config
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+data:
+  # ----- shared tunables -----
+  DASH_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  DASH_EMBEDDING_PROVIDER: {{ .Values.config.embeddingProvider | quote }}
+  DASH_RETRIEVAL_PERSISTENCE_PATH: {{ .Values.config.persistencePath | quote }}
+  DASH_INGESTION_PERSISTENCE_PATH: {{ .Values.config.persistencePath | quote }}
+
+  # ----- HTTP / transport -----
+  DASH_INGEST_HTTP_WORKERS: {{ .Values.config.http.ingestWorkers | quote }}
+  DASH_INGEST_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.ingestQueueCapacity | quote }}
+  DASH_INGEST_TRANSPORT_RUNTIME: {{ .Values.config.http.ingestTransportRuntime | quote }}
+  DASH_RETRIEVAL_HTTP_WORKERS: {{ .Values.config.http.retrievalWorkers | quote }}
+  DASH_RETRIEVAL_TRANSPORT_RUNTIME: {{ .Values.config.http.retrievalTransportRuntime | quote }}
+
+  # ----- WAL durability -----
+  DASH_INGEST_WAL_SYNC_EVERY_RECORDS: {{ .Values.config.wal.ingestSyncEveryRecords | quote }}
+  DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: {{ .Values.config.wal.ingestAppendBufferRecords | quote }}
+  DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: {{ .Values.config.wal.ingestAsyncFlushIntervalMs | quote }}
+  DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: {{ .Values.config.wal.ingestBackgroundFlushOnly | quote }}
+  DASH_INGEST_WAL_SYNC_INTERVAL_MS: {{ .Values.config.wal.ingestSyncIntervalMs | quote }}
+
+  # ----- Filesystem layout (WAL + segments) -----
+  DASH_INGEST_WAL_PATH: {{ printf "%s/wal/ingestion.wal" .Values.config.persistencePath | quote }}
+  DASH_RETRIEVAL_WAL_PATH: {{ printf "%s/wal/retrieval.wal" .Values.config.persistencePath | quote }}
+  DASH_INGEST_SEGMENT_DIR: {{ printf "%s/segments/ingestion" .Values.config.persistencePath | quote }}
+  DASH_RETRIEVAL_SEGMENT_DIR: {{ printf "%s/segments/retrieval" .Values.config.persistencePath | quote }}
+  DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: {{ .Values.config.segment.ingestMaintenanceIntervalMs | quote }}
+
+  # ----- Checkpoint thresholds -----
+  DASH_CHECKPOINT_MAX_WAL_RECORDS: {{ .Values.config.checkpoint.maxWalRecords | quote }}
+  DASH_CHECKPOINT_MAX_WAL_BYTES: {{ .Values.config.checkpoint.maxWalBytes | quote }}
+
+  # ----- Bind addresses (inside the pod) -----
+  DASH_INGEST_BIND: {{ .Values.config.bind.ingestion | quote }}
+  DASH_RETRIEVAL_BIND: {{ .Values.config.bind.retrieval | quote }}
+{{- if .Values.secret.create }}
+---
+# Per-service Secret split: a compromised pod should only see the
+# keys it needs. Two Secrets keep blast radius small.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "dash.fullname" . }}-retrieval-secrets
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: retrieval
+type: Opaque
+stringData:
+  DASH_RETRIEVAL_JWT_PUBLIC_KEY: {{ .Values.secret.jwtPublicKey | default "change-me-jwt-public-key" | quote }}
+  DASH_RETRIEVAL_JWT_HS256_SECRET: {{ .Values.secret.retrieval.hs256Secret | default "change-me-retrieval-jwt" | quote }}
+  DASH_RETRIEVAL_API_KEY: {{ .Values.secret.retrieval.apiKey | default "change-me-retrieval-key" | quote }}
+  DASH_OPENAI_API_KEY: {{ .Values.secret.openaiApiKey | default "change-me-openai-api-key" | quote }}
+  DASH_OLLAMA_BASE_URL: {{ .Values.secret.ollamaBaseUrl | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "dash.fullname" . }}-ingestion-secrets
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+type: Opaque
+stringData:
+  DASH_INGESTION_JWT_PUBLIC_KEY: {{ .Values.secret.jwtPublicKey | default "change-me-jwt-public-key" | quote }}
+  DASH_INGESTION_JWT_HS256_SECRET: {{ .Values.secret.ingestion.hs256Secret | default "change-me-ingest-jwt" | quote }}
+  DASH_INGESTION_API_KEY: {{ .Values.secret.ingestion.apiKey | default "change-me-ingest-key" | quote }}
+{{- end }}

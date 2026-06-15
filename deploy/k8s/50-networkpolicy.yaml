@@ -1,0 +1,111 @@
+---
+# Defense-in-depth traffic rules for the dash-system namespace.
+#
+# Layers (evaluated additively):
+#   1. default-deny-all       - block everything by default.
+#   2. allow-dns              - kube-system DNS is required for service
+#                               resolution and pod startup.
+#   3. allow-retrieval-egress - retrieval -> ingestion:8081 and
+#                               retrieval -> external embedding
+#                               providers (OpenAI/Ollama).
+#   4. allow-ingestion-egress - ingestion needs DNS only; data plane
+#                               is inbound via service mesh / future
+#                               internal ingress.
+#   5. allow-nginx-ingress    - ingress controller -> retrieval:8080.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: dash-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: dash-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-retrieval-egress
+  namespace: dash-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: retrieval
+  policyTypes:
+  - Egress
+  egress:
+  # Internal: forward to ingestion for /v1/ingest (and any future
+  # in-cluster RPC).
+  - to:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: dash
+          app.kubernetes.io/component: ingestion
+    ports:
+    - port: 8081
+      protocol: TCP
+  # External: OpenAI (HTTPS) and self-hosted Ollama.
+  # The ipBlock excludes the in-cluster CIDRs so that traffic to
+  # pod IPs / services is still governed by the rule above.
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - port: 443
+      protocol: TCP
+    - port: 11434
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nginx-ingress
+  namespace: dash-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: retrieval
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - port: http
+      protocol: TCP
+    - port: http-alt
+      protocol: TCP

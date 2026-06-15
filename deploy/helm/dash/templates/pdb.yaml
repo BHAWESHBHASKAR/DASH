@@ -1,0 +1,38 @@
+{{- if .Values.pdb.enabled -}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dash.componentName" (list . "retrieval") }}
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: retrieval
+spec:
+  {{- if .Values.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dash.retrievalSelectorLabels" . | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dash.componentName" (list . "ingestion") }}
+  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  {{- if .Values.pdb.maxUnavailable }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- else }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+{{- end }}

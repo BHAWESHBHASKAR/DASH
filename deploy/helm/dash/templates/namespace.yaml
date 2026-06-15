@@ -1,0 +1,22 @@
+{{- /*
+Render the namespace only when the chart is responsible for creating
+it. Helm's `helm install --create-namespace` is the more common path
+on real clusters, so this defaults to false. Toggle via
+.namespace.create=true.
+*/ -}}
+{{- if .Values.namespace.create -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace.name | default "dash-system" }}
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    name: {{ .Values.namespace.name | default "dash-system" }}
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+{{- end }}
