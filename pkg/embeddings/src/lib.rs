@@ -17,7 +17,8 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -36,6 +37,8 @@ pub enum EmbeddingError {
     DimensionMismatch { expected: usize, actual: usize },
     #[error("timeout after {0} seconds")]
     Timeout(u64),
+    #[error("circuit breaker is open: {reason}")]
+    CircuitOpen { reason: String },
 }
 
 pub trait EmbeddingProvider: Send + Sync {
@@ -417,6 +420,177 @@ fn parse_status(headers: &str) -> Result<u16, EmbeddingError> {
         .map_err(|_| EmbeddingError::Parse(format!("invalid status code: {code}")))
 }
 
+// ---------------------------------------------------------------------------
+// Circuit breaker
+// ---------------------------------------------------------------------------
+//
+// `CircuitBreaker` and `CircuitBreakerProvider` wrap any `EmbeddingProvider`
+// and short-circuit calls when the provider has been failing repeatedly.
+//
+// State machine:
+//   Closed   -> on `failure_threshold` consecutive failures:  Open
+//   Open     -> after `reset_timeout` since the breaker opened: HalfOpen
+//   HalfOpen -> on successful probe:  Closed
+//   HalfOpen -> on failed probe:      Open (timer restarts)
+//
+// `Closed` is the steady state and lets every request through. `Open` rejects
+// every request immediately with `EmbeddingError::CircuitOpen`. `HalfOpen`
+// lets a single request through as a probe; if it succeeds, the breaker
+// closes; if it fails, the breaker reopens for another `reset_timeout`.
+//
+// This is opt-in: callers compose `CircuitBreakerProvider` around the inner
+// provider explicitly, so the default behavior of `OpenAIEmbeddingProvider`
+// and `OllamaEmbeddingProvider` is unchanged.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitState {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    failure_threshold: u32,
+    reset_timeout: Duration,
+    state: Mutex<CircuitStateInner>,
+}
+
+#[derive(Debug)]
+struct CircuitStateInner {
+    kind: CircuitState,
+    consecutive_failures: u32,
+    opened_at: Option<Instant>,
+}
+
+impl CircuitBreaker {
+    pub fn new(failure_threshold: u32, reset_timeout: Duration) -> Self {
+        let failure_threshold = failure_threshold.max(1);
+        Self {
+            failure_threshold,
+            reset_timeout,
+            state: Mutex::new(CircuitStateInner {
+                kind: CircuitState::Closed,
+                consecutive_failures: 0,
+                opened_at: None,
+            }),
+        }
+    }
+
+    pub fn state(&self) -> CircuitState {
+        let mut guard = self.state.lock().expect("circuit breaker mutex poisoned");
+        self.maybe_transition_to_half_open(&mut guard);
+        guard.kind
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.state
+            .lock()
+            .expect("circuit breaker mutex poisoned")
+            .consecutive_failures
+    }
+
+    /// Acquire a permit for one call. Returns `Ok(())` if the call is
+    /// allowed, or `Err(EmbeddingError::CircuitOpen { .. })` if the
+    /// breaker is open and the reset window has not elapsed.
+    pub fn try_acquire(&self) -> Result<(), EmbeddingError> {
+        let mut guard = self.state.lock().expect("circuit breaker mutex poisoned");
+        self.maybe_transition_to_half_open(&mut guard);
+        match guard.kind {
+            CircuitState::Closed => Ok(()),
+            CircuitState::HalfOpen => Ok(()),
+            CircuitState::Open => Err(EmbeddingError::CircuitOpen {
+                reason: format!(
+                    "breaker open after {} consecutive failures; reset in {:?}",
+                    guard.consecutive_failures, self.reset_timeout
+                ),
+            }),
+        }
+    }
+
+    pub fn record_success(&self) {
+        let mut guard = self.state.lock().expect("circuit breaker mutex poisoned");
+        guard.kind = CircuitState::Closed;
+        guard.consecutive_failures = 0;
+        guard.opened_at = None;
+    }
+
+    pub fn record_failure(&self) {
+        let mut guard = self.state.lock().expect("circuit breaker mutex poisoned");
+        guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+        let should_open = guard.kind == CircuitState::HalfOpen
+            || guard.consecutive_failures >= self.failure_threshold;
+        if should_open {
+            guard.kind = CircuitState::Open;
+            guard.opened_at = Some(Instant::now());
+        }
+    }
+
+    fn maybe_transition_to_half_open(&self, guard: &mut CircuitStateInner) {
+        if guard.kind != CircuitState::Open {
+            return;
+        }
+        if let Some(opened_at) = guard.opened_at
+            && opened_at.elapsed() >= self.reset_timeout
+        {
+            guard.kind = CircuitState::HalfOpen;
+        }
+    }
+}
+
+pub struct CircuitBreakerProvider<P: EmbeddingProvider> {
+    inner: P,
+    breaker: Arc<CircuitBreaker>,
+}
+
+impl<P: EmbeddingProvider> CircuitBreakerProvider<P> {
+    pub fn new(inner: P, breaker: Arc<CircuitBreaker>) -> Self {
+        Self { inner, breaker }
+    }
+
+    pub fn breaker(&self) -> Arc<CircuitBreaker> {
+        Arc::clone(&self.breaker)
+    }
+
+    pub fn inner(&self) -> &P {
+        &self.inner
+    }
+}
+
+impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.breaker.try_acquire()?;
+        match self.inner.embed(texts) {
+            Ok(v) => {
+                self.breaker.record_success();
+                Ok(v)
+            }
+            Err(e) => {
+                self.breaker.record_failure();
+                Err(e)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +741,205 @@ mod tests {
             Err(EmbeddingError::Timeout(_)) => {}
             other => panic!("expected Timeout error, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Circuit breaker tests
+    // -----------------------------------------------------------------
+
+    /// Counting provider used to drive the breaker through a known
+    /// sequence of successes and failures.
+    struct CountingProvider {
+        name: &'static str,
+        dims: usize,
+        outcomes: std::sync::Mutex<Vec<Result<Vec<Vec<f32>>, EmbeddingError>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingProvider {
+        fn new(name: &'static str, dims: usize, outcomes: Vec<Result<Vec<Vec<f32>>, EmbeddingError>>) -> Self {
+            Self {
+                name,
+                dims,
+                outcomes: std::sync::Mutex::new(outcomes),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl EmbeddingProvider for CountingProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut outcomes = self.outcomes.lock().expect("outcomes mutex poisoned");
+            if outcomes.is_empty() {
+                panic!("CountingProvider ran out of scripted outcomes");
+            }
+            outcomes.remove(0)
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_starts_closed() {
+        let breaker = CircuitBreaker::new(3, Duration::from_secs(30));
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.consecutive_failures(), 0);
+        breaker.try_acquire().expect("closed breaker allows calls");
+    }
+
+    #[test]
+    fn circuit_breaker_opens_after_threshold_failures() {
+        let breaker = CircuitBreaker::new(3, Duration::from_secs(30));
+        for _ in 0..3 {
+            breaker.record_failure();
+        }
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert_eq!(breaker.consecutive_failures(), 3);
+        let err = breaker.try_acquire().expect_err("open breaker rejects");
+        match err {
+            EmbeddingError::CircuitOpen { .. } => {}
+            other => panic!("expected CircuitOpen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_success_resets_failure_count() {
+        let breaker = CircuitBreaker::new(3, Duration::from_secs(30));
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.consecutive_failures(), 2);
+        breaker.record_success();
+        assert_eq!(breaker.consecutive_failures(), 0);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn circuit_breaker_transitions_to_half_open_after_timeout() {
+        let breaker = CircuitBreaker::new(2, Duration::from_millis(50));
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        std::thread::sleep(Duration::from_millis(70));
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        // Half-open allows a probe
+        breaker.try_acquire().expect("half-open allows probe");
+    }
+
+    #[test]
+    fn circuit_breaker_successful_probe_closes_breaker() {
+        let breaker = CircuitBreaker::new(2, Duration::from_millis(30));
+        breaker.record_failure();
+        breaker.record_failure();
+        std::thread::sleep(Duration::from_millis(40));
+        // State should be half-open now
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        breaker.record_success();
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn circuit_breaker_failed_probe_reopens_breaker() {
+        let breaker = CircuitBreaker::new(2, Duration::from_millis(30));
+        breaker.record_failure();
+        breaker.record_failure();
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        let err = breaker.try_acquire().expect_err("reopened breaker rejects");
+        assert!(matches!(err, EmbeddingError::CircuitOpen { .. }));
+    }
+
+    #[test]
+    fn circuit_breaker_provider_short_circuits_inner_provider() {
+        // Inner provider fails 3 times then would succeed; the breaker
+        // should trip after 2 failures and the inner provider should
+        // not be called for the third request.
+        let inner = CountingProvider::new(
+            "counting",
+            4,
+            vec![
+                Err(EmbeddingError::Io("first".to_string())),
+                Err(EmbeddingError::Io("second".to_string())),
+                Ok(vec![vec![1.0, 0.0, 0.0, 0.0]]),
+            ],
+        );
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_secs(30)));
+        let wrapped = CircuitBreakerProvider::new(inner, Arc::clone(&breaker));
+
+        let err1 = wrapped.embed(&["a".to_string()]).expect_err("first fails");
+        assert!(matches!(err1, EmbeddingError::Io(_)));
+        let err2 = wrapped.embed(&["b".to_string()]).expect_err("second fails");
+        assert!(matches!(err2, EmbeddingError::Io(_)));
+
+        // Now the breaker is open, the third call should be short-circuited
+        // and return CircuitOpen without consulting the inner provider.
+        let err3 = wrapped.embed(&["c".to_string()]).expect_err("third short-circuits");
+        match err3 {
+            EmbeddingError::CircuitOpen { .. } => {}
+            other => panic!("expected CircuitOpen, got {other:?}"),
+        }
+
+        // Inner provider should have been called exactly twice (the third
+        // call was short-circuited).
+        assert_eq!(wrapped.inner().calls(), 2);
+    }
+
+    #[test]
+    fn circuit_breaker_provider_recovers_via_probe() {
+        // Script: 2 failures, then 1 success, then 1 success.
+        let inner = CountingProvider::new(
+            "counting",
+            4,
+            vec![
+                Err(EmbeddingError::Io("a".to_string())),
+                Err(EmbeddingError::Io("b".to_string())),
+                Ok(vec![vec![1.0, 0.0, 0.0, 0.0]]),
+                Ok(vec![vec![0.0, 1.0, 0.0, 0.0]]),
+            ],
+        );
+        let breaker = Arc::new(CircuitBreaker::new(2, Duration::from_millis(30)));
+        let wrapped = CircuitBreakerProvider::new(inner, Arc::clone(&breaker));
+
+        let _ = wrapped.embed(&["a".to_string()]).expect_err("a fails");
+        let _ = wrapped.embed(&["b".to_string()]).expect_err("b fails");
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        // Wait for the reset window
+        std::thread::sleep(Duration::from_millis(40));
+        // Probe call: breaker is half-open, allows the call, inner succeeds,
+        // breaker closes.
+        let r = wrapped
+            .embed(&["c".to_string()])
+            .expect("probe succeeds");
+        assert_eq!(r, vec![vec![1.0, 0.0, 0.0, 0.0]]);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        // Next call should pass through and the inner provider should be
+        // called again (4 total invocations of the inner: 2 failed, 1 probe,
+        // 1 post-recovery).
+        let r2 = wrapped
+            .embed(&["d".to_string()])
+            .expect("post-recovery call succeeds");
+        assert_eq!(r2, vec![vec![0.0, 1.0, 0.0, 0.0]]);
+        assert_eq!(wrapped.inner().calls(), 4);
+    }
+
+    #[test]
+    fn circuit_breaker_dimensions_passthrough() {
+        let inner = HashEmbeddingProvider::new(96);
+        let breaker = Arc::new(CircuitBreaker::new(3, Duration::from_secs(30)));
+        let wrapped = CircuitBreakerProvider::new(inner, Arc::clone(&breaker));
+        assert_eq!(wrapped.dimensions(), 96);
+        assert_eq!(wrapped.name(), "hash");
     }
 }
