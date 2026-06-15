@@ -20,7 +20,10 @@ pub use disk::{DiskBackedStore, DiskStatus};
 
 mod wal;
 mod ann;
+mod metrics;
 pub use ann::AnnTuningConfig;
+pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
+pub(crate) use metrics::{VectorBackendPreference, VECTOR_BACKEND_ENV};
 pub(crate) use ann::{TenantAnnGraph, ScoredNode, ANN_GRAPH_LEVELS};
 
 #[derive(Default)]
@@ -96,58 +99,6 @@ impl From<std::io::Error> for StoreError {
 
 
 const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
-const VECTOR_BACKEND_ENV: &str = "DASH_VECTOR_BACKEND";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VectorBackendPreference {
-    Auto,
-    Cpu,
-    Gpu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VectorBackendRuntime {
-    #[default]
-    Cpu,
-    Gpu,
-    CpuFallbackFeatureDisabled,
-    CpuFallbackUnavailable,
-}
-
-impl VectorBackendRuntime {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Gpu => "gpu",
-            Self::CpuFallbackFeatureDisabled => "cpu (gpu-feature-disabled)",
-            Self::CpuFallbackUnavailable => "cpu (gpu-unavailable)",
-        }
-    }
-
-    pub fn is_gpu(self) -> bool {
-        matches!(self, Self::Gpu)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StoreLoadStats {
-    pub replay: WalReplayStats,
-    pub claims_loaded: usize,
-    pub evidence_loaded: usize,
-    pub edges_loaded: usize,
-    pub vectors_loaded: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub struct StoreIndexStats {
-    pub tenant_count: usize,
-    pub claim_count: usize,
-    pub vector_count: usize,
-    pub inverted_terms: usize,
-    pub entity_terms: usize,
-    pub temporal_buckets: usize,
-    pub ann_vector_buckets: usize,
-}
 
 #[derive(Default)]
 pub struct InMemoryStore {
