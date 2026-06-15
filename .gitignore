@@ -1,6 +1,10 @@
 # Rust build artifacts
 /target/
 
+# cargo-fuzz build artifacts (fuzz/ is its own workspace with its own Cargo.lock)
+/fuzz/target/
+/fuzz/Cargo.lock
+
 # Local collaboration / planning artifacts (not part of product)
 /.buddy/
 buddy.md
@@ -19,6 +23,9 @@ progress.md
 # Local helper scratch files
 fix_structs.py
 
+# Stray test markers
+.bash_test_marker.txt
+
 # Runtime local files
 *.wal
 *.wal.snapshot
@@ -29,4 +36,41 @@ fix_structs.py
 .env.*
 .DS_Store
 .localized
-.gitignore
+
+# ---------------------------------------------------------------------------
+# SDK build artifacts
+# ---------------------------------------------------------------------------
+
+# Python SDK (sdks/python/)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+sdks/python/dist/
+sdks/python/build/
+.venv/
+venv/
+.envrc
+
+# Go SDK (sdks/go/)
+# Go leaves no committed build artifacts (binaries are in $GOBIN).
+# Vendored deps and build cache are out-of-tree by default.
+
+# TypeScript SDK (sdks/typescript/)
+sdks/typescript/node_modules/
+sdks/typescript/dist/
+sdks/typescript/coverage/
+sdks/typescript/.tsbuild/
+*.tsbuildinfo
+.npm/
+.yarn/
+
+# WASM / R-extension artifacts (future use)
+*.wasm
+*.map
