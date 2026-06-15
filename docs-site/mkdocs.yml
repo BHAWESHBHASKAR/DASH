@@ -1,0 +1,101 @@
+site_name: DASH
+site_description: Production-grade vector database with claim, evidence, and contradiction tracking
+site_url: https://BHAWESHBHASKAR.github.io/DASH/
+repo_url: https://github.com/BHAWESHBHASKAR/DASH
+repo_name: BHAWESHBHASKAR/DASH
+edit_uri: edit/main/docs-site/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - tables
+  - footnotes
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Concepts:
+      - Overview: concepts/index.md
+      - Why DASH: concepts/why-dash.md
+      - Architecture: concepts/architecture.md
+      - Data model: concepts/data-model.md
+      - Multi-tenancy: concepts/multi-tenancy.md
+      - Persistence: concepts/persistence.md
+      - Security: concepts/security.md
+  - Guides:
+      - Overview: guides/index.md
+      - Ingest: guides/ingest.md
+      - Retrieve: guides/retrieve.md
+      - Embeddings: guides/embeddings.md
+      - SDKs: guides/sdks.md
+  - Operations:
+      - Overview: operations/index.md
+      - Deploy: operations/deploy.md
+      - Observability: operations/observability.md
+      - Scaling: operations/scaling.md
+      - Backup: operations/backup.md
+      - Security & audit: operations/security-audit.md
+  - Reference:
+      - Overview: reference/index.md
+      - HTTP API: reference/api.md
+      - Configuration: reference/configuration.md
+      - Benchmarks: reference/benchmarks.md
+      - Architecture decisions: reference/architecture-decisions.md
+  - About:
+      - Overview: about/index.md
+      - Changelog: about/changelog.md
+      - License: about/license.md
+      - Contributing: about/contributing.md
+      - Security: about/security.md
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/BHAWESHBHASKAR/DASH
+  analytics:
+    provider: google
+    property: !ENV GOOGLE_ANALYTICS_KEY
+
+copyright: Copyright &copy; 2026 DASH contributors. Distributed under the Apache License 2.0.
