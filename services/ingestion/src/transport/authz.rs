@@ -14,13 +14,14 @@ pub(super) enum AuthDecision {
     Forbidden(&'static str),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AuthPolicy {
     required_api_keys: HashSet<String>,
     revoked_api_keys: HashSet<String>,
     allowed_tenants: TenantScope,
     scoped_api_keys: HashMap<String, TenantScope>,
     jwt_validation: Option<JwtValidationConfig>,
+    rate_limiter: Option<TenantRateLimiter>,
+    revocation_list: Option<RevocationList>,
 }
 
 impl AuthPolicy {
@@ -57,6 +58,14 @@ impl AuthPolicy {
                 env_with_fallback("DASH_INGEST_JWT_LEEWAY_SECS", "EME_INGEST_JWT_LEEWAY_SECS"),
                 env_with_fallback("DASH_INGEST_JWT_REQUIRE_EXP", "EME_INGEST_JWT_REQUIRE_EXP"),
             ),
+            rate_limiter: TenantRateLimiter::from_env(
+                "DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS",
+                "DASH_INGEST_RATE_LIMIT_BURST",
+            ),
+            revocation_list: Some(RevocationList::from_env(
+                "DASH_INGEST_REVOKED_KEYS_PATH",
+                "EME_INGEST_REVOKED_KEYS_PATH",
+            )),
         }
     }
 }
@@ -102,8 +111,15 @@ pub(super) fn authorize_request_for_tenant(
     }
 
     let maybe_api_key = presented_api_key(request);
-    if let Some(api_key) = maybe_api_key
-        && policy.revoked_api_keys.contains(api_key)
+    if policy
+        .revoked_api_keys
+        .contains(maybe_api_key.unwrap_or(""))
+    {
+        return AuthDecision::Unauthorized("API key revoked");
+    }
+    if let Some(ref revocation_list) = policy.revocation_list
+        && let Some(key) = maybe_api_key
+        && revocation_list.is_revoked(key)
     {
         return AuthDecision::Unauthorized("API key revoked");
     }
@@ -128,6 +144,15 @@ pub(super) fn authorize_request_for_tenant(
 
     if !policy.allowed_tenants.allows(tenant_id) {
         return AuthDecision::Forbidden("tenant is not allowed by service policy");
+    }
+    if let Some(ref limiter) = policy.rate_limiter
+        && let Err((current, limit)) = limiter.check(tenant_id)
+    {
+        eprintln!(
+            "rate limit exceeded for tenant {}: {}/{} rps",
+            tenant_id, current, limit
+        );
+        return AuthDecision::Unauthorized("rate limit exceeded");
     }
     AuthDecision::Allowed
 }
@@ -317,4 +342,147 @@ fn parse_jwt_secrets_by_kid(raw: Option<&str>) -> HashMap<String, String> {
         out.insert(kid.to_string(), secret.to_string());
     }
     out
+}
+
+use std::sync::Mutex;
+
+#[derive(Debug)]
+pub(super) struct RevocationList {
+    #[allow(dead_code)]
+    inner: Mutex<HashSet<String>>,
+    #[allow(dead_code)]
+    path: Mutex<Option<std::path::PathBuf>>,
+}
+
+#[allow(dead_code)]
+impl RevocationList {
+    pub(super) fn from_env(primary_var: &str, fallback_var: &str) -> Self {
+        let primary = std::env::var(primary_var).ok();
+        let fallback = std::env::var(fallback_var).ok();
+        let path = primary.or(fallback);
+        let path_mutex = Mutex::new(path.clone().map(std::path::PathBuf::from));
+        let inner = Mutex::new(Self::load_from_path(path.as_deref()).unwrap_or_default());
+        Self {
+            inner,
+            path: path_mutex,
+        }
+    }
+
+    fn load_from_path(path: Option<&str>) -> Option<HashSet<String>> {
+        let path = path?;
+        let content = std::fs::read_to_string(path).ok()?;
+        let mut set = HashSet::new();
+        for line in content.lines() {
+            let key = line.trim();
+            if !key.is_empty() {
+                set.insert(key.to_string());
+            }
+        }
+        Some(set)
+    }
+
+    fn persist(&self) {
+        let path = self.path.lock().ok().and_then(|g| g.clone());
+        let Some(path) = path else { return };
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let keys: Vec<String> = guard.iter().cloned().collect();
+        drop(guard);
+        let content = keys.join("\n");
+        let _ = std::fs::write(&path, content);
+    }
+
+    pub(super) fn is_revoked(&self, key: &str) -> bool {
+        self.inner
+            .lock()
+            .ok()
+            .map(|g| g.contains(key))
+            .unwrap_or(false)
+    }
+
+    pub(super) fn revoke(&self, key: String) {
+        if self
+            .inner
+            .lock()
+            .ok()
+            .map(|mut g| g.insert(key))
+            .unwrap_or(false)
+        {
+            self.persist();
+        }
+    }
+
+    pub(super) fn revoke_many(&self, keys: &[String]) {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let mut changed = false;
+        for key in keys {
+            changed = guard.insert(key.clone()) || changed;
+        }
+        drop(guard);
+        if changed {
+            self.persist();
+        }
+    }
+}
+
+pub(super) struct TenantRateLimiter {
+    rps: usize,
+    burst: usize,
+    state: Mutex<HashMap<String, (usize, std::time::Instant)>>,
+}
+
+#[allow(dead_code)]
+impl TenantRateLimiter {
+    #[allow(dead_code)]
+    pub(super) fn new(rps: usize, burst: usize) -> Self {
+        Self {
+            rps: rps.max(1),
+            burst: burst.max(1),
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(super) fn from_env(rps_var: &str, burst_var: &str) -> Option<Self> {
+        let rps = std::env::var(rps_var)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(100);
+        let burst = std::env::var(burst_var)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(200);
+        Some(Self::new(rps, burst))
+    }
+
+    pub(super) fn check(&self, tenant_id: &str) -> Result<usize, (usize, usize)> {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return Err((0, self.rps)),
+        };
+        let now = std::time::Instant::now();
+        let entry = guard.entry(tenant_id.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1).as_secs() >= 1 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+        if entry.0 >= self.burst {
+            return Err((entry.0, self.rps));
+        }
+        entry.0 += 1;
+        Ok(entry.0)
+    }
+
+    pub(super) fn cleanup_stale(&self) {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let now = std::time::Instant::now();
+        guard.retain(|_, (_, instant)| now.duration_since(*instant).as_secs() < 300);
+    }
 }

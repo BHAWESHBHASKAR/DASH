@@ -32,7 +32,6 @@ fn main() {
     let bind_addr = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
         .unwrap_or_else(|| "127.0.0.1:8081".to_string());
     let http_workers = parse_http_workers();
-    let transport_runtime = parse_transport_runtime();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_INGEST_SEGMENT_DIR", "EME_INGEST_SEGMENT_DIR");
     let wal_sync_every_records = parse_env_with_fallback::<usize>(
@@ -171,6 +170,56 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // Opt-in: attach a `redb` persistence file if the env var
+        // is set. A failed open falls back to in-memory mode (the
+        // production-readiness property: a new dependency never
+        // makes the system less available than it was before the
+        // dependency existed).
+        if let Some(disk_path) = env_with_fallback(
+            "DASH_INGEST_PERSISTENCE_PATH",
+            "EME_INGEST_PERSISTENCE_PATH",
+        ) {
+            // `with_disk` always returns Ok(self) — on open failure
+            // the in-memory state is preserved and `disk_status` is
+            // set to `Unavailable`. We still inspect the result to
+            // log the reason. Wrap the move+rebind in a block so
+            // the borrow checker sees the reassignment.
+            store = match store.with_disk(&disk_path) {
+                Ok(updated) => {
+                    match updated.disk_status() {
+                        store::DiskStatus::Unavailable { reason } => {
+                            tracing::error!(
+                                disk_path = %disk_path,
+                                error = %reason,
+                                "ingestion redb open failed; falling back to in-memory mode"
+                            );
+                        }
+                        _ => {
+                            println!("ingestion persistence: disk={disk_path}");
+                        }
+                    }
+                    updated
+                }
+                Err(err) => {
+                    // Unreachable: `with_disk` always returns Ok.
+                    // Kept for defensive completeness. Reconstruct
+                    // a disk-less store with Unavailable status so
+                    // the rest of the function has a usable store.
+                    tracing::error!(
+                        disk_path = %disk_path,
+                        error = %err,
+                        "ingestion redb open failed; falling back to in-memory mode"
+                    );
+                    // We can't reconstruct the original (it was
+                    // moved into with_disk). In practice this is
+                    // unreachable; the caller code below uses
+                    // `store` which is now in an unknown state.
+                    // To make the borrow checker happy, we panic
+                    // — this branch is unreachable in practice.
+                    unreachable!("with_disk always returns Ok");
+                }
+            };
+        }
         println!(
             "ingestion startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
             load_stats.claims_loaded,
@@ -206,10 +255,6 @@ fn main() {
             println!("ingestion transport listening on http://{bind_addr}");
             println!("ingestion transport workers: {http_workers}");
             println!(
-                "ingestion transport runtime: {}",
-                transport_runtime.as_str()
-            );
-            println!(
                 "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
                 store.ann_tuning().max_neighbors_base,
                 store.ann_tuning().max_neighbors_upper,
@@ -232,33 +277,9 @@ fn main() {
             if let Some(summary) = runtime.placement_routing_summary() {
                 println!("ingestion placement routing: {summary}");
             }
-            match transport_runtime {
-                TransportRuntime::Std => {
-                    if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
-                        eprintln!("ingestion transport failed: {err}");
-                        std::process::exit(1);
-                    }
-                }
-                TransportRuntime::Axum => {
-                    #[cfg(feature = "async-transport")]
-                    {
-                        if let Err(err) = ingestion::transport_axum::serve_http_with_axum(
-                            runtime,
-                            &bind_addr,
-                            http_workers,
-                        ) {
-                            eprintln!("ingestion transport failed: {err}");
-                            std::process::exit(1);
-                        }
-                    }
-                    #[cfg(not(feature = "async-transport"))]
-                    {
-                        eprintln!(
-                            "ingestion transport runtime 'axum' requires build feature 'async-transport'"
-                        );
-                        std::process::exit(2);
-                    }
-                }
+            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
+                eprintln!("ingestion transport failed: {err}");
+                std::process::exit(1);
             }
         } else {
             match ingest_document_persistent_with_policy(&mut store, &mut wal, &policy, input) {
@@ -284,10 +305,6 @@ fn main() {
             println!("ingestion transport listening on http://{bind_addr}");
             println!("ingestion transport workers: {http_workers}");
             println!(
-                "ingestion transport runtime: {}",
-                transport_runtime.as_str()
-            );
-            println!(
                 "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
                 store.ann_tuning().max_neighbors_base,
                 store.ann_tuning().max_neighbors_upper,
@@ -310,33 +327,9 @@ fn main() {
             if let Some(summary) = runtime.placement_routing_summary() {
                 println!("ingestion placement routing: {summary}");
             }
-            match transport_runtime {
-                TransportRuntime::Std => {
-                    if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
-                        eprintln!("ingestion transport failed: {err}");
-                        std::process::exit(1);
-                    }
-                }
-                TransportRuntime::Axum => {
-                    #[cfg(feature = "async-transport")]
-                    {
-                        if let Err(err) = ingestion::transport_axum::serve_http_with_axum(
-                            runtime,
-                            &bind_addr,
-                            http_workers,
-                        ) {
-                            eprintln!("ingestion transport failed: {err}");
-                            std::process::exit(1);
-                        }
-                    }
-                    #[cfg(not(feature = "async-transport"))]
-                    {
-                        eprintln!(
-                            "ingestion transport runtime 'axum' requires build feature 'async-transport'"
-                        );
-                        std::process::exit(2);
-                    }
-                }
+            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
+                eprintln!("ingestion transport failed: {err}");
+                std::process::exit(1);
             }
         } else {
             let mut store = store;
@@ -574,32 +567,6 @@ fn default_http_workers() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().clamp(1, 32))
         .unwrap_or(4)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportRuntime {
-    Std,
-    Axum,
-}
-
-impl TransportRuntime {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Std => "std",
-            Self::Axum => "axum",
-        }
-    }
-}
-
-fn parse_transport_runtime() -> TransportRuntime {
-    let runtime_raw = env_with_fallback(
-        "DASH_INGEST_TRANSPORT_RUNTIME",
-        "EME_INGEST_TRANSPORT_RUNTIME",
-    );
-    match runtime_raw.as_deref() {
-        Some("axum") => TransportRuntime::Axum,
-        _ => TransportRuntime::Std,
-    }
 }
 
 #[cfg(test)]

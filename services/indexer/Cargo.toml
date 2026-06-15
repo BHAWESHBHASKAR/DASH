@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
 
 [[bin]]
 name = "segment-maintenance-daemon"

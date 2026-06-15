@@ -1,633 +1,125 @@
-use std::collections::HashMap;
-
-use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
-
 use crate::api::{
-    IngestApiRequest, IngestApiResponse, IngestBatchApiRequest, IngestBatchApiResponse,
-    IngestDocumentApiRequest, IngestDocumentApiResponse, IngestRawApiRequest, IngestRawApiResponse,
+    IngestApiRequest, IngestApiRequestWire, IngestApiResponse, IngestBatchApiRequest,
+    IngestBatchApiRequestWire, IngestBatchApiResponse, IngestDocumentApiRequest,
+    IngestDocumentApiResponse, IngestRawApiRequest, IngestRawApiResponse,
 };
 
-use super::json::{JsonValue, json_escape, parse_json};
-
 pub(super) fn build_ingest_request_from_json(body: &str) -> Result<IngestApiRequest, String> {
-    let value = parse_json(body)?;
-    if !matches!(value, JsonValue::Object(_)) {
-        return Err("request body must be a JSON object".to_string());
-    }
-    build_ingest_request_from_json_value(&value)
+    let wire: IngestApiRequestWire =
+        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    wire.into_runtime()
 }
 
 pub(super) fn build_ingest_batch_request_from_json(
     body: &str,
     max_items: usize,
 ) -> Result<IngestBatchApiRequest, String> {
-    let value = parse_json(body)?;
-    let object = match value {
-        JsonValue::Object(map) => map,
-        _ => return Err("request body must be a JSON object".to_string()),
-    };
-    let items = match object.get("items") {
-        Some(JsonValue::Array(items)) => items,
-        Some(_) => return Err("items must be an array".to_string()),
-        None => return Err("items is required".to_string()),
-    };
-    if items.is_empty() {
-        return Err("items must not be empty".to_string());
-    }
-    if items.len() > max_items {
-        return Err(format!(
-            "items length {} exceeds max batch size {}",
-            items.len(),
-            max_items
-        ));
-    }
-    let commit_id = parse_optional_string(object.get("commit_id"), "commit_id")?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    let mut parsed = Vec::with_capacity(items.len());
-    let mut expected_tenant: Option<String> = None;
-    for item in items {
-        let req = build_ingest_request_from_json_value(item)?;
-        if let Some(tenant_id) = expected_tenant.as_deref() {
-            if tenant_id != req.claim.tenant_id {
-                return Err("all batch items must share the same claim.tenant_id".to_string());
-            }
-        } else {
-            expected_tenant = Some(req.claim.tenant_id.clone());
-        }
-        parsed.push(req);
-    }
-
-    Ok(IngestBatchApiRequest {
-        commit_id,
-        items: parsed,
-    })
+    let wire: IngestBatchApiRequestWire =
+        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    wire.into_runtime(max_items)
 }
 
 pub(super) fn build_ingest_raw_request_from_json(
     body: &str,
 ) -> Result<IngestRawApiRequest, String> {
-    let value = parse_json(body)?;
-    let object = match value {
-        JsonValue::Object(map) => map,
-        _ => return Err("request body must be a JSON object".to_string()),
-    };
-
-    let claim_confidence = parse_optional_f32(object.get("claim_confidence"), "claim_confidence")?;
-    let source_quality = parse_optional_f32(object.get("source_quality"), "source_quality")?;
-    if claim_confidence.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
-        return Err("claim_confidence must be in [0, 1]".to_string());
-    }
-    if source_quality.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
-        return Err("source_quality must be in [0, 1]".to_string());
-    }
-    let min_sentence_chars =
-        parse_optional_usize(object.get("min_sentence_chars"), "min_sentence_chars")?;
-    let max_claims = parse_optional_usize(object.get("max_claims"), "max_claims")?;
-    if min_sentence_chars == Some(0) {
-        return Err("min_sentence_chars must be >= 1".to_string());
-    }
-    if max_claims == Some(0) {
-        return Err("max_claims must be >= 1".to_string());
-    }
-
-    Ok(IngestRawApiRequest {
-        tenant_id: require_string(&object, "tenant_id")?,
-        document_id: require_string(&object, "document_id")?,
-        source_id: require_string(&object, "source_id")?,
-        text: require_string(&object, "text")?,
-        extraction_model: parse_optional_string(
-            object.get("extraction_model"),
-            "extraction_model",
-        )?,
-        claim_confidence,
-        source_quality,
-        min_sentence_chars,
-        max_claims,
-        generate_embeddings: parse_optional_bool(
-            object.get("generate_embeddings"),
-            "generate_embeddings",
-        )?,
-        embedding_model: parse_optional_string(object.get("embedding_model"), "embedding_model")?
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-    })
+    let mut req: IngestRawApiRequest =
+        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    validate_raw_request_ranges(&mut req)?;
+    normalize_optional_string(&mut req.extraction_model);
+    normalize_optional_string(&mut req.embedding_model);
+    Ok(req)
 }
 
 pub(super) fn build_ingest_document_request_from_json(
     body: &str,
 ) -> Result<IngestDocumentApiRequest, String> {
-    let value = parse_json(body)?;
-    let object = match value {
-        JsonValue::Object(map) => map,
-        _ => return Err("request body must be a JSON object".to_string()),
-    };
-
-    let claim_confidence = parse_optional_f32(object.get("claim_confidence"), "claim_confidence")?;
-    let source_quality = parse_optional_f32(object.get("source_quality"), "source_quality")?;
-    if claim_confidence.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
-        return Err("claim_confidence must be in [0, 1]".to_string());
-    }
-    if source_quality.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
-        return Err("source_quality must be in [0, 1]".to_string());
-    }
-    let min_sentence_chars =
-        parse_optional_usize(object.get("min_sentence_chars"), "min_sentence_chars")?;
-    let max_claims = parse_optional_usize(object.get("max_claims"), "max_claims")?;
-    if min_sentence_chars == Some(0) {
-        return Err("min_sentence_chars must be >= 1".to_string());
-    }
-    if max_claims == Some(0) {
-        return Err("max_claims must be >= 1".to_string());
-    }
-
-    let text = parse_optional_string(object.get("text"), "text")?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let content_base64 = parse_optional_string(object.get("content_base64"), "content_base64")?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if text.is_none() && content_base64.is_none() {
-        return Err("either text or content_base64 is required".to_string());
-    }
-
-    Ok(IngestDocumentApiRequest {
-        tenant_id: require_string(&object, "tenant_id")?,
-        document_id: require_string(&object, "document_id")?,
-        source_id: require_string(&object, "source_id")?,
-        mime_type: require_string(&object, "mime_type")?,
-        text,
-        content_base64,
-        extraction_model: parse_optional_string(
-            object.get("extraction_model"),
-            "extraction_model",
-        )?,
-        claim_confidence,
-        source_quality,
-        min_sentence_chars,
-        max_claims,
-        generate_embeddings: parse_optional_bool(
-            object.get("generate_embeddings"),
-            "generate_embeddings",
-        )?,
-        embedding_model: parse_optional_string(object.get("embedding_model"), "embedding_model")?
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-    })
+    let mut req: IngestDocumentApiRequest =
+        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    validate_document_request_ranges(&mut req)?;
+    validate_document_request_content(&req)?;
+    normalize_optional_string(&mut req.extraction_model);
+    normalize_optional_string(&mut req.embedding_model);
+    Ok(req)
 }
 
 pub(super) fn render_ingest_response_json(resp: &IngestApiResponse) -> String {
-    let commit_epoch = resp
-        .commit_epoch
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_snapshot_records = resp
-        .checkpoint_snapshot_records
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_truncated_wal_records = resp
-        .checkpoint_truncated_wal_records
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    format!(
-        "{{\"ingested_claim_id\":\"{}\",\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
-        json_escape(&resp.ingested_claim_id),
-        resp.claims_total,
-        commit_epoch,
-        resp.ack_count,
-        resp.required_acks,
-        json_escape(&resp.commit_status),
-        resp.checkpoint_triggered,
-        checkpoint_snapshot_records,
-        checkpoint_truncated_wal_records
-    )
+    serde_json::to_string(resp).expect("IngestApiResponse is always serializable")
 }
 
 pub(super) fn render_ingest_batch_response_json(resp: &IngestBatchApiResponse) -> String {
-    let commit_epoch = resp
-        .commit_epoch
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_snapshot_records = resp
-        .checkpoint_snapshot_records
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_truncated_wal_records = resp
-        .checkpoint_truncated_wal_records
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let ingested_claim_ids = resp
-        .ingested_claim_ids
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"commit_id\":\"{}\",\"idempotent_replay\":{},\"batch_size\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
-        json_escape(&resp.commit_id),
-        resp.idempotent_replay,
-        resp.batch_size,
-        ingested_claim_ids,
-        resp.claims_total,
-        commit_epoch,
-        resp.ack_count,
-        resp.required_acks,
-        json_escape(&resp.commit_status),
-        resp.checkpoint_triggered,
-        checkpoint_snapshot_records,
-        checkpoint_truncated_wal_records
-    )
+    serde_json::to_string(resp).expect("IngestBatchApiResponse is always serializable")
 }
 
 pub(super) fn render_ingest_raw_response_json(resp: &IngestRawApiResponse) -> String {
-    let commit_epoch = resp
-        .commit_epoch
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_snapshot_records = resp
-        .checkpoint_snapshot_records
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_truncated_wal_records = resp
-        .checkpoint_truncated_wal_records
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let ingested_claim_ids = resp
-        .ingested_claim_ids
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    format!(
-        "{{\"document_id\":\"{}\",\"commit_id\":\"{}\",\"idempotent_replay\":{},\"extracted_count\":{},\"embedding_provider\":\"{}\",\"embeddings_generated\":{},\"embedding_dimensions\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
-        json_escape(&resp.document_id),
-        json_escape(&resp.commit_id),
-        resp.idempotent_replay,
-        resp.extracted_count,
-        json_escape(&resp.embedding_provider),
-        resp.embeddings_generated,
-        resp.embedding_dimensions
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-        ingested_claim_ids,
-        resp.claims_total,
-        commit_epoch,
-        resp.ack_count,
-        resp.required_acks,
-        json_escape(&resp.commit_status),
-        resp.checkpoint_triggered,
-        checkpoint_snapshot_records,
-        checkpoint_truncated_wal_records
-    )
+    serde_json::to_string(resp).expect("IngestRawApiResponse is always serializable")
 }
 
 pub(super) fn render_ingest_document_response_json(resp: &IngestDocumentApiResponse) -> String {
-    let commit_epoch = resp
-        .commit_epoch
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_snapshot_records = resp
-        .checkpoint_snapshot_records
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let checkpoint_truncated_wal_records = resp
-        .checkpoint_truncated_wal_records
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let ingested_claim_ids = resp
-        .ingested_claim_ids
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    format!(
-        "{{\"document_id\":\"{}\",\"mime_type\":\"{}\",\"parser_provider\":\"{}\",\"commit_id\":\"{}\",\"idempotent_replay\":{},\"extracted_count\":{},\"embedding_provider\":\"{}\",\"embeddings_generated\":{},\"embedding_dimensions\":{},\"ingested_claim_ids\":[{}],\"claims_total\":{},\"commit_epoch\":{},\"ack_count\":{},\"required_acks\":{},\"commit_status\":\"{}\",\"checkpoint_triggered\":{},\"checkpoint_snapshot_records\":{},\"checkpoint_truncated_wal_records\":{}}}",
-        json_escape(&resp.document_id),
-        json_escape(&resp.mime_type),
-        json_escape(&resp.parser_provider),
-        json_escape(&resp.commit_id),
-        resp.idempotent_replay,
-        resp.extracted_count,
-        json_escape(&resp.embedding_provider),
-        resp.embeddings_generated,
-        resp.embedding_dimensions
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-        ingested_claim_ids,
-        resp.claims_total,
-        commit_epoch,
-        resp.ack_count,
-        resp.required_acks,
-        json_escape(&resp.commit_status),
-        resp.checkpoint_triggered,
-        checkpoint_snapshot_records,
-        checkpoint_truncated_wal_records
-    )
+    serde_json::to_string(resp).expect("IngestDocumentApiResponse is always serializable")
 }
 
-fn build_ingest_request_from_json_value(value: &JsonValue) -> Result<IngestApiRequest, String> {
-    let object = match value {
-        JsonValue::Object(map) => map,
-        _ => return Err("ingest item must be a JSON object".to_string()),
-    };
-
-    let claim_obj = require_object(object, "claim")?;
-    let claim = Claim {
-        claim_id: require_string(&claim_obj, "claim_id")?,
-        tenant_id: require_string(&claim_obj, "tenant_id")?,
-        canonical_text: require_string(&claim_obj, "canonical_text")?,
-        confidence: parse_f32(
-            match claim_obj.get("confidence") {
-                Some(JsonValue::Number(raw)) => raw,
-                _ => return Err("claim.confidence must be a number".to_string()),
-            },
-            "claim.confidence",
-        )?,
-        event_time_unix: parse_optional_i64(
-            claim_obj.get("event_time_unix"),
-            "claim.event_time_unix",
-        )?,
-        entities: parse_optional_string_array(claim_obj.get("entities"), "claim.entities")?,
-        embedding_ids: parse_optional_string_array(
-            claim_obj.get("embedding_ids"),
-            "claim.embedding_ids",
-        )?,
-        claim_type: parse_optional_claim_type(claim_obj.get("claim_type"), "claim.claim_type")?,
-        valid_from: parse_optional_i64(claim_obj.get("valid_from"), "claim.valid_from")?,
-        valid_to: parse_optional_i64(claim_obj.get("valid_to"), "claim.valid_to")?,
-        created_at: parse_optional_i64(claim_obj.get("created_at"), "claim.created_at")?,
-        updated_at: parse_optional_i64(claim_obj.get("updated_at"), "claim.updated_at")?,
-    };
-
-    let evidence = match object.get("evidence") {
-        Some(JsonValue::Array(items)) => parse_evidence_array(items)?,
-        Some(_) => return Err("evidence must be an array".to_string()),
-        None => Vec::new(),
-    };
-    let edges = match object.get("edges") {
-        Some(JsonValue::Array(items)) => parse_edges_array(items)?,
-        Some(_) => return Err("edges must be an array".to_string()),
-        None => Vec::new(),
-    };
-
-    Ok(IngestApiRequest {
-        claim,
-        claim_embedding: parse_optional_f32_array(
-            claim_obj.get("embedding_vector"),
-            "claim.embedding_vector",
-        )?,
-        evidence,
-        edges,
-    })
+fn validate_raw_request_ranges(req: &mut IngestRawApiRequest) -> Result<(), String> {
+    if let Some(value) = req.claim_confidence
+        && !(0.0..=1.0).contains(&value)
+    {
+        return Err("claim_confidence must be in [0, 1]".to_string());
+    }
+    if let Some(value) = req.source_quality
+        && !(0.0..=1.0).contains(&value)
+    {
+        return Err("source_quality must be in [0, 1]".to_string());
+    }
+    if req.min_sentence_chars == Some(0) {
+        return Err("min_sentence_chars must be >= 1".to_string());
+    }
+    if req.max_claims == Some(0) {
+        return Err("max_claims must be >= 1".to_string());
+    }
+    Ok(())
 }
 
-fn parse_optional_f32_array(
-    value: Option<&JsonValue>,
-    field: &str,
-) -> Result<Option<Vec<f32>>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                let raw = match item {
-                    JsonValue::Number(raw) => raw,
-                    _ => return Err(format!("{field} must be an array of numbers")),
-                };
-                let parsed = parse_f32(raw, field)?;
-                if !parsed.is_finite() {
-                    return Err(format!("{field} values must be finite numbers"));
-                }
-                out.push(parsed);
-            }
-            if out.is_empty() {
-                return Err(format!("{field} must not be empty when provided"));
-            }
-            Ok(Some(out))
+fn validate_document_request_ranges(req: &mut IngestDocumentApiRequest) -> Result<(), String> {
+    if let Some(value) = req.claim_confidence
+        && !(0.0..=1.0).contains(&value)
+    {
+        return Err("claim_confidence must be in [0, 1]".to_string());
+    }
+    if let Some(value) = req.source_quality
+        && !(0.0..=1.0).contains(&value)
+    {
+        return Err("source_quality must be in [0, 1]".to_string());
+    }
+    if req.min_sentence_chars == Some(0) {
+        return Err("min_sentence_chars must be >= 1".to_string());
+    }
+    if req.max_claims == Some(0) {
+        return Err("max_claims must be >= 1".to_string());
+    }
+    Ok(())
+}
+
+fn validate_document_request_content(req: &IngestDocumentApiRequest) -> Result<(), String> {
+    let text = req
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let content = req
+        .content_base64
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if text.is_none() && content.is_none() {
+        return Err("either text or content_base64 is required".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_optional_string(field: &mut Option<String>) {
+    if let Some(value) = field.as_mut() {
+        *value = value.trim().to_string();
+        if value.is_empty() {
+            *field = None;
         }
-        Some(_) => Err(format!("{field} must be an array or null")),
-    }
-}
-
-fn parse_evidence_array(items: &[JsonValue]) -> Result<Vec<Evidence>, String> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let obj = match item {
-            JsonValue::Object(map) => map,
-            _ => return Err("evidence items must be objects".to_string()),
-        };
-        let stance = match require_string(obj, "stance")?.as_str() {
-            "supports" => Stance::Supports,
-            "contradicts" => Stance::Contradicts,
-            "neutral" => Stance::Neutral,
-            _ => {
-                return Err("evidence.stance must be supports, contradicts, or neutral".to_string());
-            }
-        };
-
-        out.push(Evidence {
-            evidence_id: require_string(obj, "evidence_id")?,
-            claim_id: require_string(obj, "claim_id")?,
-            source_id: require_string(obj, "source_id")?,
-            stance,
-            source_quality: parse_f32(
-                match obj.get("source_quality") {
-                    Some(JsonValue::Number(raw)) => raw,
-                    _ => return Err("evidence.source_quality must be a number".to_string()),
-                },
-                "evidence.source_quality",
-            )?,
-            chunk_id: parse_optional_string(obj.get("chunk_id"), "evidence.chunk_id")?,
-            span_start: parse_optional_u32(obj.get("span_start"), "evidence.span_start")?,
-            span_end: parse_optional_u32(obj.get("span_end"), "evidence.span_end")?,
-            doc_id: parse_optional_string(obj.get("doc_id"), "evidence.doc_id")?,
-            extraction_model: parse_optional_string(
-                obj.get("extraction_model"),
-                "evidence.extraction_model",
-            )?,
-            ingested_at: None,
-        });
-    }
-    Ok(out)
-}
-
-fn parse_edges_array(items: &[JsonValue]) -> Result<Vec<ClaimEdge>, String> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        let obj = match item {
-            JsonValue::Object(map) => map,
-            _ => return Err("edges items must be objects".to_string()),
-        };
-        let relation = match require_string(obj, "relation")?.as_str() {
-            "supports" => Relation::Supports,
-            "contradicts" => Relation::Contradicts,
-            "refines" => Relation::Refines,
-            "duplicates" => Relation::Duplicates,
-            "depends_on" => Relation::DependsOn,
-            _ => {
-                return Err(
-                    "edge.relation must be supports, contradicts, refines, duplicates, or depends_on"
-                        .to_string(),
-                );
-            }
-        };
-
-        out.push(ClaimEdge {
-            edge_id: require_string(obj, "edge_id")?,
-            from_claim_id: require_string(obj, "from_claim_id")?,
-            to_claim_id: require_string(obj, "to_claim_id")?,
-            relation,
-            strength: parse_f32(
-                match obj.get("strength") {
-                    Some(JsonValue::Number(raw)) => raw,
-                    _ => return Err("edge.strength must be a number".to_string()),
-                },
-                "edge.strength",
-            )?,
-            reason_codes: parse_optional_string_array(
-                obj.get("reason_codes"),
-                "edge.reason_codes",
-            )?,
-            created_at: None,
-        });
-    }
-    Ok(out)
-}
-
-fn require_object(
-    map: &HashMap<String, JsonValue>,
-    key: &str,
-) -> Result<HashMap<String, JsonValue>, String> {
-    match map.get(key) {
-        Some(JsonValue::Object(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("{key} must be an object")),
-        None => Err(format!("{key} is required")),
-    }
-}
-
-fn require_string(map: &HashMap<String, JsonValue>, key: &str) -> Result<String, String> {
-    match map.get(key) {
-        Some(JsonValue::String(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("{key} must be a string")),
-        None => Err(format!("{key} is required")),
-    }
-}
-
-fn parse_f32(raw: &str, field_name: &str) -> Result<f32, String> {
-    raw.parse::<f32>()
-        .map_err(|_| format!("{field_name} must be a valid number"))
-}
-
-fn parse_optional_i64(value: Option<&JsonValue>, field_name: &str) -> Result<Option<i64>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<i64>()
-            .map(Some)
-            .map_err(|_| format!("{field_name} must be an i64 timestamp")),
-        _ => Err(format!("{field_name} must be an i64 timestamp or null")),
-    }
-}
-
-fn parse_optional_usize(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<usize>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<usize>()
-            .map(Some)
-            .map_err(|_| format!("{field_name} must be an integer")),
-        _ => Err(format!("{field_name} must be an integer or null")),
-    }
-}
-
-fn parse_optional_u32(value: Option<&JsonValue>, field_name: &str) -> Result<Option<u32>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| format!("{field_name} must be a u32 offset or null")),
-        _ => Err(format!("{field_name} must be a u32 offset or null")),
-    }
-}
-
-fn parse_optional_f32(value: Option<&JsonValue>, field_name: &str) -> Result<Option<f32>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<f32>()
-            .map(Some)
-            .map_err(|_| format!("{field_name} must be a valid number")),
-        _ => Err(format!("{field_name} must be a number or null")),
-    }
-}
-
-fn parse_optional_bool(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<bool>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::Bool(raw)) => Ok(Some(*raw)),
-        _ => Err(format!("{field_name} must be a boolean or null")),
-    }
-}
-
-fn parse_optional_string(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<String>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(None),
-        Some(JsonValue::String(raw)) => Ok(Some(raw.clone())),
-        _ => Err(format!("{field_name} must be a string or null")),
-    }
-}
-
-fn parse_optional_string_array(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Vec<String>, String> {
-    match value {
-        None | Some(JsonValue::Null) => Ok(Vec::new()),
-        Some(JsonValue::Array(items)) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    JsonValue::String(value) => out.push(value.clone()),
-                    _ => return Err(format!("{field_name} items must be strings")),
-                }
-            }
-            Ok(out)
-        }
-        _ => Err(format!("{field_name} must be an array of strings or null")),
-    }
-}
-
-fn parse_optional_claim_type(
-    value: Option<&JsonValue>,
-    field_name: &str,
-) -> Result<Option<ClaimType>, String> {
-    let raw = match value {
-        None | Some(JsonValue::Null) => return Ok(None),
-        Some(JsonValue::String(raw)) => raw.trim().to_ascii_lowercase(),
-        _ => return Err(format!("{field_name} must be a string or null")),
-    };
-
-    match raw.as_str() {
-        "factual" => Ok(Some(ClaimType::Factual)),
-        "opinion" => Ok(Some(ClaimType::Opinion)),
-        "prediction" => Ok(Some(ClaimType::Prediction)),
-        "temporal" => Ok(Some(ClaimType::Temporal)),
-        "causal" => Ok(Some(ClaimType::Causal)),
-        _ => Err(format!(
-            "{field_name} must be one of: factual, opinion, prediction, temporal, causal"
-        )),
     }
 }

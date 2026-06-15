@@ -8,11 +8,9 @@ use std::{
 };
 
 use auth::sha256_hex;
+use serde_json::{Value, json};
 
-use super::{
-    SharedRuntime,
-    json::{JsonValue, json_escape, parse_json},
-};
+use super::SharedRuntime;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AuditEvent<'a> {
@@ -99,17 +97,20 @@ fn render_chained_audit_payload(
     let prev_hash = state.last_hash.as_str();
     let canonical = canonical_audit_payload(seq, timestamp_ms, event, prev_hash);
     let hash = sha256_hex(canonical.as_bytes());
-    let payload = format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"ingestion\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":{},\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\",\"hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        optional_json_string(event.claim_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-        hash,
-    );
+    let payload = json!({
+        "seq": seq,
+        "ts_unix_ms": timestamp_ms,
+        "service": "ingestion",
+        "action": event.action,
+        "tenant_id": event.tenant_id,
+        "claim_id": event.claim_id,
+        "status": event.status,
+        "outcome": event.outcome,
+        "reason": event.reason,
+        "prev_hash": prev_hash,
+        "hash": hash,
+    })
+    .to_string();
     (
         payload,
         AuditChainState {
@@ -125,22 +126,19 @@ fn canonical_audit_payload(
     event: &AuditEvent<'_>,
     prev_hash: &str,
 ) -> String {
-    format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"ingestion\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":{},\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        optional_json_string(event.claim_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-    )
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value
-        .map(|raw| format!("\"{}\"", json_escape(raw)))
-        .unwrap_or_else(|| "null".to_string())
+    json!({
+        "seq": seq,
+        "ts_unix_ms": timestamp_ms,
+        "service": "ingestion",
+        "action": event.action,
+        "tenant_id": event.tenant_id,
+        "claim_id": event.claim_id,
+        "status": event.status,
+        "outcome": event.outcome,
+        "reason": event.reason,
+        "prev_hash": prev_hash,
+    })
+    .to_string()
 }
 
 fn audit_chain_states() -> &'static Mutex<HashMap<String, AuditChainState>> {
@@ -192,9 +190,9 @@ fn load_audit_chain_state(path: &str) -> Result<AuditChainState, String> {
 }
 
 fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainState>, String> {
-    let value = parse_json(line)?;
+    let value: Value = serde_json::from_str(line).map_err(|err| err.to_string())?;
     let object = match value {
-        JsonValue::Object(object) => object,
+        Value::Object(object) => object,
         _ => return Ok(None),
     };
 
@@ -204,13 +202,13 @@ fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainStat
         return Ok(None);
     }
     let seq = match seq_value {
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<u64>()
-            .map_err(|_| "audit seq must be u64".to_string())?,
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| "audit seq must be u64".to_string())?,
         _ => return Err("audit seq is missing or invalid".to_string()),
     };
     let hash = match hash_value {
-        Some(JsonValue::String(raw)) if is_sha256_hex(raw) => raw.clone(),
+        Some(Value::String(raw)) if is_sha256_hex(raw) => raw.clone(),
         _ => return Err("audit hash is missing or invalid".to_string()),
     };
 
@@ -219,6 +217,10 @@ fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainStat
         last_hash: hash,
     }))
 }
+
+// `JsonValue` and `parse_json` are re-exported from `json_compat` for the
+// test suite, which historically inspected audit log entries with the
+// hand-rolled JSON helpers (now backed by `serde_json`).
 
 pub(super) fn is_sha256_hex(raw: &str) -> bool {
     raw.len() == 64 && raw.chars().all(|ch| ch.is_ascii_hexdigit())

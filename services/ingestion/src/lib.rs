@@ -1,8 +1,6 @@
 pub mod api;
 pub mod extraction;
 pub mod transport;
-#[cfg(feature = "async-transport")]
-pub mod transport_axum;
 
 use schema::{Claim, ClaimEdge, Evidence};
 use store::{CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalCheckpointStats};
