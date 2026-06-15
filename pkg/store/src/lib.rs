@@ -1,6 +1,6 @@
 use std::{
-
     collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
 };
 
 #[cfg(feature = "gpu-backend")]
@@ -102,7 +102,16 @@ impl From<std::io::Error> for StoreError {
 
 const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
+/// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
+/// deep redb copy). This is the redb PR 2 fix: cloning a store no
+/// longer silently drops the disk handle. Before this change, a
+/// manual `Clone` impl was required because `redb::Database` is not
+/// `Clone`; the impl set `disk: None` and `disk_status: Unavailable`
+/// on the clone, which caused disk writes to be silently lost on any
+/// code path that cloned the store. With `Arc<DiskBackedStore>`,
+/// the cloned store shares the same redb handle and writes to either
+/// are visible to both.
 pub struct InMemoryStore {
     claims: HashMap<String, Claim>,
     evidence_by_claim: HashMap<String, Vec<Evidence>>,
@@ -120,41 +129,8 @@ pub struct InMemoryStore {
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
     wal: Vec<WalEvent>,
-    disk: Option<disk::DiskBackedStore>,
+    disk: Option<Arc<disk::DiskBackedStore>>,
     disk_status: disk::DiskStatus,
-}
-
-impl Clone for InMemoryStore {
-    /// Manual `Clone` impl: the in-memory maps are cloned, but the
-    /// disk handle is dropped (a `redb::Database` is not `Clone`).
-    /// This matches the existing staging pattern: the staged copy
-    /// is a "what-if" snapshot that may be discarded. The caller
-    /// can re-attach the disk with `with_disk` if it needs the
-    /// clone to mirror writes to disk.
-    fn clone(&self) -> Self {
-        Self {
-            claims: self.claims.clone(),
-            evidence_by_claim: self.evidence_by_claim.clone(),
-            edges_by_claim: self.edges_by_claim.clone(),
-            claim_vectors: self.claim_vectors.clone(),
-            ann_vector_graphs: self.ann_vector_graphs.clone(),
-            tenant_vector_dims: self.tenant_vector_dims.clone(),
-            tenant_claim_ids: self.tenant_claim_ids.clone(),
-            inverted_index: self.inverted_index.clone(),
-            entity_index: self.entity_index.clone(),
-            embedding_index: self.embedding_index.clone(),
-            temporal_index: self.temporal_index.clone(),
-            batch_commits: self.batch_commits.clone(),
-            claim_tokens: self.claim_tokens.clone(),
-            ann_tuning: self.ann_tuning.clone(),
-            vector_backend_runtime: self.vector_backend_runtime,
-            wal: self.wal.clone(),
-            disk: None,
-            disk_status: disk::DiskStatus::Unavailable {
-                reason: "store cloned; disk not transferred".to_string(),
-            },
-        }
-    }
 }
 
 impl InMemoryStore {
@@ -203,7 +179,7 @@ impl InMemoryStore {
     pub fn with_disk(self, path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         match disk::DiskBackedStore::new(path) {
             Ok(disk) => Ok(Self {
-                disk: Some(disk),
+                disk: Some(Arc::new(disk)),
                 disk_status: disk::DiskStatus::Available,
                 ..self
             }),
@@ -269,7 +245,7 @@ impl InMemoryStore {
         // 1. Open the disk. If the open fails, fall back to the
         //    WAL-only path.
         let disk = match disk::DiskBackedStore::new(disk_path) {
-            Ok(disk) => Some(disk),
+            Ok(disk) => Some(Arc::new(disk)),
             Err(reason) => {
                 let mut store = Self::new_with_ann_tuning(ann_tuning);
                 let stats = replay_into(&mut store, wal)?;
@@ -285,10 +261,20 @@ impl InMemoryStore {
             disk_status: disk::DiskStatus::Recovering,
             ..Self::new_with_ann_tuning(ann_tuning)
         };
-        // Take the disk out so we can hold a borrow on the store
-        // across the bulk-load call. The disk is restored after the
-        // WAL tail replay, when we're done mutating the store.
-        let disk = store.disk.take().expect("disk was just attached");
+        // Arc::clone the disk handle so we can hold a borrow on the
+        // store across the bulk-load call. The Arc refcount is bumped
+        // to 2 (the store holds one, the local `disk` binding holds
+        // the other), and dropped when the binding goes out of scope
+        // at the end of this function. This replaces the pre-PR-2
+        // pattern of `take()` + restore, which was only needed when
+        // the disk was an owned `DiskBackedStore` (not Clone-able
+        // because it wraps a `redb::Database`).
+        let disk = Arc::clone(
+            store
+                .disk
+                .as_ref()
+                .expect("disk was just attached"),
+        );
         let claims_loaded = disk
             .bulk_load_claims_into(&mut store)
             .map_err(|e| format!("disk bulk load: {e}"))?;
@@ -299,8 +285,6 @@ impl InMemoryStore {
         // path will be overwritten in `claims_loaded` by the WAL
         // tail counter, so we explicitly prefer the bulk count).
         stats.claims_loaded = claims_loaded;
-        // Restore the disk on the store.
-        store.disk = Some(disk);
         store.disk_status = disk::DiskStatus::Available;
         Ok((store, stats))
     }

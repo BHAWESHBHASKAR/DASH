@@ -170,15 +170,24 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        // Opt-in: attach a `redb` persistence file if the env var
-        // is set. A failed open falls back to in-memory mode (the
-        // production-readiness property: a new dependency never
-        // makes the system less available than it was before the
-        // dependency existed).
-        if let Some(disk_path) = env_with_fallback(
+        // Default-on disk persistence (redb PR 2). The
+        // `DASH_INGEST_PERSISTENCE_PATH` env var overrides the path;
+        // setting `DASH_INGEST_PERSISTENCE_DISABLE=1` reverts to the
+        // pre-PR-2 in-memory-only mode. A failed open (e.g. read-only
+        // filesystem on the default path) falls back to in-memory mode
+        // and is logged at error level — the system stays available.
+        let disk_disabled = env_with_fallback(
+            "DASH_INGEST_PERSISTENCE_DISABLE",
+            "EME_INGEST_PERSISTENCE_DISABLE",
+        )
+        .as_deref()
+        == Some("1");
+        let disk_path = env_with_fallback(
             "DASH_INGEST_PERSISTENCE_PATH",
             "EME_INGEST_PERSISTENCE_PATH",
-        ) {
+        )
+        .unwrap_or_else(|| "./data/dash-ingestion.redb".to_string());
+        if !disk_disabled {
             // `with_disk` always returns Ok(self) — on open failure
             // the in-memory state is preserved and `disk_status` is
             // set to `Unavailable`. We still inspect the result to

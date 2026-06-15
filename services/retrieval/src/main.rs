@@ -39,12 +39,21 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
-        // Opt-in: attach a `redb` persistence file if the env var
-        // is set. A failed open falls back to in-memory mode.
-        if let Some(disk_path) = env_with_fallback(
+        // Default-on disk persistence (redb PR 2). Override via
+        // `DASH_RETRIEVAL_PERSISTENCE_PATH`, disable via
+        // `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`.
+        let disk_disabled = env_with_fallback(
+            "DASH_RETRIEVAL_PERSISTENCE_DISABLE",
+            "EME_RETRIEVAL_PERSISTENCE_DISABLE",
+        )
+        .as_deref()
+        == Some("1");
+        let disk_path = env_with_fallback(
             "DASH_RETRIEVAL_PERSISTENCE_PATH",
             "EME_RETRIEVAL_PERSISTENCE_PATH",
-        ) {
+        )
+        .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
+        if !disk_disabled {
             // `with_disk` always returns Ok(self); on open failure
             // the in-memory state is preserved and `disk_status` is
             // set to `Unavailable`. We inspect the result to log.
