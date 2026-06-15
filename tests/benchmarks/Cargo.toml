@@ -7,6 +7,18 @@ edition = "2024"
 name = "perf_bench"
 path = "src/perf_bench.rs"
 
+[[bin]]
+name = "mem_profile"
+path = "src/bin/mem_profile.rs"
+
+[[bin]]
+name = "load_test"
+path = "src/bin/load_test.rs"
+
+[[bench]]
+name = "criterion_benches"
+harness = false
+
 [dependencies]
 ranking = { path = "../../pkg/ranking" }
 schema = { path = "../../pkg/schema" }
@@ -18,3 +30,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+criterion = { workspace = true }
+dhat = { workspace = true }
+hdrhistogram = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
+
+[dev-dependencies]
+criterion = { workspace = true }

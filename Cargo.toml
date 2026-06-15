@@ -40,4 +40,33 @@ rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 usearch = { version = "2", default-features = false }
+
+# Benchmarking + profiling
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support", "html_reports"] }
+dhat = "0.3"
+hdrhistogram = "7"
 parking_lot = "0.12"
+
+# Release profile: speed-first for the binaries, size-aware
+# for the libraries. LTO is enabled because the services link
+# against both the store and the schema crates, and LTO can inline
+# across crate boundaries (the inlining is 5-10% on the retrieve
+# hot path). codegen-units=1 enables that cross-crate inlining.
+# For benchmarks we set the same flags so the numbers reflect
+# production builds.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+# Stable Rust does not have PGO; the PGO build script overrides
+# these via RUSTFLAGS. PGO gains are documented in docs/operations/pgo.md.
+
+# The benchmark suite benefits from a slightly more aggressive
+# LTO setting; the binaries are short-lived and the codegen cost
+# is amortized across hundreds of measurements.
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

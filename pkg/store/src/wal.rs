@@ -16,7 +16,7 @@
 //! etc.) that the rest of the crate consumes via re-exports from
 //! `lib.rs`.
 
-use std::fs::{create_dir_all, rename, File, OpenOptions};
+use std::fs::{create_dir_all, rename, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";

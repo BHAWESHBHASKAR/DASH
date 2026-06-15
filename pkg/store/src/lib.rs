@@ -9,10 +9,9 @@ use std::sync::OnceLock;
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, ClaimType, Evidence, Relation, RetrievalRequest,
+    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest,
     RetrievalResult, Stance, StanceMode, ValidationError, tokenize, validate_claim,
-    validate_edge,
-    validate_evidence,
+    validate_edge, validate_evidence,
 };
 
 mod disk;
@@ -43,7 +42,7 @@ pub use wal::{
     WalWritePolicy,
 };
 pub(crate) use wal::{
-    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record, record_to_line,
+    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record,
 };
 
 
@@ -99,8 +98,6 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-
-const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
 
 #[derive(Default, Clone)]
 /// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
