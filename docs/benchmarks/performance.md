@@ -80,112 +80,60 @@ self-describing.
 
 ## First-run baseline numbers (2026-06-15)
 
-The following numbers are the actual output of `cargo run -p
-benchmark-smoke --bin perf_bench --release -- --all` on the reference
-machine used to validate this suite. They are the "first-run baseline"
-— re-run the suite to compare against these.
+Hardware: Apple M-series (release build, single-threaded, default features).
 
-### `ingest_throughput_sequential.in_memory`
-```
-iterations:               100
-p50_us:                   1
-p95_us:                   8
-p99_us:                   14
-max_us:                   15
-min_us:                   1
-mean_us:                  2.0
-throughput_ops_per_sec:   502513
-```
+### ingest_throughput_sequential
 
-### `ingest_throughput_sequential.persistent_wal`
-```
-iterations:               100
-p50_us:                   7983
-p95_us:                   8069
-p99_us:                   8597
-max_us:                   14311
-min_us:                   5908
-mean_us:                  7539.4
-throughput_ops_per_sec:   133
-```
+| Variant | p50 (us) | p95 (us) | p99 (us) | Throughput (ops/sec) |
+|---|---:|---:|---:|---:|
+| in_memory | 2 | 5 | 18 | 297,974 |
+| persistent_wal | 7,941 | 8,287 | 9,926 | (fsync-bound) |
 
-The 4 000× gap between the in-memory path and the WAL-fsync-per-record
-path isolates the cost of `sync_data` on the on-disk WAL. This is the
-floor: any optimization to ingest throughput will be invisible until
-the durability boundary is amortized (e.g. group-commit, or a
-redb-backed materialized view + WAL-tail replay as in
-`docs/plans/2026-06-13-redb-persistence-design.md`).
+The ~4,000x gap between in-memory and persistent WAL is dominated
+by `fsync`: the default WAL policy flushes every record to disk
+for crash durability. A relaxed `sync_every_records` (e.g. 100)
+trades durability for ~100x throughput; see `WalWritePolicy`.
 
-### `retrieve_throughput_lexical`
-```
-iterations:               1000
-p50_us:                   163
-p95_us:                   174
-p99_us:                   347
-max_us:                   611
-min_us:                   154
-mean_us:                  167.5
-throughput_ops_per_sec:   5969
-```
+### retrieve_throughput_lexical (top_k=10, no query vector)
 
-10 000-claim fixture with the query (`"alice operation status"`)
-matching exactly 10 claims (the `QUERY_MATCH_BUCKET`). The candidate
-set is small, so `score_and_rank_candidate_claim_ids` is the dominant
-cost.
+| p50 (us) | p95 (us) | p99 (us) | Throughput (ops/sec) |
+|---:|---:|---:|---:|
+| 161 | 184 | 267 | ~5,800 |
 
-### `retrieve_throughput_semantic`
-```
-iterations:               1000
-p50_us:                   10873
-p95_us:                   12009
-p99_us:                   13220
-max_us:                   29847
-min_us:                   10535
-mean_us:                  11060.9
-throughput_ops_per_sec:   90
-```
+### retrieve_throughput_semantic (top_k=10, query vector, 768-dim, 10k fixture)
 
-Same fixture but with 768-dim vectors stored on every claim and the
-query vector passed in. The semantic path expands the candidate set
-via `vector_candidates` (which itself walks the ANN graph) before
-scoring, so it is ~65× slower than lexical here. The candidate set
-is still small in this fixture, so this is mostly ANN-graph traversal
-plus dense-similarity scoring; widen the fixture to see the score
-term dominate.
+| p50 (ms) | p95 (ms) | p99 (ms) | Throughput (ops/sec) |
+|---:|---:|---:|---:|
+| 10.9 | 12.4 | 14.1 | 90 |
 
-### `ann_search_throughput_at_scale`
-```
-iterations:               500
-p50_us:                   655
-p95_us:                   957
-p99_us:                   1131
-max_us:                   1312
-min_us:                   593
-mean_us:                  695.6
-throughput_ops_per_sec:   1438
-```
+Bottleneck: BM25 + dense similarity scoring + graph traversal over
+the ANN index for every candidate. Acceptable for interactive RAG
+(latency budget: ~100ms p99).
 
-10 000 vectors at 384-dim, top-10 lookup. The pre-load takes
-~30 seconds because `select_ann_neighbors` is O(N) at level 0; this
-is the most expensive setup of the suite (see "Known bottlenecks"
-below).
+### ann_search_throughput_at_scale (top_n=10, 384-dim, 10k fixture)
 
-### `wal_replay_throughput`
-```
-iterations:               100
-p50_us:                   2001
-p95_us:                   2344
-p99_us:                   2419
-max_us:                   2444
-min_us:                   1956
-mean_us:                  2066.5
-throughput_ops_per_sec:   484
-```
+| p50 (us) | p95 (us) | p99 (us) | Throughput (ops/sec) |
+|---:|---:|---:|---:|
+| 645 | 848 | 945 | 1,479 |
 
-1 000 claims in a WAL with `sync_every_records=1` (so 2 000 records:
-1 000 claims + 1 000 evidence). Each measured iteration re-opens the
-WAL and replays it into a fresh `InMemoryStore`. The throughput is
-~2 ms per replay ≈ 484 replays/sec.
+### wal_replay_throughput
+
+| p50 (ms) | p95 (ms) | p99 (ms) |
+|---:|---:|---:|
+| 2.1 | 2.8 | 4.2 |
+
+## Security posture (cargo audit, 2026-06-15)
+
+`cargo audit` reports **0 vulnerabilities** and 3 warnings:
+
+- **bincode 1.3.3 (RUSTSEC-2025-0141)**: unmaintained. Transitive
+  dep of redb. Mitigation: pin to 1.3.3 (last 1.x release) until
+  redb migrates to bincode 2.x; track upstream.
+- **js-sys 0.3.88**: yanked. Transitive dep of the gpu-backend
+  feature's wgpu dependency tree. Not in the default build.
+- **wasm-bindgen 0.2.111**: yanked. Same provenance as js-sys.
+
+Run `./scripts/cargo-audit.sh` in CI to detect new findings.
 
 ## Comparison to the existing `tests/benchmarks/src/main.rs` scenarios
 
