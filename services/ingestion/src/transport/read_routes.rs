@@ -7,7 +7,26 @@ pub(super) fn handle_get_request(
     query: &HashMap<String, String>,
 ) -> HttpResponse {
     match path {
-        "/health" => HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()),
+        // Versioned + unversioned health endpoints. The unversioned
+        // paths are kept for backward compat with existing k8s
+        // probe configs; `/v1/*` is the new canonical versioned path
+        // that matches every other `/v1/*` endpoint.
+        "/health" | "/v1/health" => {
+            HttpResponse::ok_json("{\"status\":\"ok\"}".to_string())
+        }
+        // Liveness: process is alive, not deadlocked. K8s restarts
+        // the pod if this fails. No disk / network checks.
+        "/live" | "/v1/live" => {
+            HttpResponse::ok_json("{\"status\":\"alive\"}".to_string())
+        }
+        // Readiness: process is up AND can serve traffic. K8s
+        // removes the pod from the service if this fails. We
+        // check that the SharedRuntime mutex is reachable; a
+        // poisoned mutex means something else is very wrong.
+        "/ready" | "/v1/ready" => match runtime.lock() {
+            Ok(_) => HttpResponse::ok_json("{\"status\":\"ready\"}".to_string()),
+            Err(_) => HttpResponse::internal_server_error("runtime mutex poisoned"),
+        },
         "/metrics" => {
             let body = match runtime.lock() {
                 Ok(mut rt) => {

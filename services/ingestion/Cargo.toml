@@ -24,6 +24,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+signal-hook = { workspace = true }
+dash-common = { path = "../common" }
 
 [dev-dependencies]
 tempfile = "3"

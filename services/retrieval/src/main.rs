@@ -3,7 +3,14 @@ use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
 fn main() {
-    let serve_mode = std::env::args().any(|arg| arg == "--serve");
+    // Default to serve mode (this is a server binary; the CLI
+    // mode is for smoke tests and one-shot benchmarks). Pass
+    // `--cli` or `--no-serve` to run the one-shot path without
+    // binding to a TCP port. The previous behavior (require
+    // `--serve` to start the server) was a footgun: most users
+    // assumed the default was to serve, and the service would
+    // silently exit after printing the startup banner.
+    let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
     let bind_addr = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let http_workers = parse_http_workers();
@@ -171,7 +178,13 @@ fn main() {
         println!("retrieval health endpoint: http://{bind_addr}/health");
         println!("retrieval metrics endpoint: http://{bind_addr}/metrics");
         println!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
-        if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers) {
+        // Install SIGTERM/SIGINT handlers that set a flag the
+        // accept loop polls every 50ms. This gives us sub-second
+        // graceful shutdown: in-flight requests drain, the worker
+        // threads finish, then the process exits cleanly.
+        let shutdown = dash_common::ShutdownSignal::install();
+        eprintln!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
+        if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers, shutdown) {
             eprintln!("retrieval transport failed: {err}");
             std::process::exit(1);
         }

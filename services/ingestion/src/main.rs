@@ -28,7 +28,14 @@ struct WalDurabilityConfig {
 }
 
 fn main() {
-    let serve_mode = std::env::args().any(|arg| arg == "--serve");
+    // Default to serve mode (this is a server binary; the CLI
+    // mode is for smoke tests and one-shot benchmarks). Pass
+    // `--cli` or `--no-serve` to run the one-shot path without
+    // binding to a TCP port. The previous behavior (require
+    // `--serve` to start the server) was a footgun: most users
+    // assumed the default was to serve, and the service would
+    // silently exit after printing the startup banner.
+    let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
     let bind_addr = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
         .unwrap_or_else(|| "127.0.0.1:8081".to_string());
     let http_workers = parse_http_workers();
@@ -286,7 +293,10 @@ fn main() {
             if let Some(summary) = runtime.placement_routing_summary() {
                 println!("ingestion placement routing: {summary}");
             }
-            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
+            // Graceful shutdown: install SIGTERM/SIGINT handlers.
+            let shutdown = dash_common::ShutdownSignal::install();
+            eprintln!("ingestion: serving on http://{bind_addr} (--cli to run without a port)");
+            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers, shutdown) {
                 eprintln!("ingestion transport failed: {err}");
                 std::process::exit(1);
             }
@@ -336,7 +346,10 @@ fn main() {
             if let Some(summary) = runtime.placement_routing_summary() {
                 println!("ingestion placement routing: {summary}");
             }
-            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers) {
+            // Graceful shutdown: install SIGTERM/SIGINT handlers.
+            let shutdown = dash_common::ShutdownSignal::install();
+            eprintln!("ingestion: serving on http://{bind_addr} (--cli to run without a port)");
+            if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers, shutdown) {
                 eprintln!("ingestion transport failed: {err}");
                 std::process::exit(1);
             }

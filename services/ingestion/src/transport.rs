@@ -1257,15 +1257,17 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
 }
 
 pub fn serve_http(runtime: IngestionRuntime, bind_addr: &str) -> std::io::Result<()> {
-    serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS)
+    let shutdown = dash_common::ShutdownSignal::install();
+    serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
 }
 
 pub fn serve_http_with_workers(
     runtime: IngestionRuntime,
     bind_addr: &str,
     worker_count: usize,
+    shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
 ) -> std::io::Result<()> {
-    server_runtime::serve_http_with_workers(runtime, bind_addr, worker_count)
+    server_runtime::serve_http_with_workers(runtime, bind_addr, worker_count, shutdown)
 }
 
 pub fn handle_http_request_bytes(

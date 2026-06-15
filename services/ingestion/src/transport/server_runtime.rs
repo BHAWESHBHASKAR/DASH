@@ -4,6 +4,7 @@ pub(super) fn serve_http_with_workers(
     runtime: IngestionRuntime,
     bind_addr: &str,
     worker_count: usize,
+    shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
@@ -94,9 +95,14 @@ pub(super) fn serve_http_with_workers(
             });
         }
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
+        listener.set_nonblocking(true).expect("set listener non-blocking");
+        loop {
+            if shutdown.is_triggered() {
+                eprintln!("ingestion: shutdown signal received, draining in-flight requests");
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
                     backpressure_metrics.observe_enqueued();
                     match tx.try_send(stream) {
                         Ok(()) => {}
@@ -118,7 +124,14 @@ pub(super) fn serve_http_with_workers(
                         }
                     }
                 }
-                Err(err) => eprintln!("ingestion transport accept error: {err}"),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(err) => {
+                    eprintln!("ingestion transport accept error: {err}");
+                    break;
+                }
             }
         }
         let _ = flush_shutdown_tx.send(());
