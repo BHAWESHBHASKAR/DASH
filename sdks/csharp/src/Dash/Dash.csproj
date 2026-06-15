@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;netstandard2.0</TargetFrameworks>
+    <RootNamespace>Dash</RootNamespace>
+    <AssemblyName>Dash</AssemblyName>
+    <PackageId>Dash</PackageId>
+    <Version>0.2.0</Version>
+    <Description>OpenAI-compatible client SDK for DASH vector database</Description>
+    <PackageTags>vector-database;ai;embeddings;openai-compatible</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>
