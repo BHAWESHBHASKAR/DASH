@@ -81,11 +81,53 @@ pub struct OpenAIEmbeddingsResponse {
     pub usage: OpenAIUsage,
 }
 
+/// Encoding format requested by the client. Mirrors the OpenAI
+/// `/v1/embeddings` spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EncodingFormat {
+    #[default]
+    Float,
+    Base64,
+}
+
+impl EncodingFormat {
+    pub fn from_request_str(s: Option<&str>) -> Result<Self, String> {
+        match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("float") => Ok(Self::Float),
+            Some("base64") => Ok(Self::Base64),
+            Some(other) => Err(format!(
+                "encoding_format '{other}' is not supported; only 'float' and 'base64' are accepted"
+            )),
+        }
+    }
+}
+
+/// The wire format for a single embedding. Held in an untagged form so
+/// that `Serialize` produces either a `Vec<f32>` (Float) or a `String`
+/// (Base64) under the same `"embedding"` key, matching the OpenAI
+/// /v1/embeddings response shape byte-for-byte.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingValue {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenAIEmbeddingData {
     pub object: &'static str,
-    pub embedding: Vec<f32>,
     pub index: usize,
+    #[serde(serialize_with = "serialize_embedding_value")]
+    pub embedding: EmbeddingValue,
+}
+
+fn serialize_embedding_value<S: serde::Serializer>(
+    value: &EmbeddingValue,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        EmbeddingValue::Float(v) => v.serialize(serializer),
+        EmbeddingValue::Base64(s) => s.serialize(serializer),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,13 +197,8 @@ pub fn handle_openai_embeddings(body: &str) -> Result<OpenAIEmbeddingsResponse, 
             ));
         }
     }
-    if let Some(fmt) = req.encoding_format.as_deref()
-        && fmt != "float"
-    {
-        return Err(OpenAIErrorResponse::invalid_request(format!(
-            "encoding_format '{fmt}' is not supported; only 'float' is currently implemented"
-        )));
-    }
+    let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
+        .map_err(OpenAIErrorResponse::invalid_request)?;
 
     let provider = HashEmbeddingProvider::default();
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
@@ -182,7 +219,7 @@ pub fn handle_openai_embeddings(body: &str) -> Result<OpenAIEmbeddingsResponse, 
         .enumerate()
         .map(|(index, embedding)| OpenAIEmbeddingData {
             object: "embedding",
-            embedding,
+            embedding: encode_embedding_value(embedding, encoding),
             index,
         })
         .collect();
@@ -221,6 +258,8 @@ pub fn handle_openai_embeddings_with_provider(
         ));
     }
 
+    let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
+        .map_err(OpenAIErrorResponse::invalid_request)?;
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
     let embeddings = provider
         .embed(&texts)
@@ -233,7 +272,7 @@ pub fn handle_openai_embeddings_with_provider(
         .enumerate()
         .map(|(index, embedding)| OpenAIEmbeddingData {
             object: "embedding",
-            embedding,
+            embedding: encode_embedding_value(embedding, encoding),
             index,
         })
         .collect();
@@ -249,6 +288,105 @@ pub fn handle_openai_embeddings_with_provider(
             total_tokens,
         },
     })
+}
+
+/// Convert a provider-returned float vector to the wire format
+/// requested by the client. `Float` passes through unchanged; `Base64`
+/// packs the float32 values as little-endian bytes and base64-encodes
+/// the result, matching the OpenAI Python SDK's `embeddings_base64` flow.
+pub fn encode_embedding_value(embedding: Vec<f32>, encoding: EncodingFormat) -> EmbeddingValue {
+    match encoding {
+        EncodingFormat::Float => EmbeddingValue::Float(embedding),
+        EncodingFormat::Base64 => {
+            let bytes = pack_f32_le(&embedding);
+            EmbeddingValue::Base64(base64_encode(&bytes))
+        }
+    }
+}
+
+/// Pack a slice of `f32` values into a little-endian byte buffer.
+/// This is the canonical wire format for OpenAI base64 embeddings.
+pub fn pack_f32_le(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 encoder (RFC 4648 §4). Pads with `=` to a multiple
+/// of 4 characters. No URL-safe variant; matches what the OpenAI API
+/// emits in `encoding_format: "base64"` responses.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        let b2 = bytes[i + 2];
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(BASE64_ALPHABET[(b2 & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b0 = bytes[i];
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[((b0 & 0x03) << 4) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(BASE64_ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+/// Inverse of [`base64_encode`]. Accepts padded and unpadded input.
+/// Used in tests to verify the wire format round-trips.
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!(
+            "invalid base64 length {} (must be a multiple of 4)",
+            bytes.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            buf[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => 0,
+                _ => return Err(format!("invalid base64 char: {}", b as char)),
+            };
+        }
+        out.push((buf[0] << 2) | (buf[1] >> 4));
+        if chunk[2] != b'=' {
+            out.push((buf[1] << 4) | (buf[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((buf[2] << 6) | buf[3]);
+        }
+    }
+    Ok(out)
 }
 
 
@@ -346,7 +484,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_encoding_format() {
-        let body = r#"{"input": "hi", "model": "x", "encoding_format": "base64"}"#;
+        // base64 is supported in this version; use a format that
+        // is still rejected (e.g. binary, int8) to exercise the
+        // unsupported-format branch.
+        let body = r#"{"input": "hi", "model": "x", "encoding_format": "binary"}"#;
         let err = handle_openai_embeddings(body).unwrap_err();
         assert_eq!(err.error.kind, "invalid_request_error");
         assert!(err.error.message.contains("encoding_format"));
@@ -403,7 +544,11 @@ mod tests {
         let body = r#"{"input": "x", "model": "x"}"#;
         let resp = handle_openai_embeddings(body).unwrap();
         let provider = HashEmbeddingProvider::default();
-        assert_eq!(resp.data[0].embedding.len(), provider.dimensions());
+        let actual = match &resp.data[0].embedding {
+            EmbeddingValue::Float(v) => v.len(),
+            EmbeddingValue::Base64(b) => base64_decode(b).unwrap().len() / 4,
+        };
+        assert_eq!(actual, provider.dimensions());
     }
 
     #[test]
@@ -420,7 +565,11 @@ mod tests {
         let provider = HashEmbeddingProvider::new(8);
         let resp = handle_openai_embeddings_with_provider(body, &provider).unwrap();
         assert_eq!(resp.data.len(), 1);
-        assert_eq!(resp.data[0].embedding.len(), 8);
+        let actual = match &resp.data[0].embedding {
+            EmbeddingValue::Float(v) => v.len(),
+            EmbeddingValue::Base64(b) => base64_decode(b).unwrap().len() / 4,
+        };
+        assert_eq!(actual, 8);
         assert_eq!(resp.model, "test-model");
     }
 
@@ -432,5 +581,200 @@ mod tests {
         assert!(json.contains("\"error\":{"));
         assert!(json.contains("\"message\":"));
         assert!(json.contains("\"type\":\"invalid_request_error\""));
+    }
+
+    // -----------------------------------------------------------------
+    // base64 encoding format tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // RFC 4648 §10 test vector
+        assert_eq!(
+            base64_encode(b"foobarfoobarfoobarfoobarfoobarfoobar"),
+            "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFy"
+        );
+    }
+
+    #[test]
+    fn base64_decode_round_trips_with_encode() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"fooba",
+            b"foobar",
+            b"\x00\xff\x7f\x80",
+            &[0u8; 32],
+            &[0xab; 100],
+        ];
+        for original in cases {
+            let encoded = base64_encode(original);
+            let decoded = base64_decode(&encoded).expect("decode should succeed");
+            assert_eq!(&decoded, original, "round-trip for {original:?}");
+        }
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_length() {
+        let err = base64_decode("abc").expect_err("len=3 is invalid");
+        assert!(err.contains("invalid base64 length"));
+    }
+
+    #[test]
+    fn base64_decode_rejects_invalid_char() {
+        let err = base64_decode("!!!!").expect_err("invalid chars");
+        assert!(err.contains("invalid base64 char"));
+    }
+
+    #[test]
+    fn pack_f32_le_emits_little_endian_bytes() {
+        // 1.0f32 = 0x3F800000, 2.0f32 = 0x40000000
+        let bytes = pack_f32_le(&[1.0, 2.0]);
+        assert_eq!(bytes, vec![0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40]);
+    }
+
+    #[test]
+    fn pack_f32_le_handles_negative_zero_and_subnormal() {
+        // -0.0f32 = 0x80000000
+        // The smallest positive subnormal = f32::from_bits(0x00000001)
+        let smallest_subnormal = f32::from_bits(0x0000_0001);
+        let bytes = pack_f32_le(&[-0.0, smallest_subnormal]);
+        assert_eq!(bytes, vec![0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encoding_format_from_request_str_handles_all_cases() {
+        assert_eq!(EncodingFormat::from_request_str(None).unwrap(), EncodingFormat::Float);
+        assert_eq!(EncodingFormat::from_request_str(Some("")).unwrap(), EncodingFormat::Float);
+        assert_eq!(EncodingFormat::from_request_str(Some("float")).unwrap(), EncodingFormat::Float);
+        assert_eq!(EncodingFormat::from_request_str(Some("FLOAT")).unwrap(), EncodingFormat::Float);
+        assert_eq!(EncodingFormat::from_request_str(Some("base64")).unwrap(), EncodingFormat::Base64);
+        assert_eq!(EncodingFormat::from_request_str(Some("Base64")).unwrap(), EncodingFormat::Base64);
+        assert_eq!(EncodingFormat::from_request_str(Some("  base64  ")).unwrap(), EncodingFormat::Base64);
+        let err = EncodingFormat::from_request_str(Some("binary")).unwrap_err();
+        assert!(err.contains("'binary'"));
+    }
+
+    #[test]
+    fn handle_openai_embeddings_with_base64_format_returns_base64_strings() {
+        let body = r#"{"input":"hello world","model":"text-embedding-3-small","encoding_format":"base64"}"#;
+        let resp = handle_openai_embeddings(body).expect("handler should succeed");
+        assert_eq!(resp.data.len(), 1);
+        let json = serde_json::to_string(&resp).expect("serialize");
+        // The embedding field should be a base64 string, not a JSON array.
+        assert!(
+            json.contains("\"embedding\":\""),
+            "expected base64 string, got: {json}"
+        );
+        assert!(
+            !json.contains("\"embedding\":["),
+            "should not be a JSON array, got: {json}"
+        );
+        // Round-trip the value through base64_decode + f32::from_le_bytes
+        match &resp.data[0].embedding {
+            EmbeddingValue::Base64(b) => {
+                let bytes = base64_decode(b).expect("decode base64");
+                assert_eq!(bytes.len() % 4, 0, "byte length should be a multiple of 4");
+                let floats: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                assert_eq!(floats.len(), 384);
+                // Hash provider's first dim for "hello world" should match
+                let expected = HashEmbeddingProvider::default()
+                    .embed(&["hello world".to_string()])
+                    .unwrap()
+                    .remove(0);
+                for (a, b) in floats.iter().zip(expected.iter()) {
+                    assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+                }
+            }
+            other => panic!("expected Base64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_openai_embeddings_with_base64_format_for_array_input() {
+        let body = r#"{"input":["alpha","beta"],"model":"text-embedding-3-small","encoding_format":"base64"}"#;
+        let resp = handle_openai_embeddings(body).expect("handler should succeed");
+        assert_eq!(resp.data.len(), 2);
+        for (idx, item) in resp.data.iter().enumerate() {
+            match &item.embedding {
+                EmbeddingValue::Base64(b) => {
+                    let bytes = base64_decode(b).expect("decode base64");
+                    assert_eq!(bytes.len() % 4, 0);
+                    let floats: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .collect();
+                    assert_eq!(floats.len(), 384);
+                }
+                other => panic!("item {idx}: expected Base64, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn handle_openai_embeddings_with_unknown_format_returns_400() {
+        let body = r#"{"input":"hello","model":"x","encoding_format":"binary"}"#;
+        let err = handle_openai_embeddings(body).expect_err("unknown format rejected");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("'binary'"));
+        assert!(json.contains("'float'"));
+        assert!(json.contains("'base64'"));
+    }
+
+    #[test]
+    fn handle_openai_embeddings_with_provider_base64_round_trip() {
+        // A stub provider returns a known float vector; the handler must
+        // serialize it as base64 and we can decode back to the same floats.
+        struct FixedProvider;
+        impl embeddings::EmbeddingProvider for FixedProvider {
+            fn name(&self) -> &str { "fixed" }
+            fn dimensions(&self) -> usize { 4 }
+            fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+                Ok(vec![vec![1.0, -2.0, 3.5, f32::NAN]])
+            }
+        }
+        let body = r#"{"input":"x","model":"m","encoding_format":"base64"}"#;
+        let resp = handle_openai_embeddings_with_provider(body, &FixedProvider).unwrap();
+        let b = match &resp.data[0].embedding {
+            EmbeddingValue::Base64(b) => b.clone(),
+            other => panic!("expected Base64, got {other:?}"),
+        };
+        let bytes = base64_decode(&b).unwrap();
+        assert_eq!(bytes.len(), 16);
+        let floats: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(floats[0], 1.0);
+        assert_eq!(floats[1], -2.0);
+        assert_eq!(floats[2], 3.5);
+        assert!(floats[3].is_nan());
+    }
+
+    #[test]
+    fn handle_openai_embeddings_default_format_still_uses_float() {
+        // When encoding_format is absent, the response is a float array
+        // (backward-compatible with v0.2 clients).
+        let body = r#"{"input":"hi","model":"x"}"#;
+        let resp = handle_openai_embeddings(body).unwrap();
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"embedding\":["));
+        match &resp.data[0].embedding {
+            EmbeddingValue::Float(v) => assert_eq!(v.len(), 384),
+            other => panic!("expected Float, got {other:?}"),
+        }
     }
 }
