@@ -1,0 +1,166 @@
+# release.yml
+# Release pipeline: cross-compile ingestion/retrieval binaries for 4 targets,
+# publish them as a GitHub Release, build and push multi-arch Docker images
+# to ghcr.io, and attach an SBOM.
+# Triggered by pushing a tag matching v* (e.g. v0.1.0).
+# Expected runtime: ~20-30 minutes.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    name: Cross-compile binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build ingestion (${{ matrix.target }})
+        run: |
+          cross build --release --target ${{ matrix.target }} -p ingestion
+
+      - name: Build retrieval (${{ matrix.target }})
+        run: |
+          cross build --release --target ${{ matrix.target }} -p retrieval
+
+      - name: Package artifacts
+        run: |
+          mkdir -p release-artifacts
+          for bin in ingestion retrieval; do
+            src="target/${{ matrix.target }}/release/$bin"
+            if [ -f "$src" ]; then
+              cp "$src" "release-artifacts/${bin}-${{ matrix.target }}"
+            fi
+          done
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dash-binaries-${{ matrix.target }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  docker:
+    name: Build & push Docker images
+    runs-on: ubuntu-latest
+    needs: binaries
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ingestion, retrieval]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dash-${{ matrix.service }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          build-args: |
+            SERVICE=${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM
+        id: sbom
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-${{ matrix.service }}.spdx.json
+          image: ghcr.io/${{ github.repository_owner }}/dash-${{ matrix.service }}:latest
+          format: spdx-json
+          anchor-version: latest
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: ${{ steps.sbom.outputs.artifact-name }}
+          if-no-files-found: warn
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [binaries, docker]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find dist -type f -name "*-*" -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

@@ -1,0 +1,98 @@
+# fuzz-nightly.yml
+# Nightly fuzzing of the DASH Rust fuzz targets (cargo-fuzz).
+# Runs daily at 03:00 UTC and on manual dispatch.
+# Each target is exercised for 60 seconds; the corpus is uploaded as an artifact.
+# Expected runtime: ~5-8 minutes total (4 targets x 60s + setup).
+name: Fuzz Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-nightly-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: cargo-fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust build artifacts (fuzz workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Run fuzz_jwt (60s)
+        id: fuzz_jwt
+        working-directory: fuzz
+        run: |
+          mkdir -p ../fuzz-corpus/jwt
+          cargo fuzz run fuzz_jwt -- -max_total_time=60 || echo "CRASH:fuzz_jwt" >> ../fuzz-crashes.txt
+        continue-on-error: true
+
+      - name: Run fuzz_openai_embeddings (60s)
+        id: fuzz_openai_embeddings
+        working-directory: fuzz
+        run: |
+          mkdir -p ../fuzz-corpus/openai_embeddings
+          cargo fuzz run fuzz_openai_embeddings -- -max_total_time=60 || echo "CRASH:fuzz_openai_embeddings" >> ../fuzz-crashes.txt
+        continue-on-error: true
+
+      - name: Run fuzz_ranking (60s)
+        id: fuzz_ranking
+        working-directory: fuzz
+        run: |
+          mkdir -p ../fuzz-corpus/ranking
+          cargo fuzz run fuzz_ranking -- -max_total_time=60 || echo "CRASH:fuzz_ranking" >> ../fuzz-crashes.txt
+        continue-on-error: true
+
+      - name: Run fuzz_wal_parse (60s)
+        id: fuzz_wal_parse
+        working-directory: fuzz
+        run: |
+          mkdir -p ../fuzz-corpus/wal_parse
+          cargo fuzz run fuzz_wal_parse -- -max_total_time=60 || echo "CRASH:fuzz_wal_parse" >> ../fuzz-crashes.txt
+        continue-on-error: true
+
+      - name: Upload fuzz corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz-corpus/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summarize crashes
+        if: always()
+        run: |
+          if [ -s fuzz-crashes.txt ]; then
+            {
+              echo "## :bug: Fuzz crashes detected"
+              echo ""
+              echo "The following targets reported failures during this run:"
+              echo ""
+              echo '```'
+              cat fuzz-crashes.txt
+              echo '```'
+              echo ""
+              echo "Please reproduce locally with: \`cargo fuzz run <target> <artifact>\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          else
+            echo "No crashes detected." >> "$GITHUB_STEP_SUMMARY"
+          fi
