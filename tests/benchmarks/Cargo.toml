@@ -3,6 +3,10 @@ name = "benchmark-smoke"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "perf_bench"
+path = "src/perf_bench.rs"
+
 [dependencies]
 ranking = { path = "../../pkg/ranking" }
 schema = { path = "../../pkg/schema" }
@@ -10,3 +14,7 @@ store = { path = "../../pkg/store" }
 retrieval = { path = "../../services/retrieval" }
 indexer = { path = "../../services/indexer" }
 ingestion = { path = "../../services/ingestion" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

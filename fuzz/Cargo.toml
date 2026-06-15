@@ -1,0 +1,38 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz_jwt"
+path = "fuzz_targets/fuzz_jwt.rs"
+
+[[bin]]
+name = "fuzz_openai_embeddings"
+path = "fuzz_targets/fuzz_openai_embeddings.rs"
+
+[[bin]]
+name = "fuzz_ranking"
+path = "fuzz_targets/fuzz_ranking.rs"
+
+[[bin]]
+name = "fuzz_wal_parse"
+path = "fuzz_targets/fuzz_wal_parse.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+auth = { path = "../pkg/auth" }
+ranking = { path = "../pkg/ranking" }
+store = { path = "../pkg/store" }
+embeddings = { path = "../pkg/embeddings" }
+retrieval = { path = "../services/retrieval" }
+schema = { path = "../pkg/schema" }
