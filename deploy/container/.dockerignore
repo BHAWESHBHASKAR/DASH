@@ -1,0 +1,50 @@
+# Keep the Docker build context small. Anything matched here is excluded
+# from `docker build` and `docker compose build` contexts, which speeds up
+# builds and shrinks the cache. The build context is the repo root, not
+# this directory; paths below are relative to the repo root.
+
+# Build artifacts and dependency caches
+target
+**/target
+**/node_modules
+**/__pycache__
+*.pyc
+
+# VCS metadata
+.git
+.gitignore
+.gitattributes
+
+# Editor / OS noise
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo
+
+# Logs and local runtime artifacts
+*.log
+*.wal
+*.wal.snapshot
+.env
+.env.*
+.localized
+
+# Heavy / non-build documentation and history
+docs
+*.md
+!deploy/container/README.md
+
+# Buddy / planning / local collaboration artifacts
+.buddy
+.planning
+skills
+progress.md
+buddy.md
+fix_structs.py
+dist
+dist-hook-test
+
+# GitHub / CI config (not needed at build time)
+.github
+reference

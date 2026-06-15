@@ -1,58 +1,140 @@
-services:
-  dash-ingestion:
-    build:
-      context: ../..
-      dockerfile: deploy/container/Dockerfile
-    command: ["/opt/dash/bin/ingestion", "--serve"]
-    environment:
-      DASH_INGEST_WAL_PATH: /var/lib/dash/claims.wal
-      DASH_INGEST_HTTP_WORKERS: "8"
-      DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
-      DASH_INGEST_TRANSPORT_RUNTIME: std
-      DASH_INGEST_API_KEY: change-me-ingest-key
-      DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
-      DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
-      DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
-      DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
-      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments
-      DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
-      DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
-      DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
-    volumes:
-      - dash_data:/var/lib/dash
+name: dash
 
-  dash-retrieval:
+# Common settings for every service. Anchored here and merged into each
+# service via YAML's `<<:` merge key so the runtime config stays DRY.
+x-rest-base: &rest-base
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+  user: "10001:10001"
+  read_only: false
+  stop_grace_period: 30s
+
+# Default env vars that every service inherits. The merge key is reused
+# inside each service's `environment` block to layer service-specific
+# vars on top of these defaults.
+x-base-env: &base-env
+  RUST_LOG: ${RUST_LOG:-info,dash=debug}
+  DASH_HOME: /opt/dash
+  DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
+  # WAL durability knobs that ingestion and retrieval both honor.
+  # Override per-service if you need to tune.
+  DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
+  DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
+  DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
+  DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
+  DASH_INGEST_WAL_SYNC_INTERVAL_MS: "1000"
+  DASH_INGEST_HTTP_WORKERS: "8"
+  DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
+  DASH_INGEST_TRANSPORT_RUNTIME: std
+  DASH_RETRIEVAL_HTTP_WORKERS: "8"
+  DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
+  DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
+  DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
+
+services:
+  ingestion:
+    <<: *rest-base
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile
-    command: ["/opt/dash/bin/retrieval", "--serve"]
+      target: runtime
+    image: dash/ingestion:latest
+    container_name: dash-ingestion
+    command: ["--serve"]
+    ports:
+      - "8081:8081"
+    volumes:
+      - dash-state:/var/lib/dash
     environment:
-      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/claims.wal
-      DASH_RETRIEVAL_BIND: 0.0.0.0:8080
-      DASH_RETRIEVAL_HTTP_WORKERS: "8"
-      DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
-      DASH_RETRIEVAL_API_KEY: change-me-retrieval-key
-      DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments
+      <<: *base-env
+      DASH_BIN: ingestion
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8081/health
+      DASH_INGEST_BIND: 0.0.0.0:8081
+      DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
+      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
+      DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
+      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:-change-me-ingest-key}
+      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:-change-me-ingest-jwt}
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 1g
+    pids_limit: 1024
+
+  retrieval:
+    <<: *rest-base
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: runtime
+    image: dash/retrieval:latest
+    container_name: dash-retrieval
+    command: ["--serve"]
     ports:
       - "8080:8080"
     volumes:
-      - dash_data:/var/lib/dash
+      - dash-state:/var/lib/dash
+    environment:
+      <<: *base-env
+      DASH_BIN: retrieval
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
+      DASH_RETRIEVAL_BIND: 0.0.0.0:8080
+      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/wal/retrieval.wal
+      DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
+      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:-change-me-retrieval-key}
+      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:-change-me-retrieval-jwt}
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
-      - dash-ingestion
+      ingestion:
+        condition: service_healthy
+    mem_limit: 2g
+    pids_limit: 2048
 
-  dash-segment-maintenance:
+  segment-maintenance:
+    <<: *rest-base
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile
-    command: ["/opt/dash/bin/segment-maintenance-daemon"]
+      target: runtime
+    image: dash/segment-maintenance:latest
+    container_name: dash-segment-maintenance
+    # segment-maintenance-daemon runs its own loop; pass no --serve flag.
+    command: []
+    volumes:
+      - dash-state:/var/lib/dash
     environment:
-      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments
+      <<: *base-env
+      DASH_BIN: segment-maintenance-daemon
+      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
       DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "30000"
       DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS: "60000"
-    volumes:
-      - dash_data:/var/lib/dash
+    # Long-running daemon with no HTTP endpoint; rely on logs + liveness
+    # via the process exit code rather than an HTTP probe.
+    healthcheck:
+      test: ["CMD-SHELL", "pidof segment-maintenance-daemon >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
-      - dash-ingestion
+      ingestion:
+        condition: service_healthy
+    mem_limit: 512m
+    pids_limit: 256
 
 volumes:
-  dash_data:
+  dash-state:
+    name: dash-state
+    driver: local

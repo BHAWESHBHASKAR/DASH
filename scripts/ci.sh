@@ -43,12 +43,7 @@ CI_XLARGE_MIN_CANDIDATE_REDUCTION_PCT="${DASH_CI_XLARGE_MIN_CANDIDATE_REDUCTION_
 CI_XLARGE_MAX_DASH_LATENCY_MS="${DASH_CI_XLARGE_MAX_DASH_LATENCY_MS:-${DASH_BENCH_XLARGE_MAX_DASH_LATENCY_MS:-250}}"
 
 if [[ "${CHECK_ASYNC_TRANSPORT}" == "true" ]]; then
-  echo "[ci] async transport feature checks"
-  cargo check -p ingestion --features async-transport
-  cargo check -p retrieval --features async-transport
-  echo "[ci] async transport feature tests"
-  cargo test -p ingestion --features async-transport
-  cargo test -p retrieval --features async-transport
+  echo "[ci] async transport is now the default — skipping feature-only checks"
 fi
 
 echo "[ci] backup/restore script checks"

@@ -1,0 +1,178 @@
+# Local development overlay. Use in combination with docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Provides:
+#   - dev build target (rust toolchain + cargo-watch)
+#   - source code mounted at /build for hot-reload via cargo-watch
+#   - cargo home and target dir on named volumes (persist across restarts)
+#   - debug logging by default
+#   - isolated dev volumes so you don't clobber the prod dash-state
+#   - per-service bind ports identical to prod
+#
+# UID/GID: by default the dev containers run as UID:GID = 1000:1000 (the
+# typical first user on Linux). If your host UID is different, override:
+#   DASH_DEV_UID=$(id -u) DASH_DEV_GID=$(id -g) docker compose \
+#       -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  ingestion:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: dev
+    image: dash/ingestion:dev
+    container_name: dash-ingestion-dev
+    user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    # cargo-watch rebuilds + restarts the binary when source changes.
+    # -w paths limit watch to ingestion sources and shared packages; tweak
+    #   to taste if you want to also watch tests, etc.
+    command:
+      - cargo
+      - watch
+      - -w
+      - /build/Cargo.toml
+      - -w
+      - /build/Cargo.lock
+      - -w
+      - /build/pkg
+      - -w
+      - /build/services/ingestion
+      - -w
+      - /build/services/indexer
+      - -x
+      - run -p ingestion --bin ingestion -- --serve
+    environment:
+      RUST_LOG: ${RUST_LOG:-debug}
+      CARGO_TERM_COLOR: always
+      CARGO_HOME: /usr/local/cargo
+      DASH_BIN: ingestion
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8081/health
+      DASH_INGEST_BIND: 0.0.0.0:8081
+      DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
+      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
+      DASH_INGEST_API_KEY: dev-ingest-key
+      DASH_INGEST_JWT_HS256_SECRET: dev-ingest-jwt
+      DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
+      DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
+      DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
+      DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
+      DASH_INGEST_HTTP_WORKERS: "4"
+      DASH_INGEST_HTTP_QUEUE_CAPACITY: "128"
+      DASH_CHECKPOINT_MAX_WAL_RECORDS: "1000"
+    volumes:
+      - ../..:/build
+      - dash-dev-cargo:/usr/local/cargo
+      - dash-dev-target:/build/target
+      - dash-dev-state:/var/lib/dash
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    depends_on: {}
+
+  retrieval:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: dev
+    image: dash/retrieval:dev
+    container_name: dash-retrieval-dev
+    user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    command:
+      - cargo
+      - watch
+      - -w
+      - /build/Cargo.toml
+      - -w
+      - /build/Cargo.lock
+      - -w
+      - /build/pkg
+      - -w
+      - /build/services/retrieval
+      - -w
+      - /build/services/indexer
+      - -x
+      - run -p retrieval --bin retrieval -- --serve
+    environment:
+      RUST_LOG: ${RUST_LOG:-debug}
+      CARGO_TERM_COLOR: always
+      CARGO_HOME: /usr/local/cargo
+      DASH_BIN: retrieval
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
+      DASH_RETRIEVAL_BIND: 0.0.0.0:8080
+      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/wal/retrieval.wal
+      DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
+      DASH_RETRIEVAL_API_KEY: dev-retrieval-key
+      DASH_RETRIEVAL_JWT_HS256_SECRET: dev-retrieval-jwt
+      DASH_RETRIEVAL_HTTP_WORKERS: "4"
+      DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
+    volumes:
+      - ../..:/build
+      - dash-dev-cargo:/usr/local/cargo
+      - dash-dev-target:/build/target
+      - dash-dev-state:/var/lib/dash
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      ingestion:
+        condition: service_started
+
+  segment-maintenance:
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: dev
+    image: dash/segment-maintenance:dev
+    container_name: dash-segment-maintenance-dev
+    user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    command:
+      - cargo
+      - watch
+      - -w
+      - /build/Cargo.toml
+      - -w
+      - /build/Cargo.lock
+      - -w
+      - /build/pkg
+      - -w
+      - /build/services/indexer
+      - -x
+      - run -p indexer --bin segment-maintenance-daemon
+    environment:
+      RUST_LOG: ${RUST_LOG:-debug}
+      CARGO_TERM_COLOR: always
+      CARGO_HOME: /usr/local/cargo
+      DASH_BIN: segment-maintenance-daemon
+      DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
+      DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "10000"
+      DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS: "30000"
+    volumes:
+      - ../..:/build
+      - dash-dev-cargo:/usr/local/cargo
+      - dash-dev-target:/build/target
+      - dash-dev-state:/var/lib/dash
+    healthcheck:
+      test: ["CMD-SHELL", "pidof segment-maintenance-daemon >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      ingestion:
+        condition: service_started
+
+volumes:
+  dash-dev-cargo:
+  dash-dev-target:
+  dash-dev-state:
