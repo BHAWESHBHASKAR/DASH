@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering,
+
     collections::{BTreeMap, HashMap, HashSet},
 };
 
@@ -19,6 +19,19 @@ mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
 mod wal;
+mod ann;
+pub use ann::AnnTuningConfig;
+pub(crate) use ann::{TenantAnnGraph, ScoredNode, ANN_GRAPH_LEVELS};
+
+#[derive(Default)]
+pub(crate) struct Bm25Context {
+    doc_freq: HashMap<String, usize>,
+    total_docs: usize,
+    avg_doc_len: f32,
+}
+
+
+
 pub use wal::{
     CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary,
     WalReplayStats, WalReplicationDelta, WalReplicationExport, WalRollbackPoint,
@@ -82,11 +95,6 @@ impl From<std::io::Error> for StoreError {
 }
 
 
-const ANN_GRAPH_LEVELS: usize = 4;
-const ANN_GRAPH_MAX_NEIGHBORS_BASE_DEFAULT: usize = 12;
-const ANN_GRAPH_MAX_NEIGHBORS_UPPER_DEFAULT: usize = 6;
-const ANN_SEARCH_EXPANSION_FACTOR_DEFAULT: usize = 16;
-const ANN_SEARCH_EXPANSION_MIN_DEFAULT: usize = 64;
 const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
 const VECTOR_BACKEND_ENV: &str = "DASH_VECTOR_BACKEND";
 
@@ -139,81 +147,6 @@ pub struct StoreIndexStats {
     pub entity_terms: usize,
     pub temporal_buckets: usize,
     pub ann_vector_buckets: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnnTuningConfig {
-    pub max_neighbors_base: usize,
-    pub max_neighbors_upper: usize,
-    pub search_expansion_factor: usize,
-    pub search_expansion_min: usize,
-    pub search_expansion_max: usize,
-}
-
-impl Default for AnnTuningConfig {
-    fn default() -> Self {
-        Self {
-            max_neighbors_base: ANN_GRAPH_MAX_NEIGHBORS_BASE_DEFAULT,
-            max_neighbors_upper: ANN_GRAPH_MAX_NEIGHBORS_UPPER_DEFAULT,
-            search_expansion_factor: ANN_SEARCH_EXPANSION_FACTOR_DEFAULT,
-            search_expansion_min: ANN_SEARCH_EXPANSION_MIN_DEFAULT,
-            search_expansion_max: ANN_SEARCH_EXPANSION_MAX_DEFAULT,
-        }
-    }
-}
-
-#[derive(Default)]
-struct Bm25Context {
-    doc_freq: HashMap<String, usize>,
-    total_docs: usize,
-    avg_doc_len: f32,
-}
-
-#[derive(Debug, Clone)]
-struct TenantAnnGraph {
-    entry_point: Option<String>,
-    entry_level: usize,
-    levels: Vec<HashMap<String, Vec<String>>>,
-    node_levels: HashMap<String, usize>,
-}
-
-impl Default for TenantAnnGraph {
-    fn default() -> Self {
-        Self {
-            entry_point: None,
-            entry_level: 0,
-            levels: (0..ANN_GRAPH_LEVELS).map(|_| HashMap::new()).collect(),
-            node_levels: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ScoredNode {
-    claim_id: String,
-    score: f32,
-}
-
-impl PartialEq for ScoredNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.claim_id == other.claim_id && self.score.to_bits() == other.score.to_bits()
-    }
-}
-
-impl Eq for ScoredNode {}
-
-impl PartialOrd for ScoredNode {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ScoredNode {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| self.claim_id.cmp(&other.claim_id))
-    }
 }
 
 #[derive(Default)]
