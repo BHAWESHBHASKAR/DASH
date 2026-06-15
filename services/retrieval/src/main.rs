@@ -7,7 +7,6 @@ fn main() {
     let bind_addr = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let http_workers = parse_http_workers();
-    let transport_runtime = parse_transport_runtime();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");
 
@@ -40,8 +39,43 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
-        println!("retrieval ready: claims={}", store.claims_len());
-        store
+        // Opt-in: attach a `redb` persistence file if the env var
+        // is set. A failed open falls back to in-memory mode.
+        if let Some(disk_path) = env_with_fallback(
+            "DASH_RETRIEVAL_PERSISTENCE_PATH",
+            "EME_RETRIEVAL_PERSISTENCE_PATH",
+        ) {
+            // `with_disk` always returns Ok(self); on open failure
+            // the in-memory state is preserved and `disk_status` is
+            // set to `Unavailable`. We inspect the result to log.
+            let store = match store.with_disk(&disk_path) {
+                Ok(updated) => {
+                    match updated.disk_status() {
+                        store::DiskStatus::Unavailable { reason } => {
+                            eprintln!(
+                                "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
+                            );
+                        }
+                        _ => {
+                            println!("retrieval persistence: disk={disk_path}");
+                        }
+                    }
+                    updated
+                }
+                Err(err) => {
+                    // Unreachable: `with_disk` always returns Ok.
+                    eprintln!(
+                        "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+                    );
+                    unreachable!("with_disk always returns Ok");
+                }
+            };
+            println!("retrieval ready: claims={}", store.claims_len());
+            store
+        } else {
+            println!("retrieval ready: claims={}", store.claims_len());
+            store
+        }
     } else {
         let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
         store
@@ -94,10 +128,6 @@ fn main() {
         println!("retrieval transport listening on http://{bind_addr}");
         println!("retrieval transport workers: {http_workers}");
         println!(
-            "retrieval transport runtime: {}",
-            transport_runtime.as_str()
-        );
-        println!(
             "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
             store.ann_tuning().max_neighbors_base,
             store.ann_tuning().max_neighbors_upper,
@@ -132,33 +162,9 @@ fn main() {
         println!("retrieval health endpoint: http://{bind_addr}/health");
         println!("retrieval metrics endpoint: http://{bind_addr}/metrics");
         println!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
-        match transport_runtime {
-            TransportRuntime::Std => {
-                if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers) {
-                    eprintln!("retrieval transport failed: {err}");
-                    std::process::exit(1);
-                }
-            }
-            TransportRuntime::Axum => {
-                #[cfg(feature = "async-transport")]
-                {
-                    if let Err(err) = retrieval::transport_axum::serve_http_with_axum(
-                        std::sync::Arc::new(store),
-                        &bind_addr,
-                        http_workers,
-                    ) {
-                        eprintln!("retrieval transport failed: {err}");
-                        std::process::exit(1);
-                    }
-                }
-                #[cfg(not(feature = "async-transport"))]
-                {
-                    eprintln!(
-                        "retrieval transport runtime 'axum' requires build feature 'async-transport'"
-                    );
-                    std::process::exit(2);
-                }
-            }
+        if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers) {
+            eprintln!("retrieval transport failed: {err}");
+            std::process::exit(1);
         }
     }
 }
@@ -246,30 +252,4 @@ where
         }
     }
     None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportRuntime {
-    Std,
-    Axum,
-}
-
-impl TransportRuntime {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Std => "std",
-            Self::Axum => "axum",
-        }
-    }
-}
-
-fn parse_transport_runtime() -> TransportRuntime {
-    let runtime_raw = env_with_fallback(
-        "DASH_RETRIEVAL_TRANSPORT_RUNTIME",
-        "EME_RETRIEVAL_TRANSPORT_RUNTIME",
-    );
-    match runtime_raw.as_deref() {
-        Some("axum") => TransportRuntime::Axum,
-        _ => TransportRuntime::Std,
-    }
 }

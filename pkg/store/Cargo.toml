@@ -4,13 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
-gpu-backend = ["dep:bytemuck", "dep:pollster", "dep:wgpu"]
+# Historical GPU compute path. The code is feature-gated so it can be
+# re-enabled without rewriting the call sites. With the feature off (default),
+# the wgpu/kosmic backends are compiled out and the store falls back to CPU
+# cosine via `usearch`.
+gpu-backend = []
 
 [dependencies]
 schema = { path = "../schema" }
 ranking = { path = "../ranking" }
 graph = { path = "../graph" }
-bytemuck = { version = "1.18", optional = true, features = ["derive"] }
-pollster = { version = "0.3", optional = true }
-wgpu = { version = "0.19", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+redb = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+usearch = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }

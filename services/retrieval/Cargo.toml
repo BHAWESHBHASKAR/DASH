@@ -3,10 +3,6 @@ name = "retrieval"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-async-transport = ["dep:axum", "dep:tokio"]
-
 [dependencies]
 auth = { path = "../../pkg/auth" }
 schema = { path = "../../pkg/schema" }
@@ -14,5 +10,18 @@ store = { path = "../../pkg/store" }
 graph = { path = "../../pkg/graph" }
 indexer = { path = "../indexer" }
 metadata-router = { path = "../metadata-router" }
-axum = { version = "0.7", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"], optional = true }
+embeddings = { path = "../../pkg/embeddings" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

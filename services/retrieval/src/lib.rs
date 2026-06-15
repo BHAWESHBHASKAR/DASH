@@ -1,7 +1,6 @@
 pub mod api;
+pub mod openai_embeddings;
 pub mod transport;
-#[cfg(feature = "async-transport")]
-pub mod transport_axum;
 
 use schema::{RetrievalRequest, RetrievalResult};
 use store::InMemoryStore;

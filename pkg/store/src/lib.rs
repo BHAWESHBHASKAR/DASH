@@ -13,10 +13,14 @@ use std::sync::OnceLock;
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, ClaimType, Evidence, Relation, RetrievalRequest, RetrievalResult,
-    Stance, StanceMode, ValidationError, tokenize, validate_claim, validate_edge,
+    Citation, Claim, ClaimEdge, ClaimType, Evidence, Relation, RetrievalRequest,
+    RetrievalResult, Stance, StanceMode, ValidationError, tokenize, validate_claim,
+    validate_edge,
     validate_evidence,
 };
+
+mod disk;
+pub use disk::{DiskBackedStore, DiskStatus};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEvent {
@@ -27,7 +31,7 @@ pub enum WalEvent {
     BatchCommit(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
     pub commit_id: String,
     pub batch_size: usize,
@@ -192,7 +196,7 @@ pub struct StoreLoadStats {
     pub vectors_loaded: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct StoreIndexStats {
     pub tenant_count: usize,
     pub claim_count: usize,
@@ -781,7 +785,7 @@ impl Drop for FileWal {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct InMemoryStore {
     claims: HashMap<String, Claim>,
     evidence_by_claim: HashMap<String, Vec<Evidence>>,
@@ -799,6 +803,41 @@ pub struct InMemoryStore {
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
     wal: Vec<WalEvent>,
+    disk: Option<disk::DiskBackedStore>,
+    disk_status: disk::DiskStatus,
+}
+
+impl Clone for InMemoryStore {
+    /// Manual `Clone` impl: the in-memory maps are cloned, but the
+    /// disk handle is dropped (a `redb::Database` is not `Clone`).
+    /// This matches the existing staging pattern: the staged copy
+    /// is a "what-if" snapshot that may be discarded. The caller
+    /// can re-attach the disk with `with_disk` if it needs the
+    /// clone to mirror writes to disk.
+    fn clone(&self) -> Self {
+        Self {
+            claims: self.claims.clone(),
+            evidence_by_claim: self.evidence_by_claim.clone(),
+            edges_by_claim: self.edges_by_claim.clone(),
+            claim_vectors: self.claim_vectors.clone(),
+            ann_vector_graphs: self.ann_vector_graphs.clone(),
+            tenant_vector_dims: self.tenant_vector_dims.clone(),
+            tenant_claim_ids: self.tenant_claim_ids.clone(),
+            inverted_index: self.inverted_index.clone(),
+            entity_index: self.entity_index.clone(),
+            embedding_index: self.embedding_index.clone(),
+            temporal_index: self.temporal_index.clone(),
+            batch_commits: self.batch_commits.clone(),
+            claim_tokens: self.claim_tokens.clone(),
+            ann_tuning: self.ann_tuning.clone(),
+            vector_backend_runtime: self.vector_backend_runtime,
+            wal: self.wal.clone(),
+            disk: None,
+            disk_status: disk::DiskStatus::Unavailable {
+                reason: "store cloned; disk not transferred".to_string(),
+            },
+        }
+    }
 }
 
 impl InMemoryStore {
@@ -830,6 +869,123 @@ impl InMemoryStore {
 
     pub fn vector_backend_label(&self) -> &'static str {
         self.vector_backend_runtime.as_str()
+    }
+
+    /// Attach a `redb`-backed disk store to this in-memory store. The
+    /// disk store is opened at `path` (creating it on first use).
+    /// Every subsequent `apply_*` call will mirror the in-memory
+    /// mutation to disk BEFORE the in-memory state changes. If the
+    /// disk write fails, the in-memory apply is aborted and the error
+    /// is returned to the caller.
+    ///
+    /// On open failure, returns the in-memory store with the disk
+    /// detached and `disk_status` set to `Unavailable { reason }`.
+    /// The error is also returned so the caller can log it. The
+    /// store is always returned (the caller's in-memory state is
+    /// preserved).
+    pub fn with_disk(self, path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        match disk::DiskBackedStore::new(path) {
+            Ok(disk) => Ok(Self {
+                disk: Some(disk),
+                disk_status: disk::DiskStatus::Available,
+                ..self
+            }),
+            Err(reason) => Ok(Self {
+                disk: None,
+                disk_status: disk::DiskStatus::Unavailable { reason: reason.clone() },
+                ..self
+            }),
+        }
+    }
+
+    /// The current disk status. Returns `DiskStatus::Unavailable` if
+    /// no disk was attached (the default in-memory mode).
+    pub fn disk_status(&self) -> &disk::DiskStatus {
+        &self.disk_status
+    }
+
+    /// Construct an `InMemoryStore` by bulk-loading from a disk
+    /// snapshot, then replaying any WAL delta. Returns the new store
+    /// + load stats. This is the cold-start path when both the WAL
+    /// and the redb snapshot are available.
+    #[allow(clippy::doc_lazy_continuation)]
+    pub fn load_from_disk_and_wal(
+        disk_path: impl AsRef<std::path::Path>,
+        wal: &mut FileWal,
+        ann_tuning: AnnTuningConfig,
+    ) -> Result<(Self, StoreLoadStats), String> {
+        // Helper: replay the WAL into an in-memory store, returning
+        // the breakdown stats. Errors are converted to `String` for
+        // the disk API.
+        fn replay_into(
+            store: &mut InMemoryStore,
+            wal: &mut FileWal,
+        ) -> Result<StoreLoadStats, String> {
+            let (records, replay_stats) = wal
+                .replay_records_with_stats()
+                .map_err(|e| format!("wal replay: {e:?}"))?;
+            let mut claims_loaded = 0usize;
+            let mut evidence_loaded = 0usize;
+            let mut edges_loaded = 0usize;
+            let mut vectors_loaded = 0usize;
+            for record in records {
+                match &record {
+                    PersistedRecord::Claim(_) => claims_loaded += 1,
+                    PersistedRecord::Evidence(_) => evidence_loaded += 1,
+                    PersistedRecord::Edge(_) => edges_loaded += 1,
+                    PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
+                    PersistedRecord::BatchCommit(_) => {}
+                }
+                store
+                    .apply_persisted_record(record)
+                    .map_err(|e| format!("apply_persisted_record: {e:?}"))?;
+            }
+            Ok(StoreLoadStats {
+                replay: replay_stats,
+                claims_loaded,
+                evidence_loaded,
+                edges_loaded,
+                vectors_loaded,
+            })
+        }
+
+        // 1. Open the disk. If the open fails, fall back to the
+        //    WAL-only path.
+        let disk = match disk::DiskBackedStore::new(disk_path) {
+            Ok(disk) => Some(disk),
+            Err(reason) => {
+                let mut store = Self::new_with_ann_tuning(ann_tuning);
+                let stats = replay_into(&mut store, wal)?;
+                store.disk_status = disk::DiskStatus::Unavailable { reason };
+                return Ok((store, stats));
+            }
+        };
+
+        // 2. Set status to Recovering for the duration of the bulk
+        //    load + WAL tail replay.
+        let mut store = Self {
+            disk,
+            disk_status: disk::DiskStatus::Recovering,
+            ..Self::new_with_ann_tuning(ann_tuning)
+        };
+        // Take the disk out so we can hold a borrow on the store
+        // across the bulk-load call. The disk is restored after the
+        // WAL tail replay, when we're done mutating the store.
+        let disk = store.disk.take().expect("disk was just attached");
+        let claims_loaded = disk
+            .bulk_load_claims_into(&mut store)
+            .map_err(|e| format!("disk bulk load: {e}"))?;
+        // 3. Replay the WAL tail over the bulk-loaded state.
+        let mut stats = replay_into(&mut store, wal)?;
+        // The bulk-loaded count is the dominant figure; merge it
+        // with the WAL tail counts (claims loaded by the bulk
+        // path will be overwritten in `claims_loaded` by the WAL
+        // tail counter, so we explicitly prefer the bulk count).
+        stats.claims_loaded = claims_loaded;
+        // Restore the disk on the store.
+        store.disk = Some(disk);
+        store.disk_status = disk::DiskStatus::Available;
+        Ok((store, stats))
     }
 
     pub fn load_from_wal(wal: &FileWal) -> Result<Self, StoreError> {
@@ -981,6 +1137,26 @@ impl InMemoryStore {
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {
         self.retrieve_with_time_range_and_query_vector(req, None, None, None)
+    }
+
+    /// Semantic-first retrieval. Takes a pre-computed embedding of the
+    /// query and uses it as the primary ranking signal (cosine in
+    /// `[-1, 1]`, mapped to `[0, 1]`); the lexical+BM25 score becomes a
+    /// small tie-breaker. When the query vector is the same shape as
+    /// the stored vectors for the tenant, this is the recommended
+    /// retrieval entry point — the lexical fallback is for environments
+    /// that haven't yet wired up an embedding model.
+    pub fn retrieve_semantic(
+        &self,
+        req: &RetrievalRequest,
+        query_vector: &[f32],
+    ) -> Vec<RetrievalResult> {
+        self.retrieve_with_time_range_and_query_vector(
+            req,
+            None,
+            None,
+            Some(query_vector),
+        )
     }
 
     pub fn retrieve_with_time_range(
@@ -1141,7 +1317,7 @@ impl InMemoryStore {
                 .copied()
                 .unwrap_or(0.0);
 
-            let score = score_claim_with_bm25(
+            let lexical_score = score_claim_with_bm25(
                 &req.query,
                 claim,
                 avg_quality,
@@ -1150,7 +1326,24 @@ impl InMemoryStore {
                     contradicts,
                 },
                 bm25,
-            ) + (dense_similarity * 0.35);
+            );
+
+            let score = if query_vector.is_some() {
+                // Semantic-first retrieval: dense similarity is the
+                // PRIMARY signal (cosine in [-1, 1] -> mapped to
+                // [0, 1] via the embedding backend). The lexical/BM25
+                // score is a small tie-breaker when dense similarities
+                // are tied. This replaces the historical 0.35 additive
+                // weight with semantic-primary scoring, which is the
+                // right default when the caller explicitly provides
+                // a query vector.
+                let dense_primary = (dense_similarity + 1.0) * 0.5;
+                dense_primary + (lexical_score * 0.1)
+            } else {
+                // Lexical-only retrieval: historical behavior
+                // (dense_similarity is 0.0 when no query_vector).
+                lexical_score + (dense_similarity * 0.35)
+            };
 
             let citations = evidence
                 .iter()
@@ -1394,6 +1587,52 @@ impl InMemoryStore {
 
     pub fn claims_len(&self) -> usize {
         self.claims.len()
+    }
+
+    // ----------------------------------------------------------------
+    // Internal iterators used by the disk module's checkpoint path.
+    // `pub(crate)` so the disk module can read every record but the
+    // public API stays unchanged.
+    // ----------------------------------------------------------------
+
+    pub(crate) fn claims_iter(&self) -> impl Iterator<Item = &Claim> {
+        self.claims.values()
+    }
+
+    pub(crate) fn evidence_iter(&self) -> impl Iterator<Item = (&str, &Vec<Evidence>)> {
+        self.evidence_by_claim
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub(crate) fn edges_iter(&self) -> impl Iterator<Item = (&str, &Vec<ClaimEdge>)> {
+        self.edges_by_claim
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub(crate) fn claim_vectors_iter(&self) -> impl Iterator<Item = (&str, &Vec<f32>)> {
+        self.claim_vectors
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub(crate) fn batch_commits_iter(&self) -> impl Iterator<Item = &BatchCommitMetadata> {
+        self.batch_commits.values()
+    }
+
+    pub(crate) fn tenant_dims_iter(&self) -> impl Iterator<Item = (&str, &usize)> {
+        self.tenant_vector_dims
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub(crate) fn tenant_claim_set_iter(&self) -> impl Iterator<Item = (String, String)> {
+        self.tenant_claim_ids
+            .iter()
+            .flat_map(|(tenant, claims)| {
+                claims.iter().map(move |claim| (tenant.clone(), claim.clone()))
+            })
     }
 
     fn should_checkpoint(
@@ -1802,6 +2041,24 @@ impl InMemoryStore {
     }
 
     fn apply_claim(&mut self, claim: Claim) -> Result<(), StoreError> {
+        // Write to disk BEFORE mutating in-memory state. If the disk
+        // write fails, the in-memory state is unchanged.
+        if let Some(disk) = self.disk.as_ref() {
+            disk.put_claim(&claim).map_err(StoreError::Io)?;
+            disk.add_claim_to_tenant(&claim.tenant_id, &claim.claim_id)
+                .map_err(StoreError::Io)?;
+        }
+        self.apply_claim_inner(claim)
+    }
+
+    /// In-memory only — no disk mirror. Used by the disk module's
+    /// bulk-load path (`bulk_load_claims_into`) to avoid re-writing
+    /// data that's already on disk.
+    pub(crate) fn apply_claim_for_load(&mut self, claim: Claim) -> Result<(), StoreError> {
+        self.apply_claim_inner(claim)
+    }
+
+    fn apply_claim_inner(&mut self, claim: Claim) -> Result<(), StoreError> {
         validate_claim(&claim)?;
         let claim_id = claim.claim_id.clone();
         if let Some(previous) = self.claims.get(&claim_id).cloned() {
@@ -1820,6 +2077,44 @@ impl InMemoryStore {
     }
 
     fn apply_evidence(&mut self, evidence: Evidence) -> Result<(), StoreError> {
+        // Write to disk BEFORE mutating in-memory state.
+        if let Some(disk) = self.disk.as_ref() {
+            // Read the current evidence blob (if any), append the
+            // new evidence, write it back. The on-disk blob is
+            // always a full Vec<Evidence> for the claim, so a single
+            // append + replace keeps the on-disk state consistent.
+            let mut current: Vec<Evidence> = disk
+                .get_evidence_blob(&evidence.claim_id)
+                .map_err(StoreError::Io)?
+                .unwrap_or_default();
+            current.push(evidence.clone());
+            disk.put_evidence_blob(&evidence.claim_id, &current)
+                .map_err(StoreError::Io)?;
+        }
+        self.apply_evidence_inner(evidence)
+    }
+
+    /// Apply a pre-built evidence blob to the in-memory state.
+    /// No disk mirror. Used by the bulk-load path.
+    pub(crate) fn apply_evidence_blob_for_load(
+        &mut self,
+        claim_id: &str,
+        evidence: &[Evidence],
+    ) -> Result<(), StoreError> {
+        if !self.claims.contains_key(claim_id) {
+            return Err(StoreError::MissingClaim(claim_id.to_string()));
+        }
+        let entry = self
+            .evidence_by_claim
+            .entry(claim_id.to_string())
+            .or_default();
+        for evd in evidence {
+            entry.push(evd.clone());
+        }
+        Ok(())
+    }
+
+    fn apply_evidence_inner(&mut self, evidence: Evidence) -> Result<(), StoreError> {
         validate_evidence(&evidence)?;
         if !self.claims.contains_key(&evidence.claim_id) {
             return Err(StoreError::MissingClaim(evidence.claim_id));
@@ -1834,6 +2129,37 @@ impl InMemoryStore {
     }
 
     fn apply_edge(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
+        // Write to disk BEFORE mutating in-memory state.
+        if let Some(disk) = self.disk.as_ref() {
+            let mut current: Vec<ClaimEdge> = disk
+                .get_edge_blob(&edge.from_claim_id)
+                .map_err(StoreError::Io)?
+                .unwrap_or_default();
+            current.push(edge.clone());
+            disk.put_edge_blob(&edge.from_claim_id, &current)
+                .map_err(StoreError::Io)?;
+        }
+        self.apply_edge_inner(edge)
+    }
+
+    /// Apply a pre-built edge blob to the in-memory state. No disk
+    /// mirror. Used by the bulk-load path.
+    pub(crate) fn apply_edge_blob_for_load(
+        &mut self,
+        from: &str,
+        edges: &[ClaimEdge],
+    ) -> Result<(), StoreError> {
+        if !self.claims.contains_key(from) {
+            return Err(StoreError::MissingClaim(from.to_string()));
+        }
+        let entry = self.edges_by_claim.entry(from.to_string()).or_default();
+        for edge in edges {
+            entry.push(edge.clone());
+        }
+        Ok(())
+    }
+
+    fn apply_edge_inner(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
         validate_edge(&edge)?;
         if !self.claims.contains_key(&edge.from_claim_id) {
             return Err(StoreError::MissingClaim(edge.from_claim_id));
@@ -1847,6 +2173,50 @@ impl InMemoryStore {
     }
 
     fn apply_claim_vector(&mut self, claim_id: &str, vector: Vec<f32>) -> Result<(), StoreError> {
+        // Resolve the tenant and check the dimension match BEFORE
+        // doing any disk I/O, so we don't write a half-bad state.
+        let claim = self
+            .claims
+            .get(claim_id)
+            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
+        let tenant_id = claim.tenant_id.clone();
+        let new_dim_needed = match self.tenant_vector_dims.get(&tenant_id) {
+            Some(existing_dim) if *existing_dim != vector.len() => {
+                return Err(StoreError::InvalidVector(format!(
+                    "vector dimension mismatch for tenant '{}': expected {}, got {}",
+                    tenant_id, existing_dim, vector.len()
+                )));
+            }
+            None => Some(vector.len()),
+            _ => None,
+        };
+
+        // Write to disk BEFORE mutating in-memory state.
+        if let Some(disk) = self.disk.as_ref() {
+            disk.put_vector(claim_id, &vector).map_err(StoreError::Io)?;
+            if let Some(dim) = new_dim_needed {
+                disk.put_tenant_dim(&tenant_id, dim)
+                    .map_err(StoreError::Io)?;
+            }
+        }
+        self.apply_claim_vector_inner(claim_id, vector)
+    }
+
+    /// Apply a vector to the in-memory state (rebuilds the ANN
+    /// index). No disk mirror. Used by the bulk-load path.
+    pub(crate) fn apply_claim_vector_blob_for_load(
+        &mut self,
+        claim_id: &str,
+        vector: Vec<f32>,
+    ) -> Result<(), StoreError> {
+        self.apply_claim_vector_inner(claim_id, vector)
+    }
+
+    fn apply_claim_vector_inner(
+        &mut self,
+        claim_id: &str,
+        vector: Vec<f32>,
+    ) -> Result<(), StoreError> {
         validate_vector(&vector)?;
         let claim = self
             .claims
@@ -1885,6 +2255,8 @@ impl InMemoryStore {
     }
 
     fn apply_batch_commit_record(&mut self, record: BatchCommitRecord) -> Result<(), StoreError> {
+        // Compute the metadata the same way the inner function will,
+        // so we can mirror to disk before mutating in-memory state.
         let payload_fingerprint =
             batch_commit_payload_fingerprint(record.batch_size, &record.claim_ids);
         if let Some(existing) = self.batch_commits.get(&record.commit_id) {
@@ -1894,21 +2266,58 @@ impl InMemoryStore {
                     record.commit_id, existing.payload_fingerprint, payload_fingerprint
                 )));
             }
+            // Idempotent: the record is already in memory and on disk.
             return Ok(());
         }
 
-        self.batch_commits.insert(
-            record.commit_id.clone(),
-            BatchCommitMetadata {
-                commit_id: record.commit_id.clone(),
-                batch_size: record.batch_size,
-                ts_unix_ms: record.ts_unix_ms,
-                claim_ids: record.claim_ids,
-                payload_fingerprint,
-            },
-        );
+        let metadata = BatchCommitMetadata {
+            commit_id: record.commit_id.clone(),
+            batch_size: record.batch_size,
+            ts_unix_ms: record.ts_unix_ms,
+            claim_ids: record.claim_ids.clone(),
+            payload_fingerprint: payload_fingerprint.clone(),
+        };
+        if let Some(disk) = self.disk.as_ref() {
+            disk.put_batch_commit(&metadata).map_err(StoreError::Io)?;
+        }
+        self.batch_commits.insert(record.commit_id.clone(), metadata);
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
         Ok(())
+    }
+
+    /// Apply a batch-commit metadata to the in-memory state. No
+    /// disk mirror. Used by the bulk-load path.
+    pub(crate) fn apply_batch_commit_for_load(
+        &mut self,
+        commit: &BatchCommitMetadata,
+    ) -> Result<(), StoreError> {
+        if let Some(existing) = self.batch_commits.get(&commit.commit_id) {
+            if existing.payload_fingerprint != commit.payload_fingerprint {
+                return Err(StoreError::Conflict(format!(
+                    "batch commit_id '{}' already exists with different payload (existing_fingerprint={}, incoming_fingerprint={})",
+                    commit.commit_id, existing.payload_fingerprint, commit.payload_fingerprint
+                )));
+            }
+            return Ok(());
+        }
+        self.batch_commits
+            .insert(commit.commit_id.clone(), commit.clone());
+        Ok(())
+    }
+
+    /// Apply a tenant vector dimension to the in-memory state. No
+    /// disk mirror. Used by the bulk-load path.
+    pub(crate) fn apply_tenant_dim_for_load(&mut self, tenant: &str, dim: usize) {
+        self.tenant_vector_dims.insert(tenant.to_string(), dim);
+    }
+
+    /// Apply a tenant-claim set membership to the in-memory state.
+    /// No disk mirror. Used by the bulk-load path.
+    pub(crate) fn apply_tenant_claim_set_for_load(&mut self, tenant: &str, claim: &str) {
+        self.tenant_claim_ids
+            .entry(tenant.to_string())
+            .or_default()
+            .insert(claim.to_string());
     }
 
     fn add_vector_index_entry(&mut self, tenant_id: &str, claim_id: &str, vector: &[f32]) {

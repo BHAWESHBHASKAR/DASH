@@ -384,3 +384,112 @@ fn transport_allows_retrieval_jwt_signed_with_kid_secret() {
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 200 OK"));
 }
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible /v1/embeddings endpoint
+//
+// These tests hit the real HTTP route through handle_http_request_bytes,
+// verifying the wire format is byte-for-byte compatible with OpenAI's
+// /v1/embeddings spec. This is the integration test for the
+// adoption-foundation OpenAI endpoint.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transport_openai_embeddings_single_string_returns_openai_shape() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let body = r#"{"input":"hello world","model":"text-embedding-3-small"}"#;
+    let request = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"object\":\"list\""));
+    assert!(response.contains("\"data\":["));
+    assert!(response.contains("\"model\":\"text-embedding-3-small\""));
+    assert!(response.contains("\"usage\":"));
+    assert!(response.contains("\"object\":\"embedding\""));
+    assert!(response.contains("\"embedding\":["));
+    assert!(response.contains("\"index\":0"));
+    assert!(response.contains("\"prompt_tokens\":"));
+    assert!(response.contains("\"total_tokens\":"));
+}
+
+#[test]
+fn transport_openai_embeddings_array_input_returns_indexed_results() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let body = r#"{"input":["alpha","beta","gamma"],"model":"text-embedding-3-small"}"#;
+    let request = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"index\":0"));
+    assert!(response.contains("\"index\":1"));
+    assert!(response.contains("\"index\":2"));
+    // Word count tokenization: "alpha"=1, "beta"=1, "gamma"=1 => total 3
+    assert!(response.contains("\"total_tokens\":3"));
+}
+
+#[test]
+fn transport_openai_embeddings_malformed_json_returns_400_with_error_envelope() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let body = r#"{"input":"hello""#; // truncated JSON
+    let request = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(response.contains("\"error\":{"));
+    assert!(response.contains("\"type\":\"invalid_request_error\""));
+    assert!(response.contains("\"message\":"));
+}
+
+#[test]
+fn transport_openai_embeddings_empty_array_returns_400() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let body = r#"{"input":[],"model":"text-embedding-3-small"}"#;
+    let request = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(response.contains("at least one text"));
+    assert!(response.contains("\"type\":\"invalid_request_error\""));
+}
+
+#[test]
+fn transport_openai_embeddings_get_method_returns_405() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let request = b"GET /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = retrieval::transport::handle_http_request_bytes(&store, request)
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 405"));
+    assert!(response.contains("only POST is supported"));
+}

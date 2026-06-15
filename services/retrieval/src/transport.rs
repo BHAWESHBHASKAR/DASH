@@ -1031,7 +1031,7 @@ fn handle_request(store: &InMemoryStore, request: &HttpRequest) -> HttpResponse 
     handle_request_with_metrics(store, request, &metrics)
 }
 
-#[cfg(any(test, feature = "async-transport"))]
+#[cfg(test)]
 pub(crate) fn handle_request_with_metrics(
     store: &InMemoryStore,
     request: &HttpRequest,
@@ -1405,7 +1405,47 @@ fn handle_request_with_metrics_and_reload(
                 }
             }
         }
+        ("POST", "/v1/embeddings") => {
+            // OpenAI-compatible embeddings endpoint. No auth required at the
+            // HTTP layer (it accepts only the request body); a future
+            // version will wire JWT/API-key checks here.
+            //
+            // The embedding backend is selected at request time from the
+            // DASH_EMBEDDING_PROVIDER env var. The default is `hash`
+            // (deterministic, no network) which is suitable for
+            // testing and for environments that have not yet wired up
+            // a real embedding model. Production deployments should
+            // set `DASH_EMBEDDING_PROVIDER=ollama` or `=openai` so the
+            // vectors are semantically meaningful.
+            let body = match std::str::from_utf8(&request.body) {
+                Ok(text) => text,
+                Err(_) => {
+                    return HttpResponse::bad_request("request body must be valid UTF-8")
+                }
+            };
+            let provider = crate::openai_embeddings::select_provider_from_env();
+            match crate::openai_embeddings::handle_openai_embeddings_with_provider(
+                body,
+                provider.as_ref(),
+            ) {
+                Ok(resp) => {
+                    let body = serde_json::to_string(&resp)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    HttpResponse::ok_json(body)
+                }
+                Err(err) => {
+                    let body = serde_json::to_string(&err)
+                        .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
+                    HttpResponse {
+                        status: 400,
+                        content_type: "application/json",
+                        body,
+                    }
+                }
+            }
+        }
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
+        (_, "/v1/embeddings") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/health")
         | (_, "/metrics")
         | (_, "/debug/placement")
