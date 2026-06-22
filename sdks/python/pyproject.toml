@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.18"]
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -33,15 +33,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "requests>=2.28",
-    "httpx>=0.24",
+    "requests>=2.32.5",
+    "httpx>=0.28.1",
 ]
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7.0",
-    "pytest-mock>=3.10",
-    "pytest-asyncio>=0.21",
+    "pytest>=8.4.2",
+    "pytest-mock>=3.15.1",
+    "pytest-asyncio>=1.2.0",
 ]
 
 [project.urls]
