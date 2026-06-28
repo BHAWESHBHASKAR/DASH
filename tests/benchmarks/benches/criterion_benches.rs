@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
@@ -287,8 +287,7 @@ fn bench_wal_replay(c: &mut Criterion) {
         let _keep_alive = &tmp;
         b.iter(|| {
             let wal = FileWal::open(&wal_path).expect("reopen");
-            let (store, _stats) = InMemoryStore::load_from_wal_with_stats(&wal)
-                .expect("replay");
+            let (store, _stats) = InMemoryStore::load_from_wal_with_stats(&wal).expect("replay");
             std::hint::black_box(store);
         });
     });
@@ -302,7 +301,8 @@ fn bench_wal_replay(c: &mut Criterion) {
 fn bench_disk_vs_memory_ingest(c: &mut Criterion) {
     let mut group = c.benchmark_group("disk_vs_memory_ingest");
     group.throughput(Throughput::Elements(1_000));
-    for n in [1_000] {
+    {
+        let n = 1_000;
         // In-memory path
         group.bench_with_input(BenchmarkId::new("in_memory", n), &n, |b, &n| {
             b.iter(|| {
@@ -310,11 +310,7 @@ fn bench_disk_vs_memory_ingest(c: &mut Criterion) {
                 for i in 0..n {
                     let id = format!("c{i}");
                     store
-                        .ingest_bundle(
-                            make_claim(&id, "t1", &format!("text {i}")),
-                            vec![],
-                            vec![],
-                        )
+                        .ingest_bundle(make_claim(&id, "t1", &format!("text {i}")), vec![], vec![])
                         .expect("ingest");
                 }
                 std::hint::black_box(store);
@@ -325,17 +321,12 @@ fn bench_disk_vs_memory_ingest(c: &mut Criterion) {
             b.iter(|| {
                 let tmp = TempDir::new().unwrap();
                 let disk_path = tmp.path().join("bench.redb");
-                let mut store =
-                    InMemoryStore::new_with_ann_tuning(AnnTuningConfig::default());
+                let mut store = InMemoryStore::new_with_ann_tuning(AnnTuningConfig::default());
                 store = store.with_disk(&disk_path).expect("with_disk");
                 for i in 0..n {
                     let id = format!("c{i}");
                     store
-                        .ingest_bundle(
-                            make_claim(&id, "t1", &format!("text {i}")),
-                            vec![],
-                            vec![],
-                        )
+                        .ingest_bundle(make_claim(&id, "t1", &format!("text {i}")), vec![], vec![])
                         .expect("ingest");
                 }
                 std::hint::black_box(store);

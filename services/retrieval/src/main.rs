@@ -1,6 +1,6 @@
 use retrieval::{retrieve_for_rag, transport::serve_http_with_workers};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
-use store::{AnnTuningConfig, FileWal, InMemoryStore};
+use store::{AnnTuningConfig, DistanceMetric, FileWal, InMemoryStore};
 
 fn main() {
     // Default to serve mode (this is a server binary; the CLI
@@ -54,7 +54,7 @@ fn main() {
             "EME_RETRIEVAL_PERSISTENCE_DISABLE",
         )
         .as_deref()
-        == Some("1");
+            == Some("1");
         let disk_path = env_with_fallback(
             "DASH_RETRIEVAL_PERSISTENCE_PATH",
             "EME_RETRIEVAL_PERSISTENCE_PATH",
@@ -171,8 +171,7 @@ fn main() {
             )
             .unwrap_or_else(|| "0".to_string());
             println!(
-                "retrieval placement routing: file={}, local_node_id={}, read_preference={}, reload_interval_ms={}",
-                placement_file, local_node, read_preference, reload_interval_ms
+                "retrieval placement routing: file={placement_file}, local_node_id={local_node}, read_preference={read_preference}, reload_interval_ms={reload_interval_ms}"
             );
         }
         println!("retrieval health endpoint: http://{bind_addr}/health");
@@ -259,6 +258,11 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
         ])
         .filter(|value| *value > 0)
         .unwrap_or(defaults.search_expansion_max),
+        metric: std::env::var("DASH_RETRIEVAL_VECTOR_METRIC")
+            .or_else(|_| std::env::var("DASH_VECTOR_METRIC"))
+            .ok()
+            .and_then(|raw| DistanceMetric::parse(&raw))
+            .unwrap_or(defaults.metric),
     }
 }
 

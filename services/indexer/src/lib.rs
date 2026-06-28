@@ -145,7 +145,7 @@ pub fn build_segments(claims: &[Claim], max_segment_size: usize) -> Vec<Segment>
         let ids = buckets.remove(&tier).unwrap_or_default();
         for (idx, chunk) in ids.chunks(max_segment_size).enumerate() {
             out.push(Segment {
-                segment_id: format!("{:?}-{}", tier, idx).to_ascii_lowercase(),
+                segment_id: format!("{tier:?}-{idx}").to_ascii_lowercase(),
                 tier: tier.clone(),
                 claim_ids: chunk.to_vec(),
             });
@@ -180,7 +180,7 @@ pub fn plan_tier_compaction(
         tier: tier.clone(),
         segments: selected,
         merged_segment: Segment {
-            segment_id: format!("{:?}-merged", tier).to_ascii_lowercase(),
+            segment_id: format!("{tier:?}-merged").to_ascii_lowercase(),
             tier,
             claim_ids: merged_ids,
         },
@@ -556,8 +556,7 @@ fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
     let actual_checksum = segment_checksum(&tier, &claim_ids);
     if actual_checksum != expected_checksum {
         return Err(SegmentStoreError::Integrity(format!(
-            "segment '{}' checksum mismatch: expected={}, actual={}",
-            segment_id, expected_checksum, actual_checksum
+            "segment '{segment_id}' checksum mismatch: expected={expected_checksum}, actual={actual_checksum}"
         )));
     }
 

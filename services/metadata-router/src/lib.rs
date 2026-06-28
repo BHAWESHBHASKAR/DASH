@@ -530,7 +530,7 @@ fn parse_http_url(url: &str) -> Result<(String, String), String> {
         .strip_prefix("http://")
         .ok_or_else(|| "control-plane URL must start with http://".to_string())?;
     let (authority, path_and_query) = match without_scheme.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{}", suffix)),
+        Some((authority, suffix)) => (authority, format!("/{suffix}")),
         None => (without_scheme, "/".to_string()),
     };
     if authority.trim().is_empty() {

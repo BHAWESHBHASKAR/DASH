@@ -154,10 +154,7 @@ pub(super) fn authorize_request_for_tenant(
     if let Some(ref limiter) = policy.rate_limiter
         && let Err((current, limit)) = limiter.check(tenant_id)
     {
-        eprintln!(
-            "rate limit exceeded for tenant {}: {}/{} rps",
-            tenant_id, current, limit
-        );
+        eprintln!("rate limit exceeded for tenant {tenant_id}: {current}/{limit} rps");
         return AuthDecision::Unauthorized("rate limit exceeded");
     }
     AuthDecision::Allowed

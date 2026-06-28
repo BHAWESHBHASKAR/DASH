@@ -5,8 +5,7 @@ use crate::api::{
 };
 
 pub(super) fn build_ingest_request_from_json(body: &str) -> Result<IngestApiRequest, String> {
-    let wire: IngestApiRequestWire =
-        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    let wire: IngestApiRequestWire = serde_json::from_str(body).map_err(|err| err.to_string())?;
     wire.into_runtime()
 }
 
@@ -22,8 +21,7 @@ pub(super) fn build_ingest_batch_request_from_json(
 pub(super) fn build_ingest_raw_request_from_json(
     body: &str,
 ) -> Result<IngestRawApiRequest, String> {
-    let mut req: IngestRawApiRequest =
-        serde_json::from_str(body).map_err(|err| err.to_string())?;
+    let mut req: IngestRawApiRequest = serde_json::from_str(body).map_err(|err| err.to_string())?;
     validate_raw_request_ranges(&mut req)?;
     normalize_optional_string(&mut req.extraction_model);
     normalize_optional_string(&mut req.embedding_model);

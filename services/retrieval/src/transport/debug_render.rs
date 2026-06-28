@@ -86,8 +86,7 @@ pub(super) fn evaluate_storage_divergence_warning(
         ))
     } else {
         Some(format!(
-            "divergence_ratio={:.6} exceeds {:.6}",
-            ratio, warn_ratio
+            "divergence_ratio={ratio:.6} exceeds {warn_ratio:.6}"
         ))
     };
     (warn, reason, ratio)
@@ -173,7 +172,7 @@ pub(super) fn render_placement_debug_json(
             .map(|value| format!("\"{}\"", json_escape(value)))
             .unwrap_or_else(|| "null".to_string()),
         read_preference
-            .map(|value| format!("\"{}\"", value))
+            .map(|value| format!("\"{value}\""))
             .unwrap_or_else(|| "null".to_string()),
         shard_count,
         render_placements_json(placements),

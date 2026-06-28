@@ -45,6 +45,46 @@ pub(crate) const ANN_SEARCH_EXPANSION_MIN_DEFAULT: usize = 64;
 pub(crate) const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
 
 // ---------------------------------------------------------------------------
+// Distance metric
+// ---------------------------------------------------------------------------
+
+/// The similarity/distance function used for vector candidate
+/// generation and dense scoring. `Cosine` is the calibrated default
+/// (the retrieval scoring formula maps cosine `[-1, 1]` into `[0, 1]`);
+/// `DotProduct` and `Euclidean` are available for callers whose
+/// embeddings are tuned for those geometries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DistanceMetric {
+    #[default]
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
+impl DistanceMetric {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::DotProduct => "dot",
+            Self::Euclidean => "euclidean",
+        }
+    }
+
+    /// Parse a metric from an env/config string. Accepts common
+    /// aliases (`cos`, `ip`/`inner_product`, `l2`). Returns `None`
+    /// for unrecognized values so callers can fall back to the
+    /// default and log.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cosine" | "cos" => Some(Self::Cosine),
+            "dot" | "dotproduct" | "dot_product" | "ip" | "inner_product" => Some(Self::DotProduct),
+            "euclidean" | "l2" | "l2sq" => Some(Self::Euclidean),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tunable configuration
 // ---------------------------------------------------------------------------
 
@@ -55,6 +95,7 @@ pub struct AnnTuningConfig {
     pub search_expansion_factor: usize,
     pub search_expansion_min: usize,
     pub search_expansion_max: usize,
+    pub metric: DistanceMetric,
 }
 
 impl Default for AnnTuningConfig {
@@ -65,6 +106,7 @@ impl Default for AnnTuningConfig {
             search_expansion_factor: ANN_SEARCH_EXPANSION_FACTOR_DEFAULT,
             search_expansion_min: ANN_SEARCH_EXPANSION_MIN_DEFAULT,
             search_expansion_max: ANN_SEARCH_EXPANSION_MAX_DEFAULT,
+            metric: DistanceMetric::Cosine,
         }
     }
 }

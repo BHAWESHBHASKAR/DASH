@@ -22,7 +22,8 @@ use std::{
     collections::BTreeMap,
     env, fmt, fs,
     path::PathBuf,
-    process, time::{Instant, SystemTime, UNIX_EPOCH},
+    process,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
@@ -116,10 +117,7 @@ where
             "--all" => out.all = true,
             "--help" | "-h" => out.help = true,
             other => {
-                return Err(format!(
-                    "Unknown argument '{other}'.\n\n{}",
-                    usage_text()
-                ));
+                return Err(format!("Unknown argument '{other}'.\n\n{}", usage_text()));
             }
         }
     }
@@ -230,7 +228,7 @@ impl fmt::Display for BenchResult {
             self.throughput_ops_per_sec()
         )?;
         for (key, value) in &self.extras {
-            writeln!(f, "  {:<25} {}", key, value)?;
+            writeln!(f, "  {key:<25} {value}")?;
         }
         Ok(())
     }
@@ -306,7 +304,9 @@ fn make_evidence(evidence_id: &str, claim_id: &str) -> Evidence {
 
 fn fixture_vector(seed: usize, dim: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(dim);
-    let mut state = (seed as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut state = (seed as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1);
     for _ in 0..dim {
         state = state
             .wrapping_mul(2862933555777941757)
@@ -345,12 +345,7 @@ fn ingest_one_in_memory(store: &mut InMemoryStore, tenant: &str, index: usize) {
         .expect("in-memory ingest should succeed");
 }
 
-fn ingest_one_persistent(
-    store: &mut InMemoryStore,
-    wal: &mut FileWal,
-    tenant: &str,
-    index: usize,
-) {
+fn ingest_one_persistent(store: &mut InMemoryStore, wal: &mut FileWal, tenant: &str, index: usize) {
     let id = format!("claim-perf-pw-{index}");
     let claim = make_claim(&id, tenant, "perf persistent ingest claim", 0.9);
     let evidence = make_evidence(&format!("evd-perf-pw-{index}"), &id);
@@ -572,7 +567,10 @@ fn scenario_ann_search_throughput_at_scale(
             .with_extra("fixture_size", ANN_VECTORS.to_string())
             .with_extra("vector_dim", ANN_DIM.to_string())
             .with_extra("top_n", ANN_TOP_N.to_string())
-            .with_extra("note", "ANN graph build is O(N^2); scale reduced from 100k spec for build feasibility"),
+            .with_extra(
+                "note",
+                "ANN graph build is O(N^2); scale reduced from 100k spec for build feasibility",
+            ),
     ])
 }
 
@@ -675,10 +673,7 @@ fn main() {
 
     let selected: Vec<String> = if let Some(scenario) = args.scenario.as_deref() {
         if !ALL_SCENARIOS.contains(&scenario) {
-            eprintln!(
-                "Unknown scenario '{scenario}'. Valid: {:?}",
-                ALL_SCENARIOS
-            );
+            eprintln!("Unknown scenario '{scenario}'. Valid: {ALL_SCENARIOS:?}");
             process::exit(2);
         }
         vec![scenario.to_string()]

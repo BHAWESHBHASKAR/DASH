@@ -125,9 +125,7 @@ impl IngestBatchApiRequestWire {
             let req = item.into_runtime()?;
             if let Some(tenant_id) = expected_tenant.as_deref() {
                 if tenant_id != req.claim.tenant_id {
-                    return Err(
-                        "all batch items must share the same claim.tenant_id".to_string(),
-                    );
+                    return Err("all batch items must share the same claim.tenant_id".to_string());
                 }
             } else {
                 expected_tenant = Some(req.claim.tenant_id.clone());
@@ -196,14 +194,10 @@ impl ClaimWire {
 
         if let Some(vector) = &self.embedding_vector {
             if vector.is_empty() {
-                return Err(
-                    "claim.embedding_vector must not be empty when provided".to_string(),
-                );
+                return Err("claim.embedding_vector must not be empty when provided".to_string());
             }
             if !vector.iter().all(|v| v.is_finite()) {
-                return Err(
-                    "claim.embedding_vector values must be finite numbers".to_string(),
-                );
+                return Err("claim.embedding_vector values must be finite numbers".to_string());
             }
         }
 
@@ -259,9 +253,7 @@ impl EvidenceWire {
             "contradicts" => Stance::Contradicts,
             "neutral" => Stance::Neutral,
             _ => {
-                return Err(
-                    "evidence.stance must be supports, contradicts, or neutral".to_string(),
-                );
+                return Err("evidence.stance must be supports, contradicts, or neutral".to_string());
             }
         };
         Ok(Evidence {

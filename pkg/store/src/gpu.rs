@@ -18,12 +18,7 @@ struct GpuBackendEngine {
 #[cfg(feature = "gpu-backend")]
 static GPU_BACKEND_ENGINE: OnceLock<Result<GpuBackendEngine, String>> = OnceLock::new();
 
-//!
-//! This module is entirely gated behind the \ cargo
-//! feature. The build script wires it into the store at compile
-//! time; if the feature is disabled, the store falls back to
-//! the CPU similarity implementation in lib.rs.
-
+#[cfg(feature = "gpu-backend")]
 fn gpu_backend_engine() -> Option<&'static GpuBackendEngine> {
     GPU_BACKEND_ENGINE
         .get_or_init(GpuBackendEngine::new)
@@ -268,4 +263,3 @@ impl GpuBackendEngine {
         Ok(candidate_ids.into_iter().zip(scores).collect())
     }
 }
-

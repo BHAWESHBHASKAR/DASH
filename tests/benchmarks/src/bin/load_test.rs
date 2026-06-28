@@ -67,7 +67,8 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut url = std::env::var("DASH_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let mut url =
+        std::env::var("DASH_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let mut concurrency = 16;
     let mut duration_seconds = 30;
     let mut endpoint = "retrieve".to_string();
@@ -123,7 +124,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 2;
             }
             "--help" | "-h" => {
-                eprintln!("{}", USAGE);
+                eprintln!("{USAGE}");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown flag: {other}")),
@@ -164,7 +165,11 @@ async fn wait_for_health(client: &Client, url: &str) -> Result<(), String> {
     while Instant::now() < deadline {
         match client.get(format!("{url}/v1/health")).send().await {
             Ok(r) if r.status().is_success() => return Ok(()),
-            Ok(r) => eprintln!("health: {} {}", r.status(), r.text().await.unwrap_or_default()),
+            Ok(r) => eprintln!(
+                "health: {} {}",
+                r.status(),
+                r.text().await.unwrap_or_default()
+            ),
             Err(e) => eprintln!("health: {e}"),
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -320,8 +325,7 @@ async fn main() {
                 result.p999_ms,
                 result.max_ms
             );
-            let json = serde_json::to_string(&vec![result])
-                .expect("serialize result");
+            let json = serde_json::to_string(&vec![result]).expect("serialize result");
             println!("\nLOAD_JSON: {json}");
         }
         Err(e) => {

@@ -36,14 +36,10 @@ fn convert(value: serde_json::Value) -> JsonValue {
         serde_json::Value::Bool(b) => JsonValue::Bool(b),
         serde_json::Value::Number(n) => JsonValue::Number(n.to_string()),
         serde_json::Value::String(s) => JsonValue::String(s),
-        serde_json::Value::Array(arr) => {
-            JsonValue::Array(arr.into_iter().map(convert).collect())
+        serde_json::Value::Array(arr) => JsonValue::Array(arr.into_iter().map(convert).collect()),
+        serde_json::Value::Object(obj) => {
+            JsonValue::Object(obj.into_iter().map(|(k, v)| (k, convert(v))).collect())
         }
-        serde_json::Value::Object(obj) => JsonValue::Object(
-            obj.into_iter()
-                .map(|(k, v)| (k, convert(v)))
-                .collect(),
-        ),
     }
 }
 

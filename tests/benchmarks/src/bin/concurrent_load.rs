@@ -137,15 +137,15 @@ fn run(config: Config) -> Result<(), String> {
         "success_rate_pct: {:.2}",
         (success as f64 / total_requests as f64) * 100.0
     );
-    println!("elapsed_seconds: {:.4}", elapsed_seconds);
+    println!("elapsed_seconds: {elapsed_seconds:.4}");
     println!(
         "throughput_rps: {:.2}",
         success as f64 / elapsed_seconds.max(0.0001)
     );
-    println!("latency_avg_ms: {:.4}", avg_ms);
-    println!("latency_p50_ms: {:.4}", p50_ms);
-    println!("latency_p95_ms: {:.4}", p95_ms);
-    println!("latency_p99_ms: {:.4}", p99_ms);
+    println!("latency_avg_ms: {avg_ms:.4}");
+    println!("latency_p50_ms: {p50_ms:.4}");
+    println!("latency_p95_ms: {p95_ms:.4}");
+    println!("latency_p99_ms: {p99_ms:.4}");
 
     if failed > 0 {
         for err in errors {

@@ -262,7 +262,7 @@ fn load_placement_routing_runtime(
     let placements = load_shard_placements_from_source(placement_file, control_plane_base_url)?;
     if placements.is_empty() {
         let source = control_plane_base_url
-            .map(|value| format!("control-plane '{}'", value))
+            .map(|value| format!("control-plane '{value}'"))
             .or_else(|| placement_file.map(|value| format!("placement file '{}'", value.display())))
             .unwrap_or_else(|| "placement source".to_string());
         return Err(format!("{source} has no placement records"));

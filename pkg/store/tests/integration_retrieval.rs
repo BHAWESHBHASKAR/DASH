@@ -17,9 +17,7 @@
 //! integration test binary, and they require only the public API of the
 //! store crate.
 
-use schema::{
-    Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, Stance, StanceMode,
-};
+use schema::{Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore, WalWritePolicy};
 use tempfile::TempDir;
 fn make_claim(id: &str, tenant: &str, text: &str, confidence: f32) -> Claim {
@@ -39,13 +37,7 @@ fn make_claim(id: &str, tenant: &str, text: &str, confidence: f32) -> Claim {
     }
 }
 
-fn make_evidence(
-    id: &str,
-    claim_id: &str,
-    source: &str,
-    stance: Stance,
-    quality: f32,
-) -> Evidence {
+fn make_evidence(id: &str, claim_id: &str, source: &str, stance: Stance, quality: f32) -> Evidence {
     Evidence {
         evidence_id: id.to_string(),
         claim_id: claim_id.to_string(),
@@ -103,11 +95,7 @@ fn ingest_then_retrieve_returns_ingested_claim() {
 fn retrieve_returns_empty_for_unknown_tenant() {
     let mut store = InMemoryStore::new();
     store
-        .ingest_bundle(
-            make_claim("c1", "t1", "secret claim", 0.9),
-            vec![],
-            vec![],
-        )
+        .ingest_bundle(make_claim("c1", "t1", "secret claim", 0.9), vec![], vec![])
         .unwrap();
 
     let results = store.retrieve(&RetrievalRequest {
@@ -183,11 +171,15 @@ fn vector_search_is_tenant_isolated() {
     let hits_a = store.exact_vector_top_candidates("tenant-a", &[1.0, 0.0, 0.0], 5);
     let hits_b = store.exact_vector_top_candidates("tenant-b", &[1.0, 0.0, 0.0], 5);
     assert!(hits_a.contains(&"c-a".to_string()));
-    assert!(!hits_a.contains(&"c-b".to_string()),
-        "tenant A must not see tenant B vectors");
+    assert!(
+        !hits_a.contains(&"c-b".to_string()),
+        "tenant A must not see tenant B vectors"
+    );
     assert!(hits_b.contains(&"c-b".to_string()));
-    assert!(!hits_b.contains(&"c-a".to_string()),
-        "tenant B must not see tenant A vectors");
+    assert!(
+        !hits_b.contains(&"c-a".to_string()),
+        "tenant B must not see tenant A vectors"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +303,15 @@ fn support_only_drops_claim_with_more_contradictions_than_supports() {
         stance_mode: StanceMode::SupportOnly,
     });
     // The two contradicted claims should be filtered out; "clean" should remain
-    assert_eq!(results.len(), 1, "support-only must drop contradicted claims, got: {:?}",
-        results.iter().map(|r| (&r.claim_id, r.supports, r.contradicts)).collect::<Vec<_>>());
+    assert_eq!(
+        results.len(),
+        1,
+        "support-only must drop contradicted claims, got: {:?}",
+        results
+            .iter()
+            .map(|r| (&r.claim_id, r.supports, r.contradicts))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(results[0].claim_id, "clean");
 }
 
@@ -362,13 +361,7 @@ fn edge_contradicts_evidence_increments_contradict_count() {
     store
         .ingest_bundle(
             make_claim("c1", "t1", "claim one", 0.9),
-            vec![make_evidence(
-                "e1",
-                "c1",
-                "src",
-                Stance::Supports,
-                0.9,
-            )],
+            vec![make_evidence("e1", "c1", "src", Stance::Supports, 0.9)],
             vec![],
         )
         .unwrap();
@@ -377,13 +370,7 @@ fn edge_contradicts_evidence_increments_contradict_count() {
     store
         .ingest_bundle(
             make_claim("c2", "t1", "claim two", 0.9),
-            vec![make_evidence(
-                "e2",
-                "c2",
-                "src",
-                Stance::Supports,
-                0.9,
-            )],
+            vec![make_evidence("e2", "c2", "src", Stance::Supports, 0.9)],
             vec![edge],
         )
         .unwrap();
@@ -398,7 +385,11 @@ fn edge_contradicts_evidence_increments_contradict_count() {
         stance_mode: StanceMode::Balanced,
     });
     let c1 = results.iter().find(|r| r.claim_id == "c1").unwrap();
-    assert!(c1.supports >= 1, "evidence supports must be counted, got {}", c1.supports);
+    assert!(
+        c1.supports >= 1,
+        "evidence supports must be counted, got {}",
+        c1.supports
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -411,11 +402,13 @@ fn ann_and_exact_return_consistent_top_hit() {
     for i in 0..20 {
         let id = format!("c{i}");
         let vector = vec![(i as f32) * 0.05, 1.0 - (i as f32) * 0.05, 0.5];
-        store.ingest_bundle(
-            make_claim(&id, "t1", &format!("claim {i} text"), 0.9),
-            vec![],
-            vec![],
-        ).unwrap();
+        store
+            .ingest_bundle(
+                make_claim(&id, "t1", &format!("claim {i} text"), 0.9),
+                vec![],
+                vec![],
+            )
+            .unwrap();
         store.upsert_claim_vector(&id, vector).unwrap();
     }
     let query = vec![0.0, 1.0, 0.5];
@@ -423,9 +416,10 @@ fn ann_and_exact_return_consistent_top_hit() {
     let ann = store.ann_vector_top_candidates("t1", &query, 5);
     assert!(!exact.is_empty());
     assert!(!ann.is_empty());
-    assert_eq!(exact[0], ann[0],
-        "top hit must match between ANN and exact: exact={:?} ann={:?}",
-        exact, ann);
+    assert_eq!(
+        exact[0], ann[0],
+        "top hit must match between ANN and exact: exact={exact:?} ann={ann:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +436,9 @@ fn retrieve_with_query_vector_prefers_aligned_claim() {
             vec![],
         )
         .unwrap();
-    store.upsert_claim_vector("aligned", vec![1.0, 0.0, 0.0]).unwrap();
+    store
+        .upsert_claim_vector("aligned", vec![1.0, 0.0, 0.0])
+        .unwrap();
     store
         .ingest_bundle(
             make_claim("orthogonal", "t1", "this one does not", 0.9),
@@ -479,13 +475,7 @@ fn higher_confidence_with_supports_ranks_above_lower_confidence_with_contradicts
     store
         .ingest_bundle(
             make_claim("strong", "t1", "strong evidence-backed claim", 0.95),
-            vec![make_evidence(
-                "es",
-                "strong",
-                "src",
-                Stance::Supports,
-                0.95,
-            )],
+            vec![make_evidence("es", "strong", "src", Stance::Supports, 0.95)],
             vec![],
         )
         .unwrap();
@@ -543,11 +533,9 @@ fn wal_persistence_and_replay_round_trip() {
 
     // Reopen and verify the claim + evidence round-tripped
     let wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _stats) = InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
-        &wal2,
-        AnnTuningConfig::default(),
-    )
-    .unwrap();
+    let (store2, _stats) =
+        InMemoryStore::load_from_wal_with_stats_and_ann_tuning(&wal2, AnnTuningConfig::default())
+            .unwrap();
     let results = store2.retrieve(&RetrievalRequest {
         tenant_id: "t1".into(),
         query: "restart".into(),
@@ -577,20 +565,25 @@ fn wal_checkpoint_compacts_state() {
             .unwrap();
     }
     let stats = store.checkpoint_and_compact(&mut wal).unwrap();
-    assert!(stats.snapshot_records > 0, "snapshot should contain the 5 claims");
+    assert!(
+        stats.snapshot_records > 0,
+        "snapshot should contain the 5 claims"
+    );
     // After checkpoint the WAL is truncated; its record count drops to 0.
-    assert_eq!(wal.wal_record_count().unwrap(), 0,
-        "WAL record count should be 0 after checkpoint, got {}", wal.wal_record_count().unwrap());
+    assert_eq!(
+        wal.wal_record_count().unwrap(),
+        0,
+        "WAL record count should be 0 after checkpoint, got {}",
+        wal.wal_record_count().unwrap()
+    );
     drop(wal);
     drop(store);
 
     // Reopen and verify all 5 claims are present
     let wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _) = InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
-        &wal2,
-        AnnTuningConfig::default(),
-    )
-    .unwrap();
+    let (store2, _) =
+        InMemoryStore::load_from_wal_with_stats_and_ann_tuning(&wal2, AnnTuningConfig::default())
+            .unwrap();
     for i in 0..5 {
         let id = format!("c{i}");
         let claim = store2.claim_by_id(&id);
@@ -624,11 +617,9 @@ fn wal_with_custom_write_policy_does_not_lose_records() {
     drop(store);
 
     let wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _) = InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
-        &wal2,
-        AnnTuningConfig::default(),
-    )
-    .unwrap();
+    let (store2, _) =
+        InMemoryStore::load_from_wal_with_stats_and_ann_tuning(&wal2, AnnTuningConfig::default())
+            .unwrap();
     for i in 0..3 {
         assert!(store2.claim_by_id(&format!("c{i}")).is_some());
     }
@@ -668,7 +659,11 @@ fn empty_query_returns_all_tenant_claims() {
         top_k: 10,
         stance_mode: StanceMode::Balanced,
     });
-    assert_eq!(results.len(), 3, "empty query should fall back to all tenant claims");
+    assert_eq!(
+        results.len(),
+        3,
+        "empty query should fall back to all tenant claims"
+    );
 }
 
 #[test]
@@ -696,39 +691,31 @@ fn top_k_limits_results() {
 fn claim_id_reuse_across_tenants_is_rejected() {
     let mut store = InMemoryStore::new();
     store
-        .ingest_bundle(
-            make_claim("c1", "t1", "first", 0.9),
-            vec![],
-            vec![],
-        )
+        .ingest_bundle(make_claim("c1", "t1", "first", 0.9), vec![], vec![])
         .unwrap();
     let err = store
-        .ingest_bundle(
-            make_claim("c1", "t2", "collision", 0.9),
-            vec![],
-            vec![],
-        )
+        .ingest_bundle(make_claim("c1", "t2", "collision", 0.9), vec![], vec![])
         .unwrap_err();
-    assert!(matches!(err, store::StoreError::Conflict(_)),
-        "claim_id reuse across tenants must be rejected, got {err:?}");
+    assert!(
+        matches!(err, store::StoreError::Conflict(_)),
+        "claim_id reuse across tenants must be rejected, got {err:?}"
+    );
 }
 
 #[test]
 fn dim_mismatch_on_vector_update_is_rejected() {
     let mut store = InMemoryStore::new();
     store
-        .ingest_bundle(
-            make_claim("c1", "t1", "claim", 0.9),
-            vec![],
-            vec![],
-        )
+        .ingest_bundle(make_claim("c1", "t1", "claim", 0.9), vec![], vec![])
         .unwrap();
-    store.upsert_claim_vector("c1", vec![1.0, 0.0, 0.0]).unwrap();
-    let err = store
-        .upsert_claim_vector("c1", vec![1.0, 0.0])
-        .unwrap_err();
-    assert!(matches!(err, store::StoreError::InvalidVector(_)),
-        "dimension mismatch must be rejected, got {err:?}");
+    store
+        .upsert_claim_vector("c1", vec![1.0, 0.0, 0.0])
+        .unwrap();
+    let err = store.upsert_claim_vector("c1", vec![1.0, 0.0]).unwrap_err();
+    assert!(
+        matches!(err, store::StoreError::InvalidVector(_)),
+        "dimension mismatch must be rejected, got {err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +740,6 @@ fn index_stats_reports_correct_tenant_count() {
     assert!(stats.temporal_buckets <= 1);
 }
 
-
 // ---------------------------------------------------------------------------
 // Semantic-first retrieval
 //
@@ -771,15 +757,15 @@ fn retrieve_semantic_ranks_aligned_claim_first() {
     let mut store = InMemoryStore::new();
     for (id, text, vec) in [
         ("c-aligned", "company acquired target", vec![1.0, 0.0, 0.0]),
-        ("c-orthogonal", "weather forecast sunny", vec![0.0, 1.0, 0.0]),
+        (
+            "c-orthogonal",
+            "weather forecast sunny",
+            vec![0.0, 1.0, 0.0],
+        ),
         ("c-tangential", "blue whale migration", vec![0.0, 0.0, 1.0]),
     ] {
         store
-            .ingest_bundle(
-                make_claim(id, "t1", text, 0.9),
-                vec![],
-                vec![],
-            )
+            .ingest_bundle(make_claim(id, "t1", text, 0.9), vec![], vec![])
             .unwrap();
         store.upsert_claim_vector(id, vec).unwrap();
     }
@@ -795,9 +781,15 @@ fn retrieve_semantic_ranks_aligned_claim_first() {
         },
         &[1.0, 0.0, 0.0],
     );
-    assert_eq!(results.len(), 3, "semantic-first should still return all candidates");
-    assert_eq!(results[0].claim_id, "c-aligned",
-        "semantic-first must rank the aligned claim first, got {:?}", results);
+    assert_eq!(
+        results.len(),
+        3,
+        "semantic-first should still return all candidates"
+    );
+    assert_eq!(
+        results[0].claim_id, "c-aligned",
+        "semantic-first must rank the aligned claim first, got {results:?}"
+    );
 }
 
 #[test]
@@ -842,9 +834,10 @@ fn retrieve_semantic_uses_dense_similarity_as_primary_signal() {
     // semantic-only is the dense-aligned claim; lexical-only is the
     // lexically-aligned one. With semantic-first scoring, semantic-only
     // must rank first.
-    assert_eq!(results[0].claim_id, "semantic-only",
-        "semantic-first must prefer dense alignment over lexical match, got {:?}",
-        results);
+    assert_eq!(
+        results[0].claim_id, "semantic-only",
+        "semantic-first must prefer dense alignment over lexical match, got {results:?}"
+    );
 }
 
 #[test]
@@ -861,9 +854,7 @@ fn retrieve_semantic_with_tenant_isolation_filters_other_tenants() {
                     vec![],
                 )
                 .unwrap();
-            store
-                .upsert_claim_vector(&id, vec![1.0, 0.0, 0.0])
-                .unwrap();
+            store.upsert_claim_vector(&id, vec![1.0, 0.0, 0.0]).unwrap();
         }
     }
     let results = store.retrieve_semantic(
@@ -875,9 +866,14 @@ fn retrieve_semantic_with_tenant_isolation_filters_other_tenants() {
         },
         &[1.0, 0.0, 0.0],
     );
-    assert!(results.iter().all(|r| r.claim_id.contains("tenant-a")),
-        "semantic-first must not leak across tenants, got {:?}", results);
-    assert!(!results.is_empty(), "should return at least one tenant-a result");
+    assert!(
+        results.iter().all(|r| r.claim_id.contains("tenant-a")),
+        "semantic-first must not leak across tenants, got {results:?}"
+    );
+    assert!(
+        !results.is_empty(),
+        "should return at least one tenant-a result"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -923,12 +919,9 @@ fn disk_persistence_round_trip() {
     //    should give us all 10 claims; the WAL tail (if any) is
     //    replayed over the snapshot.
     let mut wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _stats) = InMemoryStore::load_from_disk_and_wal(
-        &disk_path,
-        &mut wal2,
-        AnnTuningConfig::default(),
-    )
-    .expect("disk + WAL cold-start should succeed");
+    let (store2, _stats) =
+        InMemoryStore::load_from_disk_and_wal(&disk_path, &mut wal2, AnnTuningConfig::default())
+            .expect("disk + WAL cold-start should succeed");
     assert_eq!(store2.claims_len(), 10, "all 10 claims must be loaded");
     for i in 0..10 {
         let id = format!("c{i}");
@@ -939,10 +932,7 @@ fn disk_persistence_round_trip() {
     }
 
     // 3. Disk status is Available after a successful cold-start.
-    assert!(matches!(
-        store2.disk_status(),
-        store::DiskStatus::Available
-    ));
+    assert!(matches!(store2.disk_status(), store::DiskStatus::Available));
 }
 
 #[test]
@@ -1021,12 +1011,9 @@ fn disk_tenant_set_membership_consistency() {
 
     // 2. Reopen and check tenant-set membership.
     let mut wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _stats) = InMemoryStore::load_from_disk_and_wal(
-        &disk_path,
-        &mut wal2,
-        AnnTuningConfig::default(),
-    )
-    .expect("cold-start should succeed");
+    let (store2, _stats) =
+        InMemoryStore::load_from_disk_and_wal(&disk_path, &mut wal2, AnnTuningConfig::default())
+            .expect("cold-start should succeed");
 
     assert!(store2.claim_by_id("c-a-0").is_some());
     assert!(store2.claim_by_id("c-a-1").is_some());
@@ -1039,7 +1026,10 @@ fn disk_tenant_set_membership_consistency() {
     // 3. The `tenant_ids` API must report both tenants (in
     //    sorted order) and only those tenants.
     let tenant_ids = store2.tenant_ids();
-    assert_eq!(tenant_ids, vec!["tenant-a".to_string(), "tenant-b".to_string()]);
+    assert_eq!(
+        tenant_ids,
+        vec!["tenant-a".to_string(), "tenant-b".to_string()]
+    );
 }
 
 #[test]
@@ -1084,19 +1074,19 @@ fn disk_bulk_load_rebuilds_ann_index() {
     // 2. Reopen via disk + WAL and verify ANN search returns the
     //    right top hit.
     let mut wal2 = FileWal::open(&wal_path).unwrap();
-    let (store2, _stats) = InMemoryStore::load_from_disk_and_wal(
-        &disk_path,
-        &mut wal2,
-        AnnTuningConfig::default(),
-    )
-    .expect("cold-start should succeed");
+    let (store2, _stats) =
+        InMemoryStore::load_from_disk_and_wal(&disk_path, &mut wal2, AnnTuningConfig::default())
+            .expect("cold-start should succeed");
 
     let query = [0.99, 0.01, 0.0, 0.0];
     let ann = store2.ann_vector_top_candidates("t1", &query, 1);
     let exact = store2.exact_vector_top_candidates("t1", &query, 1);
     assert_eq!(ann.first().map(String::as_str), Some("c0"));
     assert_eq!(exact.first().map(String::as_str), Some("c0"));
-    assert_eq!(ann, exact, "ANN and exact must agree after a disk cold-start");
+    assert_eq!(
+        ann, exact,
+        "ANN and exact must agree after a disk cold-start"
+    );
 }
 
 #[test]
@@ -1110,7 +1100,9 @@ fn disk_open_failure_does_not_crash_service() {
 
     // 1. `with_disk` must not panic.
     let mut store = InMemoryStore::new();
-    store = store.with_disk(&invalid_path).expect("with_disk returns Ok");
+    store = store
+        .with_disk(&invalid_path)
+        .expect("with_disk returns Ok");
     // 2. `disk_status()` must be `Unavailable` (not panic, not
     //    `Recovering`, not `Available`).
     assert!(
@@ -1188,12 +1180,9 @@ fn disk_clone_preserves_disk_handle_and_shares_storage() {
     //    present. This proves the clone's disk writes actually
     //    landed in the shared redb.
     let mut wal3 = FileWal::open(&wal_path).unwrap();
-    let (reloaded, _stats) = InMemoryStore::load_from_disk_and_wal(
-        &disk_path,
-        &mut wal3,
-        AnnTuningConfig::default(),
-    )
-    .expect("cold start should succeed");
+    let (reloaded, _stats) =
+        InMemoryStore::load_from_disk_and_wal(&disk_path, &mut wal3, AnnTuningConfig::default())
+            .expect("cold start should succeed");
     assert_eq!(reloaded.claims_len(), 2);
     assert!(reloaded.claim_by_id("c-via-clone").is_some());
     assert!(reloaded.claim_by_id("c-original").is_some());

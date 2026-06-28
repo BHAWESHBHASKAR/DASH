@@ -121,8 +121,7 @@ fn parse_wal_async_flush_interval_override() -> Option<Option<Duration>> {
             Ok(_) => return Some(None),
             Err(_) => {
                 eprintln!(
-                    "ingestion ignoring invalid {}='{}' (expected positive integer ms or off)",
-                    key, trimmed
+                    "ingestion ignoring invalid {key}='{trimmed}' (expected positive integer ms or off)"
                 );
                 return Some(None);
             }

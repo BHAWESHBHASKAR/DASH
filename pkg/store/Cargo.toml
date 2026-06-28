@@ -6,8 +6,8 @@ edition = "2024"
 [features]
 # Historical GPU compute path. The code is feature-gated so it can be
 # re-enabled without rewriting the call sites. With the feature off (default),
-# the wgpu/kosmic backends are compiled out and the store falls back to CPU
-# cosine via `usearch`.
+# the wgpu/kosmic backends are compiled out and the store falls back to the
+# hand-rolled CPU similarity implementation in `lib.rs` (cosine/dot/L2).
 gpu-backend = []
 
 [dependencies]

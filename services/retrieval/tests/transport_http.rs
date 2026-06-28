@@ -281,8 +281,7 @@ fn transport_denies_cross_tenant_retrieval_for_jwt_claim_scope() {
 
     let store = sample_store();
     let request = format!(
-        "GET /v1/retrieve?tenant_id=tenant-blocked&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        token
+        "GET /v1/retrieve?tenant_id=tenant-blocked&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
     let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
         .expect("request should parse and return response");
@@ -308,8 +307,7 @@ fn transport_denies_expired_retrieval_jwt() {
 
     let store = sample_store();
     let request = format!(
-        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        token
+        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
     let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
         .expect("request should parse and return response");
@@ -342,8 +340,7 @@ fn transport_allows_retrieval_jwt_signed_with_rotation_fallback_secret() {
 
     let store = sample_store();
     let request = format!(
-        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        token
+        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
     let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
         .expect("request should parse and return response");
@@ -376,8 +373,7 @@ fn transport_allows_retrieval_jwt_signed_with_kid_secret() {
 
     let store = sample_store();
     let request = format!(
-        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        token
+        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
     let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
         .expect("request should parse and return response");
