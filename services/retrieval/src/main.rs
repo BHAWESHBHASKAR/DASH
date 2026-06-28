@@ -271,6 +271,12 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
         rrf_k: parse_env_first::<f32>(&["DASH_RETRIEVAL_RRF_K", "DASH_RRF_K"])
             .filter(|value| *value > 0.0)
             .unwrap_or(defaults.rrf_k),
+        filtered_overfetch_factor: parse_env_first::<usize>(&[
+            "DASH_RETRIEVAL_FILTERED_OVERFETCH_FACTOR",
+            "DASH_FILTERED_OVERFETCH_FACTOR",
+        ])
+        .filter(|value| *value > 0)
+        .unwrap_or(defaults.filtered_overfetch_factor),
     }
 }
 
