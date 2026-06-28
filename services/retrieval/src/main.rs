@@ -1,6 +1,6 @@
 use retrieval::{retrieve_for_rag, transport::serve_http_with_workers};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
-use store::{AnnTuningConfig, DistanceMetric, FileWal, InMemoryStore};
+use store::{AnnTuningConfig, DistanceMetric, FileWal, HybridFusion, InMemoryStore};
 
 fn main() {
     // Default to serve mode (this is a server binary; the CLI
@@ -263,6 +263,14 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
             .ok()
             .and_then(|raw| DistanceMetric::parse(&raw))
             .unwrap_or(defaults.metric),
+        hybrid_fusion: std::env::var("DASH_RETRIEVAL_HYBRID_FUSION")
+            .or_else(|_| std::env::var("DASH_HYBRID_FUSION"))
+            .ok()
+            .and_then(|raw| HybridFusion::parse(&raw))
+            .unwrap_or(defaults.hybrid_fusion),
+        rrf_k: parse_env_first::<f32>(&["DASH_RETRIEVAL_RRF_K", "DASH_RRF_K"])
+            .filter(|value| *value > 0.0)
+            .unwrap_or(defaults.rrf_k),
     }
 }
 

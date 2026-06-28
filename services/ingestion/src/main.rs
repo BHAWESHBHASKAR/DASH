@@ -565,6 +565,10 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
             .ok()
             .and_then(|raw| DistanceMetric::parse(&raw))
             .unwrap_or(defaults.metric),
+        // Hybrid fusion is a retrieval-time concern; ingestion only builds
+        // the graph, so it keeps the defaults here.
+        hybrid_fusion: defaults.hybrid_fusion,
+        rrf_k: defaults.rrf_k,
     }
 }
 

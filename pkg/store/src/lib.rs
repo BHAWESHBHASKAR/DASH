@@ -22,7 +22,7 @@ mod gpu;
 mod metrics;
 mod wal;
 pub(crate) use ann::{ANN_GRAPH_LEVELS, ScoredNode, TenantAnnGraph};
-pub use ann::{AnnTuningConfig, DistanceMetric};
+pub use ann::{AnnTuningConfig, DistanceMetric, HybridFusion, RRF_K_DEFAULT};
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
 
@@ -527,7 +527,6 @@ impl InMemoryStore {
         query_vector: Option<&[f32]>,
         candidates: Vec<String>,
     ) -> Vec<RetrievalResult> {
-        let mut ranked: Vec<RetrievalResult> = Vec::new();
         let bm25_context = self.bm25_context_for_tenant(&req.tenant_id, &req.query);
         let dense_similarities = query_vector.map(|vector| {
             let candidate_vectors: Vec<(String, &[f32])> = candidates
@@ -546,6 +545,20 @@ impl InMemoryStore {
                 .collect::<HashMap<String, f32>>()
         });
 
+        // First pass: gather the dense + lexical signals for every candidate
+        // that survives stance filtering. The full surviving set is needed
+        // before Reciprocal Rank Fusion can assign per-modality ranks.
+        struct ScoredCandidate {
+            claim_id: String,
+            canonical_text: String,
+            supports: usize,
+            contradicts: usize,
+            dense_similarity: f32,
+            lexical_score: f32,
+            citations: Vec<Citation>,
+        }
+
+        let mut scored: Vec<ScoredCandidate> = Vec::new();
         for claim_id in candidates {
             let Some(claim) = self.claims.get(&claim_id) else {
                 continue;
@@ -615,23 +628,6 @@ impl InMemoryStore {
                 bm25,
             );
 
-            let score = if query_vector.is_some() {
-                // Semantic-first retrieval: dense similarity is the
-                // PRIMARY signal (cosine in [-1, 1] -> mapped to
-                // [0, 1] via the embedding backend). The lexical/BM25
-                // score is a small tie-breaker when dense similarities
-                // are tied. This replaces the historical 0.35 additive
-                // weight with semantic-primary scoring, which is the
-                // right default when the caller explicitly provides
-                // a query vector.
-                let dense_primary = (dense_similarity + 1.0) * 0.5;
-                dense_primary + (lexical_score * 0.1)
-            } else {
-                // Lexical-only retrieval: historical behavior
-                // (dense_similarity is 0.0 when no query_vector).
-                lexical_score + (dense_similarity * 0.35)
-            };
-
             let citations = evidence
                 .iter()
                 .map(|e| Citation {
@@ -647,15 +643,58 @@ impl InMemoryStore {
                     ingested_at: e.ingested_at,
                 })
                 .collect();
-            ranked.push(RetrievalResult {
+            scored.push(ScoredCandidate {
                 claim_id: claim.claim_id.clone(),
                 canonical_text: claim.canonical_text.clone(),
-                score,
                 supports,
                 contradicts,
+                dense_similarity,
+                lexical_score,
                 citations,
             });
         }
+
+        let final_scores = if query_vector.is_some() {
+            match self.ann_tuning.hybrid_fusion {
+                HybridFusion::Rrf => {
+                    // Reciprocal Rank Fusion: fuse the dense and lexical
+                    // orderings. Scale-free, so the dense `[-1, 1]` cosine
+                    // range and the unbounded BM25 range combine cleanly.
+                    let dense: Vec<f32> = scored.iter().map(|s| s.dense_similarity).collect();
+                    let lexical: Vec<f32> = scored.iter().map(|s| s.lexical_score).collect();
+                    reciprocal_rank_fusion_scores(&dense, &lexical, self.ann_tuning.rrf_k)
+                }
+                HybridFusion::SemanticPrimary => scored
+                    .iter()
+                    .map(|s| {
+                        // Semantic-first: dense similarity (cosine in
+                        // [-1, 1] -> [0, 1]) is primary; lexical/BM25 is a
+                        // small additive tie-breaker.
+                        let dense_primary = (s.dense_similarity + 1.0) * 0.5;
+                        dense_primary + (s.lexical_score * 0.1)
+                    })
+                    .collect(),
+            }
+        } else {
+            // Lexical-only retrieval (dense_similarity is 0.0 here).
+            scored
+                .iter()
+                .map(|s| s.lexical_score + (s.dense_similarity * 0.35))
+                .collect::<Vec<f32>>()
+        };
+
+        let mut ranked: Vec<RetrievalResult> = scored
+            .into_iter()
+            .zip(final_scores)
+            .map(|(s, score)| RetrievalResult {
+                claim_id: s.claim_id,
+                canonical_text: s.canonical_text,
+                score,
+                supports: s.supports,
+                contradicts: s.contradicts,
+                citations: s.citations,
+            })
+            .collect();
 
         ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
         ranked.into_iter().take(req.top_k).collect()
@@ -2294,6 +2333,32 @@ fn vector_similarity(
             Some(-sum)
         }
     }
+}
+
+/// 1-based ranks for each index in `values` ordered by descending value
+/// (rank 1 = highest). Ties are broken by original index so the mapping is
+/// deterministic.
+fn descending_ranks(values: &[f32]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then_with(|| a.cmp(&b)));
+    let mut ranks = vec![0usize; values.len()];
+    for (position, &idx) in order.iter().enumerate() {
+        ranks[idx] = position + 1;
+    }
+    ranks
+}
+
+/// Reciprocal Rank Fusion of the dense and lexical rankings. Each candidate
+/// `i` scores `1/(k + rank_dense_i) + 1/(k + rank_lexical_i)`, where ranks
+/// are 1-based positions in each modality's descending ordering. Only the
+/// orderings matter, so the two score scales never need calibrating.
+fn reciprocal_rank_fusion_scores(dense: &[f32], lexical: &[f32], k: f32) -> Vec<f32> {
+    debug_assert_eq!(dense.len(), lexical.len());
+    let dense_ranks = descending_ranks(dense);
+    let lexical_ranks = descending_ranks(lexical);
+    (0..dense.len())
+        .map(|i| 1.0 / (k + dense_ranks[i] as f32) + 1.0 / (k + lexical_ranks[i] as f32))
+        .collect()
 }
 
 #[cfg(test)]
@@ -4053,6 +4118,100 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_fusion_parse_accepts_aliases() {
+        assert_eq!(HybridFusion::parse("rrf"), Some(HybridFusion::Rrf));
+        assert_eq!(
+            HybridFusion::parse("Reciprocal_Rank_Fusion"),
+            Some(HybridFusion::Rrf)
+        );
+        assert_eq!(
+            HybridFusion::parse(" semantic "),
+            Some(HybridFusion::SemanticPrimary)
+        );
+        assert_eq!(
+            HybridFusion::parse("dense_primary"),
+            Some(HybridFusion::SemanticPrimary)
+        );
+        assert_eq!(HybridFusion::parse("bogus"), None);
+        assert_eq!(HybridFusion::default(), HybridFusion::SemanticPrimary);
+    }
+
+    #[test]
+    fn descending_ranks_are_one_based_and_break_ties_by_index() {
+        // idx1 and idx2 tie at 0.9 -> the lower index gets the better rank.
+        let ranks = descending_ranks(&[0.5, 0.9, 0.9, 0.1]);
+        assert_eq!(ranks, vec![3, 1, 2, 4]);
+    }
+
+    #[test]
+    fn rrf_promotes_strong_lexical_over_dense_only_candidate() {
+        // dense order: A,B,C ; lexical order: B,C,A
+        let dense = [1.0, 0.99, 0.97];
+        let lexical = [0.0, 2.0, 1.0];
+        let scores = reciprocal_rank_fusion_scores(&dense, &lexical, RRF_K_DEFAULT);
+        // B (rank-1 lexical, rank-2 dense) edges out A (rank-1 dense only).
+        assert!(scores[1] > scores[0]);
+        assert!(scores[0] > scores[2]);
+    }
+
+    #[test]
+    fn rrf_mode_changes_top_result_vs_semantic_primary() {
+        let build = |fusion| {
+            let tuning = AnnTuningConfig {
+                hybrid_fusion: fusion,
+                ..AnnTuningConfig::default()
+            };
+            let mut store = InMemoryStore::new_with_ann_tuning(tuning);
+            store
+                .ingest_bundle(
+                    claim("c-dense", "weather forecast sunny skies"),
+                    vec![],
+                    vec![],
+                )
+                .unwrap();
+            store
+                .ingest_bundle(
+                    claim("c-lexical", "project helios acquisition merger terms"),
+                    vec![],
+                    vec![],
+                )
+                .unwrap();
+            store
+                .ingest_bundle(claim("c-mid", "project helios acquisition"), vec![], vec![])
+                .unwrap();
+            // Dense: c-dense >> c-lexical > c-mid (well separated so the
+            // semantic-primary formula keeps c-dense on top).
+            store
+                .upsert_claim_vector("c-dense", vec![1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+            store
+                .upsert_claim_vector("c-lexical", vec![0.2, 1.0, 0.0, 0.0])
+                .unwrap();
+            store
+                .upsert_claim_vector("c-mid", vec![0.1, 0.0, 1.0, 0.0])
+                .unwrap();
+            store
+        };
+        let req = RetrievalRequest {
+            tenant_id: "tenant-a".into(),
+            query: "acquisition merger terms".into(),
+            top_k: 3,
+            stance_mode: StanceMode::Balanced,
+        };
+        let query_vec = [1.0, 0.0, 0.0, 0.0];
+
+        // Default (semantic-primary): the top dense match wins.
+        let semantic = build(HybridFusion::SemanticPrimary);
+        let semantic_results = semantic.retrieve_semantic(&req, &query_vec);
+        assert_eq!(semantic_results[0].claim_id, "c-dense");
+
+        // RRF: the strongest lexical match wins despite ranking #2 on dense.
+        let rrf = build(HybridFusion::Rrf);
+        let rrf_results = rrf.retrieve_semantic(&req, &query_vec);
+        assert_eq!(rrf_results[0].claim_id, "c-lexical");
+    }
+
+    #[test]
     fn ann_graph_populates_multiple_levels_for_tenant() {
         let mut store = InMemoryStore::new();
         let mut high_level_claim_id = None;
@@ -4102,6 +4261,8 @@ mod tests {
             search_expansion_min: 32,
             search_expansion_max: 2048,
             metric: DistanceMetric::default(),
+            hybrid_fusion: HybridFusion::default(),
+            rrf_k: RRF_K_DEFAULT,
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);
