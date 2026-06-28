@@ -772,6 +772,8 @@ where
             defaults.search_expansion_max,
         ),
         metric: defaults.metric,
+        hybrid_fusion: defaults.hybrid_fusion,
+        rrf_k: defaults.rrf_k,
     };
     let mut large_min_candidate_reduction_pct =
         env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);

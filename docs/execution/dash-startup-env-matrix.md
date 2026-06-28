@@ -102,6 +102,8 @@ Ingestion segment lifecycle daemon note:
 | `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` | no | `64` | ANN minimum expansion budget clamp | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` |
 | `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | ANN maximum expansion budget clamp | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX` |
 | `DASH_RETRIEVAL_VECTOR_METRIC` / `DASH_VECTOR_METRIC` | no | `cosine` | vector distance metric for ANN + scoring: `cosine`/`cos`, `dot`/`ip`/`inner_product`, `l2`/`euclidean` (the per-service var wins over the shared `DASH_VECTOR_METRIC`) | none |
+| `DASH_RETRIEVAL_HYBRID_FUSION` / `DASH_HYBRID_FUSION` | no | `semantic_primary` | how dense + lexical signals are combined when a query vector is supplied: `semantic_primary`/`dense` (dense primary, BM25 tie-break) or `rrf`/`reciprocal_rank_fusion` (Reciprocal Rank Fusion) | none |
+| `DASH_RETRIEVAL_RRF_K` / `DASH_RRF_K` | no | `60` | RRF `k` constant (only used when fusion is `rrf`); larger `k` flattens the rank-position weighting | none |
 
 Runtime note:
 

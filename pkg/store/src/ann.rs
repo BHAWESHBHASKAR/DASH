@@ -85,10 +85,56 @@ impl DistanceMetric {
 }
 
 // ---------------------------------------------------------------------------
+// Hybrid fusion strategy
+// ---------------------------------------------------------------------------
+
+/// How the dense (vector) and lexical (BM25) signals are combined when a
+/// query vector is supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HybridFusion {
+    /// Dense similarity is the primary signal and the lexical/BM25 score is
+    /// a small additive tie-breaker. Backwards-compatible default and the
+    /// right choice when the embedding is the trusted relevance signal.
+    #[default]
+    SemanticPrimary,
+    /// Reciprocal Rank Fusion: each candidate's dense and lexical *ranks*
+    /// contribute `1 / (k + rank)`, summed across modalities. Scale-free
+    /// (only the orderings matter), so it is robust when the dense and
+    /// lexical scores live on different scales — the modern hybrid-search
+    /// default (Qdrant/Weaviate/Elastic).
+    Rrf,
+}
+
+impl HybridFusion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SemanticPrimary => "semantic_primary",
+            Self::Rrf => "rrf",
+        }
+    }
+
+    /// Parse a fusion strategy from an env/config string. Returns `None`
+    /// for unrecognized values so callers can fall back to the default.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "semantic_primary" | "semantic" | "dense_primary" | "dense" | "default" => {
+                Some(Self::SemanticPrimary)
+            }
+            "rrf" | "reciprocal_rank_fusion" | "reciprocal-rank-fusion" => Some(Self::Rrf),
+            _ => None,
+        }
+    }
+}
+
+/// Default `k` constant for Reciprocal Rank Fusion. 60 is the value from
+/// the original Cormack et al. RRF paper and the de-facto industry default.
+pub const RRF_K_DEFAULT: f32 = 60.0;
+
+// ---------------------------------------------------------------------------
 // Tunable configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnnTuningConfig {
     pub max_neighbors_base: usize,
     pub max_neighbors_upper: usize,
@@ -96,6 +142,8 @@ pub struct AnnTuningConfig {
     pub search_expansion_min: usize,
     pub search_expansion_max: usize,
     pub metric: DistanceMetric,
+    pub hybrid_fusion: HybridFusion,
+    pub rrf_k: f32,
 }
 
 impl Default for AnnTuningConfig {
@@ -107,6 +155,8 @@ impl Default for AnnTuningConfig {
             search_expansion_min: ANN_SEARCH_EXPANSION_MIN_DEFAULT,
             search_expansion_max: ANN_SEARCH_EXPANSION_MAX_DEFAULT,
             metric: DistanceMetric::Cosine,
+            hybrid_fusion: HybridFusion::SemanticPrimary,
+            rrf_k: RRF_K_DEFAULT,
         }
     }
 }
