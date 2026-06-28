@@ -861,7 +861,7 @@ impl InMemoryStore {
             return 0;
         }
         let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-        self.vector_candidates(tenant_id, query_vector, vector_top_n)
+        self.vector_candidates(tenant_id, query_vector, vector_top_n, &|_| true, false)
             .len()
     }
 
@@ -874,7 +874,7 @@ impl InMemoryStore {
         if query_vector.is_empty() || top_n == 0 {
             return Vec::new();
         }
-        self.vector_candidates(tenant_id, query_vector, top_n)
+        self.vector_candidates(tenant_id, query_vector, top_n, &|_| true, false)
     }
 
     pub fn exact_vector_top_candidates(
@@ -999,9 +999,34 @@ impl InMemoryStore {
             }
         }
 
+        // Predicate-aware (filtered-HNSW) candidate generation: when the
+        // query carries a time-range or allow-list, push that predicate
+        // into the vector traversal so a selective filter doesn't starve
+        // the candidate pool with non-matching high-similarity hits.
+        let filtered = from_unix.is_some() || to_unix.is_some() || allowed_claim_ids.is_some();
+        let predicate = |claim_id: &str| -> bool {
+            let Some(claim) = self.claims.get(claim_id) else {
+                return false;
+            };
+            if claim.tenant_id != tenant_id {
+                return false;
+            }
+            if !claim_matches_time_range(claim, from_unix, to_unix) {
+                return false;
+            }
+            if let Some(allowed_ids) = allowed_claim_ids
+                && !allowed_ids.contains(claim_id)
+            {
+                return false;
+            }
+            true
+        };
+
         if let Some(vector) = query_vector {
             let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-            for claim_id in self.vector_candidates(tenant_id, vector, vector_top_n) {
+            for claim_id in
+                self.vector_candidates(tenant_id, vector, vector_top_n, &predicate, filtered)
+            {
                 candidates.insert(claim_id);
             }
         }
@@ -1034,13 +1059,23 @@ impl InMemoryStore {
         tenant_id: &str,
         query_vector: &[f32],
         top_n: usize,
+        predicate: &dyn Fn(&str) -> bool,
+        filtered: bool,
     ) -> Vec<String> {
         if query_vector.is_empty() {
             return Vec::new();
         }
 
-        let mut scoped_ids = self.approximate_vector_candidate_ids(tenant_id, query_vector, top_n);
+        let mut scoped_ids = self.approximate_vector_candidate_ids(
+            tenant_id,
+            query_vector,
+            top_n,
+            predicate,
+            filtered,
+        );
         if scoped_ids.is_empty() {
+            // Full-scan fallback (selective predicate or no graph hit):
+            // honor the predicate so it remains a true filtered search.
             scoped_ids = self
                 .claim_vectors
                 .keys()
@@ -1048,6 +1083,7 @@ impl InMemoryStore {
                     self.claims
                         .get(*claim_id)
                         .is_some_and(|claim| claim.tenant_id == tenant_id)
+                        && predicate(claim_id)
                 })
                 .cloned()
                 .collect();
@@ -1126,6 +1162,8 @@ impl InMemoryStore {
         tenant_id: &str,
         query_vector: &[f32],
         top_n: usize,
+        predicate: &dyn Fn(&str) -> bool,
+        filtered: bool,
     ) -> HashSet<String> {
         let mut out = HashSet::new();
         let metric = self.ann_tuning.metric;
@@ -1216,7 +1254,7 @@ impl InMemoryStore {
             });
         }
 
-        let expansion_budget = top_n
+        let base_budget = top_n
             .saturating_mul(self.ann_tuning.search_expansion_factor.max(1))
             .clamp(
                 self.ann_tuning.search_expansion_min.max(1),
@@ -1224,12 +1262,22 @@ impl InMemoryStore {
                     .search_expansion_max
                     .max(self.ann_tuning.search_expansion_min.max(1)),
             );
-        let mut expanded = 0usize;
+        // Over-fetch when filtering: the walk visits the same nodes but
+        // only emits matching ones, so a selective predicate needs a
+        // deeper traversal budget to still surface `top_n` candidates.
+        let expansion_budget = if filtered {
+            base_budget.saturating_mul(self.ann_tuning.filtered_overfetch_factor.max(1))
+        } else {
+            base_budget
+        };
+        let mut explored = 0usize;
 
         while let Some(node) = frontier.pop() {
-            out.insert(node.claim_id.clone());
-            expanded += 1;
-            if expanded >= expansion_budget {
+            if predicate(&node.claim_id) {
+                out.insert(node.claim_id.clone());
+            }
+            explored += 1;
+            if explored >= expansion_budget {
                 break;
             }
 
@@ -3629,6 +3677,49 @@ mod tests {
     }
 
     #[test]
+    fn default_ann_tuning_enables_filtered_overfetch() {
+        // Filtered-HNSW over-fetch is on by default (factor > 1) so a
+        // selective predicate does not starve the candidate pool.
+        assert!(AnnTuningConfig::default().filtered_overfetch_factor > 1);
+    }
+
+    #[test]
+    fn filtered_semantic_search_excludes_out_of_range_claims() {
+        // Every claim is near the query vector; only the time predicate
+        // separates them. The predicate-aware traversal + post-filter must
+        // return exactly the in-range claims.
+        let mut store = InMemoryStore::new();
+        let in_range = ["c-r1", "c-r2"];
+        let out_of_range = ["c-old1", "c-old2", "c-old3"];
+        for (i, id) in in_range.iter().chain(out_of_range.iter()).enumerate() {
+            let mut c = claim(id, "project helios acquisition merger terms");
+            // in-range claims at t=2_000, out-of-range at t=100.
+            c.event_time_unix = Some(if i < in_range.len() { 2_000 } else { 100 });
+            store.ingest_bundle(c, vec![], vec![]).unwrap();
+            // Slightly different vectors, all strongly aligned to the query.
+            let jitter = 0.01 * i as f32;
+            store
+                .upsert_claim_vector(id, vec![1.0 - jitter, jitter, 0.0, 0.0])
+                .unwrap();
+        }
+
+        let results = store.retrieve_with_time_range_and_query_vector(
+            &RetrievalRequest {
+                tenant_id: "tenant-a".into(),
+                query: "acquisition merger terms".into(),
+                top_k: 10,
+                stance_mode: StanceMode::Balanced,
+            },
+            Some(1_000),
+            None,
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        );
+
+        let ids: HashSet<&str> = results.iter().map(|r| r.claim_id.as_str()).collect();
+        assert_eq!(ids, in_range.iter().copied().collect::<HashSet<&str>>());
+    }
+
+    #[test]
     fn retrieve_with_explicit_candidate_claim_ids_scores_only_explicit_set() {
         let mut store = InMemoryStore::new();
         store
@@ -4263,6 +4354,7 @@ mod tests {
             metric: DistanceMetric::default(),
             hybrid_fusion: HybridFusion::default(),
             rrf_k: RRF_K_DEFAULT,
+            filtered_overfetch_factor: 4,
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);

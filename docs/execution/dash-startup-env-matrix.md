@@ -104,6 +104,7 @@ Ingestion segment lifecycle daemon note:
 | `DASH_RETRIEVAL_VECTOR_METRIC` / `DASH_VECTOR_METRIC` | no | `cosine` | vector distance metric for ANN + scoring: `cosine`/`cos`, `dot`/`ip`/`inner_product`, `l2`/`euclidean` (the per-service var wins over the shared `DASH_VECTOR_METRIC`) | none |
 | `DASH_RETRIEVAL_HYBRID_FUSION` / `DASH_HYBRID_FUSION` | no | `semantic_primary` | how dense + lexical signals are combined when a query vector is supplied: `semantic_primary`/`dense` (dense primary, BM25 tie-break) or `rrf`/`reciprocal_rank_fusion` (Reciprocal Rank Fusion) | none |
 | `DASH_RETRIEVAL_RRF_K` / `DASH_RRF_K` | no | `60` | RRF `k` constant (only used when fusion is `rrf`); larger `k` flattens the rank-position weighting | none |
+| `DASH_RETRIEVAL_FILTERED_OVERFETCH_FACTOR` / `DASH_FILTERED_OVERFETCH_FACTOR` | no | `4` | filtered-HNSW over-fetch multiplier: when a query carries a time-range or allow-list predicate, the level-0 exploration budget is multiplied by this so a selective filter doesn't starve the candidate pool (`1` disables over-fetch) | none |
 
 Runtime note:
 

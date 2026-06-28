@@ -44,6 +44,13 @@ pub(crate) const ANN_SEARCH_EXPANSION_MIN_DEFAULT: usize = 64;
 /// top_k values).
 pub(crate) const ANN_SEARCH_EXPANSION_MAX_DEFAULT: usize = 4096;
 
+/// Default over-fetch multiplier applied to the level-0 exploration
+/// budget when a query carries a metadata predicate (time-range or
+/// allow-list). Filtered-HNSW traverses the same graph but only *emits*
+/// matching nodes, so a selective predicate needs a deeper walk to
+/// avoid starving the candidate pool. 1 disables over-fetch.
+pub(crate) const ANN_FILTERED_OVERFETCH_FACTOR_DEFAULT: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Distance metric
 // ---------------------------------------------------------------------------
@@ -144,6 +151,8 @@ pub struct AnnTuningConfig {
     pub metric: DistanceMetric,
     pub hybrid_fusion: HybridFusion,
     pub rrf_k: f32,
+    /// Over-fetch multiplier for filtered (predicate-aware) ANN search.
+    pub filtered_overfetch_factor: usize,
 }
 
 impl Default for AnnTuningConfig {
@@ -157,6 +166,7 @@ impl Default for AnnTuningConfig {
             metric: DistanceMetric::Cosine,
             hybrid_fusion: HybridFusion::SemanticPrimary,
             rrf_k: RRF_K_DEFAULT,
+            filtered_overfetch_factor: ANN_FILTERED_OVERFETCH_FACTOR_DEFAULT,
         }
     }
 }
