@@ -29,7 +29,7 @@ Be respectful, constructive, and collaborative. We're building this in the open 
 
 ### Prerequisites
 
-- **Rust 1.83+** — `rustup install stable`
+- **Rust 1.88+** — `rustup install stable` (the workspace uses edition 2024, which requires 1.85+; the current dependency tree raises the effective floor to 1.88, pinned in `rust-toolchain.toml`)
 - **Git** — for version control
 - Familiarity with Rust fundamentals (ownership, traits, error handling)
 

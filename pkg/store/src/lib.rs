@@ -9,23 +9,22 @@ use std::sync::OnceLock;
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest,
-    RetrievalResult, Stance, StanceMode, ValidationError, tokenize, validate_claim,
-    validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, Stance, StanceMode,
+    ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
 };
 
 mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
-mod wal;
 mod ann;
-mod metrics;
 #[cfg(feature = "gpu-backend")]
 mod gpu;
-pub use ann::AnnTuningConfig;
+mod metrics;
+mod wal;
+pub(crate) use ann::{ANN_GRAPH_LEVELS, ScoredNode, TenantAnnGraph};
+pub use ann::{AnnTuningConfig, DistanceMetric};
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
-pub(crate) use metrics::{VectorBackendPreference, VECTOR_BACKEND_ENV};
-pub(crate) use ann::{TenantAnnGraph, ScoredNode, ANN_GRAPH_LEVELS};
+pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
 
 #[derive(Default)]
 pub(crate) struct Bm25Context {
@@ -34,17 +33,11 @@ pub(crate) struct Bm25Context {
     avg_doc_len: f32,
 }
 
-
-
+pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
 pub use wal::{
-    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary,
-    WalReplayStats, WalReplicationDelta, WalReplicationExport, WalRollbackPoint,
-    WalWritePolicy,
+    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
+    WalReplicationDelta, WalReplicationExport, WalRollbackPoint, WalWritePolicy,
 };
-pub(crate) use wal::{
-    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record,
-};
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
@@ -98,7 +91,6 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-
 #[derive(Default, Clone)]
 /// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
 /// deep redb copy). This is the redb PR 2 fix: cloning a store no
@@ -114,6 +106,11 @@ pub struct InMemoryStore {
     evidence_by_claim: HashMap<String, Vec<Evidence>>,
     edges_by_claim: HashMap<String, Vec<ClaimEdge>>,
     claim_vectors: HashMap<String, Vec<f32>>,
+    /// Cached L2 norm of each stored vector, keyed by claim_id. Kept
+    /// coherent with `claim_vectors` (set on insert, cleared on
+    /// remove) so the cosine hot path does not recompute the stored
+    /// vector's norm on every comparison.
+    claim_vector_norms: HashMap<String, f32>,
     ann_vector_graphs: HashMap<String, TenantAnnGraph>,
     tenant_vector_dims: HashMap<String, usize>,
     tenant_claim_ids: HashMap<String, HashSet<String>>,
@@ -182,7 +179,9 @@ impl InMemoryStore {
             }),
             Err(reason) => Ok(Self {
                 disk: None,
-                disk_status: disk::DiskStatus::Unavailable { reason: reason.clone() },
+                disk_status: disk::DiskStatus::Unavailable {
+                    reason: reason.clone(),
+                },
                 ..self
             }),
         }
@@ -266,12 +265,7 @@ impl InMemoryStore {
         // pattern of `take()` + restore, which was only needed when
         // the disk was an owned `DiskBackedStore` (not Clone-able
         // because it wraps a `redb::Database`).
-        let disk = Arc::clone(
-            store
-                .disk
-                .as_ref()
-                .expect("disk was just attached"),
-        );
+        let disk = Arc::clone(store.disk.as_ref().expect("disk was just attached"));
         let claims_loaded = disk
             .bulk_load_claims_into(&mut store)
             .map_err(|e| format!("disk bulk load: {e}"))?;
@@ -449,12 +443,7 @@ impl InMemoryStore {
         req: &RetrievalRequest,
         query_vector: &[f32],
     ) -> Vec<RetrievalResult> {
-        self.retrieve_with_time_range_and_query_vector(
-            req,
-            None,
-            None,
-            Some(query_vector),
-        )
+        self.retrieve_with_time_range_and_query_vector(req, None, None, Some(query_vector))
     }
 
     pub fn retrieve_with_time_range(
@@ -898,21 +887,15 @@ impl InMemoryStore {
     }
 
     pub(crate) fn evidence_iter(&self) -> impl Iterator<Item = (&str, &Vec<Evidence>)> {
-        self.evidence_by_claim
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.evidence_by_claim.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn edges_iter(&self) -> impl Iterator<Item = (&str, &Vec<ClaimEdge>)> {
-        self.edges_by_claim
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.edges_by_claim.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn claim_vectors_iter(&self) -> impl Iterator<Item = (&str, &Vec<f32>)> {
-        self.claim_vectors
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.claim_vectors.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn batch_commits_iter(&self) -> impl Iterator<Item = &BatchCommitMetadata> {
@@ -920,17 +903,15 @@ impl InMemoryStore {
     }
 
     pub(crate) fn tenant_dims_iter(&self) -> impl Iterator<Item = (&str, &usize)> {
-        self.tenant_vector_dims
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.tenant_vector_dims.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn tenant_claim_set_iter(&self) -> impl Iterator<Item = (String, String)> {
-        self.tenant_claim_ids
-            .iter()
-            .flat_map(|(tenant, claims)| {
-                claims.iter().map(move |claim| (tenant.clone(), claim.clone()))
-            })
+        self.tenant_claim_ids.iter().flat_map(|(tenant, claims)| {
+            claims
+                .iter()
+                .map(move |claim| (tenant.clone(), claim.clone()))
+        })
     }
 
     fn should_checkpoint(
@@ -1053,6 +1034,15 @@ impl InMemoryStore {
             .collect()
     }
 
+    /// The L2 norm of a stored vector, served from the coherent cache
+    /// when available and computed on the fly otherwise.
+    fn norm_for_claim(&self, claim_id: &str, vector: &[f32]) -> f32 {
+        self.claim_vector_norms
+            .get(claim_id)
+            .copied()
+            .unwrap_or_else(|| l2_norm(vector))
+    }
+
     fn score_query_candidate_vectors(
         &self,
         query_vector: &[f32],
@@ -1062,7 +1052,11 @@ impl InMemoryStore {
             return Vec::new();
         }
 
-        if self.vector_backend_runtime.is_gpu() {
+        let metric = self.ann_tuning.metric;
+
+        // The GPU shader implements cosine only; fall back to the CPU
+        // path for the other metrics.
+        if metric == DistanceMetric::Cosine && self.vector_backend_runtime.is_gpu() {
             #[cfg(feature = "gpu-backend")]
             if let Some(scored) =
                 gpu_score_query_candidate_vectors(query_vector, &candidate_vectors)
@@ -1071,7 +1065,21 @@ impl InMemoryStore {
             }
         }
 
-        score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
+        let query_norm = l2_norm(query_vector);
+        candidate_vectors
+            .iter()
+            .filter_map(|(claim_id, candidate_vector)| {
+                let candidate_norm = self.norm_for_claim(claim_id, candidate_vector);
+                let score = vector_similarity(
+                    metric,
+                    query_vector,
+                    query_norm,
+                    candidate_vector,
+                    candidate_norm,
+                )?;
+                Some((claim_id.clone(), score))
+            })
+            .collect()
     }
 
     fn approximate_vector_candidate_ids(
@@ -1081,16 +1089,26 @@ impl InMemoryStore {
         top_n: usize,
     ) -> HashSet<String> {
         let mut out = HashSet::new();
+        let metric = self.ann_tuning.metric;
+        let query_norm = l2_norm(query_vector);
         let Some(graph) = self.ann_vector_graphs.get(tenant_id) else {
             return out;
         };
         let Some(entry_point) = graph.entry_point.as_ref() else {
             return out;
         };
-        let Some(mut current_score) = self
-            .claim_vectors
-            .get(entry_point)
-            .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
+        let Some(mut current_score) =
+            self.claim_vectors
+                .get(entry_point)
+                .and_then(|entry_vector| {
+                    vector_similarity(
+                        metric,
+                        query_vector,
+                        query_norm,
+                        entry_vector,
+                        self.norm_for_claim(entry_point, entry_vector),
+                    )
+                })
         else {
             return out;
         };
@@ -1108,7 +1126,13 @@ impl InMemoryStore {
                         self.claim_vectors
                             .get(neighbor_id)
                             .and_then(|neighbor_vector| {
-                                cosine_similarity(query_vector, neighbor_vector)
+                                vector_similarity(
+                                    metric,
+                                    query_vector,
+                                    query_norm,
+                                    neighbor_vector,
+                                    self.norm_for_claim(neighbor_id, neighbor_vector),
+                                )
                             })
                     else {
                         continue;
@@ -1137,7 +1161,15 @@ impl InMemoryStore {
             && let Some(score) = self
                 .claim_vectors
                 .get(entry_point)
-                .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
+                .and_then(|entry_vector| {
+                    vector_similarity(
+                        metric,
+                        query_vector,
+                        query_norm,
+                        entry_vector,
+                        self.norm_for_claim(entry_point, entry_vector),
+                    )
+                })
         {
             frontier.push(ScoredNode {
                 claim_id: entry_point.clone(),
@@ -1172,7 +1204,13 @@ impl InMemoryStore {
                 let Some(neighbor_vector) = self.claim_vectors.get(neighbor_id) else {
                     continue;
                 };
-                let Some(score) = cosine_similarity(query_vector, neighbor_vector) else {
+                let Some(score) = vector_similarity(
+                    metric,
+                    query_vector,
+                    query_norm,
+                    neighbor_vector,
+                    self.norm_for_claim(neighbor_id, neighbor_vector),
+                ) else {
                     continue;
                 };
                 frontier.push(ScoredNode {
@@ -1482,7 +1520,9 @@ impl InMemoryStore {
             Some(existing_dim) if *existing_dim != vector.len() => {
                 return Err(StoreError::InvalidVector(format!(
                     "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id, existing_dim, vector.len()
+                    tenant_id,
+                    existing_dim,
+                    vector.len()
                 )));
             }
             None => Some(vector.len()),
@@ -1546,6 +1586,8 @@ impl InMemoryStore {
             self.claim_vectors.get(claim_id).cloned().ok_or_else(|| {
                 StoreError::InvalidVector("failed to store claim vector".to_string())
             })?;
+        self.claim_vector_norms
+            .insert(claim_id.to_string(), l2_norm(&stored_vector));
         self.add_vector_index_entry(&tenant_id, claim_id, &stored_vector);
         self.wal
             .push(WalEvent::ClaimVectorUpsert(claim_id.to_string()));
@@ -1578,7 +1620,8 @@ impl InMemoryStore {
         if let Some(disk) = self.disk.as_ref() {
             disk.put_batch_commit(&metadata).map_err(StoreError::Io)?;
         }
-        self.batch_commits.insert(record.commit_id.clone(), metadata);
+        self.batch_commits
+            .insert(record.commit_id.clone(), metadata);
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
         Ok(())
     }
@@ -1691,6 +1734,8 @@ impl InMemoryStore {
         level: usize,
         max_neighbors: usize,
     ) -> Vec<String> {
+        let metric = self.ann_tuning.metric;
+        let vector_norm = self.norm_for_claim(claim_id, vector);
         let mut scored: Vec<(String, f32)> = self
             .claim_vectors
             .iter()
@@ -1705,7 +1750,13 @@ impl InMemoryStore {
                 if !self.ann_node_is_visible_at_level(tenant_id, other_claim_id, level) {
                     return None;
                 }
-                let sim = cosine_similarity(vector, other_vector)?;
+                let sim = vector_similarity(
+                    metric,
+                    vector,
+                    vector_norm,
+                    other_vector,
+                    self.norm_for_claim(other_claim_id, other_vector),
+                )?;
                 Some((other_claim_id.clone(), sim))
             })
             .collect();
@@ -1784,11 +1835,19 @@ impl InMemoryStore {
             return;
         }
 
+        let metric = self.ann_tuning.metric;
+        let node_norm = self.norm_for_claim(claim_id, &node_vector);
         let mut scored: Vec<(String, f32)> = candidate_neighbors
             .into_iter()
             .filter_map(|neighbor_id| {
                 let neighbor_vector = self.claim_vectors.get(&neighbor_id)?;
-                let similarity = cosine_similarity(&node_vector, neighbor_vector)?;
+                let similarity = vector_similarity(
+                    metric,
+                    &node_vector,
+                    node_norm,
+                    neighbor_vector,
+                    self.norm_for_claim(&neighbor_id, neighbor_vector),
+                )?;
                 Some((neighbor_id, similarity))
             })
             .collect();
@@ -1897,6 +1956,7 @@ impl InMemoryStore {
     }
 
     fn remove_claim_indexes(&mut self, claim: &Claim) {
+        self.claim_vector_norms.remove(&claim.claim_id);
         if let Some(previous) = self.claim_vectors.remove(&claim.claim_id) {
             let _ = previous;
             self.remove_vector_index_entry(&claim.tenant_id, &claim.claim_id);
@@ -2054,19 +2114,6 @@ fn resolve_gpu_backend_runtime(explicit_gpu_required: bool) -> VectorBackendRunt
     }
 }
 
-fn score_query_candidate_vectors_cpu(
-    query_vector: &[f32],
-    candidate_vectors: &[(String, &[f32])],
-) -> Vec<(String, f32)> {
-    candidate_vectors
-        .iter()
-        .filter_map(|(claim_id, candidate_vector)| {
-            let score = cosine_similarity(query_vector, candidate_vector)?;
-            Some((claim_id.clone(), score))
-        })
-        .collect()
-}
-
 fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
     if let Some(from) = from_unix
         && value < from
@@ -2197,26 +2244,57 @@ struct GpuCosineParams {
     pad1: u32,
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+fn l2_norm(v: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for x in v {
+        sum += x * x;
+    }
+    sum.sqrt()
+}
+
+fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// Metric-aware similarity where a HIGHER value always means "more
+/// similar" (so the same greedy/heap traversal and descending sort
+/// work for every metric). For `Euclidean` this returns the negated
+/// squared distance. `a_norm`/`b_norm` are the precomputed L2 norms,
+/// used only by `Cosine`.
+fn vector_similarity(
+    metric: DistanceMetric,
+    a: &[f32],
+    a_norm: f32,
+    b: &[f32],
+    b_norm: f32,
+) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom <= f32::EPSILON {
-        None
-    } else {
-        Some(dot / denom)
+    match metric {
+        DistanceMetric::Cosine => {
+            let denom = a_norm * b_norm;
+            if denom <= f32::EPSILON {
+                None
+            } else {
+                Some(dot_product(a, b) / denom)
+            }
+        }
+        DistanceMetric::DotProduct => Some(dot_product(a, b)),
+        DistanceMetric::Euclidean => {
+            let mut sum = 0.0f32;
+            for i in 0..a.len() {
+                let diff = a[i] - b[i];
+                sum += diff * diff;
+            }
+            Some(-sum)
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3878,6 +3956,103 @@ mod tests {
     }
 
     #[test]
+    fn distance_metric_parse_accepts_aliases() {
+        assert_eq!(
+            DistanceMetric::parse("cosine"),
+            Some(DistanceMetric::Cosine)
+        );
+        assert_eq!(DistanceMetric::parse(" COS "), Some(DistanceMetric::Cosine));
+        assert_eq!(
+            DistanceMetric::parse("dot"),
+            Some(DistanceMetric::DotProduct)
+        );
+        assert_eq!(
+            DistanceMetric::parse("inner_product"),
+            Some(DistanceMetric::DotProduct)
+        );
+        assert_eq!(
+            DistanceMetric::parse("ip"),
+            Some(DistanceMetric::DotProduct)
+        );
+        assert_eq!(DistanceMetric::parse("l2"), Some(DistanceMetric::Euclidean));
+        assert_eq!(DistanceMetric::parse("nonsense"), None);
+        assert_eq!(DistanceMetric::default(), DistanceMetric::Cosine);
+    }
+
+    #[test]
+    fn vector_similarity_higher_is_more_similar_per_metric() {
+        let q = [1.0f32, 0.0, 0.0];
+        let near = [2.0f32, 0.0, 0.0]; // same direction, larger magnitude
+        let far = [0.0f32, 1.0, 0.0]; // orthogonal
+        let qn = l2_norm(&q);
+
+        // Cosine ignores magnitude: same-direction vector is maximally
+        // similar (1.0) regardless of length.
+        let cos_near =
+            vector_similarity(DistanceMetric::Cosine, &q, qn, &near, l2_norm(&near)).unwrap();
+        let cos_far =
+            vector_similarity(DistanceMetric::Cosine, &q, qn, &far, l2_norm(&far)).unwrap();
+        assert!((cos_near - 1.0).abs() < 1e-6);
+        assert!(cos_near > cos_far);
+
+        // Dot product rewards magnitude along the query direction.
+        let dot_near =
+            vector_similarity(DistanceMetric::DotProduct, &q, qn, &near, l2_norm(&near)).unwrap();
+        assert!((dot_near - 2.0).abs() < 1e-6);
+
+        // Euclidean returns negated squared distance (higher = closer).
+        let euc_near =
+            vector_similarity(DistanceMetric::Euclidean, &q, qn, &near, l2_norm(&near)).unwrap();
+        let euc_far =
+            vector_similarity(DistanceMetric::Euclidean, &q, qn, &far, l2_norm(&far)).unwrap();
+        assert!(euc_near > euc_far);
+        assert!(euc_near <= 0.0);
+    }
+
+    #[test]
+    fn norm_cache_matches_stored_vector_norm() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(claim("c-norm", "norm cache claim"), vec![], vec![])
+            .unwrap();
+        let vector = vec![3.0f32, 4.0, 0.0]; // L2 norm = 5.0
+        store.upsert_claim_vector("c-norm", vector.clone()).unwrap();
+        let cached = store
+            .claim_vector_norms
+            .get("c-norm")
+            .copied()
+            .expect("norm should be cached after upsert");
+        assert!((cached - 5.0).abs() < 1e-6);
+        assert!((cached - l2_norm(&vector)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dot_product_metric_prefers_larger_magnitude_candidate() {
+        let tuning = AnnTuningConfig {
+            metric: DistanceMetric::DotProduct,
+            ..AnnTuningConfig::default()
+        };
+        let mut store = InMemoryStore::new_with_ann_tuning(tuning);
+        store
+            .ingest_bundle(claim("c-small", "small magnitude"), vec![], vec![])
+            .unwrap();
+        store
+            .ingest_bundle(claim("c-large", "large magnitude"), vec![], vec![])
+            .unwrap();
+        // Same direction as the query; c-large has the larger dot product.
+        store
+            .upsert_claim_vector("c-small", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert_claim_vector("c-large", vec![5.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let exact = store.exact_vector_top_candidates("tenant-a", &query, 2);
+        assert_eq!(exact.first().map(String::as_str), Some("c-large"));
+    }
+
+    #[test]
     fn ann_graph_populates_multiple_levels_for_tenant() {
         let mut store = InMemoryStore::new();
         let mut high_level_claim_id = None;
@@ -3926,6 +4101,7 @@ mod tests {
             search_expansion_factor: 9,
             search_expansion_min: 32,
             search_expansion_max: 2048,
+            metric: DistanceMetric::default(),
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);

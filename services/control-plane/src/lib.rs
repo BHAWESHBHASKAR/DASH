@@ -162,8 +162,7 @@ impl ControlPlanePlacementState {
             let current_epoch = self.highest_epoch();
             if expected_epoch != current_epoch {
                 return Err(format!(
-                    "stale placement epoch: expected={}, current={}",
-                    expected_epoch, current_epoch
+                    "stale placement epoch: expected={expected_epoch}, current={current_epoch}"
                 ));
             }
         }
@@ -181,18 +180,15 @@ impl ControlPlanePlacementState {
             .iter_mut()
             .find(|placement| placement.tenant_id == tenant_id && placement.shard_id == shard_id)
             .ok_or_else(|| {
-                format!(
-                    "placement not found for tenant '{}' shard {}",
-                    tenant_id, shard_id
-                )
+                format!("placement not found for tenant '{tenant_id}' shard {shard_id}")
             })?;
 
         promote_replica_to_leader(placement, node_id).map_err(|err| match err {
             PlacementRouteError::ReplicaNotFound { .. } => {
-                format!("replica '{}' not found in shard {}", node_id, shard_id)
+                format!("replica '{node_id}' not found in shard {shard_id}")
             }
             PlacementRouteError::ReplicaUnhealthy { .. } => {
-                format!("replica '{}' is not promotable due to health", node_id)
+                format!("replica '{node_id}' is not promotable due to health")
             }
             other => format!("promotion failed: {other:?}"),
         })

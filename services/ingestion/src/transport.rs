@@ -609,10 +609,7 @@ impl IngestionRuntime {
                 Err(err) => {
                     self.segment_publish_failure_total =
                         self.segment_publish_failure_total.saturating_add(1);
-                    eprintln!(
-                        "ingestion segment publish failed for tenant '{}': {err:?}",
-                        tenant_id
-                    );
+                    eprintln!("ingestion segment publish failed for tenant '{tenant_id}': {err:?}");
                 }
             }
         }
@@ -680,7 +677,7 @@ impl IngestionRuntime {
         let status = self
             .replication_commit_status
             .get_mut(commit_id)
-            .ok_or_else(|| format!("unknown commit_id '{}'", commit_id))?;
+            .ok_or_else(|| format!("unknown commit_id '{commit_id}'"))?;
         if status
             .acknowledged_replicas
             .insert(replica_id.trim().to_string())

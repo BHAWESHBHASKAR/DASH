@@ -19,7 +19,10 @@
 //!   `HashEmbeddingProvider` for an `OllamaEmbeddingProvider` or
 //!   `OpenAIEmbeddingProvider` and the wire format stays the same.
 
-use embeddings::{EmbeddingError, EmbeddingProvider, HashEmbeddingProvider, OllamaEmbeddingProvider, OpenAIEmbeddingProvider};
+use embeddings::{
+    EmbeddingError, EmbeddingProvider, HashEmbeddingProvider, OllamaEmbeddingProvider,
+    OpenAIEmbeddingProvider,
+};
 use serde::{Deserialize, Serialize};
 
 /// Wire-compatible request body for `POST /v1/embeddings`.
@@ -179,11 +182,12 @@ impl OpenAIErrorResponse {
 /// `HashEmbeddingProvider` (deterministic, no network) and serializes
 /// the response. Swap the provider to integrate Ollama, OpenAI, or
 /// custom models.
-pub fn handle_openai_embeddings(body: &str) -> Result<OpenAIEmbeddingsResponse, OpenAIErrorResponse> {
-    let req: OpenAIEmbeddingsRequest =
-        serde_json::from_str(body).map_err(|err| {
-            OpenAIErrorResponse::invalid_request(format!("invalid request body: {err}"))
-        })?;
+pub fn handle_openai_embeddings(
+    body: &str,
+) -> Result<OpenAIEmbeddingsResponse, OpenAIErrorResponse> {
+    let req: OpenAIEmbeddingsRequest = serde_json::from_str(body).map_err(|err| {
+        OpenAIErrorResponse::invalid_request(format!("invalid request body: {err}"))
+    })?;
 
     if req.input.is_empty() {
         return Err(OpenAIErrorResponse::invalid_request(
@@ -247,10 +251,9 @@ pub fn handle_openai_embeddings_with_provider(
     body: &str,
     provider: &dyn EmbeddingProvider,
 ) -> Result<OpenAIEmbeddingsResponse, OpenAIErrorResponse> {
-    let req: OpenAIEmbeddingsRequest =
-        serde_json::from_str(body).map_err(|err| {
-            OpenAIErrorResponse::invalid_request(format!("invalid request body: {err}"))
-        })?;
+    let req: OpenAIEmbeddingsRequest = serde_json::from_str(body).map_err(|err| {
+        OpenAIErrorResponse::invalid_request(format!("invalid request body: {err}"))
+    })?;
 
     if req.input.is_empty() {
         return Err(OpenAIErrorResponse::invalid_request(
@@ -261,11 +264,9 @@ pub fn handle_openai_embeddings_with_provider(
     let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
         .map_err(OpenAIErrorResponse::invalid_request)?;
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
-    let embeddings = provider
-        .embed(&texts)
-        .map_err(|err: EmbeddingError| {
-            OpenAIErrorResponse::server_error(format!("embedding failed: {err}"))
-        })?;
+    let embeddings = provider.embed(&texts).map_err(|err: EmbeddingError| {
+        OpenAIErrorResponse::server_error(format!("embedding failed: {err}"))
+    })?;
 
     let data: Vec<OpenAIEmbeddingData> = embeddings
         .into_iter()
@@ -389,7 +390,6 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-
 // ---------------------------------------------------------------------------
 // Env-driven provider selection
 // ---------------------------------------------------------------------------
@@ -420,8 +420,7 @@ pub fn select_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + '
             Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
         }
         "openai" => {
-            let key = std::env::var("DASH_OPENAI_API_KEY")
-                .unwrap_or_default();
+            let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
             let model = std::env::var("DASH_OPENAI_MODEL")
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string());
             match OpenAIEmbeddingProvider::new(model, key) {
@@ -436,9 +435,7 @@ pub fn select_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + '
         }
         "hash" => Box::new(HashEmbeddingProvider::default()),
         other => {
-            eprintln!(
-                "dash: unknown DASH_EMBEDDING_PROVIDER='{other}'; falling back to hash"
-            );
+            eprintln!("dash: unknown DASH_EMBEDDING_PROVIDER='{other}'; falling back to hash");
             Box::new(HashEmbeddingProvider::default())
         }
     }
@@ -459,8 +456,7 @@ mod tests {
 
     #[test]
     fn parses_array_input() {
-        let body =
-            r#"{"input": ["hello", "world", "foo"], "model": "text-embedding-3-small"}"#;
+        let body = r#"{"input": ["hello", "world", "foo"], "model": "text-embedding-3-small"}"#;
         let req: OpenAIEmbeddingsRequest = serde_json::from_str(body).unwrap();
         assert_eq!(req.input.len(), 3);
         assert_eq!(req.input.texts(), vec!["hello", "world", "foo"]);
@@ -654,13 +650,34 @@ mod tests {
 
     #[test]
     fn encoding_format_from_request_str_handles_all_cases() {
-        assert_eq!(EncodingFormat::from_request_str(None).unwrap(), EncodingFormat::Float);
-        assert_eq!(EncodingFormat::from_request_str(Some("")).unwrap(), EncodingFormat::Float);
-        assert_eq!(EncodingFormat::from_request_str(Some("float")).unwrap(), EncodingFormat::Float);
-        assert_eq!(EncodingFormat::from_request_str(Some("FLOAT")).unwrap(), EncodingFormat::Float);
-        assert_eq!(EncodingFormat::from_request_str(Some("base64")).unwrap(), EncodingFormat::Base64);
-        assert_eq!(EncodingFormat::from_request_str(Some("Base64")).unwrap(), EncodingFormat::Base64);
-        assert_eq!(EncodingFormat::from_request_str(Some("  base64  ")).unwrap(), EncodingFormat::Base64);
+        assert_eq!(
+            EncodingFormat::from_request_str(None).unwrap(),
+            EncodingFormat::Float
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("")).unwrap(),
+            EncodingFormat::Float
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("float")).unwrap(),
+            EncodingFormat::Float
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("FLOAT")).unwrap(),
+            EncodingFormat::Float
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("base64")).unwrap(),
+            EncodingFormat::Base64
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("Base64")).unwrap(),
+            EncodingFormat::Base64
+        );
+        assert_eq!(
+            EncodingFormat::from_request_str(Some("  base64  ")).unwrap(),
+            EncodingFormat::Base64
+        );
         let err = EncodingFormat::from_request_str(Some("binary")).unwrap_err();
         assert!(err.contains("'binary'"));
     }
@@ -740,9 +757,16 @@ mod tests {
         // serialize it as base64 and we can decode back to the same floats.
         struct FixedProvider;
         impl embeddings::EmbeddingProvider for FixedProvider {
-            fn name(&self) -> &str { "fixed" }
-            fn dimensions(&self) -> usize { 4 }
-            fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+            fn name(&self) -> &str {
+                "fixed"
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn embed(
+                &self,
+                _texts: &[String],
+            ) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
                 Ok(vec![vec![1.0, -2.0, 3.5, f32::NAN]])
             }
         }

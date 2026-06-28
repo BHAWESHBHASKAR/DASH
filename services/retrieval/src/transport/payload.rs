@@ -708,7 +708,7 @@ fn render_optional_i64(out: &mut String, value: Option<i64>) {
 
 fn render_optional_f32(out: &mut String, value: Option<f32>) {
     if let Some(value) = value {
-        out.push_str(&format!("{:.6}", value));
+        out.push_str(&format!("{value:.6}"));
     } else {
         out.push_str("null");
     }

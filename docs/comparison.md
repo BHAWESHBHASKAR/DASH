@@ -14,7 +14,7 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Temporal validity windows | first-class (`event_time_unix`, `valid_from`, `valid_to`, `time_range` filter) | metadata only | manual | manual | manual | manual |
 | OpenAI-compatible `/v1/embeddings` | yes, native | partial | yes | via proxy layer | via proxy layer | yes |
 | Swap embedding provider | trait-based (`EmbeddingProvider`) | n/a | plugin-based | n/a | n/a | function-based |
-| HNSW ANN | yes (`usearch`) | yes, proprietary | yes | yes | yes | yes |
+| HNSW ANN | yes (custom Rust HNSW; cosine/dot/L2) | yes, proprietary | yes | yes | yes | yes |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
 | Hash-chained audit log | yes, SHA-256 chain | no | no | no | no | no |
 | Tenant isolation (strict authz) | yes, allowlist + scoped keys | yes | yes (OIDC) | yes | partial | no |

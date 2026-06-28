@@ -771,6 +771,7 @@ where
             "DASH_BENCH_ANN_SEARCH_EXPANSION_MAX",
             defaults.search_expansion_max,
         ),
+        metric: defaults.metric,
     };
     let mut large_min_candidate_reduction_pct =
         env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);
@@ -1013,8 +1014,7 @@ where
     let effective_iterations = iterations.unwrap_or_else(|| profile.default_iterations());
     if effective_iterations < min_benchmark_iterations {
         return Err(format!(
-            "effective benchmark iterations {} is below --min-iterations {}",
-            effective_iterations, min_benchmark_iterations
+            "effective benchmark iterations {effective_iterations} is below --min-iterations {min_benchmark_iterations}"
         ));
     }
 
@@ -2028,8 +2028,7 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
-        "- segment_refresh_avg_ms: {:.4}",
-        segment_refresh_avg_ms
+        "- segment_refresh_avg_ms: {segment_refresh_avg_ms:.4}"
     )?;
     if let Some(wal_scale) = summary.wal_scale.as_ref() {
         writeln!(file)?;
@@ -2098,8 +2097,7 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
-        "- contradiction_detection_f1_gate: {:.2}",
-        CONTRADICTION_DETECTION_F1_GATE
+        "- contradiction_detection_f1_gate: {CONTRADICTION_DETECTION_F1_GATE:.2}"
     )?;
     writeln!(
         file,
@@ -2128,8 +2126,7 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
-        "- citation_coverage_gate: {:.2}",
-        CITATION_COVERAGE_GATE
+        "- citation_coverage_gate: {CITATION_COVERAGE_GATE:.2}"
     )?;
     writeln!(
         file,
@@ -2159,8 +2156,7 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
-        "- extraction_span_coverage_gate: {:.2}",
-        EXTRACTION_SPAN_COVERAGE_GATE
+        "- extraction_span_coverage_gate: {EXTRACTION_SPAN_COVERAGE_GATE:.2}"
     )?;
     writeln!(
         file,

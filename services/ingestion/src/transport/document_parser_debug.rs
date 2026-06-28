@@ -81,7 +81,7 @@ pub(super) fn render_document_parser_debug_json() -> String {
         .join(",");
     let builtin_mime_types = BUILTIN_UTF8_MIME_TYPES
         .iter()
-        .map(|value| format!("\"{}\"", value))
+        .map(|value| format!("\"{value}\""))
         .collect::<Vec<_>>()
         .join(",");
 
@@ -100,8 +100,7 @@ pub(super) fn render_document_parser_debug_json() -> String {
     }
     if !adapter_script_present {
         warnings.push(format!(
-            "recommended adapter script is missing at {}",
-            DOCUMENT_ADAPTER_SCRIPT_PATH
+            "recommended adapter script is missing at {DOCUMENT_ADAPTER_SCRIPT_PATH}"
         ));
     }
     if embedding_provider == "adapter_command" && embedding_adapter_command.is_none() {
@@ -178,7 +177,7 @@ fn command_preview(command: &str) -> Option<String> {
 fn command_exists(command: &str) -> bool {
     Command::new("sh")
         .arg("-c")
-        .arg(format!("command -v {} >/dev/null 2>&1", command))
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
         .map(|status| status.success())
         .unwrap_or(false)

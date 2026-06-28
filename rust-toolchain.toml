@@ -1,0 +1,6 @@
+[toolchain]
+# DASH uses edition 2024 (requires Rust 1.85+). The current
+# dependency tree raises the effective floor to 1.88 (via `time`
+# and the `icu_*` crates), so the workspace is pinned to 1.88.
+channel = "1.88"
+components = ["rustfmt", "clippy"]

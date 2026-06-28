@@ -861,7 +861,9 @@ pub fn serve_http_with_workers(
         // accept() calls with shutdown-flag polling. The 50ms
         // sleep caps shutdown latency at ~50ms p99 and bounds
         // CPU usage in the idle case.
-        listener.set_nonblocking(true).expect("set listener non-blocking");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
         loop {
             if shutdown.is_triggered() {
                 eprintln!("retrieval: shutdown signal received, draining in-flight requests");
@@ -1146,9 +1148,7 @@ fn handle_request_with_metrics_and_reload(
             // mutex is poisoned, something else is very wrong.
             match metrics.lock() {
                 Ok(_) => HttpResponse::ok_json("{\"status\":\"ready\"}".to_string()),
-                Err(_) => HttpResponse::internal_server_error(
-                    "metrics mutex poisoned",
-                ),
+                Err(_) => HttpResponse::internal_server_error("metrics mutex poisoned"),
             }
         }
         ("GET", "/metrics") => {
@@ -1463,9 +1463,7 @@ fn handle_request_with_metrics_and_reload(
             // vectors are semantically meaningful.
             let body = match std::str::from_utf8(&request.body) {
                 Ok(text) => text,
-                Err(_) => {
-                    return HttpResponse::bad_request("request body must be valid UTF-8")
-                }
+                Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
             };
             let provider = crate::openai_embeddings::select_provider_from_env();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
@@ -1473,8 +1471,7 @@ fn handle_request_with_metrics_and_reload(
                 provider.as_ref(),
             ) {
                 Ok(resp) => {
-                    let body = serde_json::to_string(&resp)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
                     HttpResponse::ok_json(body)
                 }
                 Err(err) => {
@@ -1772,7 +1769,7 @@ fn load_placement_routing_runtime(
     let placements = load_shard_placements_from_source(placement_file, control_plane_base_url)?;
     if placements.is_empty() {
         let source = control_plane_base_url
-            .map(|value| format!("control-plane '{}'", value))
+            .map(|value| format!("control-plane '{value}'"))
             .or_else(|| placement_file.map(|value| format!("placement file '{}'", value.display())))
             .unwrap_or_else(|| "placement source".to_string());
         return Err(format!("{source} has no placement records"));
@@ -2894,16 +2891,13 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert_eq!(debug_response.status, 200);
         assert!(debug_response.body.contains("\"tenant_id\":\"tenant-a\""));
         assert!(debug_response.body.contains(&format!(
-            "\"storage_merge_model\":\"{}\"",
-            STORAGE_MERGE_MODEL
+            "\"storage_merge_model\":\"{STORAGE_MERGE_MODEL}\""
         )));
         assert!(debug_response.body.contains(&format!(
-            "\"source_of_truth_model\":\"{}\"",
-            STORAGE_SOURCE_OF_TRUTH_MODEL
+            "\"source_of_truth_model\":\"{STORAGE_SOURCE_OF_TRUTH_MODEL}\""
         )));
         assert!(debug_response.body.contains(&format!(
-            "\"execution_mode\":\"{}\"",
-            STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE
+            "\"execution_mode\":\"{STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE}\""
         )));
         assert!(
             debug_response
@@ -2916,8 +2910,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
                 .contains("\"execution_candidate_count\":2")
         );
         assert!(debug_response.body.contains(&format!(
-            "\"promotion_boundary_state\":\"{}\"",
-            STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA
+            "\"promotion_boundary_state\":\"{STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA}\""
         )));
         assert!(
             debug_response

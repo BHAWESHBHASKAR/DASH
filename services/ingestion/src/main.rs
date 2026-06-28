@@ -3,7 +3,9 @@ use ingestion::{
     transport::IngestionRuntime, transport::serve_http_with_workers,
 };
 use schema::{Claim, Evidence, Stance};
-use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWritePolicy};
+use store::{
+    AnnTuningConfig, CheckpointPolicy, DistanceMetric, FileWal, InMemoryStore, WalWritePolicy,
+};
 
 const SAFE_WAL_SYNC_EVERY_RECORDS_MAX: usize = 256;
 const SAFE_WAL_APPEND_BUFFER_RECORDS_MAX: usize = 256;
@@ -188,7 +190,7 @@ fn main() {
             "EME_INGEST_PERSISTENCE_DISABLE",
         )
         .as_deref()
-        == Some("1");
+            == Some("1");
         let disk_path = env_with_fallback(
             "DASH_INGEST_PERSISTENCE_PATH",
             "EME_INGEST_PERSISTENCE_PATH",
@@ -458,30 +460,26 @@ fn wal_durability_guardrail_violations(
     let mut violations = Vec::new();
     if sync_every_records > SAFE_WAL_SYNC_EVERY_RECORDS_MAX {
         violations.push(format!(
-            "DASH_INGEST_WAL_SYNC_EVERY_RECORDS={} exceeds safe max {}",
-            sync_every_records, SAFE_WAL_SYNC_EVERY_RECORDS_MAX
+            "DASH_INGEST_WAL_SYNC_EVERY_RECORDS={sync_every_records} exceeds safe max {SAFE_WAL_SYNC_EVERY_RECORDS_MAX}"
         ));
     }
     if append_buffer_records > SAFE_WAL_APPEND_BUFFER_RECORDS_MAX {
         violations.push(format!(
-            "DASH_INGEST_WAL_APPEND_BUFFER_RECORDS={} exceeds safe max {}",
-            append_buffer_records, SAFE_WAL_APPEND_BUFFER_RECORDS_MAX
+            "DASH_INGEST_WAL_APPEND_BUFFER_RECORDS={append_buffer_records} exceeds safe max {SAFE_WAL_APPEND_BUFFER_RECORDS_MAX}"
         ));
     }
     if let Some(interval_ms) = sync_interval_ms
         && interval_ms > SAFE_WAL_SYNC_INTERVAL_MS_MAX
     {
         violations.push(format!(
-            "DASH_INGEST_WAL_SYNC_INTERVAL_MS={} exceeds safe max {}",
-            interval_ms, SAFE_WAL_SYNC_INTERVAL_MS_MAX
+            "DASH_INGEST_WAL_SYNC_INTERVAL_MS={interval_ms} exceeds safe max {SAFE_WAL_SYNC_INTERVAL_MS_MAX}"
         ));
     }
     if let Some(interval_ms) = async_flush_interval_ms
         && interval_ms > SAFE_WAL_SYNC_INTERVAL_MS_MAX
     {
         violations.push(format!(
-            "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS={} exceeds safe max {}",
-            interval_ms, SAFE_WAL_SYNC_INTERVAL_MS_MAX
+            "DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS={interval_ms} exceeds safe max {SAFE_WAL_SYNC_INTERVAL_MS_MAX}"
         ));
     }
     let request_thread_batching_enabled =
@@ -562,6 +560,11 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
         ])
         .filter(|value| *value > 0)
         .unwrap_or(defaults.search_expansion_max),
+        metric: std::env::var("DASH_INGEST_VECTOR_METRIC")
+            .or_else(|_| std::env::var("DASH_VECTOR_METRIC"))
+            .ok()
+            .and_then(|raw| DistanceMetric::parse(&raw))
+            .unwrap_or(defaults.metric),
     }
 }
 

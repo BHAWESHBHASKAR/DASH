@@ -95,7 +95,9 @@ pub(super) fn serve_http_with_workers(
             });
         }
 
-        listener.set_nonblocking(true).expect("set listener non-blocking");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
         loop {
             if shutdown.is_triggered() {
                 eprintln!("ingestion: shutdown signal received, draining in-flight requests");

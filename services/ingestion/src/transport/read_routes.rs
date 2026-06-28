@@ -11,14 +11,10 @@ pub(super) fn handle_get_request(
         // paths are kept for backward compat with existing k8s
         // probe configs; `/v1/*` is the new canonical versioned path
         // that matches every other `/v1/*` endpoint.
-        "/health" | "/v1/health" => {
-            HttpResponse::ok_json("{\"status\":\"ok\"}".to_string())
-        }
+        "/health" | "/v1/health" => HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()),
         // Liveness: process is alive, not deadlocked. K8s restarts
         // the pod if this fails. No disk / network checks.
-        "/live" | "/v1/live" => {
-            HttpResponse::ok_json("{\"status\":\"alive\"}".to_string())
-        }
+        "/live" | "/v1/live" => HttpResponse::ok_json("{\"status\":\"alive\"}".to_string()),
         // Readiness: process is up AND can serve traffic. K8s
         // removes the pod from the service if this fails. We
         // check that the SharedRuntime mutex is reachable; a
@@ -151,7 +147,7 @@ fn handle_replication_commit_status_get(
                 HttpResponse::ok_json(render_replication_commit_status_json(&snapshot))
             }
             None => {
-                HttpResponse::error_with_status(404, &format!("unknown commit_id '{}'", commit_id))
+                HttpResponse::error_with_status(404, &format!("unknown commit_id '{commit_id}'"))
             }
         },
         Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
