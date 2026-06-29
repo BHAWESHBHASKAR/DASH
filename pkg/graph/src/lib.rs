@@ -353,6 +353,133 @@ fn relation_weight(relation: &Relation, config: GraphReasoningConfig) -> f32 {
     }
 }
 
+/// Tuning for weighted PageRank / centrality over the support subgraph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CentralityConfig {
+    /// Probability of following an edge vs. teleporting (standard PageRank `d`).
+    pub damping: f32,
+    /// Hard cap on power-iteration rounds.
+    pub max_iterations: usize,
+    /// L1 convergence threshold between successive rank vectors.
+    pub tolerance: f32,
+}
+
+impl Default for CentralityConfig {
+    fn default() -> Self {
+        Self {
+            damping: 0.85,
+            max_iterations: 100,
+            tolerance: 1e-6,
+        }
+    }
+}
+
+/// Authority signals for a claim, derived from the directed support subgraph.
+///
+/// `pagerank` is the stationary distribution of a random surfer that follows
+/// `Supports` edges (weighted by `strength`); higher means more corroborated by
+/// other authoritative claims. The degree counts give a cheap, explainable
+/// companion signal (how many claims directly support / are supported by this).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeCentrality {
+    pub pagerank: f32,
+    pub support_in_degree: usize,
+    pub support_out_degree: usize,
+}
+
+/// Weighted PageRank + degree centrality over the `Supports` subgraph.
+///
+/// Only `Supports` edges participate: PageRank requires non-negative transition
+/// weights, and "which claims are authoritative" is a property of corroboration,
+/// not contradiction. Edge `strength` is used as the transition weight. Dangling
+/// nodes (no outgoing support edge) redistribute their mass uniformly so the
+/// vector stays a proper probability distribution that sums to 1.
+pub fn compute_support_centrality(
+    edges: &[ClaimEdge],
+    config: CentralityConfig,
+) -> HashMap<String, NodeCentrality> {
+    let mut nodes: HashSet<&str> = HashSet::new();
+    let mut out_neighbors: HashMap<&str, Vec<(&str, f32)>> = HashMap::new();
+    let mut out_weight: HashMap<&str, f32> = HashMap::new();
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    let mut out_degree: HashMap<&str, usize> = HashMap::new();
+
+    for edge in edges {
+        if !matches!(edge.relation, Relation::Supports) {
+            continue;
+        }
+        let from = edge.from_claim_id.as_str();
+        let to = edge.to_claim_id.as_str();
+        let weight = edge.strength.max(0.0);
+        nodes.insert(from);
+        nodes.insert(to);
+        out_neighbors.entry(from).or_default().push((to, weight));
+        *out_weight.entry(from).or_insert(0.0) += weight;
+        *out_degree.entry(from).or_insert(0) += 1;
+        *in_degree.entry(to).or_insert(0) += 1;
+    }
+
+    if nodes.is_empty() {
+        return HashMap::new();
+    }
+
+    let n = nodes.len();
+    let inv_n = 1.0 / n as f32;
+    let damping = config.damping.clamp(0.0, 1.0);
+    let teleport = (1.0 - damping) * inv_n;
+
+    let mut rank: HashMap<&str, f32> = nodes.iter().map(|&node| (node, inv_n)).collect();
+
+    for _ in 0..config.max_iterations.max(1) {
+        // Mass held by dangling nodes (no outgoing support edge) is spread evenly.
+        let dangling_mass: f32 = nodes
+            .iter()
+            .filter(|node| out_weight.get(*node).copied().unwrap_or(0.0) <= 0.0)
+            .map(|node| rank[node])
+            .sum();
+        let dangling_share = damping * dangling_mass * inv_n;
+
+        let mut next: HashMap<&str, f32> = nodes
+            .iter()
+            .map(|&node| (node, teleport + dangling_share))
+            .collect();
+
+        for (&from, neighbors) in &out_neighbors {
+            let total = out_weight.get(from).copied().unwrap_or(0.0);
+            if total <= 0.0 {
+                continue;
+            }
+            let share = damping * rank[from] / total;
+            for &(to, weight) in neighbors {
+                *next.get_mut(to).expect("edge target is a known node") += share * weight;
+            }
+        }
+
+        let delta: f32 = nodes
+            .iter()
+            .map(|node| (next[node] - rank[node]).abs())
+            .sum();
+        rank = next;
+        if delta < config.tolerance {
+            break;
+        }
+    }
+
+    nodes
+        .iter()
+        .map(|&node| {
+            (
+                node.to_string(),
+                NodeCentrality {
+                    pagerank: rank[node],
+                    support_in_degree: in_degree.get(node).copied().unwrap_or(0),
+                    support_out_degree: out_degree.get(node).copied().unwrap_or(0),
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +671,66 @@ mod tests {
                 .get("c2")
                 .map(|node| node.contradiction_chain_depth),
             Some(0)
+        );
+    }
+
+    fn support_edge(id: &str, from: &str, to: &str, strength: f32) -> ClaimEdge {
+        ClaimEdge {
+            edge_id: id.into(),
+            from_claim_id: from.into(),
+            to_claim_id: to.into(),
+            relation: Relation::Supports,
+            strength,
+            reason_codes: vec![],
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn pagerank_ranks_more_supported_claims_higher() {
+        // c1, c2, c3 all support c-hub; c-hub supports c-leaf.
+        let edges = vec![
+            support_edge("e1", "c1", "c-hub", 1.0),
+            support_edge("e2", "c2", "c-hub", 1.0),
+            support_edge("e3", "c3", "c-hub", 1.0),
+            support_edge("e4", "c-hub", "c-leaf", 1.0),
+        ];
+        let centrality = compute_support_centrality(&edges, CentralityConfig::default());
+
+        let hub = centrality.get("c-hub").expect("hub present");
+        let c1 = centrality.get("c1").expect("c1 present");
+        assert_eq!(hub.support_in_degree, 3);
+        assert!(
+            hub.pagerank > c1.pagerank,
+            "well-supported hub should outrank a leaf source: {} vs {}",
+            hub.pagerank,
+            c1.pagerank
+        );
+
+        // Stationary distribution must sum to ~1.
+        let total: f32 = centrality.values().map(|node| node.pagerank).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "pagerank should sum to 1, got {total}"
+        );
+    }
+
+    #[test]
+    fn centrality_ignores_non_support_edges_and_empty_graphs() {
+        assert!(compute_support_centrality(&[], CentralityConfig::default()).is_empty());
+
+        let contradiction = vec![ClaimEdge {
+            edge_id: "e1".into(),
+            from_claim_id: "c1".into(),
+            to_claim_id: "c2".into(),
+            relation: Relation::Contradicts,
+            strength: 0.9,
+            reason_codes: vec![],
+            created_at: None,
+        }];
+        assert!(
+            compute_support_centrality(&contradiction, CentralityConfig::default()).is_empty(),
+            "only support edges define the authority subgraph"
         );
     }
 

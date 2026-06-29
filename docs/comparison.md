@@ -20,6 +20,7 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Filtered vector search | predicate-aware HNSW (over-fetch + full-scan fallback) | metadata filter | filtered-HNSW | filtered | SQL `WHERE` | payload filter |
 | Explainable score breakdown | first-class (`score_explanation`: dense/lexical/fusion/edges) | no | no | no | no | no |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
+| Graph algorithms (authority/centrality) | weighted PageRank + degree over support subgraph (`support_authority`) | no | no | no | no | yes (GDS library) |
 | Hash-chained audit log | yes, SHA-256 chain | no | no | no | no | no |
 | Tenant isolation (strict authz) | yes, allowlist + scoped keys | yes | yes (OIDC) | yes | partial | no |
 | Per-tenant rate limits | yes | yes | yes | yes | partial | no |

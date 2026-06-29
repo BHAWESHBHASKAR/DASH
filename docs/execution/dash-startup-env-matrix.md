@@ -105,6 +105,8 @@ Ingestion segment lifecycle daemon note:
 | `DASH_RETRIEVAL_HYBRID_FUSION` / `DASH_HYBRID_FUSION` | no | `semantic_primary` | how dense + lexical signals are combined when a query vector is supplied: `semantic_primary`/`dense` (dense primary, BM25 tie-break) or `rrf`/`reciprocal_rank_fusion` (Reciprocal Rank Fusion) | none |
 | `DASH_RETRIEVAL_RRF_K` / `DASH_RRF_K` | no | `60` | RRF `k` constant (only used when fusion is `rrf`); larger `k` flattens the rank-position weighting | none |
 | `DASH_RETRIEVAL_FILTERED_OVERFETCH_FACTOR` / `DASH_FILTERED_OVERFETCH_FACTOR` | no | `4` | filtered-HNSW over-fetch multiplier: when a query carries a time-range or allow-list predicate, the level-0 exploration budget is multiplied by this so a selective filter doesn't starve the candidate pool (`1` disables over-fetch) | none |
+| `DASH_RETRIEVAL_GRAPH_PAGERANK_DAMPING` / `EME_RETRIEVAL_GRAPH_PAGERANK_DAMPING` | no | `0.85` | damping factor for the support-subgraph PageRank used to compute per-claim `support_authority` (only when `return_graph=true`); clamped to `[0,1]` | yes |
+| `DASH_RETRIEVAL_GRAPH_PAGERANK_MAX_ITERATIONS` / `EME_RETRIEVAL_GRAPH_PAGERANK_MAX_ITERATIONS` | no | `100` | hard cap on PageRank power-iteration rounds (iteration also stops early once the L1 delta falls below the convergence tolerance) | yes |
 
 Runtime note:
 

@@ -673,6 +673,10 @@ fn render_evidence_node_json(out: &mut String, node: &crate::api::EvidenceNode) 
     render_optional_usize(out, node.support_path_count);
     out.push_str(",\"contradiction_chain_depth\":");
     render_optional_usize(out, node.contradiction_chain_depth);
+    out.push_str(",\"support_authority\":");
+    render_optional_f32(out, node.support_authority);
+    out.push_str(",\"support_in_degree\":");
+    render_optional_usize(out, node.support_in_degree);
     out.push_str(",\"supports\":");
     out.push_str(&node.supports.to_string());
     out.push_str(",\"contradicts\":");

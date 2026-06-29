@@ -1,6 +1,6 @@
 use graph::{
-    GraphReasoningConfig, NodeReasoningSignals, compute_node_reasoning_with_config,
-    traverse_edges_multi_hop,
+    CentralityConfig, GraphReasoningConfig, NodeCentrality, NodeReasoningSignals,
+    compute_node_reasoning_with_config, compute_support_centrality, traverse_edges_multi_hop,
 };
 use schema::{Claim, ClaimType, RetrievalRequest, Stance, StanceMode};
 mod result_projection;
@@ -60,6 +60,8 @@ pub struct EvidenceNode {
     pub graph_score: Option<f32>,
     pub support_path_count: Option<usize>,
     pub contradiction_chain_depth: Option<usize>,
+    pub support_authority: Option<f32>,
+    pub support_in_degree: Option<usize>,
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<CitationNode>,
@@ -315,8 +317,14 @@ pub fn execute_api_query_with_storage_snapshot(
             traverse_edges_multi_hop(&start_ids, &all_edges, graph_reasoning_config.max_hops);
         let reasoning_by_claim =
             compute_node_reasoning_with_config(&start_ids, &traversed, graph_reasoning_config);
+        let centrality_by_claim =
+            compute_support_centrality(&all_edges, centrality_config_from_env());
         for node in &mut nodes {
-            apply_graph_reasoning(node, reasoning_by_claim.get(&node.claim_id));
+            apply_graph_reasoning(
+                node,
+                reasoning_by_claim.get(&node.claim_id),
+                centrality_by_claim.get(&node.claim_id),
+            );
         }
         let mut node_map: std::collections::HashMap<String, EvidenceNode> = nodes
             .iter()
@@ -374,7 +382,11 @@ pub fn execute_api_query_with_storage_snapshot(
             });
         }
         for node in node_map.values_mut() {
-            apply_graph_reasoning(node, reasoning_by_claim.get(&node.claim_id));
+            apply_graph_reasoning(
+                node,
+                reasoning_by_claim.get(&node.claim_id),
+                centrality_by_claim.get(&node.claim_id),
+            );
         }
 
         let mut graph_nodes: Vec<EvidenceNode> = node_map.into_values().collect();
@@ -398,11 +410,19 @@ pub fn execute_api_query_with_storage_snapshot(
     )
 }
 
-fn apply_graph_reasoning(node: &mut EvidenceNode, reasoning: Option<&NodeReasoningSignals>) {
+fn apply_graph_reasoning(
+    node: &mut EvidenceNode,
+    reasoning: Option<&NodeReasoningSignals>,
+    centrality: Option<&NodeCentrality>,
+) {
     if let Some(reasoning) = reasoning {
         node.graph_score = Some(reasoning.graph_score);
         node.support_path_count = Some(reasoning.support_path_count);
         node.contradiction_chain_depth = Some(reasoning.contradiction_chain_depth);
+    }
+    if let Some(centrality) = centrality {
+        node.support_authority = Some(centrality.pagerank);
+        node.support_in_degree = Some(centrality.support_in_degree);
     }
 }
 
@@ -758,6 +778,26 @@ fn graph_reasoning_config_from_env() -> GraphReasoningConfig {
     config
 }
 
+fn centrality_config_from_env() -> CentralityConfig {
+    let mut config = CentralityConfig::default();
+    if let Some(value) = env_f32_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_PAGERANK_DAMPING",
+        "EME_RETRIEVAL_GRAPH_PAGERANK_DAMPING",
+    ) {
+        config.damping = value.clamp(0.0, 1.0);
+    }
+    if let Some(value) = env_with_fallback(
+        "DASH_RETRIEVAL_GRAPH_PAGERANK_MAX_ITERATIONS",
+        "EME_RETRIEVAL_GRAPH_PAGERANK_MAX_ITERATIONS",
+    )
+    .and_then(|value| value.parse::<usize>().ok())
+    .filter(|value| *value > 0)
+    {
+        config.max_iterations = value;
+    }
+    config
+}
+
 #[cfg(test)]
 fn segment_prefilter_refresh_interval() -> Duration {
     segment_storage::segment_prefilter_refresh_interval()
@@ -990,6 +1030,18 @@ mod tests {
                 .nodes
                 .iter()
                 .all(|node| node.graph_score.is_some() && node.support_path_count.is_some())
+        );
+        // PageRank authority: c1 --Supports--> c2, so c2 is the supported (authoritative)
+        // node and must outrank c1, with one incoming support edge.
+        let c1 = graph.nodes.iter().find(|n| n.claim_id == "c1").unwrap();
+        let c2 = graph.nodes.iter().find(|n| n.claim_id == "c2").unwrap();
+        assert_eq!(c2.support_in_degree, Some(1));
+        assert_eq!(c1.support_in_degree, Some(0));
+        assert!(
+            c2.support_authority.unwrap() > c1.support_authority.unwrap(),
+            "supported claim should have higher authority: {:?} vs {:?}",
+            c2.support_authority,
+            c1.support_authority
         );
     }
 
