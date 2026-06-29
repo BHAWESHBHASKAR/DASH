@@ -28,6 +28,8 @@ pub(super) fn evidence_node_from_parts(
         graph_score: None,
         support_path_count: None,
         contradiction_chain_depth: None,
+        support_authority: None,
+        support_in_degree: None,
         supports: signals.supports,
         contradicts: signals.contradicts,
         citations: signals.citations,
