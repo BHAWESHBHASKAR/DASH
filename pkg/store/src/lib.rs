@@ -9,8 +9,9 @@ use std::sync::OnceLock;
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, Stance, StanceMode,
-    ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, ScoreExplanation,
+    Stance, StanceMode, ValidationError, tokenize, validate_claim, validate_edge,
+    validate_evidence,
 };
 
 mod disk;
@@ -683,6 +684,11 @@ impl InMemoryStore {
                 .collect::<Vec<f32>>()
         };
 
+        let fusion_label = if query_vector.is_some() {
+            self.ann_tuning.hybrid_fusion.as_str()
+        } else {
+            "lexical_only"
+        };
         let mut ranked: Vec<RetrievalResult> = scored
             .into_iter()
             .zip(final_scores)
@@ -693,6 +699,14 @@ impl InMemoryStore {
                 supports: s.supports,
                 contradicts: s.contradicts,
                 citations: s.citations,
+                score_explanation: Some(ScoreExplanation {
+                    fusion: fusion_label.to_string(),
+                    dense_similarity: s.dense_similarity,
+                    lexical_score: s.lexical_score,
+                    supports: s.supports,
+                    contradicts: s.contradicts,
+                    final_score: score,
+                }),
             })
             .collect();
 
@@ -3674,6 +3688,54 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].claim_id, "c-allow");
+    }
+
+    #[test]
+    fn retrieval_results_carry_score_explanation() {
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                claim("c-explain", "project helios acquisition merger terms"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        store
+            .upsert_claim_vector("c-explain", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let results = store.retrieve_semantic(
+            &RetrievalRequest {
+                tenant_id: "tenant-a".into(),
+                query: "acquisition merger terms".into(),
+                top_k: 5,
+                stance_mode: StanceMode::Balanced,
+            },
+            &[1.0, 0.0, 0.0, 0.0],
+        );
+
+        let explanation = results[0]
+            .score_explanation
+            .as_ref()
+            .expect("semantic retrieval should attach a score explanation");
+        assert_eq!(explanation.fusion, "semantic_primary");
+        assert_eq!(explanation.final_score, results[0].score);
+        assert!(explanation.dense_similarity > 0.9);
+
+        // Lexical-only retrieval labels the fusion accordingly.
+        let lexical = store.retrieve(&RetrievalRequest {
+            tenant_id: "tenant-a".into(),
+            query: "acquisition merger terms".into(),
+            top_k: 5,
+            stance_mode: StanceMode::Balanced,
+        });
+        assert_eq!(
+            lexical[0]
+                .score_explanation
+                .as_ref()
+                .map(|e| e.fusion.as_str()),
+            Some("lexical_only")
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Distance metrics | cosine / dot / L2 (selectable) | proprietary | cosine/dot/L2/Hamming | many | cosine/dot/L2/Manhattan | cosine/L2/ip |
 | Hybrid fusion (dense + lexical) | RRF or semantic-primary (selectable) | sparse-dense | RRF | RRF | RRF / DBSF | manual |
 | Filtered vector search | predicate-aware HNSW (over-fetch + full-scan fallback) | metadata filter | filtered-HNSW | filtered | SQL `WHERE` | payload filter |
+| Explainable score breakdown | first-class (`score_explanation`: dense/lexical/fusion/edges) | no | no | no | no | no |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
 | Hash-chained audit log | yes, SHA-256 chain | no | no | no | no | no |
 | Tenant isolation (strict authz) | yes, allowlist + scoped keys | yes | yes (OIDC) | yes | partial | no |
