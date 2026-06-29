@@ -159,6 +159,28 @@ pub struct Citation {
     pub ingested_at: Option<i64>,
 }
 
+/// Per-result breakdown of how the final score was produced. Surfaces the
+/// dense + lexical signals and the fusion strategy so callers can audit and
+/// explain ranking decisions (an evidence-grade requirement, not just a
+/// black-box similarity).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ScoreExplanation {
+    /// Fusion strategy applied: `semantic_primary`, `rrf`, or `lexical_only`.
+    pub fusion: String,
+    /// Dense (vector) similarity in the configured metric. 0.0 when the query
+    /// carried no vector.
+    pub dense_similarity: f32,
+    /// Lexical/BM25 relevance signal.
+    pub lexical_score: f32,
+    /// Number of supporting edges considered.
+    pub supports: usize,
+    /// Number of contradicting edges considered.
+    pub contradicts: usize,
+    /// The final fused score (same value as `RetrievalResult::score`).
+    pub final_score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RetrievalResult {
@@ -168,6 +190,8 @@ pub struct RetrievalResult {
     pub supports: usize,
     pub contradicts: usize,
     pub citations: Vec<Citation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_explanation: Option<ScoreExplanation>,
 }
 
 // ---------------------------------------------------------------------------
