@@ -30,15 +30,15 @@ cd deploy/container && docker compose -f docker-compose.yml up -d --build
 
 ## Devin Secrets Needed
 
-- None for local validation. The compose file uses the default keys
-  `change-me-ingest-key` and `change-me-retrieval-key`.
+- None for local validation. Set `DASH_INGEST_API_KEY` and
+  `DASH_RETRIEVAL_API_KEY` in a `.env` file or shell before starting compose.
 
 ## Service endpoints and keys
 
-| Service | Port | Default API key | Health endpoint |
+| Service | Port | API key env var | Health endpoint |
 |---|---|---|---|
-| ingestion | `8081` | `change-me-ingest-key` | `http://127.0.0.1:8081/health` |
-| retrieval | `8080` | `change-me-retrieval-key` | `http://127.0.0.1:8080/health` |
+| ingestion | `8081` | `DASH_INGEST_API_KEY` | `http://127.0.0.1:8081/health` |
+| retrieval | `8080` | `DASH_RETRIEVAL_API_KEY` | `http://127.0.0.1:8080/health` |
 
 Auth is `x-api-key` (or `Authorization: Bearer <key>`).
 

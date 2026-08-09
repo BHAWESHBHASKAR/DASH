@@ -1,0 +1,5 @@
+# Ignore placeholder API keys in the testing skill that were committed
+# with literal `change-me-*` examples and later scrubbed. These are
+# documented local-dev placeholders, not real secrets.
+01b33f1cf63efa4f988e17d568fc5b5acb3a21d1:.agents/skills/testing-dash/SKILL.md:curl-auth-header:50
+01b33f1cf63efa4f988e17d568fc5b5acb3a21d1:.agents/skills/testing-dash/SKILL.md:curl-auth-header:68
