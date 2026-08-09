@@ -86,7 +86,7 @@ A production-ready DASH deployment must guarantee:
 | M7 | quorum replication with lag SLO | Done | 0.75 session |
 | M8 | disk-first segment serving tier | Done | 0.25 session |
 | M9 | object-storage backup/restore | Done | 0.75 session |
-| M10 | Helm operator / managed cloud scaffolding | Not started | 1 session |
+| M10 | Helm control-plane + managed cloud scaffolding | Done | 0.75 session |
 | M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Not started | 1.5 sessions |
 
 ## 5. Risk register

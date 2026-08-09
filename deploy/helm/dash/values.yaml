@@ -26,6 +26,9 @@ image:
   ingestion:
     repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/ingestion"
     tag: ""         # empty -> image.tag
+  controlPlane:
+    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/control-plane"
+    tag: ""         # empty -> image.tag
 
 # -----------------------------------------------------------------------------
 # Names
@@ -51,6 +54,7 @@ namespace:
 replicas:
   retrieval: 2
   ingestion: 2
+  controlPlane: 1  # leader election is file-backed; scale >1 requires a shared ReadWriteMany volume
 
 # -----------------------------------------------------------------------------
 # Common image-pull / runtime labels
@@ -72,6 +76,8 @@ serviceAccount:
   retrieval:
     name: ""
   ingestion:
+    name: ""
+  controlPlane:
     name: ""
 
 # -----------------------------------------------------------------------------
@@ -100,6 +106,12 @@ config:
   bind:
     ingestion: "0.0.0.0:8081"
     retrieval: "0.0.0.0:8080"
+    controlPlane: "0.0.0.0:8090"
+
+  # Control-plane leader-election tunables.
+  controlPlane:
+    leaseDurationMs: 30000
+    leaseRenewalMs: 10000
   checkpoint:
     maxWalRecords: 50000
     maxWalBytes: 52428800
@@ -152,6 +164,7 @@ resources:
     ephemeralStorage: 512Mi
   retrieval: {}
   ingestion: {}
+  controlPlane: {}
 
 # -----------------------------------------------------------------------------
 # Workload identity / scheduling
@@ -198,6 +211,7 @@ service:
   type: ClusterIP
   ports:
     http: 80
+    controlPlane: 8090
   # If you change `service.ports.http`, you must also update
   # ingress.rules[].http.paths[].backend.service.port.number.
 

@@ -42,6 +42,14 @@ data:
   # ----- Bind addresses (inside the pod) -----
   DASH_INGEST_BIND: {{ .Values.config.bind.ingestion | quote }}
   DASH_RETRIEVAL_BIND: {{ .Values.config.bind.retrieval | quote }}
+  DASH_CONTROL_PLANE_BIND: {{ .Values.config.bind.controlPlane | quote }}
+
+  # ----- Control-plane persistence paths -----
+  DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" .Values.config.persistencePath | quote }}
+  DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" .Values.config.persistencePath | quote }}
+  DASH_CONTROL_PLANE_LEASE_PATH: {{ printf "%s/state/control-plane.lease" .Values.config.persistencePath | quote }}
+  DASH_CONTROL_PLANE_LEASE_DURATION_MS: {{ .Values.config.controlPlane.leaseDurationMs | quote }}
+  DASH_CONTROL_PLANE_LEASE_RENEWAL_MS: {{ .Values.config.controlPlane.leaseRenewalMs | quote }}
 {{- if .Values.secret.create }}
 ---
 # Per-service Secret split: a compromised pod should only see the
