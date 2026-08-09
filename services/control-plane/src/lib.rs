@@ -13,6 +13,8 @@ use metadata_router::{
     promote_replica_to_leader, render_shard_placements_csv,
 };
 
+pub mod leader;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlanePersistence {
     state_path: PathBuf,
@@ -39,22 +41,47 @@ impl ControlPlanePersistence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Default)]
 pub struct ControlPlanePlacementState {
     placements: Vec<ShardPlacement>,
     persistence: Option<ControlPlanePersistence>,
+    lease: Option<Arc<leader::LeaderLease>>,
 }
+
+impl std::fmt::Debug for ControlPlanePlacementState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlanePlacementState")
+            .field("placements", &self.placements)
+            .field("persistence", &self.persistence)
+            .field("lease", &self.lease.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
+impl PartialEq for ControlPlanePlacementState {
+    fn eq(&self, other: &Self) -> bool {
+        self.placements == other.placements && self.persistence == other.persistence
+    }
+}
+
+impl Eq for ControlPlanePlacementState {}
 
 impl ControlPlanePlacementState {
     pub fn new(placements: Vec<ShardPlacement>) -> Self {
         Self {
             placements,
             persistence: None,
+            lease: None,
         }
     }
 
     pub fn with_persistence(mut self, persistence: ControlPlanePersistence) -> Self {
         self.persistence = Some(persistence);
+        self
+    }
+
+    pub fn with_lease(mut self, lease: Arc<leader::LeaderLease>) -> Self {
+        self.lease = Some(lease);
         self
     }
 
@@ -122,6 +149,45 @@ impl ControlPlanePlacementState {
 
     pub fn persistence_state_path(&self) -> Option<&Path> {
         self.persistence.as_ref().map(|cfg| cfg.state_path())
+    }
+
+    pub fn is_leader(&self) -> Result<bool, String> {
+        match &self.lease {
+            Some(lease) => lease.is_leader(),
+            None => Ok(true),
+        }
+    }
+
+    pub fn current_leader_info(&self) -> Result<Option<leader::LeaseRecord>, String> {
+        match &self.lease {
+            Some(lease) => lease.current_leader(),
+            None => Ok(Some(leader::LeaseRecord {
+                node_id: self.local_node_id_or_unknown(),
+                epoch: self.highest_epoch(),
+                expires_at_ms: u64::MAX,
+            })),
+        }
+    }
+
+    pub fn try_acquire_leader(&self, epoch: u64) -> Result<bool, String> {
+        match &self.lease {
+            Some(lease) => lease.try_acquire(epoch),
+            None => Ok(true),
+        }
+    }
+
+    pub fn renew_leader(&self, epoch: u64) -> Result<bool, String> {
+        match &self.lease {
+            Some(lease) => lease.renew(epoch),
+            None => Ok(true),
+        }
+    }
+
+    pub fn local_node_id_or_unknown(&self) -> String {
+        match &self.lease {
+            Some(lease) => lease.node_id().to_string(),
+            None => "standalone".to_string(),
+        }
     }
 
     pub fn replace_placements_monotonic(
@@ -391,6 +457,56 @@ fn handle_request(
         ("GET", "/health") | ("GET", "/v1/control-plane/health") => {
             HttpResponse::ok_json("{\"status\":\"ok\"}".to_string())
         }
+        ("GET", "/ready") | ("GET", "/v1/control-plane/ready") => {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+            };
+            match guard.is_leader() {
+                Ok(true) => {
+                    HttpResponse::ok_json("{\"status\":\"ready\",\"is_leader\":true}".to_string())
+                }
+                Ok(false) => HttpResponse::error(503, "control-plane is not the leader"),
+                Err(reason) => HttpResponse::error(500, &reason),
+            }
+        }
+        ("GET", "/v1/control-plane/leader") => {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+            };
+            let info = match guard.current_leader_info() {
+                Ok(Some(record)) => record,
+                Ok(None) => return HttpResponse::error(503, "no leader elected"),
+                Err(reason) => return HttpResponse::error(500, &reason),
+            };
+            let local = guard.local_node_id_or_unknown();
+            let is_leader = info.node_id == local;
+            HttpResponse::ok_json(format!(
+                "{{\"is_leader\":{},\"leader_node_id\":\"{}\",\"epoch\":{},\"expires_at_ms\":{},\"local_node_id\":\"{}\"}}",
+                is_leader,
+                json_escape(&info.node_id),
+                info.epoch,
+                info.expires_at_ms,
+                json_escape(&local)
+            ))
+        }
+        ("POST", "/v1/control-plane/leader/acquire") => {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+            };
+            let epoch = guard.highest_epoch();
+            match guard.try_acquire_leader(epoch) {
+                Ok(true) => HttpResponse::ok_json(format!(
+                    "{{\"status\":\"ok\",\"is_leader\":true,\"node_id\":\"{}\",\"epoch\":{}}}",
+                    json_escape(&guard.local_node_id_or_unknown()),
+                    epoch
+                )),
+                Ok(false) => HttpResponse::error(503, "leader lease is held by another node"),
+                Err(reason) => HttpResponse::error(500, &reason),
+            }
+        }
         ("GET", "/v1/control-plane/placement") => {
             let guard = match state.lock() {
                 Ok(guard) => guard,
@@ -418,6 +534,11 @@ fn handle_request(
                 Ok(guard) => guard,
                 Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
             };
+            if let Err(reason) = guard.is_leader() {
+                return HttpResponse::error(500, &reason);
+            } else if !guard.is_leader().unwrap_or(false) {
+                return HttpResponse::error(503, "only the leader may update placements");
+            }
             if let Err(reason) = guard.cas_matches(expected_epoch) {
                 return HttpResponse::error(409, &reason);
             }
@@ -443,6 +564,16 @@ fn handle_request(
                 Ok(value) => value,
                 Err(reason) => return HttpResponse::bad_request(&reason),
             };
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+            };
+            if let Err(reason) = guard.is_leader() {
+                return HttpResponse::error(500, &reason);
+            } else if !guard.is_leader().unwrap_or(false) {
+                return HttpResponse::error(503, "only the leader may promote a replica");
+            }
+            drop(guard);
             let tenant_id = match query.get("tenant_id") {
                 Some(value) if !value.trim().is_empty() => value.trim(),
                 _ => {

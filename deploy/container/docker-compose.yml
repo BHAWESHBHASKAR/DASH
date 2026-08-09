@@ -107,6 +107,37 @@ services:
     mem_limit: 2g
     pids_limit: 2048
 
+  control-plane:
+    <<: *rest-base
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: runtime
+    image: dash/control-plane:latest
+    container_name: dash-control-plane
+    command: ["--serve"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - dash-state:/var/lib/dash
+    environment:
+      <<: *base-env
+      DASH_BIN: control-plane
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8090/v1/control-plane/health
+      DASH_CONTROL_PLANE_BIND: 0.0.0.0:8090
+      DASH_CONTROL_PLANE_NODE_ID: control-plane
+      DASH_CONTROL_PLANE_STATE_PATH: /var/lib/dash/state/control-plane.csv
+      DASH_CONTROL_PLANE_STATE_SHA256_PATH: /var/lib/dash/state/control-plane.csv.sha256
+      DASH_CONTROL_PLANE_LEASE_PATH: /var/lib/dash/state/control-plane.lease
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    mem_limit: 256m
+    pids_limit: 256
+
   segment-maintenance:
     <<: *rest-base
     build:

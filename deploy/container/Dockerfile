@@ -45,6 +45,7 @@ RUN set -eux; \
     for bin in \
         target/release/ingestion \
         target/release/retrieval \
+        target/release/control-plane \
         target/release/segment-maintenance-daemon; do \
         if [ -f "$bin" ]; then \
             strip "$bin"; \
@@ -77,6 +78,7 @@ RUN mkdir -p \
 
 COPY --from=builder --chown=dash:dash /build/target/release/ingestion /opt/dash/bin/ingestion
 COPY --from=builder --chown=dash:dash /build/target/release/retrieval /opt/dash/bin/retrieval
+COPY --from=builder --chown=dash:dash /build/target/release/control-plane /opt/dash/bin/control-plane
 COPY --from=builder --chown=dash:dash /build/target/release/segment-maintenance-daemon /opt/dash/bin/segment-maintenance-daemon
 COPY --chown=dash:dash deploy/container/scripts/entrypoint.sh /opt/dash/bin/dash-entrypoint
 COPY --chown=dash:dash deploy/container/scripts/healthcheck.sh /opt/dash/bin/dash-healthcheck
@@ -87,7 +89,7 @@ USER dash
 ENV DASH_HOME=/opt/dash \
     PATH=/opt/dash/bin:$PATH
 
-EXPOSE 8080 8081
+EXPOSE 8080 8081 8090
 
 # Default healthcheck probes the retrieval service on 127.0.0.1:8080/health.
 # docker-compose overrides this per service via DASH_HEALTHCHECK_URL.
