@@ -60,7 +60,7 @@ use request::{parse_query_usize, parse_request_line, read_http_request, split_ta
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
     WalReplicationExport, batch_commit_payload_fingerprint,
 };
 
@@ -949,6 +949,10 @@ impl IngestionRuntime {
     fn observe_replication_pull_failure(&mut self, error: String) {
         self.replication_pull_failure_total = self.replication_pull_failure_total.saturating_add(1);
         self.replication_last_error = Some(error);
+    }
+
+    pub fn disk_status(&self) -> &DiskStatus {
+        self.store.disk_status()
     }
 
     fn metrics_text(&self) -> String {

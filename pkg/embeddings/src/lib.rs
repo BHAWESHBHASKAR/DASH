@@ -589,6 +589,61 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
     }
 }
 
+/// Build an [`EmbeddingProvider`] from the process environment. This is the
+/// single place service binaries read `DASH_EMBEDDING_PROVIDER` so the
+/// selection logic stays consistent between ingestion and retrieval.
+///
+/// Reads:
+/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
+///   network), `"ollama"`, or `"openai"`. Unknown values fall back to `hash`
+///   with a warning.
+/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
+///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
+/// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
+///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
+pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
+    let provider = std::env::var("DASH_EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "hash".to_string())
+        .to_ascii_lowercase();
+
+    match provider.as_str() {
+        "ollama" => {
+            let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let model = std::env::var("DASH_OLLAMA_MODEL")
+                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
+        }
+        "openai" => {
+            let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
+            let model = std::env::var("DASH_OPENAI_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+            match OpenAIEmbeddingProvider::new(model, key) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    eprintln!(
+                        "dash: failed to build OpenAI embedding provider ({e}); falling back to hash"
+                    );
+                    Box::new(HashEmbeddingProvider::default())
+                }
+            }
+        }
+        "hash" => Box::new(HashEmbeddingProvider::default()),
+        other => {
+            eprintln!("dash: unknown DASH_EMBEDDING_PROVIDER='{other}'; falling back to hash");
+            Box::new(HashEmbeddingProvider::default())
+        }
+    }
+}
+
+/// Returns the configured provider name (or `"hash"` when unset) without
+/// building the provider. Useful for startup banners and strict-mode checks.
+pub fn embedding_provider_name_from_env() -> String {
+    std::env::var("DASH_EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "hash".to_string())
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

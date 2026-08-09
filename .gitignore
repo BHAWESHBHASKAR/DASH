@@ -34,6 +34,7 @@ fix_structs.py
 # Env/editor/system
 .env
 .env.*
+!.env.example
 .DS_Store
 .localized
 

@@ -18,6 +18,7 @@ x-rest-base: &rest-base
 # vars on top of these defaults.
 x-base-env: &base-env
   RUST_LOG: ${RUST_LOG:-info,dash=debug}
+  DASH_STRICT_SECRETS: "1"
   DASH_HOME: /opt/dash
   DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
   DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
@@ -59,8 +60,8 @@ services:
       DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
       DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
       DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
-      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:-change-me-ingest-key}
-      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:-change-me-ingest-jwt}
+      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:?DASH_INGEST_API_KEY must be set (see deploy/container/.env.example)}
+      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:?DASH_INGEST_JWT_HS256_SECRET must be set}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -91,8 +92,9 @@ services:
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
       DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081
       DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
-      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:-change-me-retrieval-key}
-      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:-change-me-retrieval-jwt}
+      DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: /var/lib/dash/state/retrieval-replication.offset
+      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:?DASH_RETRIEVAL_API_KEY must be set (see deploy/container/.env.example)}
+      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:?DASH_RETRIEVAL_JWT_HS256_SECRET must be set}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s

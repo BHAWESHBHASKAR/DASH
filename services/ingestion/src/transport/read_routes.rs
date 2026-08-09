@@ -17,10 +17,27 @@ pub(super) fn handle_get_request(
         "/live" | "/v1/live" => HttpResponse::ok_json("{\"status\":\"alive\"}".to_string()),
         // Readiness: process is up AND can serve traffic. K8s
         // removes the pod from the service if this fails. We
-        // check that the SharedRuntime mutex is reachable; a
-        // poisoned mutex means something else is very wrong.
+        // check that the SharedRuntime mutex is reachable and that
+        // disk persistence is healthy when a persistence path was
+        // configured.
         "/ready" | "/v1/ready" => match runtime.lock() {
-            Ok(_) => HttpResponse::ok_json("{\"status\":\"ready\"}".to_string()),
+            Ok(rt) => match rt.disk_status() {
+                DiskStatus::Available | DiskStatus::Recovering => {
+                    HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                }
+                DiskStatus::Unavailable { reason } => {
+                    if persistence_path_configured() {
+                        HttpResponse::error_with_status(
+                            503,
+                            &format!(
+                                "{{\"status\":\"not_ready\",\"reason\":\"disk unavailable: {reason}\"}}"
+                            ),
+                        )
+                    } else {
+                        HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                    }
+                }
+            },
             Err(_) => HttpResponse::internal_server_error("runtime mutex poisoned"),
         },
         "/metrics" => {
@@ -166,6 +183,20 @@ fn render_replication_commit_status_json(snapshot: &ReplicationCommitStatusSnaps
         snapshot.required_acks,
         escape_json(&snapshot.commit_status)
     )
+}
+
+/// True when a persistence path was explicitly configured and disk
+/// persistence was not disabled. Used by the /ready probe to decide
+/// whether an `Unavailable` disk status should fail readiness.
+fn persistence_path_configured() -> bool {
+    let disabled = std::env::var("DASH_INGEST_PERSISTENCE_DISABLE")
+        .ok()
+        .or_else(|| std::env::var("EME_INGEST_PERSISTENCE_DISABLE").ok())
+        .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes"));
+    let path_set = std::env::var("DASH_INGEST_PERSISTENCE_PATH")
+        .or_else(|_| std::env::var("EME_INGEST_PERSISTENCE_PATH"))
+        .is_ok_and(|value| !value.trim().is_empty());
+    !disabled && path_set
 }
 
 fn escape_json(value: &str) -> String {

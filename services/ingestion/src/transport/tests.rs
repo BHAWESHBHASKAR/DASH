@@ -964,8 +964,8 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
     let pull_response = handle_request(&runtime, &pull_request);
     assert_eq!(pull_response.status, 200);
     assert!(pull_response.body.contains("status=ok"));
-    assert!(pull_response.body.contains("records=1"));
-    assert!(pull_response.body.contains("next_offset=1"));
+    assert!(pull_response.body.contains("records=2"));
+    assert!(pull_response.body.contains("next_offset=2"));
 
     let guard = runtime.lock().expect("runtime lock should be available");
     let _ = std::fs::remove_file(

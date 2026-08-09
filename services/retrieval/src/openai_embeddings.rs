@@ -11,7 +11,7 @@
 //!
 //! - `model` is accepted as a string but is treated as a hint for the
 //!   response payload; the actual embedding is produced by the
-//!   configured [`EmbeddingProvider`] (default: [`HashEmbeddingProvider`]).
+//!   configured `EmbeddingProvider` (default: `HashEmbeddingProvider`).
 //! - `encoding_format` is accepted but currently only `"float"` is
 //!   supported (base64 JSON encoding may be added later).
 //!
@@ -19,10 +19,7 @@
 //!   `HashEmbeddingProvider` for an `OllamaEmbeddingProvider` or
 //!   `OpenAIEmbeddingProvider` and the wire format stays the same.
 
-use embeddings::{
-    EmbeddingError, EmbeddingProvider, HashEmbeddingProvider, OllamaEmbeddingProvider,
-    OpenAIEmbeddingProvider,
-};
+use embeddings::{EmbeddingError, EmbeddingProvider};
 use serde::{Deserialize, Serialize};
 
 /// Wire-compatible request body for `POST /v1/embeddings`.
@@ -203,7 +200,7 @@ pub fn handle_openai_embeddings(
     let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
         .map_err(OpenAIErrorResponse::invalid_request)?;
 
-    let provider = select_provider_from_env();
+    let provider = embeddings::select_embedding_provider_from_env();
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
     let embeddings = provider
         .embed(&texts)
@@ -391,53 +388,9 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 
 // ---------------------------------------------------------------------------
 // Env-driven provider selection
-// ---------------------------------------------------------------------------
-
-/// Build an [`EmbeddingProvider`] from the process environment. Reads:
-///
-/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
-///   network), `"ollama"`, or `"openai"`. Unknown values fall back to
-///   `hash` with a tracing warning.
-/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
-///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
-/// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
-///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
-///
-/// The returned trait object is `Send + Sync + 'static` so it can be
-/// shared across the service's worker threads.
-pub fn select_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
-    let provider = std::env::var("DASH_EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "hash".to_string())
-        .to_ascii_lowercase();
-
-    match provider.as_str() {
-        "ollama" => {
-            let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let model = std::env::var("DASH_OLLAMA_MODEL")
-                .unwrap_or_else(|_| "nomic-embed-text".to_string());
-            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
-        }
-        "openai" => {
-            let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
-            let model = std::env::var("DASH_OPENAI_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            match OpenAIEmbeddingProvider::new(model, key) {
-                Ok(p) => Box::new(p),
-                Err(e) => {
-                    eprintln!(
-                        "dash: failed to build OpenAI embedding provider ({e}); falling back to hash"
-                    );
-                    Box::new(HashEmbeddingProvider::default())
-                }
-            }
-        }
-        "hash" => Box::new(HashEmbeddingProvider::default()),
-        other => {
-            eprintln!("dash: unknown DASH_EMBEDDING_PROVIDER='{other}'; falling back to hash");
-            Box::new(HashEmbeddingProvider::default())
-        }
-    }
+/// Returns the provider name for startup logging/strict-mode checks.
+pub fn provider_name_from_env() -> String {
+    embeddings::embedding_provider_name_from_env()
 }
 
 #[cfg(test)]
@@ -538,7 +491,7 @@ mod tests {
     fn embedding_dimensions_match_provider() {
         let body = r#"{"input": "x", "model": "x"}"#;
         let resp = handle_openai_embeddings(body).unwrap();
-        let provider = HashEmbeddingProvider::default();
+        let provider = embeddings::HashEmbeddingProvider::default();
         let actual = match &resp.data[0].embedding {
             EmbeddingValue::Float(v) => v.len(),
             EmbeddingValue::Base64(b) => base64_decode(b).unwrap().len() / 4,
@@ -557,7 +510,7 @@ mod tests {
     #[test]
     fn custom_provider_is_used() {
         let body = r#"{"input": "hello", "model": "test-model"}"#;
-        let provider = HashEmbeddingProvider::new(8);
+        let provider = embeddings::HashEmbeddingProvider::new(8);
         let resp = handle_openai_embeddings_with_provider(body, &provider).unwrap();
         assert_eq!(resp.data.len(), 1);
         let actual = match &resp.data[0].embedding {
@@ -707,7 +660,7 @@ mod tests {
                     .collect();
                 assert_eq!(floats.len(), 384);
                 // Hash provider's first dim for "hello world" should match
-                let expected = HashEmbeddingProvider::default()
+                let expected = embeddings::HashEmbeddingProvider::default()
                     .embed(&["hello world".to_string()])
                     .unwrap()
                     .remove(0);

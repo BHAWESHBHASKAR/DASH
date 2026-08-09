@@ -7,6 +7,7 @@ use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
 fn main() {
+    dash_common::init_logging();
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass
     // `--cli` or `--no-serve` to run the one-shot path without
@@ -23,12 +24,26 @@ fn main() {
 
     if let Err(reason) = validate_startup_secrets() {
         if dash_common::strict_secrets_enabled() {
-            eprintln!("retrieval startup secret validation failed: {reason}");
+            tracing::error!("retrieval startup secret validation failed: {reason}");
             std::process::exit(2);
         } else {
-            eprintln!("retrieval startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)");
+            tracing::error!(
+                "retrieval startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)"
+            );
         }
     }
+
+    let disk_disabled = env_with_fallback(
+        "DASH_RETRIEVAL_PERSISTENCE_DISABLE",
+        "EME_RETRIEVAL_PERSISTENCE_DISABLE",
+    )
+    .as_deref()
+        == Some("1");
+    let disk_path = env_with_fallback(
+        "DASH_RETRIEVAL_PERSISTENCE_PATH",
+        "EME_RETRIEVAL_PERSISTENCE_PATH",
+    )
+    .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
 
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
@@ -36,21 +51,21 @@ fn main() {
         let wal = match FileWal::open(&wal_path) {
             Ok(wal) => wal,
             Err(err) => {
-                eprintln!("retrieval failed opening WAL '{wal_path}': {err:?}");
+                tracing::error!("retrieval failed opening WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
-        let (store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
+        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
             &wal,
             ann_tuning.clone(),
         ) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("retrieval failed replaying WAL '{wal_path}': {err:?}");
+                tracing::error!("retrieval failed replaying WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
-        println!(
+        tracing::info!(
             "retrieval startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
             load_stats.claims_loaded,
             load_stats.evidence_loaded,
@@ -59,52 +74,11 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
-        // Default-on disk persistence (redb PR 2). Override via
-        // `DASH_RETRIEVAL_PERSISTENCE_PATH`, disable via
-        // `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`.
-        let disk_disabled = env_with_fallback(
-            "DASH_RETRIEVAL_PERSISTENCE_DISABLE",
-            "EME_RETRIEVAL_PERSISTENCE_DISABLE",
-        )
-        .as_deref()
-            == Some("1");
-        let disk_path = env_with_fallback(
-            "DASH_RETRIEVAL_PERSISTENCE_PATH",
-            "EME_RETRIEVAL_PERSISTENCE_PATH",
-        )
-        .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
         if !disk_disabled {
-            // `with_disk` always returns Ok(self); on open failure
-            // the in-memory state is preserved and `disk_status` is
-            // set to `Unavailable`. We inspect the result to log.
-            let store = match store.with_disk(&disk_path) {
-                Ok(updated) => {
-                    match updated.disk_status() {
-                        store::DiskStatus::Unavailable { reason } => {
-                            eprintln!(
-                                "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                            );
-                        }
-                        _ => {
-                            println!("retrieval persistence: disk={disk_path}");
-                        }
-                    }
-                    updated
-                }
-                Err(err) => {
-                    // Unreachable: `with_disk` always returns Ok.
-                    eprintln!(
-                        "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
-                    );
-                    unreachable!("with_disk always returns Ok");
-                }
-            };
-            println!("retrieval ready: claims={}", store.claims_len());
-            store
-        } else {
-            println!("retrieval ready: claims={}", store.claims_len());
-            store
+            store = attach_disk(store, &disk_path);
         }
+        tracing::info!("retrieval ready: claims={}", store.claims_len());
+        store
     } else {
         let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
         store
@@ -149,7 +123,10 @@ fn main() {
                 stance_mode: StanceMode::Balanced,
             },
         );
-        println!("retrieval ready: results={}", results.len());
+        tracing::info!("retrieval ready: results={}", results.len());
+        if !disk_disabled {
+            store = attach_disk(store, &disk_path);
+        }
         store
     };
 
@@ -159,9 +136,9 @@ fn main() {
     if serve_mode {
         {
             let store_guard = shared_store.read().unwrap_or_else(|p| p.into_inner());
-            println!("retrieval transport listening on http://{bind_addr}");
-            println!("retrieval transport workers: {http_workers}");
-            println!(
+            tracing::info!("retrieval transport listening on http://{bind_addr}");
+            tracing::info!("retrieval transport workers: {http_workers}");
+            tracing::info!(
                 "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
                 store_guard.ann_tuning().max_neighbors_base,
                 store_guard.ann_tuning().max_neighbors_upper,
@@ -169,12 +146,12 @@ fn main() {
                 store_guard.ann_tuning().search_expansion_min,
                 store_guard.ann_tuning().search_expansion_max
             );
-            println!(
+            tracing::info!(
                 "retrieval vector backend: {}",
                 store_guard.vector_backend_label()
             );
             if let Some(segment_dir) = segment_dir.as_deref() {
-                println!("retrieval segment read dir: {segment_dir}");
+                tracing::info!("retrieval segment read dir: {segment_dir}");
             }
         }
         if let Some(placement_file) =
@@ -192,23 +169,26 @@ fn main() {
                 "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
             )
             .unwrap_or_else(|| "0".to_string());
-            println!(
+            tracing::info!(
                 "retrieval placement routing: file={}, local_node_id={}, read_preference={}, reload_interval_ms={}",
-                placement_file, local_node, read_preference, reload_interval_ms
+                placement_file,
+                local_node,
+                read_preference,
+                reload_interval_ms
             );
         }
-        println!("retrieval health endpoint: http://{bind_addr}/health");
-        println!("retrieval metrics endpoint: http://{bind_addr}/metrics");
-        println!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
+        tracing::info!("retrieval health endpoint: http://{bind_addr}/health");
+        tracing::info!("retrieval metrics endpoint: http://{bind_addr}/metrics");
+        tracing::info!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
         // Install SIGTERM/SIGINT handlers that set a flag the
         // accept loop polls every 50ms. This gives us sub-second
         // graceful shutdown: in-flight requests drain, the worker
         // threads finish, then the process exits cleanly.
         let shutdown = dash_common::ShutdownSignal::install();
-        eprintln!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
+        tracing::error!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
         if let Err(err) = serve_http_with_workers(shared_store, &bind_addr, http_workers, shutdown)
         {
-            eprintln!("retrieval transport failed: {err}");
+            tracing::error!("retrieval transport failed: {err}");
             std::process::exit(1);
         }
     }
@@ -332,4 +312,28 @@ where
         }
     }
     None
+}
+
+fn attach_disk(store: InMemoryStore, disk_path: &str) -> InMemoryStore {
+    match store.with_disk(disk_path) {
+        Ok(updated) => {
+            match updated.disk_status() {
+                store::DiskStatus::Unavailable { reason } => {
+                    tracing::error!(
+                        "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
+                    );
+                }
+                _ => {
+                    tracing::info!("retrieval persistence: disk={disk_path}");
+                }
+            }
+            updated
+        }
+        Err(err) => {
+            tracing::error!(
+                "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+            );
+            unreachable!("with_disk always returns Ok")
+        }
+    }
 }

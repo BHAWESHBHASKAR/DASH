@@ -52,6 +52,11 @@ pub(super) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
         (_, "/v1/ingest/document") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/v1/ingest/batch") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/health")
+        | (_, "/v1/health")
+        | (_, "/live")
+        | (_, "/v1/live")
+        | (_, "/ready")
+        | (_, "/v1/ready")
         | (_, "/metrics")
         | (_, "/debug/placement")
         | (_, "/debug/document-parser")

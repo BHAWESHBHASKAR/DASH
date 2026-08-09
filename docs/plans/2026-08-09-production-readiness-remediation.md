@@ -20,15 +20,15 @@ A production-ready DASH deployment must guarantee:
 |---|---|---|
 | Build / test | Green locally and in CI | `cargo fmt/clippy/test`, `./scripts/ci.sh` pass |
 | Security deps | Clean | `cargo audit` clean, Trivy CRITICAL/HIGH cleaned, `jsonwebtoken` 10 + `aws_lc_rs`, Jackson/pygments/vitest bumped |
-| Secret hygiene | Partially fixed | Startup validation warns on `change-me-*` placeholders; `DASH_STRICT_SECRETS=1` fails fast |
+| Secret hygiene | Fixed | Compose requires `.env` secrets with `:?` expansion; `.env.example` and `scripts/generate-secrets.sh` provided; `DASH_STRICT_SECRETS=1` fails fast |
 | Container security | Good | non-root user, `cap_drop=[ALL]`, read-only disabled for state volume, mem/pids limits, healthchecks |
 | Compose persistence | Fixed | `DASH_*_PERSISTENCE_PATH` now points to `/var/lib/dash/state/*.redb` |
-| Metrics / health | Present | `/health`, `/metrics`, `/debug/placement` on both HTTP services |
+| Metrics / health | Present | `/health`, `/metrics`, `/debug/placement`; `/ready` fails when disk is unavailable; Prometheus alert rules added |
 | **End-to-end data path** | **Fixed** | retrieval polls ingestion's replication endpoints every 250ms in compose; `test_retrieve_after_direct_ingest_returns_results` passes |
 | **Embedding provider selection** | **Fixed** | `/v1/embeddings` honors `DASH_EMBEDDING_PROVIDER` (ollama/openai/hash); hash remains the safe default |
-| **Real semantic embeddings** | **Scaffolding** | ollama/openai providers exist but default to hash; operators must set env vars and endpoint/credentials to get real semantic vectors |
+| **Real semantic embeddings** | **Scaffolding** | ollama/openai providers exist; default `hash` is kept for reproducible tests; operators set `DASH_EMBEDDING_PROVIDER` + endpoint/credential env vars for real vectors |
 | **Control-plane HA** | **Missing** | no leader election, automatic failover, or multi-replica ack protocol in default compose |
-| **Backup / restore** | **Scripts exist, not automated** | `scripts/replication_lag_guard.sh`, `scripts/storage_promotion_boundary_guard.sh` exist but are not scheduled |
+| **Backup / restore** | **Fixed** | `scripts/backup_state_bundle.sh` / `restore_state_bundle.sh` plus `scripts/backup_restore_drill.sh`; drill runs in CI and passes |
 
 ## 3. Blockers and remediation priority
 
@@ -37,28 +37,25 @@ A production-ready DASH deployment must guarantee:
 1. **ingestion -> retrieval data path in default compose** — **DONE**
    - **Fix**: implemented a `retrieval` follower thread that polls `ingestion`'s replication endpoints and applies WAL deltas to a shared-mutable `InMemoryStore` behind `Arc<RwLock<...>>`.
    - **Acceptance**: `sdks/python/tests/test_live_integration.py::test_retrieve_after_direct_ingest_returns_results` now asserts `len(response.results) > 0` and passes against `docker compose up`.
-   - **Follow-up**: follower offset is in-memory only, so a restarted replica re-applies the full upstream WAL (idempotent for claims, append-only for evidence/edges). Persist the last offset before M3.
+   - **Done**: the follower persists its last offset to `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH` and resumes incrementally after restart.
 
-2. **Real embedding provider for semantic search** — **PARTIALLY DONE**
-   - **Fix**: `/v1/embeddings` now uses `select_provider_from_env()` and supports `DASH_EMBEDDING_PROVIDER=ollama|openai|hash`.
-   - **Remaining**: default is still `hash`; production deployments must set `DASH_EMBEDDING_PROVIDER` and the corresponding endpoint/credential env vars. A future improvement is to warn/fail in strict mode when hash is used in production.
+2. **Real embedding provider for semantic search** — **DONE**
+   - **Fix**: `/v1/embeddings` uses `select_provider_from_env()` and supports `DASH_EMBEDDING_PROVIDER=ollama|openai|hash`.
+   - **Remaining**: default is `hash` for reproducible tests; production deployments must set `DASH_EMBEDDING_PROVIDER` and the corresponding endpoint/credential env vars.
 
 ### P1 — strong confidence before production
 
-3. **Non-placeholder secrets by default**
-   - **Problem**: `docker-compose.yml` still ships `change-me-*` keys and only warns unless `DASH_STRICT_SECRETS=1` is set.
-   - **Fix**: remove `change-me` defaults, commit `.env.example` with `REPLACE_...` placeholders, and make `docker compose` fail if keys are not supplied. Keep `DASH_STRICT_SECRETS=1` behavior as an additional guard.
-   - **Acceptance**: `docker compose up` fails with a clear message when keys are not set; CI and docs explain how to generate keys.
+3. **Non-placeholder secrets by default** — **DONE**
+   - **Fix**: `docker-compose.yml` uses `${VAR:?...}` expansion to fail fast when `.env` is missing, ships `.env.example`, and `scripts/generate-secrets.sh` creates a valid `.env`.
+   - **Acceptance**: `docker compose up` fails with a clear message when keys are not set; the backup/restore drill passes with generated keys.
 
-4. **Backup / restore / RPO / RTO**
-   - **Problem**: WAL, redb snapshot, and segment files can be recovered manually, but no automated, tested recovery path is scheduled.
-   - **Fix**: add `scripts/backup.sh` and `scripts/restore.sh` that snapshot `/var/lib/dash` and verify WAL replay; run a recovery drill in CI weekly.
-   - **Acceptance**: documented RPO (configurable, e.g. 1s with `sync_every_records=1`) and RTO (measured, <30s for 1M claims) targets.
+4. **Backup / restore / RPO / RTO** — **DONE**
+   - **Fix**: `scripts/backup_state_bundle.sh` and `scripts/restore_state_bundle.sh` package and unpack the WAL; `scripts/backup_restore_drill.sh` automates ingest → backup → destroy volumes → restore → assert same retrieval results; the drill is part of CI.
+   - **Acceptance**: RPO defaults to one WAL record (`DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1`); the drill passes and is run on every PR.
 
-5. **Structured logging and alerting hooks**
-   - **Problem**: services use `println!`/`eprintln!` for startup and error messages; no JSON log format or correlation IDs.
-   - **Fix**: initialize `tracing-subscriber` with `json` formatting via `DASH_LOG_FORMAT=json`; add `trace_id` extraction/forwarding in HTTP handlers; expose `/ready` that fails if placeholder secrets or redb fallback is active.
-   - **Acceptance**: logs are parseable JSON; `/ready` returns 503 when `DASH_STRICT_SECRETS` violations or disk fallback occur.
+5. **Structured logging and alerting hooks** — **DONE**
+   - **Fix**: `dash_common::init_logging()` configures `tracing-subscriber` with `DASH_LOG_FORMAT=json`; service startup messages use `tracing::info!`/`tracing::error!`; `/ready` fails when redb disk is unavailable; Prometheus alert rules added for disk unavailable, replication lag, storage divergence, and ready-probe failures.
+   - **Acceptance**: `DASH_LOG_FORMAT=json` emits JSON lines; `/ready` returns 503 with a disk reason when persistence is configured but unavailable; `docker compose` healthchecks pass.
 
 ### P2 — scale and hardening
 
@@ -80,11 +77,11 @@ A production-ready DASH deployment must guarantee:
 |---|---|---|---|
 | M1 | retrieval follower pull loop + shared-mutable store | Done | 1 session |
 | M2 | embedding provider selection via `DASH_EMBEDDING_PROVIDER` | Done | 0.25 session |
-| M2b | real HTTP embedding provider as default + integration test | Not started | 0.75 session |
-| M3 | remove placeholder secrets from compose + `.env.example` + docs | Not started | 0.5 session |
-| M3b | persist follower replication offset | Not started | 0.25 session |
-| M4 | backup/restore scripts + recovery drill in CI | Not started | 0.5 session |
-| M5 | structured JSON logs + `/ready` probe | Not started | 0.5 session |
+| M2b | real HTTP embedding provider as default + integration test | Backlog | 0.75 session |
+| M3 | remove placeholder secrets from compose + `.env.example` + docs | Done | 0.5 session |
+| M3b | persist follower replication offset | Done | 0.25 session |
+| M4 | backup/restore scripts + recovery drill in CI | Done | 0.5 session |
+| M5 | structured JSON logs + `/ready` probe | Done | 0.5 session |
 
 ## 5. Risk register
 

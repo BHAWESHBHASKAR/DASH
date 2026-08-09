@@ -25,7 +25,10 @@ pub(super) fn handle_ingest_post(
         Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
     };
     match build_ingest_request_from_json(body) {
-        Ok(api_req) => {
+        Ok(mut api_req) => {
+            if let Err(err) = api_req.embed_claim_if_missing() {
+                return HttpResponse::bad_request(&err);
+            }
             let tenant_id = api_req.claim.tenant_id.clone();
             let claim_id = api_req.claim.claim_id.clone();
             match authorize_request_for_tenant(request, &tenant_id, auth_policy) {

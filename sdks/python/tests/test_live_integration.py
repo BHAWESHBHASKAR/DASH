@@ -48,11 +48,15 @@ def _ingestion_url() -> Optional[str]:
 
 
 def _api_key() -> Optional[str]:
-    return os.environ.get("DASH_LIVE_API_KEY")
+    return os.environ.get("DASH_LIVE_API_KEY") or os.environ.get("DASH_RETRIEVAL_API_KEY")
 
 
 def _ingest_api_key() -> Optional[str]:
-    return os.environ.get("DASH_LIVE_INGEST_API_KEY") or _api_key()
+    return (
+        os.environ.get("DASH_LIVE_INGEST_API_KEY")
+        or os.environ.get("DASH_INGEST_API_KEY")
+        or _api_key()
+    )
 
 
 def _auth_headers(key: Optional[str]) -> Dict[str, str]:

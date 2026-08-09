@@ -122,3 +122,28 @@ pub fn strict_secrets_enabled() -> bool {
         Ok("1" | "true" | "yes")
     )
 }
+
+/// Initialize a `tracing` subscriber for the service.
+///
+/// When `DASH_LOG_FORMAT` is `json`, events are emitted as JSON lines;
+/// otherwise a compact human-readable format is used. The default
+/// `RUST_LOG` filter is applied from the environment.
+pub fn init_logging() {
+    let json_logs = std::env::var("DASH_LOG_FORMAT")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("json");
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Ignore "already initialized" so tests that spawn multiple service
+    // binaries in the same process do not panic.
+    if json_logs {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+}

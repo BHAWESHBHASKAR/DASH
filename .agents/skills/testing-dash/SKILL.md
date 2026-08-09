@@ -18,6 +18,8 @@ cargo test --workspace --all-features -- --test-threads=1
 ./scripts/ci.sh
 cd sdks/python && pip install -e '.[test]' && pytest -v
 cd sdks/typescript && npm install && npm test
+./scripts/generate-secrets.sh
+set -a; source deploy/container/.env; set +a
 cd deploy/container && docker compose -f docker-compose.yml up -d --build
 ```
 
@@ -30,11 +32,12 @@ cd deploy/container && docker compose -f docker-compose.yml up -d --build
 
 ## Devin Secrets Needed
 
-- None for local validation. Set `DASH_INGEST_API_KEY` and
-  `DASH_RETRIEVAL_API_KEY` in a `.env` file or shell before starting compose.
-- The Docker Compose defaults use `change-me-*` placeholder keys. Services
-  will emit a startup warning; set `DASH_STRICT_SECRETS=1` to fail on
-  placeholder or short secrets in production.
+- Run `./scripts/generate-secrets.sh` to create `deploy/container/.env` with
+  strong random API keys and JWT secrets. Docker Compose loads `.env`
+  automatically.
+- `docker-compose.yml` requires these keys and sets `DASH_STRICT_SECRETS=1`,
+  so `docker compose up` fails fast if secrets are missing, placeholders, or
+  too short.
 
 ## Service endpoints and keys
 
@@ -92,12 +95,12 @@ curl -X POST http://127.0.0.1:8080/v1/retrieve \
    `/internal/replication/wal` endpoint every 250ms in the default compose
    (`DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081`). A retrieve
    after an ingest now returns the ingested claim.
-3. Follower replication offset is currently in-memory only, so a restarted
-   `retrieval` replica re-applies the full upstream WAL on startup.
+3. Follower replication offset is persisted to
+   `/var/lib/dash/state/retrieval-replication.offset` inside the retrieval
+   container, so restarts resume from the last applied offset.
 4. Python live integration tests (`sdks/python/tests/test_live_integration.py`)
-   read API keys from `DASH_LIVE_API_KEY` (retrieval) and
-   `DASH_LIVE_INGEST_API_KEY` (ingestion, falling back to `DASH_LIVE_API_KEY`).
-   Set these before running the tests; no default secrets are included.
+   read `DASH_LIVE_API_KEY` / `DASH_LIVE_INGEST_API_KEY`, and fall back to
+   `DASH_RETRIEVAL_API_KEY` / `DASH_INGEST_API_KEY` from `.env`.
 
 ## Useful diagnostics
 
@@ -109,11 +112,10 @@ docker compose -f deploy/container/docker-compose.yml ps
 docker compose -f deploy/container/docker-compose.yml logs --tail=50 <service>
 
 # live SDK tests (requires running compose and exported keys)
+set -a; source ../../deploy/container/.env; set +a
 export DASH_LIVE_URL=http://127.0.0.1:8080
 export DASH_LIVE_RETRIEVAL_URL=http://127.0.0.1:8080
 export DASH_LIVE_INGESTION_URL=http://127.0.0.1:8081
-export DASH_LIVE_API_KEY='<YOUR_RETRIEVAL_API_KEY>'
-export DASH_LIVE_INGEST_API_KEY='<YOUR_INGEST_API_KEY>'
 cd sdks/python
 pytest -v tests/test_live_integration.py
 ```

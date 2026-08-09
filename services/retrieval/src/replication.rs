@@ -21,6 +21,7 @@ pub struct ReplicationFollowerConfig {
     poll_interval: Duration,
     max_records: usize,
     token: Option<String>,
+    offset_path: String,
 }
 
 impl ReplicationFollowerConfig {
@@ -53,11 +54,18 @@ impl ReplicationFollowerConfig {
         )
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+        let offset_path = env_with_fallback(
+            "DASH_RETRIEVAL_REPLICATION_OFFSET_PATH",
+            "EME_RETRIEVAL_REPLICATION_OFFSET_PATH",
+        )
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/var/lib/dash/state/retrieval-replication.offset".to_string());
         Some(Self {
             source_base_url,
             poll_interval: Duration::from_millis(poll_interval_ms),
             max_records,
             token,
+            offset_path,
         })
     }
 
@@ -89,7 +97,10 @@ pub fn spawn_replication_follower(store: Arc<RwLock<InMemoryStore>>) {
     );
 
     thread::spawn(move || {
-        let mut last_offset: usize = 0;
+        let mut last_offset = read_offset(&config.offset_path);
+        if last_offset > 0 {
+            eprintln!("retrieval replication follower resuming from offset {last_offset}");
+        }
         loop {
             match pull_and_apply(&store, &config, last_offset) {
                 Ok(next_offset) => {
@@ -124,7 +135,7 @@ fn pull_and_apply(
     }
     let delta_frame = parse_replication_delta_frame(&delta_response.body)?;
 
-    if delta_frame.needs_resync {
+    let next_offset = if delta_frame.needs_resync {
         let export_response =
             request_replication_source(&config.export_url(), config.token.as_deref())?;
         if export_response.status != 200 {
@@ -139,13 +150,18 @@ fn pull_and_apply(
         all_lines.extend(export_frame.snapshot_lines.iter().cloned());
         all_lines.extend(export_frame.wal_lines.iter().cloned());
         apply_lines(store, &all_lines)?;
-        return Ok(export_frame.wal_lines.len());
-    }
-
-    if !delta_frame.wal_lines.is_empty() {
+        export_frame.snapshot_lines.len() + export_frame.wal_lines.len()
+    } else if !delta_frame.wal_lines.is_empty() {
         apply_lines(store, &delta_frame.wal_lines)?;
+        delta_frame.next_offset
+    } else {
+        delta_frame.next_offset
+    };
+
+    if let Err(err) = write_offset(&config.offset_path, next_offset) {
+        eprintln!("retrieval replication follower failed to persist offset: {err}");
     }
-    Ok(delta_frame.next_offset)
+    Ok(next_offset)
 }
 
 fn apply_lines(store: &Arc<RwLock<InMemoryStore>>, lines: &[String]) -> Result<(), String> {
@@ -363,6 +379,24 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn read_offset(path: &str) -> usize {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_offset(path: &str, offset: usize) -> std::io::Result<()> {
+    let dir = std::path::Path::new(path).parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "offset path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(path, offset.to_string())
 }
 
 // So the module satisfies the unused-import lint when StoreError is not
