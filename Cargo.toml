@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", default-features = true, features = ["aws_lc_rs"] }
 base64 = "0.22"
 redb = "2"
 bincode = "1.3"

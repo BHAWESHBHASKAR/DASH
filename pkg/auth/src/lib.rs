@@ -254,8 +254,14 @@ fn map_jwt_error(err: jsonwebtoken::errors::Error) -> JwtValidationError {
         ErrorKind::Utf8(_) => JwtValidationError::InvalidUtf8,
         ErrorKind::InvalidAlgorithm
         | ErrorKind::InvalidAlgorithmName
-        | ErrorKind::InvalidKeyFormat => JwtValidationError::UnsupportedAlgorithm,
-        ErrorKind::Crypto(_) => JwtValidationError::InvalidSignature,
+        | ErrorKind::InvalidKeyFormat
+        | ErrorKind::MissingAlgorithm
+        | ErrorKind::InvalidEcdsaKey
+        | ErrorKind::InvalidEddsaKey
+        | ErrorKind::InvalidRsaKey(_)
+        | ErrorKind::RsaFailedSigning
+        | ErrorKind::Signing(_) => JwtValidationError::UnsupportedAlgorithm,
+        ErrorKind::Provider(_) => JwtValidationError::InvalidSignature,
         _ => JwtValidationError::InvalidTokenFormat,
     }
 }
