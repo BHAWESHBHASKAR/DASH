@@ -46,10 +46,19 @@ Auth is `x-api-key` (or `Authorization: Bearer <key>`).
 
 Ingest:
 
+Set the keys in your shell first (do not commit real secrets):
+
+```bash
+export DASH_INGEST_API_KEY='<YOUR_INGEST_API_KEY>'
+export DASH_RETRIEVAL_API_KEY='<YOUR_RETRIEVAL_API_KEY>'
+```
+
+Ingest:
+
 ```bash
 curl -X POST http://127.0.0.1:8081/v1/ingest \
   -H 'Content-Type: application/json' \
-  -H 'x-api-key: change-me-ingest-key' \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -d '{
     "claim": {
       "claim_id": "c1",
@@ -67,7 +76,7 @@ Retrieve:
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/retrieve \
   -H 'Content-Type: application/json' \
-  -H 'x-api-key: change-me-retrieval-key' \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -d '{"tenant_id":"t1","query":"DASH end-to-end test claim","top_k":3}'
 ```
 
@@ -83,9 +92,9 @@ curl -X POST http://127.0.0.1:8080/v1/retrieve \
    compose-level replication path is configured, so a retrieve after an
    ingest returns an empty `results` array by default.
 3. Python live integration tests (`sdks/python/tests/test_live_integration.py`)
-   use `api_key="not_needed"`. That works for the unauthenticated
-   `/v1/embeddings` endpoint, but `/v1/retrieve` rejects it when the retrieval
-   service requires the configured `change-me-retrieval-key`.
+   read API keys from `DASH_LIVE_API_KEY` (retrieval) and
+   `DASH_LIVE_INGEST_API_KEY` (ingestion, falling back to `DASH_LIVE_API_KEY`).
+   Set these before running the tests; no default secrets are included.
 
 ## Useful diagnostics
 
@@ -96,14 +105,14 @@ docker compose -f deploy/container/docker-compose.yml ps
 # per-service logs
 docker compose -f deploy/container/docker-compose.yml logs --tail=50 <service>
 
-# live SDK tests (requires running compose)
+# live SDK tests (requires running compose and exported keys)
+export DASH_LIVE_URL=http://127.0.0.1:8080
+export DASH_LIVE_RETRIEVAL_URL=http://127.0.0.1:8080
+export DASH_LIVE_INGESTION_URL=http://127.0.0.1:8081
+export DASH_LIVE_API_KEY='<YOUR_RETRIEVAL_API_KEY>'
+export DASH_LIVE_INGEST_API_KEY='<YOUR_INGEST_API_KEY>'
 cd sdks/python
-DASH_LIVE_URL=http://127.0.0.1:8080 \
-DASH_LIVE_RETRIEVAL_URL=http://127.0.0.1:8080 \
-DASH_LIVE_INGESTION_URL=http://127.0.0.1:8081 \
-DASH_LIVE_API_KEY=change-me-retrieval-key \
-DASH_LIVE_INGEST_API_KEY=change-me-ingest-key \
-  pytest -v tests/test_live_integration.py
+pytest -v tests/test_live_integration.py
 ```
 
 ## Notes
