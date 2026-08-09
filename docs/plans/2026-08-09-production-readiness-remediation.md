@@ -83,7 +83,7 @@ A production-ready DASH deployment must guarantee:
 | M4 | backup/restore scripts + recovery drill in CI | Done | 0.5 session |
 | M5 | structured JSON logs + `/ready` probe | Done | 0.5 session |
 | M6 | control-plane leader election + failover | Done | 1 session |
-| M7 | quorum replication with lag SLO | Not started | 1 session |
+| M7 | quorum replication with lag SLO | Done | 0.75 session |
 | M8 | disk-first segment serving tier | Not started | 1 session |
 | M9 | object-storage backup/restore | Not started | 0.75 session |
 | M10 | Helm operator / managed cloud scaffolding | Not started | 1 session |
