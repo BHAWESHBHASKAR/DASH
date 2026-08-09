@@ -178,10 +178,9 @@ impl OpenAIErrorResponse {
     }
 }
 
-/// Handler for `POST /v1/embeddings`. Constructs the default
-/// `HashEmbeddingProvider` (deterministic, no network) and serializes
-/// the response. Swap the provider to integrate Ollama, OpenAI, or
-/// custom models.
+/// Handler for `POST /v1/embeddings`. Uses the provider selected by
+/// `DASH_EMBEDDING_PROVIDER` (default: `hash`) so the retrieval service can
+/// serve real semantic embeddings when Ollama or OpenAI is configured.
 pub fn handle_openai_embeddings(
     body: &str,
 ) -> Result<OpenAIEmbeddingsResponse, OpenAIErrorResponse> {
@@ -204,7 +203,7 @@ pub fn handle_openai_embeddings(
     let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
         .map_err(OpenAIErrorResponse::invalid_request)?;
 
-    let provider = HashEmbeddingProvider::default();
+    let provider = select_provider_from_env();
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
     let embeddings = provider
         .embed(&texts)
