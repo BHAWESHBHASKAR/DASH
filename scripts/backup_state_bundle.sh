@@ -9,6 +9,7 @@ SEGMENT_DIR="${DASH_INGEST_SEGMENT_DIR:-${DASH_RETRIEVAL_SEGMENT_DIR:-}}"
 PLACEMENT_FILE="${DASH_ROUTER_PLACEMENT_FILE:-}"
 OUTPUT_DIR="${DASH_BACKUP_OUTPUT_DIR:-dist/backups}"
 BUNDLE_LABEL="${DASH_BACKUP_LABEL:-$(date -u +%Y%m%d-%H%M%S)}"
+S3_URI="${DASH_BACKUP_S3_URI:-}"
 
 usage() {
   cat <<'USAGE'
@@ -22,10 +23,12 @@ Options:
   --placement-file PATH      Placement CSV file to include (optional)
   --output-dir DIR           Backup output directory (default: dist/backups)
   --bundle-label LABEL       Bundle label suffix (default: UTC timestamp)
+  --s3-uri URI               S3 destination URI, e.g. s3://bucket/path/ (optional)
   -h, --help                 Show help
 
 Output:
   <output-dir>/dash-backup-<bundle-label>.tar.gz
+  (plus upload to --s3-uri when provided)
 USAGE
 }
 
@@ -49,6 +52,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bundle-label)
       BUNDLE_LABEL="$2"
+      shift 2
+      ;;
+    --s3-uri)
+      S3_URI="$2"
       shift 2
       ;;
     -h|--help)
@@ -77,6 +84,14 @@ if [[ -n "${SEGMENT_DIR}" && ! -d "${SEGMENT_DIR}" ]]; then
 fi
 if [[ -n "${PLACEMENT_FILE}" && ! -f "${PLACEMENT_FILE}" ]]; then
   echo "placement file not found: ${PLACEMENT_FILE}" >&2
+  exit 1
+fi
+if [[ -n "${S3_URI}" && ! "${S3_URI}" =~ ^s3:// ]]; then
+  echo "--s3-uri must start with s3:// (got: ${S3_URI})" >&2
+  exit 2
+fi
+if [[ -n "${S3_URI}" ]] && ! command -v aws >/dev/null 2>&1; then
+  echo "aws CLI is required for S3 upload" >&2
   exit 1
 fi
 
@@ -141,6 +156,15 @@ fi
 
 ARCHIVE_PATH="${OUTPUT_DIR}/${BUNDLE_ROOT_NAME}.tar.gz"
 tar -czf "${ARCHIVE_PATH}" -C "${TMP_DIR}" "${BUNDLE_ROOT_NAME}"
+
+if [[ -n "${S3_URI}" ]]; then
+  S3_DEST="${S3_URI}"
+  if [[ "${S3_URI}" == */ ]]; then
+    S3_DEST="${S3_URI}${BUNDLE_ROOT_NAME}.tar.gz"
+  fi
+  echo "[backup] uploading to ${S3_DEST}"
+  aws s3 cp "${ARCHIVE_PATH}" "${S3_DEST}"
+fi
 
 rm -rf "${TMP_DIR}"
 
