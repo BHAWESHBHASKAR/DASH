@@ -16,7 +16,7 @@
 //! etc.) that the rest of the crate consumes via re-exports from
 //! `lib.rs`.
 
-use std::fs::{create_dir_all, rename, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all, rename};
 use std::io::{BufRead, BufReader, Write};
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";
@@ -602,8 +602,6 @@ impl Drop for FileWal {
         let _ = self.flush_pending_sync();
     }
 }
-
-
 
 fn count_non_empty_lines(path: &Path) -> Result<usize, StoreError> {
     let file = OpenOptions::new().read(true).open(path)?;

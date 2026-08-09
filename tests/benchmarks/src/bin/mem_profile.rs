@@ -127,7 +127,9 @@ fn scenario_with_disk() {
 }
 
 fn main() {
-    let scenario = env::args().nth(1).unwrap_or_else(|| "ingest_10k".to_string());
+    let scenario = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "ingest_10k".to_string());
     let _profiler = dhat::Profiler::new_heap(); // runs until process exit
     eprintln!("mem_profile: scenario={scenario}");
     match scenario.as_str() {
@@ -139,7 +141,5 @@ fn main() {
             std::process::exit(2);
         }
     }
-    eprintln!(
-        "mem_profile: done; load target/dhat/{scenario}.heap.json into the dhat viewer"
-    );
+    eprintln!("mem_profile: done; load target/dhat/{scenario}.heap.json into the dhat viewer");
 }

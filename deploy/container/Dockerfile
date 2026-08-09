@@ -19,7 +19,7 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #       -f deploy/container/Dockerfile -t dash:latest --load .
 
-ARG RUST_VERSION=1.83
+ARG RUST_VERSION=1.97
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
@@ -37,7 +37,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY pkg ./pkg
 COPY services ./services
 COPY tests ./tests
-COPY tools ./tools
 RUN cargo build --release --workspace --locked
 
 # Strip debug info from the three service binaries. The image size drops

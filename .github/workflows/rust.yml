@@ -50,7 +50,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests (all features)
-        run: cargo test --workspace --all-features
+        # Single-threaded: retrieval tests rely on process-global env
+        # variables/locks that are not safe under the default runner.
+        run: cargo test --workspace --all-features -- --test-threads=1
 
       - name: Release build
         run: cargo build --workspace --release

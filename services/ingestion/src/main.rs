@@ -188,7 +188,7 @@ fn main() {
             "EME_INGEST_PERSISTENCE_DISABLE",
         )
         .as_deref()
-        == Some("1");
+            == Some("1");
         let disk_path = env_with_fallback(
             "DASH_INGEST_PERSISTENCE_PATH",
             "EME_INGEST_PERSISTENCE_PATH",

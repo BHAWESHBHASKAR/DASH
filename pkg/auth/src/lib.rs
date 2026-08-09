@@ -11,7 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -351,7 +353,10 @@ mod tests {
         .unwrap();
         let result =
             verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000_000_000);
-        assert!(result.is_ok(), "expected Ok on the good token, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok on the good token, got {result:?}"
+        );
         let mut parts = token
             .split('.')
             .map(ToString::to_string)
@@ -455,7 +460,10 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-b", &sample_config(), 1_000);
-        assert!(result.is_ok(), "expected Ok via tenants array, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok via tenants array, got {result:?}"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ fn main() {
             "EME_RETRIEVAL_PERSISTENCE_DISABLE",
         )
         .as_deref()
-        == Some("1");
+            == Some("1");
         let disk_path = env_with_fallback(
             "DASH_RETRIEVAL_PERSISTENCE_PATH",
             "EME_RETRIEVAL_PERSISTENCE_PATH",

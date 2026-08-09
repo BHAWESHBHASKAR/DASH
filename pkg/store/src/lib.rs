@@ -3,29 +3,25 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(feature = "gpu-backend")]
-use std::sync::OnceLock;
-
 use graph::summarize_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest,
-    RetrievalResult, Stance, StanceMode, ValidationError, tokenize, validate_claim,
-    validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, Stance, StanceMode,
+    ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
 };
 
 mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
-mod wal;
 mod ann;
-mod metrics;
 #[cfg(feature = "gpu-backend")]
 mod gpu;
+mod metrics;
+mod wal;
 pub use ann::AnnTuningConfig;
+pub(crate) use ann::{ANN_GRAPH_LEVELS, ScoredNode, TenantAnnGraph};
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
-pub(crate) use metrics::{VectorBackendPreference, VECTOR_BACKEND_ENV};
-pub(crate) use ann::{TenantAnnGraph, ScoredNode, ANN_GRAPH_LEVELS};
+pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
 
 #[derive(Default)]
 pub(crate) struct Bm25Context {
@@ -34,17 +30,11 @@ pub(crate) struct Bm25Context {
     avg_doc_len: f32,
 }
 
-
-
+pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
 pub use wal::{
-    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary,
-    WalReplayStats, WalReplicationDelta, WalReplicationExport, WalRollbackPoint,
-    WalWritePolicy,
+    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
+    WalReplicationDelta, WalReplicationExport, WalRollbackPoint, WalWritePolicy,
 };
-pub(crate) use wal::{
-    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record,
-};
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
@@ -97,7 +87,6 @@ impl From<std::io::Error> for StoreError {
         Self::Io(value.to_string())
     }
 }
-
 
 #[derive(Default, Clone)]
 /// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
@@ -182,7 +171,9 @@ impl InMemoryStore {
             }),
             Err(reason) => Ok(Self {
                 disk: None,
-                disk_status: disk::DiskStatus::Unavailable { reason: reason.clone() },
+                disk_status: disk::DiskStatus::Unavailable {
+                    reason: reason.clone(),
+                },
                 ..self
             }),
         }
@@ -266,12 +257,7 @@ impl InMemoryStore {
         // pattern of `take()` + restore, which was only needed when
         // the disk was an owned `DiskBackedStore` (not Clone-able
         // because it wraps a `redb::Database`).
-        let disk = Arc::clone(
-            store
-                .disk
-                .as_ref()
-                .expect("disk was just attached"),
-        );
+        let disk = Arc::clone(store.disk.as_ref().expect("disk was just attached"));
         let claims_loaded = disk
             .bulk_load_claims_into(&mut store)
             .map_err(|e| format!("disk bulk load: {e}"))?;
@@ -449,12 +435,7 @@ impl InMemoryStore {
         req: &RetrievalRequest,
         query_vector: &[f32],
     ) -> Vec<RetrievalResult> {
-        self.retrieve_with_time_range_and_query_vector(
-            req,
-            None,
-            None,
-            Some(query_vector),
-        )
+        self.retrieve_with_time_range_and_query_vector(req, None, None, Some(query_vector))
     }
 
     pub fn retrieve_with_time_range(
@@ -898,21 +879,15 @@ impl InMemoryStore {
     }
 
     pub(crate) fn evidence_iter(&self) -> impl Iterator<Item = (&str, &Vec<Evidence>)> {
-        self.evidence_by_claim
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.evidence_by_claim.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn edges_iter(&self) -> impl Iterator<Item = (&str, &Vec<ClaimEdge>)> {
-        self.edges_by_claim
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.edges_by_claim.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn claim_vectors_iter(&self) -> impl Iterator<Item = (&str, &Vec<f32>)> {
-        self.claim_vectors
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.claim_vectors.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn batch_commits_iter(&self) -> impl Iterator<Item = &BatchCommitMetadata> {
@@ -920,17 +895,15 @@ impl InMemoryStore {
     }
 
     pub(crate) fn tenant_dims_iter(&self) -> impl Iterator<Item = (&str, &usize)> {
-        self.tenant_vector_dims
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
+        self.tenant_vector_dims.iter().map(|(k, v)| (k.as_str(), v))
     }
 
     pub(crate) fn tenant_claim_set_iter(&self) -> impl Iterator<Item = (String, String)> {
-        self.tenant_claim_ids
-            .iter()
-            .flat_map(|(tenant, claims)| {
-                claims.iter().map(move |claim| (tenant.clone(), claim.clone()))
-            })
+        self.tenant_claim_ids.iter().flat_map(|(tenant, claims)| {
+            claims
+                .iter()
+                .map(move |claim| (tenant.clone(), claim.clone()))
+        })
     }
 
     fn should_checkpoint(
@@ -1065,7 +1038,7 @@ impl InMemoryStore {
         if self.vector_backend_runtime.is_gpu() {
             #[cfg(feature = "gpu-backend")]
             if let Some(scored) =
-                gpu_score_query_candidate_vectors(query_vector, &candidate_vectors)
+                gpu::gpu_score_query_candidate_vectors(query_vector, &candidate_vectors)
             {
                 return scored;
             }
@@ -1482,7 +1455,9 @@ impl InMemoryStore {
             Some(existing_dim) if *existing_dim != vector.len() => {
                 return Err(StoreError::InvalidVector(format!(
                     "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id, existing_dim, vector.len()
+                    tenant_id,
+                    existing_dim,
+                    vector.len()
                 )));
             }
             None => Some(vector.len()),
@@ -1578,7 +1553,8 @@ impl InMemoryStore {
         if let Some(disk) = self.disk.as_ref() {
             disk.put_batch_commit(&metadata).map_err(StoreError::Io)?;
         }
-        self.batch_commits.insert(record.commit_id.clone(), metadata);
+        self.batch_commits
+            .insert(record.commit_id.clone(), metadata);
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
         Ok(())
     }
@@ -2036,7 +2012,7 @@ fn resolve_vector_backend_runtime(preference: VectorBackendPreference) -> Vector
 
 #[cfg(feature = "gpu-backend")]
 fn resolve_gpu_backend_runtime(explicit_gpu_required: bool) -> VectorBackendRuntime {
-    if gpu_backend_engine().is_some() {
+    if gpu::gpu_backend_engine().is_some() {
         VectorBackendRuntime::Gpu
     } else if explicit_gpu_required {
         VectorBackendRuntime::CpuFallbackUnavailable
@@ -2132,71 +2108,6 @@ fn validate_vector(vector: &[f32]) -> Result<(), StoreError> {
     Ok(())
 }
 
-#[cfg(feature = "gpu-backend")]
-const GPU_COSINE_SHADER: &str = r#"
-struct CosineParams {
-    dimension: u32,
-    candidate_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
-
-@group(0) @binding(0)
-var<storage, read> query: array<f32>;
-
-@group(0) @binding(1)
-var<storage, read> candidates: array<f32>;
-
-@group(0) @binding(2)
-var<storage, read_write> output_scores: array<f32>;
-
-@group(0) @binding(3)
-var<uniform> params: CosineParams;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let candidate_index = gid.x;
-    if (candidate_index >= params.candidate_count) {
-        return;
-    }
-
-    let base = candidate_index * params.dimension;
-    var dot: f32 = 0.0;
-    var norm_query: f32 = 0.0;
-    var norm_candidate: f32 = 0.0;
-    var i: u32 = 0u;
-
-    loop {
-        if (i >= params.dimension) {
-            break;
-        }
-        let q = query[i];
-        let c = candidates[base + i];
-        dot = dot + (q * c);
-        norm_query = norm_query + (q * q);
-        norm_candidate = norm_candidate + (c * c);
-        i = i + 1u;
-    }
-
-    let denom = sqrt(norm_query) * sqrt(norm_candidate);
-    if (denom <= 0.0000001) {
-        output_scores[candidate_index] = 0.0;
-    } else {
-        output_scores[candidate_index] = dot / denom;
-    }
-}
-"#;
-
-#[cfg(feature = "gpu-backend")]
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuCosineParams {
-    dimension: u32,
-    candidate_count: u32,
-    pad0: u32,
-    pad1: u32,
-}
-
 fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
@@ -2216,7 +2127,6 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
         Some(dot / denom)
     }
 }
-
 
 #[cfg(test)]
 mod tests {

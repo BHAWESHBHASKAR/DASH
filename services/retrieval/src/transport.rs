@@ -861,7 +861,9 @@ pub fn serve_http_with_workers(
         // accept() calls with shutdown-flag polling. The 50ms
         // sleep caps shutdown latency at ~50ms p99 and bounds
         // CPU usage in the idle case.
-        listener.set_nonblocking(true).expect("set listener non-blocking");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
         loop {
             if shutdown.is_triggered() {
                 eprintln!("retrieval: shutdown signal received, draining in-flight requests");
@@ -1146,9 +1148,7 @@ fn handle_request_with_metrics_and_reload(
             // mutex is poisoned, something else is very wrong.
             match metrics.lock() {
                 Ok(_) => HttpResponse::ok_json("{\"status\":\"ready\"}".to_string()),
-                Err(_) => HttpResponse::internal_server_error(
-                    "metrics mutex poisoned",
-                ),
+                Err(_) => HttpResponse::internal_server_error("metrics mutex poisoned"),
             }
         }
         ("GET", "/metrics") => {
@@ -1463,9 +1463,7 @@ fn handle_request_with_metrics_and_reload(
             // vectors are semantically meaningful.
             let body = match std::str::from_utf8(&request.body) {
                 Ok(text) => text,
-                Err(_) => {
-                    return HttpResponse::bad_request("request body must be valid UTF-8")
-                }
+                Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
             };
             let provider = crate::openai_embeddings::select_provider_from_env();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
@@ -1473,8 +1471,7 @@ fn handle_request_with_metrics_and_reload(
                 provider.as_ref(),
             ) {
                 Ok(resp) => {
-                    let body = serde_json::to_string(&resp)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
                     HttpResponse::ok_json(body)
                 }
                 Err(err) => {
