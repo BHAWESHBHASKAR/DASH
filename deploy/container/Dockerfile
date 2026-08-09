@@ -95,4 +95,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/opt/dash/bin/dash-healthcheck"]
 
 ENTRYPOINT ["/opt/dash/bin/dash-entrypoint"]
-CMD ["--serve"]
+# No default CMD. The entrypoint sets --serve for ingestion/retrieval
+# when no command is supplied; segment-maintenance-daemon must start
+# with no arguments.

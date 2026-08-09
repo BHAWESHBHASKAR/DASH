@@ -8,6 +8,8 @@ To exercise both the retrieval and ingestion services, also set:
 
 - ``DASH_LIVE_RETRIEVAL_URL`` (defaults to ``DASH_LIVE_URL``)
 - ``DASH_LIVE_INGESTION_URL`` (defaults to ``DASH_LIVE_URL``:8081)
+- ``DASH_LIVE_API_KEY`` for retrieval authentication
+- ``DASH_LIVE_INGEST_API_KEY`` for ingestion (falls back to ``DASH_LIVE_API_KEY``)
 
 The tests are skipped with a clear message otherwise, so the
 default ``pytest`` run is fast and offline.
@@ -24,7 +26,7 @@ import os
 import struct
 import time
 import uuid
-from typing import Optional
+from typing import Dict, Optional
 
 import pytest
 import requests
@@ -43,6 +45,21 @@ def _retrieval_url() -> Optional[str]:
 
 def _ingestion_url() -> Optional[str]:
     return os.environ.get("DASH_LIVE_INGESTION_URL") or _live_url()
+
+
+def _api_key() -> Optional[str]:
+    return os.environ.get("DASH_LIVE_API_KEY")
+
+
+def _ingest_api_key() -> Optional[str]:
+    return os.environ.get("DASH_LIVE_INGEST_API_KEY") or _api_key()
+
+
+def _auth_headers(key: Optional[str]) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    if key is not None:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
 
 
 pytestmark = pytest.mark.skipif(
@@ -81,7 +98,7 @@ def test_embed_endpoint_returns_floats() -> None:
     url = _retrieval_url()
     assert url is not None
     _wait_for_health(url)
-    client = Client(base_url=url, api_key="not_needed")
+    client = Client(base_url=url, api_key=_api_key())
     resp = client.embeddings.create(
         input="hello world", model="text-embedding-3-small"
     )
@@ -105,7 +122,7 @@ def test_embed_endpoint_base64_round_trip_via_openai_compat() -> None:
     assert url is not None
     _wait_for_health(url)
     client = openai.OpenAI(
-        base_url=f"{url.rstrip('/')}/v1", api_key="not_needed"
+        base_url=f"{url.rstrip('/')}/v1", api_key=_api_key() or "not_needed"
     )
     resp = client.embeddings.create(
         input="hello world",
@@ -149,10 +166,12 @@ def test_retrieve_after_direct_ingest_returns_results() -> None:
             }
         ],
     }
+    headers = {"Content-Type": "application/json"}
+    headers.update(_auth_headers(_ingest_api_key()))
     r = requests.post(
         f"{ingestion.rstrip('/')}/v1/ingest",
         json=ingest_body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         timeout=5.0,
     )
     # Soft check: 200, 202, or 4xx-with-warning are all acceptable
@@ -163,7 +182,7 @@ def test_retrieve_after_direct_ingest_returns_results() -> None:
 
     time.sleep(0.5)
 
-    client = Client(base_url=retrieval, api_key="not_needed")
+    client = Client(base_url=retrieval, api_key=_api_key())
     response = client.retrieve(
         tenant_id=tenant_id, query=unique_phrase, top_k=3
     )
@@ -184,7 +203,7 @@ def test_openai_python_sdk_drop_in() -> None:
     assert url is not None
     _wait_for_health(url)
     client = openai.OpenAI(
-        base_url=f"{url.rstrip('/')}/v1", api_key="not_needed"
+        base_url=f"{url.rstrip('/')}/v1", api_key=_api_key() or "not_needed"
     )
     resp = client.embeddings.create(
         input="hello from openai sdk", model="text-embedding-3-small"

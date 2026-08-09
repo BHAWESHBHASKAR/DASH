@@ -110,8 +110,8 @@ services:
       target: runtime
     image: dash/segment-maintenance:latest
     container_name: dash-segment-maintenance
-    # segment-maintenance-daemon runs its own loop; pass no --serve flag.
-    command: []
+    # segment-maintenance-daemon runs its own loop; no command override
+    # is needed (and no --serve flag is passed).
     volumes:
       - dash-state:/var/lib/dash
     environment:
