@@ -1,7 +1,7 @@
 # DASH Production-Readiness Remediation Plan
 
 Date: 2026-08-09  
-Status: in progress  
+Status: in progress — M1 e2e data path and M2 embedding provider selection implemented  
 Target: make the DASH vector/RAG engine safe to run in a production environment.
 
 ## 1. What "production ready" means for DASH
@@ -24,8 +24,9 @@ A production-ready DASH deployment must guarantee:
 | Container security | Good | non-root user, `cap_drop=[ALL]`, read-only disabled for state volume, mem/pids limits, healthchecks |
 | Compose persistence | Fixed | `DASH_*_PERSISTENCE_PATH` now points to `/var/lib/dash/state/*.redb` |
 | Metrics / health | Present | `/health`, `/metrics`, `/debug/placement` on both HTTP services |
-| **End-to-end data path** | **Broken** | ingestion and retrieval use separate WAL/segment dirs; no follower pull loop for retrieval |
-| **Real embedding providers** | **Scaffolding** | HTTP/ONNX adapters are not wired; default `HashEmbeddingProvider` is deterministic and not semantic |
+| **End-to-end data path** | **Fixed** | retrieval polls ingestion's replication endpoints every 250ms in compose; `test_retrieve_after_direct_ingest_returns_results` passes |
+| **Embedding provider selection** | **Fixed** | `/v1/embeddings` honors `DASH_EMBEDDING_PROVIDER` (ollama/openai/hash); hash remains the safe default |
+| **Real semantic embeddings** | **Scaffolding** | ollama/openai providers exist but default to hash; operators must set env vars and endpoint/credentials to get real semantic vectors |
 | **Control-plane HA** | **Missing** | no leader election, automatic failover, or multi-replica ack protocol in default compose |
 | **Backup / restore** | **Scripts exist, not automated** | `scripts/replication_lag_guard.sh`, `scripts/storage_promotion_boundary_guard.sh` exist but are not scheduled |
 
@@ -33,19 +34,14 @@ A production-ready DASH deployment must guarantee:
 
 ### P0 — must fix before any production traffic
 
-1. **ingestion -> retrieval data path in default compose**
-   - **Problem**: retrieval loads its own WAL at startup and never refreshes. Ingested data is not retrievable across the two services.
-   - **Options**:
-     a. *Follower pull*: teach `retrieval` to poll `ingestion`'s `/internal/replication/wal` and `/internal/replication/export` endpoints and apply deltas to a shared-mutable `InMemoryStore`.
-     b. *Shared read-only segment store*: make `ingestion` publish segments to a path that `retrieval` reads, and have `retrieval` load claim records from segments (not just claim IDs).
-     c. *Single local store*: run ingestion and retrieval as a single process with one WAL/segment dir (largest architectural change).
-   - **Recommended**: option (a). The replication endpoints already exist in ingestion; the retrieval side needs a background pull loop and the `InMemoryStore` made mutable behind `Arc<RwLock<...>>`.
-   - **Acceptance**: `sdks/python/tests/test_live_integration.py` `test_retrieve_after_direct_ingest_returns_results` asserts `len(response.results) > 0` and the retrieved claim matches the ingested `unique_phrase`.
+1. **ingestion -> retrieval data path in default compose** — **DONE**
+   - **Fix**: implemented a `retrieval` follower thread that polls `ingestion`'s replication endpoints and applies WAL deltas to a shared-mutable `InMemoryStore` behind `Arc<RwLock<...>>`.
+   - **Acceptance**: `sdks/python/tests/test_live_integration.py::test_retrieve_after_direct_ingest_returns_results` now asserts `len(response.results) > 0` and passes against `docker compose up`.
+   - **Follow-up**: follower offset is in-memory only, so a restarted replica re-applies the full upstream WAL (idempotent for claims, append-only for evidence/edges). Persist the last offset before M3.
 
-2. **Real embedding provider for semantic search**
-   - **Problem**: the default `HashEmbeddingProvider` returns deterministic vectors that do not encode semantic meaning. Production semantic retrieval requires an HTTP (OpenAI/Ollama) or ONNX backend.
-   - **Fix**: finish the `OpenAiEmbeddingProvider` / `OllamaEmbeddingProvider` and make one of them the default when `DASH_EMBEDDING_PROVIDER` is configured; gate `HashEmbeddingProvider` behind an explicit `test-only` setting.
-   - **Acceptance**: compose `retrieval` can answer a semantic query (`"what is the capital of France?"`) with the correct claim when using an external or mock embedding endpoint.
+2. **Real embedding provider for semantic search** — **PARTIALLY DONE**
+   - **Fix**: `/v1/embeddings` now uses `select_provider_from_env()` and supports `DASH_EMBEDDING_PROVIDER=ollama|openai|hash`.
+   - **Remaining**: default is still `hash`; production deployments must set `DASH_EMBEDDING_PROVIDER` and the corresponding endpoint/credential env vars. A future improvement is to warn/fail in strict mode when hash is used in production.
 
 ### P1 — strong confidence before production
 
@@ -80,13 +76,15 @@ A production-ready DASH deployment must guarantee:
 
 ## 4. Suggested first milestones
 
-| Milestone | Deliverable | ETA (Devin sessions) |
-|---|---|---|
-| M1 | retrieval follower pull loop + shared-mutable store | 1 session |
-| M2 | real HTTP embedding provider as default + integration test | 1 session |
-| M3 | remove placeholder secrets from compose + `.env.example` + docs | 0.5 session |
-| M4 | backup/restore scripts + recovery drill in CI | 0.5 session |
-| M5 | structured JSON logs + `/ready` probe | 0.5 session |
+| Milestone | Deliverable | State | ETA (Devin sessions) |
+|---|---|---|---|
+| M1 | retrieval follower pull loop + shared-mutable store | Done | 1 session |
+| M2 | embedding provider selection via `DASH_EMBEDDING_PROVIDER` | Done | 0.25 session |
+| M2b | real HTTP embedding provider as default + integration test | Not started | 0.75 session |
+| M3 | remove placeholder secrets from compose + `.env.example` + docs | Not started | 0.5 session |
+| M3b | persist follower replication offset | Not started | 0.25 session |
+| M4 | backup/restore scripts + recovery drill in CI | Not started | 0.5 session |
+| M5 | structured JSON logs + `/ready` probe | Not started | 0.5 session |
 
 ## 5. Risk register
 
@@ -102,3 +100,5 @@ A production-ready DASH deployment must guarantee:
 - 2026-08-09: chose `jsonwebtoken` 10 with `aws_lc_rs` over `rust_crypto` because `rust_crypto` pulled in vulnerable `rsa` 0.9.10 (RUSTSEC-2023-0071).
 - 2026-08-09: chose warning-by-default + `DASH_STRICT_SECRETS=1` exit-2 for placeholder secrets to preserve local quick-start while blocking production deployments.
 - 2026-08-09: chose follower pull (option a) for the e2e data path because ingestion already exposes the required replication endpoints and it minimizes changes to the existing storage layout.
+- 2026-08-09: implemented the retrieval follower pull loop with `Arc<RwLock<InMemoryStore>>` and `clear_wal_events()` to keep the in-memory WAL buffer from growing unbounded on follower nodes.
+- 2026-08-09: wired `select_provider_from_env()` into `/v1/embeddings` so `DASH_EMBEDDING_PROVIDER=ollama|openai|hash` works without code changes.

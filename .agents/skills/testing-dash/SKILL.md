@@ -88,13 +88,13 @@ curl -X POST http://127.0.0.1:8080/v1/retrieve \
 1. `segment-maintenance` container crash loop: the image `CMD`
    `["--serve"]` was passed to `segment-maintenance-daemon`, which does not
    accept `--serve`. The daemon runs its loop when started with no arguments.
-2. End-to-end data gap: ingestion writes WAL/segments to
-   `/var/lib/dash/wal/ingestion.wal` and `/var/lib/dash/segments/ingestion`,
-   while retrieval reads from `/var/lib/dash/wal/retrieval.wal` and
-   `/var/lib/dash/segments/retrieval` (`docker-compose.yml` defaults). No
-   compose-level replication path is configured, so a retrieve after an
-   ingest returns an empty `results` array by default.
-3. Python live integration tests (`sdks/python/tests/test_live_integration.py`)
+2. End-to-end data gap: **fixed**. `retrieval` now polls `ingestion`'s
+   `/internal/replication/wal` endpoint every 250ms in the default compose
+   (`DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081`). A retrieve
+   after an ingest now returns the ingested claim.
+3. Follower replication offset is currently in-memory only, so a restarted
+   `retrieval` replica re-applies the full upstream WAL on startup.
+4. Python live integration tests (`sdks/python/tests/test_live_integration.py`)
    read API keys from `DASH_LIVE_API_KEY` (retrieval) and
    `DASH_LIVE_INGEST_API_KEY` (ingestion, falling back to `DASH_LIVE_API_KEY`).
    Set these before running the tests; no default secrets are included.
