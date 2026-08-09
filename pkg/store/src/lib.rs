@@ -864,6 +864,14 @@ impl InMemoryStore {
         self.wal.len()
     }
 
+    /// Clear the in-memory WAL event buffer without affecting the
+    /// stored claims/evidence/edges. This is used by follower replicas
+    /// that apply replicated records to an in-memory store but never
+    /// truncate their own WAL file.
+    pub fn clear_wal_events(&mut self) {
+        self.wal.clear();
+    }
+
     pub fn claims_len(&self) -> usize {
         self.claims.len()
     }

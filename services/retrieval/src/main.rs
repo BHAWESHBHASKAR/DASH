@@ -1,4 +1,8 @@
-use retrieval::{retrieve_for_rag, transport::serve_http_with_workers};
+use std::sync::{Arc, RwLock};
+
+use retrieval::{
+    replication::spawn_replication_follower, retrieve_for_rag, transport::serve_http_with_workers,
+};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
@@ -149,20 +153,29 @@ fn main() {
         store
     };
 
+    let shared_store = Arc::new(RwLock::new(store));
+    spawn_replication_follower(Arc::clone(&shared_store));
+
     if serve_mode {
-        println!("retrieval transport listening on http://{bind_addr}");
-        println!("retrieval transport workers: {http_workers}");
-        println!(
-            "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-            store.ann_tuning().max_neighbors_base,
-            store.ann_tuning().max_neighbors_upper,
-            store.ann_tuning().search_expansion_factor,
-            store.ann_tuning().search_expansion_min,
-            store.ann_tuning().search_expansion_max
-        );
-        println!("retrieval vector backend: {}", store.vector_backend_label());
-        if let Some(segment_dir) = segment_dir.as_deref() {
-            println!("retrieval segment read dir: {segment_dir}");
+        {
+            let store_guard = shared_store.read().unwrap_or_else(|p| p.into_inner());
+            println!("retrieval transport listening on http://{bind_addr}");
+            println!("retrieval transport workers: {http_workers}");
+            println!(
+                "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
+                store_guard.ann_tuning().max_neighbors_base,
+                store_guard.ann_tuning().max_neighbors_upper,
+                store_guard.ann_tuning().search_expansion_factor,
+                store_guard.ann_tuning().search_expansion_min,
+                store_guard.ann_tuning().search_expansion_max
+            );
+            println!(
+                "retrieval vector backend: {}",
+                store_guard.vector_backend_label()
+            );
+            if let Some(segment_dir) = segment_dir.as_deref() {
+                println!("retrieval segment read dir: {segment_dir}");
+            }
         }
         if let Some(placement_file) =
             env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
@@ -193,7 +206,8 @@ fn main() {
         // threads finish, then the process exits cleanly.
         let shutdown = dash_common::ShutdownSignal::install();
         eprintln!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
-        if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers, shutdown) {
+        if let Err(err) = serve_http_with_workers(shared_store, &bind_addr, http_workers, shutdown)
+        {
             eprintln!("retrieval transport failed: {err}");
             std::process::exit(1);
         }

@@ -88,8 +88,9 @@ services:
       DASH_BIN: retrieval
       DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
       DASH_RETRIEVAL_BIND: 0.0.0.0:8080
-      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/wal/retrieval.wal
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
+      DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081
+      DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
       DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:-change-me-retrieval-key}
       DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:-change-me-retrieval-jwt}
     healthcheck:

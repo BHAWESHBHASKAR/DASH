@@ -150,19 +150,22 @@ def test_retrieve_after_direct_ingest_returns_results() -> None:
 
     tenant_id = f"test-tenant-{uuid.uuid4().hex[:8]}"
     unique_phrase = f"distinctive phrase {uuid.uuid4().hex[:12]}"
+    claim_id = f"claim-{uuid.uuid4().hex[:8]}"
 
     ingest_body = {
-        "tenant_id": tenant_id,
-        "bundles": [
+        "claim": {
+            "claim_id": claim_id,
+            "tenant_id": tenant_id,
+            "canonical_text": unique_phrase,
+            "confidence": 0.9,
+        },
+        "evidence": [
             {
-                "claim_id": f"claim-{uuid.uuid4().hex[:8]}",
-                "text": unique_phrase,
-                "evidence": [
-                    {
-                        "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
-                        "text": f"Evidence supporting: {unique_phrase}",
-                    }
-                ],
+                "evidence_id": f"ev-{uuid.uuid4().hex[:8]}",
+                "claim_id": claim_id,
+                "source_id": "test://integration",
+                "stance": "supports",
+                "source_quality": 0.8,
             }
         ],
     }
@@ -180,18 +183,24 @@ def test_retrieve_after_direct_ingest_returns_results() -> None:
     if r.status_code >= 500:
         pytest.fail(f"ingest 5xx: {r.status_code} {r.text}")
 
-    time.sleep(0.5)
-
+    deadline = time.time() + 5.0
     client = Client(base_url=retrieval, api_key=_api_key())
-    response = client.retrieve(
-        tenant_id=tenant_id, query=unique_phrase, top_k=3
-    )
-    # The retrieve call may return 0 results on a fresh tenant,
-    # which is acceptable end-to-end behavior; the test's value
-    # is in exercising the wire format, not in asserting a
-    # specific result count.
-    assert response is not None
+    response = None
+    last_error: Optional[Exception] = None
+    while time.time() < deadline:
+        try:
+            response = client.retrieve(
+                tenant_id=tenant_id, query=unique_phrase, top_k=3
+            )
+            if len(response.results) > 0:
+                break
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.25)
+
+    assert response is not None, f"retrieve call failed: {last_error}"
     assert hasattr(response, "results")
+    assert len(response.results) > 0
 
 
 def test_openai_python_sdk_drop_in() -> None:

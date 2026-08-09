@@ -4,7 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -798,13 +798,13 @@ fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
     stream.write_all(response.as_bytes())
 }
 
-pub fn serve_http(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+pub fn serve_http(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let shutdown = dash_common::ShutdownSignal::install();
     serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
 }
 
 pub fn serve_http_with_workers(
-    store: &InMemoryStore,
+    store: Arc<RwLock<InMemoryStore>>,
     bind_addr: &str,
     worker_count: usize,
     shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
@@ -834,6 +834,7 @@ pub fn serve_http_with_workers(
             let rx = Arc::clone(&rx);
             let placement_routing = Arc::clone(&placement_routing);
             let backpressure_metrics = Arc::clone(&backpressure_metrics);
+            let store = Arc::clone(&store);
             scope.spawn(move || {
                 loop {
                     let stream = {
@@ -849,7 +850,8 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) = handle_connection(store, stream, &metrics, &placement_routing)
+                    if let Err(err) =
+                        handle_connection(&store, stream, &metrics, &placement_routing)
                     {
                         eprintln!("retrieval transport error: {err}");
                     }
@@ -906,13 +908,13 @@ pub fn serve_http_with_workers(
     Ok(())
 }
 
-pub fn serve_http_once(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+pub fn serve_http_once(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     serve_http_once_with_listener(store, listener)
 }
 
 pub fn serve_http_once_with_listener(
-    store: &InMemoryStore,
+    store: Arc<RwLock<InMemoryStore>>,
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -925,7 +927,7 @@ pub fn serve_http_once_with_listener(
         },
     )?));
     let (stream, _) = listener.accept()?;
-    handle_connection(store, stream, &metrics, &placement_routing)
+    handle_connection(&store, stream, &metrics, &placement_routing)
 }
 
 pub fn handle_http_request_bytes(
@@ -998,7 +1000,7 @@ pub fn handle_http_request_bytes(
 }
 
 fn handle_connection(
-    store: &InMemoryStore,
+    store: &Arc<RwLock<InMemoryStore>>,
     mut stream: TcpStream,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
@@ -1035,8 +1037,9 @@ fn handle_connection(
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_placement_reload_snapshot(&reload_snapshot);
     }
+    let store_guard = store.read().unwrap_or_else(|p| p.into_inner());
     let response = handle_request_with_metrics_and_reload(
-        store,
+        &store_guard,
         &request,
         metrics,
         routing_snapshot.as_ref(),
