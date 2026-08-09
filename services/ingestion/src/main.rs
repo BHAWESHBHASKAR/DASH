@@ -86,6 +86,15 @@ fn main() {
         }
     };
 
+    if let Err(reason) = validate_startup_secrets() {
+        if dash_common::strict_secrets_enabled() {
+            eprintln!("ingestion startup secret validation failed: {reason}");
+            std::process::exit(2);
+        } else {
+            eprintln!("ingestion startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)");
+        }
+    }
+
     let input = IngestInput {
         claim: Claim {
             claim_id: "sample-claim".into(),
@@ -204,10 +213,8 @@ fn main() {
                 Ok(updated) => {
                     match updated.disk_status() {
                         store::DiskStatus::Unavailable { reason } => {
-                            tracing::error!(
-                                disk_path = %disk_path,
-                                error = %reason,
-                                "ingestion redb open failed; falling back to in-memory mode"
+                            eprintln!(
+                                "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
                             );
                         }
                         _ => {
@@ -221,10 +228,8 @@ fn main() {
                     // Kept for defensive completeness. Reconstruct
                     // a disk-less store with Unavailable status so
                     // the rest of the function has a usable store.
-                    tracing::error!(
-                        disk_path = %disk_path,
-                        error = %err,
-                        "ingestion redb open failed; falling back to in-memory mode"
+                    eprintln!(
+                        "ingestion redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
                     );
                     // We can't reconstruct the original (it was
                     // moved into with_disk). In practice this is
@@ -370,6 +375,41 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn validate_startup_secrets() -> Result<(), String> {
+    let api_key = env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY");
+    let api_keys = env_with_fallback("DASH_INGEST_API_KEYS", "EME_INGEST_API_KEYS");
+    let jwt_secret = env_with_fallback(
+        "DASH_INGEST_JWT_HS256_SECRET",
+        "EME_INGEST_JWT_HS256_SECRET",
+    );
+    let jwt_secrets = env_with_fallback(
+        "DASH_INGEST_JWT_HS256_SECRETS",
+        "EME_INGEST_JWT_HS256_SECRETS",
+    );
+
+    if let Some(value) = api_key.as_deref() {
+        dash_common::validate_secret(value, "DASH_INGEST_API_KEY")?;
+    }
+    if let Some(value) = api_keys.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_API_KEYS")?;
+    }
+    if let Some(value) = jwt_secret.as_deref() {
+        dash_common::validate_secret(value, "DASH_INGEST_JWT_HS256_SECRET")?;
+    }
+    if let Some(value) = jwt_secrets.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_JWT_HS256_SECRETS")?;
+    }
+
+    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
+        return Err(
+            "DASH_STRICT_SECRETS=1 requires at least one ingest API key (DASH_INGEST_API_KEY or DASH_INGEST_API_KEYS)"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_env_with_fallback<T>(primary: &str, fallback: &str) -> Option<T>

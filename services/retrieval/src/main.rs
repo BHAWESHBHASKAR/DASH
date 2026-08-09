@@ -17,6 +17,15 @@ fn main() {
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");
 
+    if let Err(reason) = validate_startup_secrets() {
+        if dash_common::strict_secrets_enabled() {
+            eprintln!("retrieval startup secret validation failed: {reason}");
+            std::process::exit(2);
+        } else {
+            eprintln!("retrieval startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)");
+        }
+    }
+
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
@@ -195,6 +204,41 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn validate_startup_secrets() -> Result<(), String> {
+    let api_key = env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY");
+    let api_keys = env_with_fallback("DASH_RETRIEVAL_API_KEYS", "EME_RETRIEVAL_API_KEYS");
+    let jwt_secret = env_with_fallback(
+        "DASH_RETRIEVAL_JWT_HS256_SECRET",
+        "EME_RETRIEVAL_JWT_HS256_SECRET",
+    );
+    let jwt_secrets = env_with_fallback(
+        "DASH_RETRIEVAL_JWT_HS256_SECRETS",
+        "EME_RETRIEVAL_JWT_HS256_SECRETS",
+    );
+
+    if let Some(value) = api_key.as_deref() {
+        dash_common::validate_secret(value, "DASH_RETRIEVAL_API_KEY")?;
+    }
+    if let Some(value) = api_keys.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_RETRIEVAL_API_KEYS")?;
+    }
+    if let Some(value) = jwt_secret.as_deref() {
+        dash_common::validate_secret(value, "DASH_RETRIEVAL_JWT_HS256_SECRET")?;
+    }
+    if let Some(value) = jwt_secrets.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_RETRIEVAL_JWT_HS256_SECRETS")?;
+    }
+
+    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
+        return Err(
+            "DASH_STRICT_SECRETS=1 requires at least one retrieval API key (DASH_RETRIEVAL_API_KEY or DASH_RETRIEVAL_API_KEYS)"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_http_workers() -> usize {

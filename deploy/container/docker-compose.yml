@@ -20,6 +20,8 @@ x-base-env: &base-env
   RUST_LOG: ${RUST_LOG:-info,dash=debug}
   DASH_HOME: /opt/dash
   DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
+  DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
+  DASH_RETRIEVAL_PERSISTENCE_PATH: /var/lib/dash/state/retrieval.redb
   # WAL durability knobs that ingestion and retrieval both honor.
   # Override per-service if you need to tune.
   DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"

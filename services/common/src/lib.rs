@@ -61,3 +61,64 @@ pub fn wait_for_drain(graceful_deadline: Duration) -> Duration {
     }
     start.elapsed()
 }
+
+const PLACEHOLDER_PATTERNS: &[&str] = &[
+    "change-me",
+    "placeholder",
+    "replace-me",
+    "example",
+    "sample",
+];
+
+/// Minimum secret length enforced in strict mode.
+pub const SECRET_MIN_LENGTH: usize = 16;
+
+/// Validate that a secret is non-empty, is not a known placeholder,
+/// and meets a minimum length. Returns an error string describing
+/// the first problem found.
+pub fn validate_secret(value: &str, name: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{name} is empty"));
+    }
+    let lower = trimmed.to_lowercase();
+    for pattern in PLACEHOLDER_PATTERNS {
+        if lower == *pattern || lower.starts_with(&format!("{pattern}-")) || lower.contains(pattern)
+        {
+            return Err(format!(
+                "{name} appears to be a placeholder value ('{trimmed}')"
+            ));
+        }
+    }
+    if trimmed.len() < SECRET_MIN_LENGTH {
+        return Err(format!(
+            "{name} is too short ({len} chars, minimum {SECRET_MIN_LENGTH})",
+            len = trimmed.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a comma-separated list of secrets, skipping empty entries.
+pub fn validate_secret_csv(values: Option<&str>, name: &str) -> Result<(), String> {
+    if let Some(raw) = values {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                validate_secret(trimmed, name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when `DASH_STRICT_SECRETS` is set to `1` or `true`.
+/// In strict mode services should refuse to start with weak or
+/// placeholder secrets; in non-strict mode they should emit a warning
+/// and continue so local development is not blocked.
+pub fn strict_secrets_enabled() -> bool {
+    matches!(
+        std::env::var("DASH_STRICT_SECRETS").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}

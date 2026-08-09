@@ -32,6 +32,9 @@ cd deploy/container && docker compose -f docker-compose.yml up -d --build
 
 - None for local validation. Set `DASH_INGEST_API_KEY` and
   `DASH_RETRIEVAL_API_KEY` in a `.env` file or shell before starting compose.
+- The Docker Compose defaults use `change-me-*` placeholder keys. Services
+  will emit a startup warning; set `DASH_STRICT_SECRETS=1` to fail on
+  placeholder or short secrets in production.
 
 ## Service endpoints and keys
 
