@@ -28,7 +28,7 @@ mod segment_runtime;
 mod server_runtime;
 
 use audit::{AuditEvent, emit_audit_event};
-use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
+pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
 use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,

@@ -39,7 +39,7 @@ mod payload;
 use audit::{AuditEvent, append_audit_record};
 #[cfg(test)]
 use audit::{audit_chain_states, is_sha256_hex};
-use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
+pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
@@ -1204,7 +1204,12 @@ fn handle_request_with_metrics_and_reload(
         ("GET", "/debug/planner") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::ReadOnly,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         emit_audit_event(
@@ -1252,7 +1257,12 @@ fn handle_request_with_metrics_and_reload(
         ("GET", "/debug/storage-visibility") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::ReadOnly,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         emit_audit_event(
@@ -1327,7 +1337,12 @@ fn handle_request_with_metrics_and_reload(
                     return HttpResponse::bad_request(&err);
                 }
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::Retrieve,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         if let Ok(mut guard) = metrics.lock() {
@@ -1424,7 +1439,12 @@ fn handle_request_with_metrics_and_reload(
                         return HttpResponse::bad_request(&err);
                     }
                     let tenant_id = req.tenant_id.clone();
-                    match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                    match authorize_request_for_tenant(
+                        request,
+                        &tenant_id,
+                        &auth_policy,
+                        Role::Retrieve,
+                    ) {
                         AuthDecision::Unauthorized(reason) => {
                             observe_auth_failure(metrics);
                             if let Ok(mut guard) = metrics.lock() {
@@ -3401,7 +3421,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a,tenant-b".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-b", &policy),
+            authorize_request_for_tenant(&request, "tenant-b", &policy, Role::Retrieve),
             AuthDecision::Allowed
         );
     }
@@ -3417,7 +3437,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
         let policy =
             AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-z", &policy),
+            authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Retrieve),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
         );
     }
@@ -3438,7 +3458,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a,tenant-b".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
         );
     }
@@ -3453,7 +3473,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
         };
         let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
         );
     }
@@ -3474,7 +3494,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             None,
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Allowed
         );
     }
@@ -3495,7 +3515,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("API key revoked")
         );
     }

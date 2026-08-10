@@ -1073,7 +1073,7 @@ fn auth_policy_scoped_key_allows_configured_tenant() {
         Some("scope-a:tenant-a,tenant-b".to_string()),
     );
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-b", &policy),
+        authorize_request_for_tenant(&request, "tenant-b", &policy, Role::Ingest),
         AuthDecision::Allowed
     );
 }
@@ -1088,7 +1088,7 @@ fn auth_policy_scoped_key_rejects_other_tenants() {
     };
     let policy = AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-z", &policy),
+        authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Ingest),
         AuthDecision::Forbidden("tenant is not allowed for this API key")
     );
 }
@@ -1109,7 +1109,7 @@ fn auth_policy_scoped_key_rejects_unknown_key_when_required_keys_are_unset() {
         Some("scope-a:tenant-a,tenant-b".to_string()),
     );
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-a", &policy),
+        authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Unauthorized("missing or invalid API key")
     );
 }
@@ -1124,7 +1124,7 @@ fn auth_policy_required_key_rejects_missing_key() {
     };
     let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-a", &policy),
+        authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Unauthorized("missing or invalid API key")
     );
 }
@@ -1145,7 +1145,7 @@ fn auth_policy_required_key_set_supports_rotation() {
         None,
     );
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-a", &policy),
+        authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Allowed
     );
 }
@@ -1166,7 +1166,7 @@ fn auth_policy_revoked_key_is_denied() {
         Some("scope-a:tenant-a".to_string()),
     );
     assert_eq!(
-        authorize_request_for_tenant(&request, "tenant-a", &policy),
+        authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Unauthorized("API key revoked")
     );
 }

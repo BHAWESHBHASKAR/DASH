@@ -3,23 +3,41 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use auth::{JwtValidationConfig, JwtValidationError, verify_hs256_token_for_tenant};
+use auth::{
+    JwtValidationConfig, JwtValidationError, OidcValidationConfig, verify_hs256_token_for_tenant,
+    verify_oidc_token_for_tenant,
+};
+pub use auth::{Role, RoleSet, parse_role_claim};
 
 use super::{HttpRequest, env_with_fallback};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum AuthDecision {
+pub(crate) enum AuthDecision {
     Allowed,
     Unauthorized(&'static str),
     Forbidden(&'static str),
 }
 
-pub(super) struct AuthPolicy {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwtMode {
+    Hs256,
+    Oidc,
+}
+
+struct ScopedKey {
+    tenant_scope: TenantScope,
+    roles: RoleSet,
+}
+
+pub(crate) struct AuthPolicy {
     required_api_keys: HashSet<String>,
     revoked_api_keys: HashSet<String>,
     allowed_tenants: TenantScope,
-    scoped_api_keys: HashMap<String, TenantScope>,
+    scoped_api_keys: HashMap<String, ScopedKey>,
     jwt_validation: Option<JwtValidationConfig>,
+    oidc_validation: Option<OidcValidationConfig>,
+    jwt_mode: JwtMode,
+    jwt_role_claim: String,
     rate_limiter: Option<TenantRateLimiter>,
     revocation_list: Option<RevocationList>,
 }
@@ -39,7 +57,21 @@ impl AuthPolicy {
             ),
             revoked_api_keys: parse_api_key_set(None, revoked_api_keys_raw.as_deref()),
             allowed_tenants: parse_tenant_scope(allowed_tenants_raw.as_deref(), true),
-            scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref()),
+            scoped_api_keys: parse_scoped_api_keys(scoped_api_keys_raw.as_deref(), Role::Ingest),
+            jwt_role_claim: env_with_fallback(
+                "DASH_INGEST_JWT_ROLE_CLAIM",
+                "EME_INGEST_JWT_ROLE_CLAIM",
+            )
+            .as_deref()
+            .map(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    "dash_roles".to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .unwrap_or_else(|| "dash_roles".to_string()),
             jwt_validation: parse_jwt_validation_config(
                 env_with_fallback(
                     "DASH_INGEST_JWT_HS256_SECRET",
@@ -66,6 +98,28 @@ impl AuthPolicy {
                 "DASH_INGEST_REVOKED_KEYS_PATH",
                 "EME_INGEST_REVOKED_KEYS_PATH",
             )),
+            oidc_validation: parse_oidc_validation_config(
+                parse_jwt_mode(
+                    env_with_fallback("DASH_INGEST_JWT_PROVIDER", "EME_INGEST_JWT_PROVIDER")
+                        .as_deref(),
+                ),
+                env_with_fallback("DASH_INGEST_JWT_JWKS_URL", "EME_INGEST_JWT_JWKS_URL"),
+                env_with_fallback("DASH_INGEST_JWT_ISSUER", "EME_INGEST_JWT_ISSUER"),
+                env_with_fallback("DASH_INGEST_JWT_AUDIENCE", "EME_INGEST_JWT_AUDIENCE"),
+                env_with_fallback("DASH_INGEST_JWT_LEEWAY_SECS", "EME_INGEST_JWT_LEEWAY_SECS"),
+                env_with_fallback("DASH_INGEST_JWT_REQUIRE_EXP", "EME_INGEST_JWT_REQUIRE_EXP"),
+                env_with_fallback(
+                    "DASH_INGEST_JWT_JWKS_REFRESH_MINUTES",
+                    "EME_INGEST_JWT_JWKS_REFRESH_MINUTES",
+                ),
+                env_with_fallback(
+                    "DASH_INGEST_JWT_TENANT_CLAIMS",
+                    "EME_INGEST_JWT_TENANT_CLAIMS",
+                ),
+            ),
+            jwt_mode: parse_jwt_mode(
+                env_with_fallback("DASH_INGEST_JWT_PROVIDER", "EME_INGEST_JWT_PROVIDER").as_deref(),
+            ),
         }
     }
 }
@@ -85,19 +139,48 @@ impl TenantScope {
     }
 }
 
-pub(super) fn authorize_request_for_tenant(
+pub(crate) fn authorize_request_for_tenant(
     request: &HttpRequest,
     tenant_id: &str,
     policy: &AuthPolicy,
+    required_role: Role,
 ) -> AuthDecision {
+    if let Some(oidc_config) = policy.oidc_validation.as_ref()
+        && let Some(token) = presented_bearer_token(request)
+        && bearer_looks_like_jwt(token)
+        && policy.jwt_mode == JwtMode::Oidc
+    {
+        return match verify_oidc_token_for_tenant(token, tenant_id, oidc_config, unix_now_secs()) {
+            Ok(claims) => {
+                if !policy.allowed_tenants.allows(tenant_id) {
+                    AuthDecision::Forbidden("tenant is not allowed by service policy")
+                } else if !parse_role_claim(&claims, &policy.jwt_role_claim).allows(required_role) {
+                    AuthDecision::Forbidden("role is not allowed for this JWT")
+                } else {
+                    AuthDecision::Allowed
+                }
+            }
+            Err(JwtValidationError::TenantNotAllowed) => {
+                AuthDecision::Forbidden("tenant is not allowed for this JWT")
+            }
+            Err(JwtValidationError::Expired) => AuthDecision::Unauthorized("JWT expired"),
+            Err(JwtValidationError::OidcProviderError(_)) => {
+                AuthDecision::Unauthorized("OIDC provider unreachable")
+            }
+            Err(_) => AuthDecision::Unauthorized("invalid OIDC token"),
+        };
+    }
+
     if let Some(jwt_config) = policy.jwt_validation.as_ref()
         && let Some(token) = presented_bearer_token(request)
         && bearer_looks_like_jwt(token)
     {
         return match verify_hs256_token_for_tenant(token, tenant_id, jwt_config, unix_now_secs()) {
-            Ok(()) => {
+            Ok(claims) => {
                 if !policy.allowed_tenants.allows(tenant_id) {
                     AuthDecision::Forbidden("tenant is not allowed by service policy")
+                } else if !parse_role_claim(&claims, &policy.jwt_role_claim).allows(required_role) {
+                    AuthDecision::Forbidden("role is not allowed for this JWT")
                 } else {
                     AuthDecision::Allowed
                 }
@@ -124,22 +207,33 @@ pub(super) fn authorize_request_for_tenant(
         return AuthDecision::Unauthorized("API key revoked");
     }
 
-    if !policy.scoped_api_keys.is_empty() {
+    let api_key_roles = if !policy.scoped_api_keys.is_empty() {
         let Some(api_key) = maybe_api_key else {
             return AuthDecision::Unauthorized("missing or invalid API key");
         };
-        if let Some(scope) = policy.scoped_api_keys.get(api_key) {
-            if !scope.allows(tenant_id) {
+        if let Some(scoped) = policy.scoped_api_keys.get(api_key) {
+            if !scoped.tenant_scope.allows(tenant_id) {
                 return AuthDecision::Forbidden("tenant is not allowed for this API key");
             }
+            Some(scoped.roles.clone())
         } else if policy.required_api_keys.is_empty() || !policy.required_api_keys.contains(api_key)
         {
             return AuthDecision::Unauthorized("missing or invalid API key");
+        } else {
+            None
         }
     } else if !policy.required_api_keys.is_empty()
         && !matches!(maybe_api_key, Some(key) if policy.required_api_keys.contains(key))
     {
         return AuthDecision::Unauthorized("missing or invalid API key");
+    } else {
+        None
+    };
+
+    if let Some(roles) = api_key_roles
+        && !roles.allows(required_role)
+    {
+        return AuthDecision::Forbidden("role is not allowed for this API key");
     }
 
     if !policy.allowed_tenants.allows(tenant_id) {
@@ -206,7 +300,7 @@ fn parse_tenant_scope(raw: Option<&str>, empty_means_any: bool) -> TenantScope {
     }
 }
 
-fn parse_scoped_api_keys(raw: Option<&str>) -> HashMap<String, TenantScope> {
+fn parse_scoped_api_keys(raw: Option<&str>, default_role: Role) -> HashMap<String, ScopedKey> {
     let mut scoped = HashMap::new();
     let Some(raw) = raw else {
         return scoped;
@@ -217,16 +311,32 @@ fn parse_scoped_api_keys(raw: Option<&str>) -> HashMap<String, TenantScope> {
         if entry.is_empty() {
             continue;
         }
-        let Some((raw_key, raw_scope)) = entry.split_once(':') else {
+        let parts: Vec<&str> = entry.splitn(3, ':').collect();
+        if parts.len() < 2 {
             continue;
-        };
-        let key = raw_key.trim();
+        }
+        let key = parts[0].trim();
         if key.is_empty() {
             continue;
         }
+        let tenant_scope = parse_tenant_scope(Some(parts[1].trim()), false);
+        let roles = if parts.len() == 3 {
+            RoleSet::from_roles(
+                parts[2]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .filter_map(Role::parse),
+            )
+        } else {
+            RoleSet::from_roles(std::iter::once(default_role))
+        };
         scoped.insert(
             key.to_string(),
-            parse_tenant_scope(Some(raw_scope.trim()), false),
+            ScopedKey {
+                tenant_scope,
+                roles,
+            },
         );
     }
     scoped
@@ -296,6 +406,83 @@ fn parse_jwt_validation_config(
         }),
         leeway_secs,
         require_exp,
+    })
+}
+
+fn parse_jwt_mode(raw: Option<&str>) -> JwtMode {
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        Some("oidc") => JwtMode::Oidc,
+        _ => JwtMode::Hs256,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_oidc_validation_config(
+    mode: JwtMode,
+    jwks_url_raw: Option<String>,
+    issuer_raw: Option<String>,
+    audience_raw: Option<String>,
+    leeway_secs_raw: Option<String>,
+    require_exp_raw: Option<String>,
+    jwks_refresh_minutes_raw: Option<String>,
+    tenant_claims_raw: Option<String>,
+) -> Option<OidcValidationConfig> {
+    if mode != JwtMode::Oidc {
+        return None;
+    }
+    let jwks_url = jwks_url_raw?;
+    let jwks_url = jwks_url.trim();
+    if jwks_url.is_empty() {
+        return None;
+    }
+    let issuer = issuer_raw?;
+    let issuer = issuer.trim();
+    if issuer.is_empty() {
+        return None;
+    }
+    let leeway_secs = leeway_secs_raw
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let require_exp = parse_bool_env_default(require_exp_raw.as_deref(), true);
+    let jwks_refresh_minutes = jwks_refresh_minutes_raw
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(15);
+    let audience = audience_raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let tenant_claims = tenant_claims_raw
+        .as_deref()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<String>>()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "tenant_id".to_string(),
+                "tenants".to_string(),
+                "tenant_ids".to_string(),
+            ]
+        });
+    Some(OidcValidationConfig {
+        issuer: issuer.to_string(),
+        audience,
+        jwks_url: jwks_url.to_string(),
+        jwks_refresh_minutes,
+        leeway_secs,
+        require_exp,
+        tenant_claims,
     })
 }
 
