@@ -54,15 +54,25 @@ Concretely, every retrieval response in DASH is `{ claim, score, supports, contr
 The five-minute path from clone to retrieval query. Requires Docker.
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+make docker
+```
+
+Or step-by-step:
+
+```bash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh
 docker compose -f deploy/container/docker-compose.yml up -d
 ```
 
-Ingest a claim with its supporting evidence:
+Ingest a claim with its supporting evidence (after `source deploy/container/.env`):
 
 ```bash
 curl -X POST http://localhost:8081/v1/ingest \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "claim": {
@@ -86,6 +96,7 @@ Retrieve with citations, dropping any claim that has been contradicted:
 
 ```bash
 curl -X POST http://localhost:8080/v1/retrieve \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "t1",
