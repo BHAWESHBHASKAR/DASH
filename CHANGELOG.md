@@ -21,6 +21,9 @@ to [Semantic Versioning](https://semver.org/).
   `UsageCounters`/`UsageSnapshot`, `GET /v1/usage` on both ingestion
   and retrieval, and per-tenant request/byte counters recorded on every
   successful ingest and retrieve. Embeddings are tracked separately.
+- **Operational dashboard** — `GET /dashboard` on the retrieval
+  service serves an HTML dashboard with health, usage, models, and a
+  retrieve form.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.

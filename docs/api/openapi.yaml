@@ -456,6 +456,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/OpenAIModelsResponse'
 
+  /dashboard:
+    get:
+      tags: [Retrieve]
+      summary: Operational dashboard
+      operationId: dashboard
+      responses:
+        '200':
+          description: HTML operational dashboard
+          content:
+            text/html:
+              schema:
+                type: string
+
   /v1/usage:
     get:
       tags: [Retrieve]

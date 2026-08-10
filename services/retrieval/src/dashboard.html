@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DASH Dashboard</title>
+  <style>
+    :root { --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --ok: #22c55e; --warn: #f59e0b; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 1.5rem; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+    h1 { margin: 0; font-size: 1.5rem; }
+    main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .card { background: var(--panel); border-radius: 0.75rem; padding: 1.25rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+    .card h2 { margin-top: 0; font-size: 1.1rem; color: var(--accent); }
+    .metric { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #334155; }
+    .metric:last-child { border-bottom: none; }
+    label { display: block; margin: 0.75rem 0 0.25rem; font-size: 0.9rem; }
+    input, button { font: inherit; padding: 0.5rem; border-radius: 0.375rem; border: 1px solid #475569; background: #0f172a; color: var(--text); }
+    button { cursor: pointer; background: var(--accent); color: #0f172a; border: none; font-weight: 600; }
+    button:hover { opacity: 0.9; }
+    pre { background: #0f172a; padding: 0.75rem; border-radius: 0.375rem; overflow: auto; max-height: 300px; font-size: 0.85rem; }
+    .status { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--ok); margin-right: 0.5rem; }
+    .status.warn { background: var(--warn); }
+    .status.err { background: #ef4444; }
+    .grid-2 { grid-column: 1 / -1; }
+    @media (min-width: 900px) { .grid-2 { grid-column: span 2; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DASH Operational Dashboard</h1>
+    <span id="health"><span class="status"></span>checking...</span>
+  </header>
+  <main>
+    <div class="card">
+      <h2>Service Health</h2>
+      <div class="metric"><span>HTTP</span><span id="http-status">-</span></div>
+      <div class="metric"><span>Claims loaded</span><span id="claim-count">-</span></div>
+      <div class="metric"><span>Uptime (s)</span><span id="uptime">-</span></div>
+    </div>
+    <div class="card">
+      <h2>Usage</h2>
+      <div id="usage-body">Loading...</div>
+    </div>
+    <div class="card">
+      <h2>Models</h2>
+      <ul id="models"></ul>
+    </div>
+    <div class="card grid-2">
+      <h2>Retrieve</h2>
+      <label for="tenant">Tenant</label>
+      <input id="tenant" type="text" value="sample-tenant">
+      <label for="query">Query</label>
+      <input id="query" type="text" value="DASH retrieval service initialized">
+      <label for="topk">Top K</label>
+      <input id="topk" type="number" value="3" min="1" max="20">
+      <br>
+      <button id="retrieve-btn">Retrieve</button>
+      <pre id="retrieve-result">Results will appear here.</pre>
+    </div>
+  </main>
+  <script>
+    async function get(path) {
+      const res = await fetch(path);
+      return res.ok ? res.json() : { error: res.statusText };
+    }
+    async function refresh() {
+      try {
+        const health = await get('/v1/health');
+        document.getElementById('health').innerHTML = '<span class="status"></span>healthy';
+        document.getElementById('http-status').textContent = '200 OK';
+      } catch (e) {
+        document.getElementById('health').innerHTML = '<span class="status err"></span>unhealthy';
+        document.getElementById('http-status').textContent = 'error';
+      }
+      const metrics = await get('/metrics');
+      const m = text => {
+        const match = metrics.match(new RegExp(`${text}\\s+(\\d+(?:\\.\\d+)?)\\b`));
+        return match ? match[1] : '-';
+      };
+      document.getElementById('claim-count').textContent = m('dash_retrieval_claims_loaded_total');
+      document.getElementById('uptime').textContent = m('dash_retrieval_uptime_seconds');
+
+      const usage = await get('/v1/usage');
+      if (usage.tenants && Object.keys(usage.tenants).length) {
+        let html = '';
+        for (const [tenant, counters] of Object.entries(usage.tenants)) {
+          html += `<div class="metric"><span>${tenant}</span><span>${counters.requests_total} req / ${counters.bytes_total} B</span></div>`;
+        }
+        document.getElementById('usage-body').innerHTML = html;
+      } else if (usage.embeddings) {
+        document.getElementById('usage-body').innerHTML = `<div class="metric"><span>Embedding requests</span><span>${usage.embeddings.requests_total}</span></div>`;
+      } else {
+        document.getElementById('usage-body').textContent = 'No usage recorded yet.';
+      }
+
+      const models = await get('/v1/models');
+      const list = document.getElementById('models');
+      list.innerHTML = '';
+      if (models.data) {
+        for (const model of models.data) {
+          const li = document.createElement('li');
+          li.textContent = `${model.id} (${model.owned_by})`;
+          list.appendChild(li);
+        }
+      }
+    }
+    document.getElementById('retrieve-btn').addEventListener('click', async () => {
+      const tenant = document.getElementById('tenant').value;
+      const query = document.getElementById('query').value;
+      const topk = document.getElementById('topk').value;
+      const url = `/v1/retrieve?tenant_id=${encodeURIComponent(tenant)}&query=${encodeURIComponent(query)}&top_k=${encodeURIComponent(topk)}`;
+      const res = await fetch(url);
+      document.getElementById('retrieve-result').textContent = res.ok ? JSON.stringify(await res.json(), null, 2) : `Error ${res.status}: ${res.statusText}`;
+    });
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

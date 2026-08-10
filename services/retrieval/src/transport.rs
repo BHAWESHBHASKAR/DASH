@@ -59,6 +59,7 @@ use payload::{
 };
 
 const METRICS_WINDOW_SIZE: usize = 2048;
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
@@ -1551,6 +1552,7 @@ fn handle_request_with_metrics_and_reload(
                 }
             }
         }
+        ("GET", "/dashboard") => HttpResponse::ok_html(DASHBOARD_HTML.to_string()),
         ("GET", "/v1/models") => {
             // OpenAI-compatible model list. Returns the models that can be
             // passed to `POST /v1/embeddings`.
@@ -1618,6 +1620,7 @@ fn handle_request_with_metrics_and_reload(
         | (_, "/ready")
         | (_, "/v1/ready")
         | (_, "/metrics")
+        | (_, "/dashboard")
         | (_, "/debug/placement")
         | (_, "/debug/planner")
         | (_, "/debug/storage-visibility") => {
@@ -2180,6 +2183,14 @@ impl HttpResponse {
         Self {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
+            body,
+        }
+    }
+
+    fn ok_html(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
             body,
         }
     }
@@ -3695,5 +3706,22 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert_eq!(response.status, 200);
         assert!(response.body.contains("\"tenant-a\""));
         assert!(response.body.contains("\"requests_total\":1"));
+    }
+
+    #[test]
+    fn transport_dashboard_endpoint_returns_html() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/dashboard".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response = handle_request_with_metrics(&store, &request, &metrics);
+        assert_eq!(response.status, 200);
+        assert!(response.content_type.contains("text/html"));
+        assert!(response.body.contains("DASH Operational Dashboard"));
+        assert!(response.body.contains("/v1/usage"));
     }
 }

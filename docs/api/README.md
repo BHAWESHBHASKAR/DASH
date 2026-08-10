@@ -107,6 +107,11 @@ the active embedding provider is selected by `DASH_EMBEDDING_PROVIDER`
 curl $OPENAI_API_BASE/models -H "Authorization: Bearer $OPENAI_API_KEY"
 ```
 
+### Operational dashboard
+
+Open `http://localhost:8080/dashboard` in a browser. It shows service health,
+per-tenant usage, available models, and a retrieve form.
+
 ### Running with real semantic embeddings (Ollama)
 
 ```bash
