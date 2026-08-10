@@ -87,7 +87,7 @@ A production-ready DASH deployment must guarantee:
 | M8 | disk-first segment serving tier | Done | 0.25 session |
 | M9 | object-storage backup/restore | Done | 0.75 session |
 | M10 | Helm control-plane + managed cloud scaffolding | Done | 0.75 session |
-| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Not started | 1.5 sessions |
+| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Planned — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
 
 ## 5. Risk register
 
