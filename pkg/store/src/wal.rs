@@ -42,8 +42,8 @@ pub enum WalEvent {
 #[derive(Debug, Clone)]
 pub(crate) enum PersistedRecord {
     Claim(Claim),
-    Evidence(Evidence),
-    Edge(ClaimEdge),
+    Evidence(Evidence, String),
+    Edge(ClaimEdge, String),
     ClaimVector(ClaimVectorRecord),
     BatchCommit(BatchCommitRecord),
 }
@@ -52,6 +52,7 @@ pub(crate) enum PersistedRecord {
 pub(crate) struct ClaimVectorRecord {
     pub(crate) claim_id: String,
     pub(crate) values: Vec<f32>,
+    pub(crate) tenant_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +61,7 @@ pub(crate) struct BatchCommitRecord {
     pub(crate) batch_size: usize,
     pub(crate) ts_unix_ms: u64,
     pub(crate) claim_ids: Vec<String>,
+    pub(crate) tenant_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,13 +195,19 @@ impl FileWal {
     fn aad_for_record(record: &PersistedRecord) -> &str {
         match record {
             PersistedRecord::Claim(claim) => &claim.tenant_id,
-            _ => "",
+            PersistedRecord::Evidence(_, tenant) => tenant,
+            PersistedRecord::Edge(_, tenant) => tenant,
+            PersistedRecord::ClaimVector(rec) => &rec.tenant_id,
+            PersistedRecord::BatchCommit(rec) => &rec.tenant_id,
         }
     }
 
     fn record_to_storage_line(&self, record: &PersistedRecord) -> Result<String, StoreError> {
         let plaintext = record_to_line(record);
         if let Some(provider) = self.encryption.as_ref() {
+            if provider.name() == "none" {
+                return Ok(plaintext);
+            }
             let aad = Self::aad_for_record(record);
             encrypt_storage_line(provider.as_ref(), &plaintext, aad)
                 .map_err(|e| StoreError::Io(e.to_string()))
@@ -256,22 +264,31 @@ impl FileWal {
         self.append_record(&PersistedRecord::Claim(claim.clone()))
     }
 
-    pub fn append_evidence(&mut self, evidence: &Evidence) -> Result<(), StoreError> {
-        self.append_record(&PersistedRecord::Evidence(evidence.clone()))
+    pub fn append_evidence(
+        &mut self,
+        evidence: &Evidence,
+        tenant_id: &str,
+    ) -> Result<(), StoreError> {
+        self.append_record(&PersistedRecord::Evidence(
+            evidence.clone(),
+            tenant_id.to_string(),
+        ))
     }
 
-    pub fn append_edge(&mut self, edge: &ClaimEdge) -> Result<(), StoreError> {
-        self.append_record(&PersistedRecord::Edge(edge.clone()))
+    pub fn append_edge(&mut self, edge: &ClaimEdge, tenant_id: &str) -> Result<(), StoreError> {
+        self.append_record(&PersistedRecord::Edge(edge.clone(), tenant_id.to_string()))
     }
 
     pub fn append_claim_vector(
         &mut self,
         claim_id: &str,
         values: &[f32],
+        tenant_id: &str,
     ) -> Result<(), StoreError> {
         self.append_record(&PersistedRecord::ClaimVector(ClaimVectorRecord {
             claim_id: claim_id.to_string(),
             values: values.to_vec(),
+            tenant_id: tenant_id.to_string(),
         }))
     }
 
@@ -281,12 +298,14 @@ impl FileWal {
         batch_size: usize,
         ts_unix_ms: u64,
         claim_ids: &[String],
+        tenant_id: &str,
     ) -> Result<(), StoreError> {
         self.append_record(&PersistedRecord::BatchCommit(BatchCommitRecord {
             commit_id: commit_id.to_string(),
             batch_size,
             ts_unix_ms,
             claim_ids: claim_ids.to_vec(),
+            tenant_id: tenant_id.to_string(),
         }))
     }
 
@@ -687,7 +706,7 @@ pub(crate) fn record_to_line(record: &PersistedRecord) -> String {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string())
         ),
-        PersistedRecord::Evidence(e) => format!(
+        PersistedRecord::Evidence(e, _) => format!(
             "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&e.evidence_id),
             escape_field(&e.claim_id),
@@ -716,7 +735,7 @@ pub(crate) fn record_to_line(record: &PersistedRecord) -> String {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "null".to_string())
         ),
-        PersistedRecord::Edge(edge) => format!(
+        PersistedRecord::Edge(edge, _) => format!(
             "G\t{}\t{}\t{}\t{}\t{}",
             escape_field(&edge.edge_id),
             escape_field(&edge.from_claim_id),
@@ -846,21 +865,24 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
             } else {
                 None
             };
-            Ok(PersistedRecord::Evidence(Evidence {
-                evidence_id: unescape_field(parts[1])?,
-                claim_id: unescape_field(parts[2])?,
-                source_id: unescape_field(parts[3])?,
-                stance: str_to_stance(parts[4])?,
-                source_quality: parts[5].parse::<f32>().map_err(|_| {
-                    StoreError::Parse("evidence record has invalid source_quality".to_string())
-                })?,
-                chunk_id,
-                span_start,
-                span_end,
-                doc_id,
-                extraction_model,
-                ingested_at,
-            }))
+            Ok(PersistedRecord::Evidence(
+                Evidence {
+                    evidence_id: unescape_field(parts[1])?,
+                    claim_id: unescape_field(parts[2])?,
+                    source_id: unescape_field(parts[3])?,
+                    stance: str_to_stance(parts[4])?,
+                    source_quality: parts[5].parse::<f32>().map_err(|_| {
+                        StoreError::Parse("evidence record has invalid source_quality".to_string())
+                    })?,
+                    chunk_id,
+                    span_start,
+                    span_end,
+                    doc_id,
+                    extraction_model,
+                    ingested_at,
+                },
+                String::new(),
+            ))
         }
         "G" => {
             if parts.len() != 6 {
@@ -868,17 +890,20 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
                     "edge record has invalid field count".to_string(),
                 ));
             }
-            Ok(PersistedRecord::Edge(ClaimEdge {
-                edge_id: unescape_field(parts[1])?,
-                from_claim_id: unescape_field(parts[2])?,
-                to_claim_id: unescape_field(parts[3])?,
-                relation: str_to_relation(parts[4])?,
-                strength: parts[5].parse::<f32>().map_err(|_| {
-                    StoreError::Parse("edge record has invalid strength".to_string())
-                })?,
-                reason_codes: vec![],
-                created_at: None,
-            }))
+            Ok(PersistedRecord::Edge(
+                ClaimEdge {
+                    edge_id: unescape_field(parts[1])?,
+                    from_claim_id: unescape_field(parts[2])?,
+                    to_claim_id: unescape_field(parts[3])?,
+                    relation: str_to_relation(parts[4])?,
+                    strength: parts[5].parse::<f32>().map_err(|_| {
+                        StoreError::Parse("edge record has invalid strength".to_string())
+                    })?,
+                    reason_codes: vec![],
+                    created_at: None,
+                },
+                String::new(),
+            ))
         }
         "V" => {
             if parts.len() != 3 {
@@ -889,6 +914,7 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
             Ok(PersistedRecord::ClaimVector(ClaimVectorRecord {
                 claim_id: unescape_field(parts[1])?,
                 values: unpack_f32_list(parts[2])?,
+                tenant_id: String::new(),
             }))
         }
         "B" => {
@@ -908,6 +934,7 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
                 batch_size,
                 ts_unix_ms,
                 claim_ids: unpack_string_list(parts[4])?,
+                tenant_id: String::new(),
             }))
         }
         _ => Err(StoreError::Parse("unknown wal record kind".to_string())),

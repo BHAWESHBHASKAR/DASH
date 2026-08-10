@@ -18,15 +18,16 @@ pub(super) fn append_input_to_wal(
     wal: &mut FileWal,
     input: &IngestInput,
 ) -> Result<(), StoreError> {
+    let tenant_id = &input.claim.tenant_id;
     wal.append_claim(&input.claim)?;
     for evidence in &input.evidence {
-        wal.append_evidence(evidence)?;
+        wal.append_evidence(evidence, tenant_id)?;
     }
     for edge in &input.edges {
-        wal.append_edge(edge)?;
+        wal.append_edge(edge, tenant_id)?;
     }
     if let Some(vector) = input.claim_embedding.as_deref() {
-        wal.append_claim_vector(&input.claim.claim_id, vector)?;
+        wal.append_claim_vector(&input.claim.claim_id, vector, tenant_id)?;
     }
     Ok(())
 }

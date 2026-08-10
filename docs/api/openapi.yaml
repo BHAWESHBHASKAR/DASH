@@ -476,96 +476,7 @@ paths:
         '200':
           description: Storage visibility JSON
 
-  /health:
-    get:
-      tags: [Diagnostics]
-      summary: Health check
-      operationId: retrievalHealth
-      responses:
-        '200':
-          description: Healthy
-
-  /v1/health:
-    get:
-      tags: [Diagnostics]
-      summary: Health check
-      operationId: retrievalV1Health
-      responses:
-        '200':
-          description: Healthy
-
-  /live:
-    get:
-      tags: [Diagnostics]
-      summary: Liveness probe
-      operationId: retrievalLive
-      responses:
-        '200':
-          description: Alive
-
-  /v1/live:
-    get:
-      tags: [Diagnostics]
-      summary: Liveness probe
-      operationId: retrievalV1Live
-      responses:
-        '200':
-          description: Alive
-
-  /ready:
-    get:
-      tags: [Diagnostics]
-      summary: Readiness probe
-      operationId: retrievalReady
-      responses:
-        '200':
-          description: Ready
-        '503':
-          description: Not ready
-
-  /v1/ready:
-    get:
-      tags: [Diagnostics]
-      summary: Readiness probe
-      operationId: retrievalV1Ready
-      responses:
-        '200':
-          description: Ready
-        '503':
-          description: Not ready
-
-  /metrics:
-    get:
-      tags: [Diagnostics]
-      summary: Prometheus metrics
-      operationId: retrievalMetrics
-      responses:
-        '200':
-          description: Prometheus text
-          content:
-            text/plain:
-              schema:
-                type: string
-
-  /debug/placement:
-    get:
-      tags: [Diagnostics]
-      summary: Placement debug snapshot
-      operationId: retrievalDebugPlacement
-      responses:
-        '200':
-          description: Placement JSON
-
   # Control-plane service
-  /health:
-    get:
-      tags: [ControlPlane]
-      summary: Health check
-      operationId: controlPlaneHealth
-      responses:
-        '200':
-          description: Healthy
-
   /v1/control-plane/health:
     get:
       tags: [ControlPlane]
@@ -574,15 +485,6 @@ paths:
       responses:
         '200':
           description: Healthy
-
-  /ready:
-    get:
-      tags: [ControlPlane]
-      summary: Readiness probe
-      operationId: controlPlaneReady
-      responses:
-        '200':
-          description: Ready
 
   /v1/control-plane/ready:
     get:

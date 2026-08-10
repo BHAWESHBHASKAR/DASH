@@ -234,8 +234,8 @@ impl InMemoryStore {
             for record in records {
                 match &record {
                     PersistedRecord::Claim(_) => claims_loaded += 1,
-                    PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                    PersistedRecord::Edge(_) => edges_loaded += 1,
+                    PersistedRecord::Evidence(..) => evidence_loaded += 1,
+                    PersistedRecord::Edge(..) => edges_loaded += 1,
                     PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
                     PersistedRecord::BatchCommit(_) => {}
                 }
@@ -325,8 +325,8 @@ impl InMemoryStore {
         for record in records {
             match &record {
                 PersistedRecord::Claim(_) => claims_loaded += 1,
-                PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                PersistedRecord::Edge(_) => edges_loaded += 1,
+                PersistedRecord::Evidence(..) => evidence_loaded += 1,
+                PersistedRecord::Edge(..) => edges_loaded += 1,
                 PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
                 PersistedRecord::BatchCommit(_) => {}
             }
@@ -363,12 +363,13 @@ impl InMemoryStore {
     ) -> Result<(), StoreError> {
         self.validate_bundle(&claim, &evidence, &edges)?;
 
+        let tenant_id = &claim.tenant_id;
         wal.append_claim(&claim)?;
         for evd in &evidence {
-            wal.append_evidence(evd)?;
+            wal.append_evidence(evd, tenant_id)?;
         }
         for edge in &edges {
-            wal.append_edge(edge)?;
+            wal.append_edge(edge, tenant_id)?;
         }
 
         self.apply_bundle(claim, evidence, edges)
@@ -406,7 +407,12 @@ impl InMemoryStore {
         vector: Vec<f32>,
     ) -> Result<(), StoreError> {
         validate_vector(&vector)?;
-        wal.append_claim_vector(claim_id, &vector)?;
+        let tenant_id = self
+            .claims
+            .get(claim_id)
+            .map(|c| c.tenant_id.clone())
+            .unwrap_or_default();
+        wal.append_claim_vector(claim_id, &vector, &tenant_id)?;
         self.apply_claim_vector(claim_id, vector)
     }
 
@@ -425,11 +431,17 @@ impl InMemoryStore {
         ts_unix_ms: u64,
         claim_ids: &[String],
     ) -> Result<(), StoreError> {
+        let tenant_id = claim_ids
+            .first()
+            .and_then(|id| self.claims.get(id))
+            .map(|c| c.tenant_id.clone())
+            .unwrap_or_default();
         self.apply_batch_commit_record(BatchCommitRecord {
             commit_id: commit_id.to_string(),
             batch_size,
             ts_unix_ms,
             claim_ids: claim_ids.to_vec(),
+            tenant_id,
         })
     }
 
@@ -1238,29 +1250,45 @@ impl InMemoryStore {
 
         for claim_id in &claim_ids {
             if let Some(values) = self.claim_vectors.get(claim_id) {
+                let tenant_id = self
+                    .claims
+                    .get(claim_id)
+                    .map(|c| c.tenant_id.clone())
+                    .unwrap_or_default();
                 records.push(PersistedRecord::ClaimVector(ClaimVectorRecord {
                     claim_id: claim_id.clone(),
                     values: values.clone(),
+                    tenant_id,
                 }));
             }
         }
 
         for claim_id in &claim_ids {
             if let Some(evidence) = self.evidence_by_claim.get(claim_id) {
+                let tenant_id = self
+                    .claims
+                    .get(claim_id)
+                    .map(|c| c.tenant_id.clone())
+                    .unwrap_or_default();
                 let mut evidence = evidence.clone();
                 evidence.sort_by(|a, b| a.evidence_id.cmp(&b.evidence_id));
                 for evd in evidence {
-                    records.push(PersistedRecord::Evidence(evd));
+                    records.push(PersistedRecord::Evidence(evd, tenant_id.clone()));
                 }
             }
         }
 
         for claim_id in &claim_ids {
             if let Some(edges) = self.edges_by_claim.get(claim_id) {
+                let tenant_id = self
+                    .claims
+                    .get(claim_id)
+                    .map(|c| c.tenant_id.clone())
+                    .unwrap_or_default();
                 let mut edges = edges.clone();
                 edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
                 for edge in edges {
-                    records.push(PersistedRecord::Edge(edge));
+                    records.push(PersistedRecord::Edge(edge, tenant_id.clone()));
                 }
             }
         }
@@ -1272,11 +1300,18 @@ impl InMemoryStore {
                 .batch_commits
                 .get(commit_id)
                 .expect("batch commit should exist");
+            let tenant_id = metadata
+                .claim_ids
+                .first()
+                .and_then(|id| self.claims.get(id))
+                .map(|c| c.tenant_id.clone())
+                .unwrap_or_default();
             records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
                 commit_id: metadata.commit_id.clone(),
                 batch_size: metadata.batch_size,
                 ts_unix_ms: metadata.ts_unix_ms,
                 claim_ids: metadata.claim_ids.clone(),
+                tenant_id,
             }));
         }
 
@@ -1332,8 +1367,8 @@ impl InMemoryStore {
     fn apply_persisted_record(&mut self, record: PersistedRecord) -> Result<(), StoreError> {
         match record {
             PersistedRecord::Claim(claim) => self.apply_claim(claim),
-            PersistedRecord::Evidence(evidence) => self.apply_evidence(evidence),
-            PersistedRecord::Edge(edge) => self.apply_edge(edge),
+            PersistedRecord::Evidence(evidence, _) => self.apply_evidence(evidence),
+            PersistedRecord::Edge(edge, _) => self.apply_edge(edge),
             PersistedRecord::ClaimVector(record) => {
                 self.apply_claim_vector(&record.claim_id, record.values)
             }
@@ -3591,6 +3626,7 @@ mod tests {
             1,
             1_700_000_000_000,
             &["c-batch".to_string()],
+            "t1",
         )
         .expect("batch commit append should succeed");
 

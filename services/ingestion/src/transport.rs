@@ -507,6 +507,10 @@ impl IngestionRuntime {
         }
 
         let commit_ts_unix_ms = unix_timestamp_millis();
+        let batch_tenant_id = inputs
+            .first()
+            .map(|i| i.claim.tenant_id.clone())
+            .unwrap_or_default();
         if let Some(wal) = self.wal.as_mut() {
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
@@ -518,6 +522,7 @@ impl IngestionRuntime {
                     ingested_claim_ids.len(),
                     commit_ts_unix_ms,
                     &ingested_claim_ids,
+                    &batch_tenant_id,
                 )?;
                 Ok::<(), StoreError>(())
             })();

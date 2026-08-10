@@ -1,6 +1,9 @@
 use aws_sdk_kms::{Client, primitives::Blob, types::DataKeySpec};
 use base64::Engine;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::{EncryptionError, EncryptionProvider, EnvProvider};
 
 pub struct AwsKmsProvider {
@@ -19,6 +22,13 @@ impl AwsKmsProvider {
         })?;
         let region = std::env::var("DASH_AWS_KMS_REGION").ok();
         let wrapped_key_file = std::env::var("DASH_ENCRYPTION_WRAPPED_KEY_FILE")
+            .or_else(|_| {
+                std::env::var("DASH_PERSISTENCE_PATH").map(|p| {
+                    let mut path = std::path::PathBuf::from(p);
+                    path.push(".dash-wrapped-key");
+                    path.to_string_lossy().into_owned()
+                })
+            })
             .unwrap_or_else(|_| ".dash-wrapped-key".to_string());
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -42,6 +52,26 @@ impl AwsKmsProvider {
             let plaintext =
                 runtime.block_on(decrypt_data_key(&client, &key_id, wrapped.clone()))?;
             (plaintext, wrapped)
+        } else if std::path::Path::new(&wrapped_key_file).exists() {
+            let encoded = std::fs::read_to_string(&wrapped_key_file).map_err(|e| {
+                EncryptionError::Config(format!(
+                    "failed to read wrapped key from {wrapped_key_file}: {e}"
+                ))
+            })?;
+            let encoded = encoded.trim();
+            if encoded.is_empty() {
+                return Err(EncryptionError::Config(format!(
+                    "wrapped key file {wrapped_key_file} is empty"
+                )));
+            }
+            let wrapped = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| {
+                    EncryptionError::Config("stored wrapped key is not valid base64".to_string())
+                })?;
+            let plaintext =
+                runtime.block_on(decrypt_data_key(&client, &key_id, wrapped.clone()))?;
+            (plaintext, wrapped)
         } else {
             let (plaintext, wrapped) = runtime.block_on(generate_data_key(&client, &key_id))?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&wrapped);
@@ -50,6 +80,22 @@ impl AwsKmsProvider {
                     "failed to write wrapped key to {wrapped_key_file}: {e}"
                 ))
             })?;
+            #[cfg(unix)]
+            {
+                let mut perms = std::fs::metadata(&wrapped_key_file)
+                    .map_err(|e| {
+                        EncryptionError::Config(format!(
+                            "failed to read permissions for {wrapped_key_file}: {e}"
+                        ))
+                    })?
+                    .permissions();
+                perms.set_mode(0o600);
+                std::fs::set_permissions(&wrapped_key_file, perms).map_err(|e| {
+                    EncryptionError::Config(format!(
+                        "failed to set permissions on {wrapped_key_file}: {e}"
+                    ))
+                })?;
+            }
             (plaintext, wrapped)
         };
 
