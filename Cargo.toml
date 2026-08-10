@@ -13,6 +13,7 @@ members = [
   "services/retrieval",
   "services/indexer",
   "services/metadata-router",
+  "services/grpc",
   "tests/benchmarks",
 ]
 resolver = "2"

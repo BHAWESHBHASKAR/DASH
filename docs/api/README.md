@@ -112,6 +112,18 @@ curl $OPENAI_API_BASE/models -H "Authorization: Bearer $OPENAI_API_KEY"
 Open `http://localhost:8080/dashboard` in a browser. It shows service health,
 per-tenant usage, available models, and a retrieve form.
 
+### gRPC
+
+A gRPC server is available in the `grpc` service. By default it listens on
+port `50051` and exposes `dash.v1.Dash` with `Embed` and `ListModels` methods:
+
+```bash
+grpcurl -plaintext -d '{"input":["hello world"],"model":"dash-hash"}' \
+  localhost:50051 dash.v1.Dash/Embed
+
+grpcurl -plaintext localhost:50051 dash.v1.Dash/ListModels
+```
+
 ### Running with real semantic embeddings (Ollama)
 
 ```bash

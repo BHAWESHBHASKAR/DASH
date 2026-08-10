@@ -24,6 +24,10 @@ to [Semantic Versioning](https://semver.org/).
 - **Operational dashboard** — `GET /dashboard` on the retrieval
   service serves an HTML dashboard with health, usage, models, and a
   retrieve form.
+- **gRPC surface** — new `services/grpc` binary exposes `dash.v1.Dash`
+  with `Embed` and `ListModels` methods on `DASH_GRPC_BIND`
+  (default `127.0.0.1:50051`), backed by the same shared embedding
+  provider selection as the REST API.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.
