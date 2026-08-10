@@ -589,28 +589,83 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
     }
 }
 
+/// Probe whether an HTTP endpoint is reachable by opening a TCP connection
+/// to its host and port. This is used during startup to decide whether an
+/// Ollama daemon is available before falling back to the hash provider.
+fn is_endpoint_reachable(endpoint: &str, timeout: Duration) -> bool {
+    let parsed = match parse_url(endpoint) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let addr = match (parsed.host.as_str(), parsed.port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+fn ollama_endpoint_from_env() -> Option<String> {
+    if let Ok(endpoint) = std::env::var("DASH_OLLAMA_ENDPOINT") {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            return Some(endpoint.to_string());
+        }
+    }
+    if let Ok(host) = std::env::var("OLLAMA_HOST") {
+        let host = host.trim();
+        if !host.is_empty() {
+            let base = host.trim_end_matches('/');
+            return Some(format!("{base}/api/embeddings"));
+        }
+    }
+    None
+}
+
 /// Build an [`EmbeddingProvider`] from the process environment. This is the
 /// single place service binaries read `DASH_EMBEDDING_PROVIDER` so the
 /// selection logic stays consistent between ingestion and retrieval.
 ///
 /// Reads:
-/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
-///   network), `"ollama"`, or `"openai"`. Unknown values fall back to `hash`
-///   with a warning.
+/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (deterministic, no network),
+///   `"ollama"`, or `"openai"`. When unset, the function probes Ollama
+///   (via `DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to `hash`
+///   with a warning if no HTTP embedding backend is reachable.
 /// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434/api/embeddings`),
 ///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
 /// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
 ///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
 pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
     let provider = std::env::var("DASH_EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "hash".to_string())
-        .to_ascii_lowercase();
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| !s.trim().is_empty());
+
+    let provider = match provider {
+        Some(p) => p,
+        None => match ollama_endpoint_from_env() {
+            Some(endpoint) if is_endpoint_reachable(&endpoint, Duration::from_millis(200)) => {
+                return Box::new(OllamaEmbeddingProvider::new(
+                    std::env::var("DASH_OLLAMA_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string()),
+                    Some(endpoint),
+                ));
+            }
+            _ => {
+                eprintln!(
+                    "dash: no DASH_EMBEDDING_PROVIDER set and no reachable Ollama endpoint; \
+                     falling back to hash embeddings. Set DASH_EMBEDDING_PROVIDER=ollama|openai for real vectors."
+                );
+                "hash".to_string()
+            }
+        },
+    };
 
     match provider.as_str() {
         "ollama" => {
-            let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty());
+            let endpoint = ollama_endpoint_from_env();
             let model = std::env::var("DASH_OLLAMA_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string());
             Box::new(OllamaEmbeddingProvider::new(model, endpoint))
@@ -637,12 +692,19 @@ pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send 
     }
 }
 
-/// Returns the configured provider name (or `"hash"` when unset) without
-/// building the provider. Useful for startup banners and strict-mode checks.
+/// Returns the configured provider name (or `"hash"` when unset and no Ollama
+/// endpoint is reachable) without building the provider. Useful for startup
+/// banners and strict-mode checks.
 pub fn embedding_provider_name_from_env() -> String {
-    std::env::var("DASH_EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "hash".to_string())
-        .to_ascii_lowercase()
+    match std::env::var("DASH_EMBEDDING_PROVIDER") {
+        Ok(value) if !value.trim().is_empty() => value.to_ascii_lowercase(),
+        _ => match ollama_endpoint_from_env() {
+            Some(endpoint) if is_endpoint_reachable(&endpoint, Duration::from_millis(200)) => {
+                "ollama".to_string()
+            }
+            _ => "hash".to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -995,5 +1057,112 @@ mod tests {
         let wrapped = CircuitBreakerProvider::new(inner, Arc::clone(&breaker));
         assert_eq!(wrapped.dimensions(), 96);
         assert_eq!(wrapped.name(), "hash");
+    }
+
+    // -----------------------------------------------------------------
+    // Provider selection from environment
+    // -----------------------------------------------------------------
+
+    struct TempEnv(&'static str, Option<String>);
+
+    impl TempEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self(key, prev)
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self(key, prev)
+        }
+    }
+
+    impl Drop for TempEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_provider_defaults_to_ollama_when_reachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let body_json = r#"{"embedding":[0.1,0.2]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_json.len(),
+            body_json,
+        );
+        let port = spawn_mock_server(response.into_bytes());
+        let endpoint = format!("http://127.0.0.1:{port}/api/embeddings");
+        let _guard4 = TempEnv::set("DASH_OLLAMA_ENDPOINT", &endpoint);
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "ollama");
+    }
+
+    #[test]
+    fn select_provider_defaults_to_hash_when_ollama_unreachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn select_provider_explicit_hash() {
+        let _guard = TempEnv::set("DASH_EMBEDDING_PROVIDER", "hash");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn select_provider_unknown_falls_back_to_hash() {
+        let _guard = TempEnv::set("DASH_EMBEDDING_PROVIDER", "unknown-provider");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn provider_name_from_env_defaults_to_hash_when_unreachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        assert_eq!(embedding_provider_name_from_env(), "hash");
+    }
+
+    #[test]
+    fn provider_name_from_env_honors_ollama_host() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+
+        let body_json = r#"{"embedding":[0.1]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_json.len(),
+            body_json,
+        );
+        let port = spawn_mock_server(response.into_bytes());
+        let host = format!("http://127.0.0.1:{port}");
+        let _guard3 = TempEnv::set("OLLAMA_HOST", &host);
+
+        assert_eq!(embedding_provider_name_from_env(), "ollama");
     }
 }
