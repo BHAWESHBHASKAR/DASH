@@ -1,7 +1,7 @@
 # DASH Production-Readiness Remediation Plan
 
 Date: 2026-08-09  
-Status: in progress — M1 e2e data path and M2 embedding provider selection implemented  
+Status: M1–M13 implemented; remaining multi-region quorum, managed-cloud metering, gRPC surface, and web dashboard in backlog.  
 Target: make the DASH vector/RAG engine safe to run in a production environment.
 
 ## 1. What "production ready" means for DASH
@@ -109,7 +109,7 @@ A production-ready DASH deployment must guarantee:
 | M8 | disk-first segment serving tier | Done | 0.25 session |
 | M9 | object-storage backup/restore | Done | 0.75 session |
 | M10 | Helm control-plane + managed cloud scaffolding | Done | 0.75 session |
-| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | In progress — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
+| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Done — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
 | M12 | OpenAPI 3 spec + SDK/client docs | Done | 0.5 session |
 | M13 | real HTTP embedding provider default + integration test | Done | 0.75 session |
 

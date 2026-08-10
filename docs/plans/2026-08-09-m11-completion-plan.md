@@ -1,5 +1,7 @@
 # M11 Completion Plan — RBAC, OIDC, CMEK, SOC 2 Readiness
 
+**Status: implemented in PR #18 (`feature/m11-production-readiness`).**
+
 ## Goal
 
 Close the remaining production-adoption blockers that mature vector databases ship as table-stakes: enterprise identity (OIDC), coarse-grained authorization (RBAC), customer-managed encryption keys (CMEK / BYOK), and the evidence package needed for SOC 2 Type II readiness.
@@ -14,11 +16,11 @@ DASH already has:
 - `DASH_STRICT_SECRETS=1` startup guard and `scripts/generate-secrets.sh`.
 - TLS is assumed to be terminated by the ingress / load balancer.
 
-What is **not** present:
-- OIDC / RS256 / JWKS-based authentication.
-- Role-based access control beyond per-tenant scope (no read-only, admin, or ingest-only roles).
-- Application-level encryption or CMEK integration; at-rest encryption is currently delegated to the block device.
-- SOC 2 control evidence collection (policy templates, evidence scripts, runbooks).
+What was added in this track:
+- OIDC / RS256 / JWKS-based authentication (`pkg/auth/src/oidc.rs`).
+- Role-based access control (`admin`, `ingest`, `retrieve`, `read_only`) enforced in the HTTP route layer.
+- Application-level CMEK integration with `env` and AWS KMS providers in `pkg/encryption`, wired into WAL/snapshot read and write paths.
+- SOC 2 control evidence collection (policy templates, evidence scripts, runbooks) in `docs/compliance/`.
 
 ## M11 sub-milestones
 
