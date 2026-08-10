@@ -140,6 +140,19 @@ docker run --rm -v $(pwd)/docs/api:/local openapitools/openapi-generator-cli gen
 The repository CI (`.github/workflows/sdks.yml`) regenerates and publishes SDKs
 on tagged releases.
 
+## Monitoring
+
+A Prometheus + Grafana overlay is available for production observability:
+
+```bash
+docker compose \
+  -f deploy/container/docker-compose.yml \
+  -f deploy/container/docker-compose.monitoring.yml \
+  --profile monitoring up
+```
+
+Prometheus scrapes the `/metrics` endpoints on `ingestion` (8081) and `retrieval` (8080). Grafana is available at http://localhost:3000 with the `DASH Overview` dashboard. Set `GRAFANA_ADMIN_PASSWORD` in `.env`.
+
 ## Health and metrics
 
 | Endpoint | Purpose |

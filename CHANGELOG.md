@@ -78,6 +78,11 @@ to [Semantic Versioning](https://semver.org/).
   and defaults `DASH_EMBEDDING_PROVIDER=ollama` when the `ollama`
   compose profile is active; `select_embedding_provider_from_env()` now
   uses the correct `/api/embeddings` path by default.
+- **Prometheus + Grafana monitoring overlay** —
+  `deploy/container/docker-compose.monitoring.yml`, `monitoring/prometheus.yml`,
+  and `monitoring/grafana-dashboards/dash-overview.json` provide a
+  turn-key observability stack with the DASH metrics exported by
+  ingestion/retrieval.
 
 ### Changed
 - **JSON parsing in services/ingestion** — replaced 633 lines of

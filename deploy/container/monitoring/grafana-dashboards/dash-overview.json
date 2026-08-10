@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 27,
+  "title": "DASH Overview",
+  "uid": "dash-overview",
+  "tags": ["dash", "vector-db", "rag"],
+  "timezone": "utc",
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP Request Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(dash_http_requests_total[5m])",
+          "legendFormat": "{{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Retrieve Latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "dash_retrieve_latency_ms_p50",
+          "legendFormat": "p50 {{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "dash_retrieve_latency_ms_p95",
+          "legendFormat": "p95 {{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Ingest-to-Visible Lag",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "dash_ingest_to_visible_lag_ms_p50",
+          "legendFormat": "p50",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        },
+        {
+          "expr": "dash_ingest_to_visible_lag_ms_p95",
+          "legendFormat": "p95",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 4,
+      "title": "Error Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(dash_retrieve_server_error_total[5m]) + rate(dash_transport_auth_failure_total[5m]) + rate(dash_transport_authz_denied_total[5m])",
+          "legendFormat": "errors/sec {{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Replica Role",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "dash_retrieve_placement_last_role",
+          "legendFormat": "{{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 }
+    },
+    {
+      "id": 6,
+      "title": "Disk Unavailable",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "dash_disk_unavailable",
+          "legendFormat": "{{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 }
+    },
+    {
+      "id": 7,
+      "title": "Transport Queue Depth",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "dash_retrieve_transport_queue_depth",
+          "legendFormat": "{{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 }
+    },
+    {
+      "id": 8,
+      "title": "Uptime",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "dash_transport_uptime_seconds / 60",
+          "legendFormat": "{{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 20 }
+    },
+    {
+      "id": 9,
+      "title": "Segment Cache Hit Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(dash_retrieve_segment_cache_hits_total[5m])",
+          "legendFormat": "hits/sec {{instance}}",
+          "datasource": { "type": "prometheus", "uid": "prometheus" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 24 }
+    }
+  ]
+}
