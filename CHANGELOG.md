@@ -83,6 +83,9 @@ to [Semantic Versioning](https://semver.org/).
   and `monitoring/grafana-dashboards/dash-overview.json` provide a
   turn-key observability stack with the DASH metrics exported by
   ingestion/retrieval.
+- **Makefile and PR/issue templates** — `Makefile` provides common
+  build/test/docker commands; `.github/PULL_REQUEST_TEMPLATE.md` and
+  `.github/ISSUE_TEMPLATE/*.md` standardize contributions.
 
 ### Changed
 - **JSON parsing in services/ingestion** — replaced 633 lines of
