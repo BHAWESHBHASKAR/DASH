@@ -15,8 +15,8 @@
 //! `tokio` dependency is gated behind the `async-runtime` feature and is
 //! reserved for future async wrappers.
 
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -121,7 +121,7 @@ fn hash_embed(text: &str, dimensions: usize) -> Vec<f32> {
     vector
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OllamaEmbeddingProvider {
     model: String,
     endpoint: String,
@@ -130,7 +130,7 @@ pub struct OllamaEmbeddingProvider {
 
 impl OllamaEmbeddingProvider {
     pub const DEFAULT_ENDPOINT: &'static str = "http://localhost:11434/api/embeddings";
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn new(model: String, endpoint: Option<String>) -> Self {
         Self {
@@ -354,7 +354,7 @@ fn http_post(
             EmbeddingError::Io(format!("no address for {}:{}", parsed.host, parsed.port))
         })?;
 
-    let stream =
+    let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_error(e, timeout))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
@@ -371,26 +371,138 @@ fn http_post(
     request.push_str("\r\n");
     request.push_str(body);
 
-    let mut stream = stream;
     stream
         .write_all(request.as_bytes())
         .map_err(|e| map_io_error(e, timeout))?;
-    stream.shutdown(Shutdown::Write).ok();
 
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| map_io_error(e, timeout))?;
+    let mut reader = BufReader::new(&stream);
+    let mut headers = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if n == 0 {
+            return Err(EmbeddingError::Parse(
+                "server closed connection before response headers".to_string(),
+            ));
+        }
+        headers.push_str(&line);
+        if headers.ends_with("\r\n\r\n") {
+            break;
+        }
+    }
 
-    let response_str = String::from_utf8(response)
+    let status = parse_status(&headers)?;
+    let content_length = parse_content_length(&headers);
+    let chunked = parse_transfer_encoding(&headers).is_some_and(|v| v == "chunked");
+
+    const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+    let mut body_bytes = Vec::new();
+    if chunked {
+        read_chunked_body(&mut reader, &mut body_bytes, timeout)?;
+    } else if let Some(len) = content_length {
+        if len > MAX_BODY_BYTES as usize {
+            return Err(EmbeddingError::Parse(format!(
+                "Content-Length {len} exceeds maximum allowed body size"
+            )));
+        }
+        if len > 0 {
+            body_bytes.resize(len, 0);
+            reader
+                .read_exact(&mut body_bytes)
+                .map_err(|e| map_io_error(e, timeout))?;
+        }
+    } else {
+        reader
+            .take(MAX_BODY_BYTES)
+            .read_to_end(&mut body_bytes)
+            .map_err(|e| map_io_error(e, timeout))?;
+    }
+
+    let body = String::from_utf8(body_bytes)
         .map_err(|e| EmbeddingError::Parse(format!("response is not utf-8: {e}")))?;
+    Ok((status, body))
+}
 
-    let (headers, body) = response_str.split_once("\r\n\r\n").ok_or_else(|| {
-        EmbeddingError::Parse("response missing header/body separator".to_string())
-    })?;
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    for line in headers.lines() {
+        if line.to_ascii_lowercase().starts_with(&prefix) {
+            return line.split_once(':').map(|x| x.1.trim().to_string());
+        }
+    }
+    None
+}
 
-    let status = parse_status(headers)?;
-    Ok((status, body.to_string()))
+fn parse_content_length(headers: &str) -> Option<usize> {
+    header_value(headers, "content-length")?.parse().ok()
+}
+
+fn parse_transfer_encoding(headers: &str) -> Option<String> {
+    header_value(headers, "transfer-encoding").map(|v| v.to_ascii_lowercase())
+}
+
+fn read_chunked_body<R: BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<(), EmbeddingError> {
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+    let mut size_line = String::new();
+    loop {
+        size_line.clear();
+        let n = reader
+            .read_line(&mut size_line)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if n == 0 {
+            return Err(EmbeddingError::Parse(
+                "chunked body ended abruptly".to_string(),
+            ));
+        }
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| EmbeddingError::Parse(format!("invalid chunk size: {size_line}")))?;
+        if size == 0 {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader
+                    .read_line(&mut line)
+                    .map_err(|e| map_io_error(e, timeout))?;
+                if n == 0 {
+                    return Err(EmbeddingError::Parse(
+                        "chunked trailer ended abruptly".to_string(),
+                    ));
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        if out.len() + size > MAX_BODY_BYTES {
+            return Err(EmbeddingError::Parse(
+                "chunked body exceeds 64 MiB limit".to_string(),
+            ));
+        }
+        let start = out.len();
+        out.resize(start + size, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .map_err(|e| map_io_error(e, timeout))?;
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if &crlf != b"\r\n" {
+            return Err(EmbeddingError::Parse(
+                "chunk data not followed by CRLF".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn map_io_error(err: std::io::Error, timeout: Duration) -> EmbeddingError {

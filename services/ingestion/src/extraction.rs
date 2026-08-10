@@ -2,6 +2,7 @@ use crate::api::{
     IngestApiRequest, IngestBatchApiRequest, IngestDocumentApiRequest, IngestRawApiRequest,
 };
 use schema::{Claim, Evidence, Stance};
+use embeddings::EmbeddingProvider as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -42,6 +43,7 @@ enum EmbeddingProvider {
     Disabled,
     HashVector { dimensions: usize },
     AdapterCommand(String),
+    Ollama(embeddings::OllamaEmbeddingProvider),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -341,6 +343,7 @@ fn resolve_embedding_provider(
         "DASH_INGEST_EMBEDDING_PROVIDER",
         "EME_INGEST_EMBEDDING_PROVIDER",
     )
+    .or_else(|| std::env::var("DASH_EMBEDDING_PROVIDER").ok())
     .unwrap_or_else(|| DEFAULT_EMBEDDING_PROVIDER.to_string());
     let normalized = raw.trim().to_ascii_lowercase();
     if normalized.is_empty()
@@ -368,8 +371,20 @@ fn resolve_embedding_provider(
         }
         return Ok(EmbeddingProvider::AdapterCommand(command));
     }
+    if normalized == "ollama" {
+        let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let model = std::env::var("DASH_OLLAMA_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "nomic-embed-text".to_string());
+        return Ok(EmbeddingProvider::Ollama(
+            embeddings::OllamaEmbeddingProvider::new(model, endpoint.map(|s| s.trim().to_string())),
+        ));
+    }
     Err(format!(
-        "unsupported embedding provider '{raw}'; expected hash_vector or adapter_command"
+        "unsupported embedding provider '{raw}'; expected hash_vector, adapter_command, or ollama"
     ))
 }
 
@@ -548,6 +563,15 @@ fn generate_claim_embedding(
         }
         EmbeddingProvider::AdapterCommand(command) => {
             generate_embedding_with_adapter_command(command, claim_text).map(Some)
+        }
+        EmbeddingProvider::Ollama(p) => {
+            let out = p
+                .embed(&[claim_text.to_string()])
+                .map_err(|e| e.to_string())?;
+            out.into_iter()
+                .next()
+                .ok_or_else(|| "ollama embedding provider returned no vectors".to_string())
+                .map(Some)
         }
     }
 }
@@ -884,6 +908,9 @@ impl EmbeddingProvider {
                     normalized
                 };
                 sanitize_id_component(&compact, 48)
+            }
+            Self::Ollama(provider) => {
+                sanitize_id_component(&format!("ollama-{}", provider.model()), 48)
             }
         }
     }
