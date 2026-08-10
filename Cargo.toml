@@ -2,6 +2,7 @@
 members = [
   "pkg/auth",
   "pkg/embeddings",
+  "pkg/encryption",
   "pkg/schema",
   "pkg/ranking",
   "pkg/graph",
