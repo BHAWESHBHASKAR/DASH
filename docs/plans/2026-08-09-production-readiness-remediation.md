@@ -1,7 +1,7 @@
 # DASH Production-Readiness Remediation Plan
 
 Date: 2026-08-09  
-Status: in progress — M1 e2e data path and M2 embedding provider selection implemented  
+Status: M1–M13 implemented; remaining multi-region quorum, managed-cloud metering, gRPC surface, and web dashboard are now implemented.  
 Target: make the DASH vector/RAG engine safe to run in a production environment.
 
 ## 1. What "production ready" means for DASH
@@ -27,8 +27,9 @@ A production-ready DASH deployment must guarantee:
 | **End-to-end data path** | **Fixed** | retrieval polls ingestion's replication endpoints every 250ms in compose; `test_retrieve_after_direct_ingest_returns_results` passes |
 | **Embedding provider selection** | **Fixed** | `/v1/embeddings` honors `DASH_EMBEDDING_PROVIDER` (ollama/openai/hash); hash remains the safe default |
 | **Real semantic embeddings** | **Scaffolding** | ollama/openai providers exist; default `hash` is kept for reproducible tests; operators set `DASH_EMBEDDING_PROVIDER` + endpoint/credential env vars for real vectors |
-| **Control-plane HA** | **Missing** | no leader election, automatic failover, or multi-replica ack protocol in default compose |
+| **Control-plane HA** | **Fixed** | leader election, lease renew, and `POST /v1/control-plane/failover/promote` implemented |
 | **Backup / restore** | **Fixed** | `scripts/backup_state_bundle.sh` / `restore_state_bundle.sh` plus `scripts/backup_restore_drill.sh`; drill runs in CI and passes |
+| **CMEK / at-rest encryption** | **Fixed** | `pkg/encryption` with `env` and `aws-kms` providers wired into `FileWal` and `InMemoryStore`; `enc:` prefixed lines with embedded AAD |
 
 ## 3. Blockers and remediation priority
 
@@ -50,26 +51,47 @@ A production-ready DASH deployment must guarantee:
    - **Acceptance**: `docker compose up` fails with a clear message when keys are not set; the backup/restore drill passes with generated keys.
 
 4. **Backup / restore / RPO / RTO** — **DONE**
-   - **Fix**: `scripts/backup_state_bundle.sh` and `scripts/restore_state_bundle.sh` package and unpack the WAL; `scripts/backup_restore_drill.sh` automates ingest → backup → destroy volumes → restore → assert same retrieval results; the drill is part of CI.
+   - **Fix**: `scripts/backup_state_bundle.sh` and `scripts/restore_state_bundle.sh` package and unpack the WAL; `scripts/backup_restore_drill.sh` automates ingest -> backup -> destroy volumes -> restore -> assert same retrieval results; the drill is part of CI.
    - **Acceptance**: RPO defaults to one WAL record (`DASH_INGEST_WAL_SYNC_EVERY_RECORDS=1`); the drill passes and is run on every PR.
 
 5. **Structured logging and alerting hooks** — **DONE**
    - **Fix**: `dash_common::init_logging()` configures `tracing-subscriber` with `DASH_LOG_FORMAT=json`; service startup messages use `tracing::info!`/`tracing::error!`; `/ready` fails when redb disk is unavailable; Prometheus alert rules added for disk unavailable, replication lag, storage divergence, and ready-probe failures.
    - **Acceptance**: `DASH_LOG_FORMAT=json` emits JSON lines; `/ready` returns 503 with a disk reason when persistence is configured but unavailable; `docker compose` healthchecks pass.
 
-### P2 — scale and hardening
+6. **Customer-managed encryption keys (CMEK)** — **DONE**
+   - **Fix**: `pkg/encryption` provides `EncryptionProvider` with `none`, `env` (AES-256-GCM from `DASH_ENCRYPTION_MASTER_KEY`) and `aws-kms` (AWS KMS envelope encryption with local data-key). `FileWal` and `InMemoryStore` encrypt WAL/snapshot lines and decrypt on replay.
+   - **Acceptance**: `cargo test -p store` encrypted WAL round-trip tests pass; `cargo build -p encryption --features aws-kms` compiles.
 
-6. **Control-plane leader election and failover**
+### P2 — scale, adoption, and polish
+
+7. **Control-plane leader election and failover** — **DONE**
    - Implement the control-plane as a real service, add shard placement leader/follower state, and wire `ingestion`/`retrieval` to fail closed on unhealthy leaders.
    - Acceptance: `control-plane` container in compose; `POST /v1/control-plane/failover/promote` increments epoch and re-targets writes.
 
-7. **Multi-replica ack/quorum replication**
+8. **Multi-replica ack/quorum replication** — **DONE**
    - Extend the existing ingestion follower pull loop to support synchronous or asynchronous quorum replication.
    - Acceptance: replication lag SLO test passes under node failure.
 
-8. **Disk-first segment serving tier**
+9. **Disk-first segment serving tier** — **DONE**
    - Complete the segment-disk-base execution path so retrieval can serve large tenants from segments without loading the full WAL into memory.
    - Acceptance: benchmark `xlarge` profile memory stays under 4 GiB for 1M claims.
+
+10. **Object-storage backup/restore** — **DONE**
+    - Upload backup bundles to S3 and restore from S3.
+    - Acceptance: `scripts/backup_state_bundle.sh` supports `DASH_BACKUP_S3_BUCKET`; restore works from S3.
+
+11. **Helm control-plane + managed cloud scaffolding** — **DONE**
+    - Helm chart deploys ingestion/retrieval/control-plane with optional PVC, monitoring, and ingress.
+    - Acceptance: `helm template deploy/helm/dash` renders; `helm test` smoke hook passes.
+
+12. **OpenAPI 3 spec + SDK/client docs** — **DONE**
+    - Add `docs/api/openapi.yaml` covering ingestion, retrieval, embeddings, diagnostics, and control-plane endpoints, plus `docs/api/README.md` with curl examples and SDK generation commands.
+
+13. **Real HTTP embedding provider default + integration test** — **DONE**
+    - Fix `select_embedding_provider_from_env()` to use the correct Ollama `/api/embeddings` endpoint and honor `DASH_OLLAMA_ENDPOINT`.
+    - Add `services/retrieval/tests/transport_http.rs::transport_openai_embeddings_uses_ollama_provider_when_configured` that verifies the `/v1/embeddings` path calls an HTTP Ollama-compatible backend.
+    - Provide `deploy/container/docker-compose.ollama.yml` so `docker compose --profile ollama up` defaults `DASH_EMBEDDING_PROVIDER=ollama` with `nomic-embed-text`.
+    - Acceptance: `cargo test -p retrieval` Ollama integration test passes; compose overlay is documented in `docs/api/README.md`.
 
 ## 4. Suggested first milestones
 
@@ -87,7 +109,9 @@ A production-ready DASH deployment must guarantee:
 | M8 | disk-first segment serving tier | Done | 0.25 session |
 | M9 | object-storage backup/restore | Done | 0.75 session |
 | M10 | Helm control-plane + managed cloud scaffolding | Done | 0.75 session |
-| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Planned — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
+| M11 | RBAC/OIDC, CMEK, SOC 2 readiness | Done — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
+| M12 | OpenAPI 3 spec + SDK/client docs | Done | 0.5 session |
+| M13 | real HTTP embedding provider default + integration test | Done | 0.75 session |
 
 ## 5. Risk register
 

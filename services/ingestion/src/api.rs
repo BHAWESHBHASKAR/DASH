@@ -45,7 +45,7 @@ impl IngestApiRequest {
         if self.claim_embedding.is_some() {
             return Ok(());
         }
-        let provider = embeddings::select_embedding_provider_from_env();
+        let provider = embeddings::shared_embedding_provider();
         let vectors = provider
             .embed(std::slice::from_ref(&self.claim.canonical_text))
             .map_err(|e| format!("embedding failed: {e}"))?;

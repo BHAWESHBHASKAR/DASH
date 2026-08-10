@@ -4,6 +4,7 @@ members = [
   "pkg/embeddings",
   "pkg/encryption",
   "pkg/schema",
+  "pkg/usage",
   "pkg/ranking",
   "pkg/graph",
   "pkg/store",
@@ -12,6 +13,7 @@ members = [
   "services/retrieval",
   "services/indexer",
   "services/metadata-router",
+  "services/grpc",
   "tests/benchmarks",
 ]
 resolver = "2"

@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers: []
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+  - job_name: 'dash'
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 'ingestion:8081'
+          - 'retrieval:8080'

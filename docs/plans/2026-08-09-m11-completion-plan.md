@@ -1,5 +1,7 @@
 # M11 Completion Plan — RBAC, OIDC, CMEK, SOC 2 Readiness
 
+**Status: implemented in PR #18 (`feature/m11-production-readiness`).**
+
 ## Goal
 
 Close the remaining production-adoption blockers that mature vector databases ship as table-stakes: enterprise identity (OIDC), coarse-grained authorization (RBAC), customer-managed encryption keys (CMEK / BYOK), and the evidence package needed for SOC 2 Type II readiness.
@@ -14,11 +16,11 @@ DASH already has:
 - `DASH_STRICT_SECRETS=1` startup guard and `scripts/generate-secrets.sh`.
 - TLS is assumed to be terminated by the ingress / load balancer.
 
-What is **not** present:
-- OIDC / RS256 / JWKS-based authentication.
-- Role-based access control beyond per-tenant scope (no read-only, admin, or ingest-only roles).
-- Application-level encryption or CMEK integration; at-rest encryption is currently delegated to the block device.
-- SOC 2 control evidence collection (policy templates, evidence scripts, runbooks).
+What was added in this track:
+- OIDC / RS256 / JWKS-based authentication (`pkg/auth/src/oidc.rs`).
+- Role-based access control (`admin`, `ingest`, `retrieve`, `read_only`) enforced in the HTTP route layer.
+- Application-level CMEK integration with `env` and AWS KMS providers in `pkg/encryption`, wired into WAL/snapshot read and write paths.
+- SOC 2 control evidence collection (policy templates, evidence scripts, runbooks) in `docs/compliance/`.
 
 ## M11 sub-milestones
 
@@ -58,25 +60,18 @@ What is **not** present:
 
 ### M11c — Customer-managed encryption keys / envelope encryption (1.5 sessions)
 
-1. Add a `pkg/encryption` crate (or `pkg/store/encryption.rs`) with:
-   - `EncryptionProvider` trait: `generate_data_key()`, `encrypt_dek(plain_dek)`, `decrypt_dek(cipher_dek)`, `encrypt_data(plain, aad)`/`decrypt_data(cipher, aad)`.
-   - `DASH_ENCRYPTION_PROVIDER=none|env|aws-kms|gcp-kms|azure-keyvault|hashicorp-vault`.
-2. Start with two concrete providers:
-   - `none` (default, backward-compatible).
-   - `env` / `master-key` — loads a 256-bit master key from `DASH_ENCRYPTION_MASTER_KEY` and does envelope encryption in-process (suitable for self-hosted and tests).
-3. Envelope encryption scheme:
-   - Per-tenant data encryption key (DEK) generated on first write.
-   - DEK encrypted by the provider’s key-encryption key (KEK) and stored alongside the tenant record header in the WAL / segment.
-   - Claims/evidence/vectors encrypted with `AES-256-GCM` or `ChaCha20-Poly1305` using the per-tenant DEK; AAD includes `tenant_id` and `claim_id` to bind ciphertext to identity.
-4. Integration points:
-   - `FileWal` writes encrypted payload bytes when encryption is enabled.
-   - `InMemoryStore` decrypts on WAL replay / segment load.
-   - Segment maintenance daemon encrypts segment output and stores wrapped DEK in segment manifest.
-5. Add key rotation helpers:
-   - `POST /v1/admin/rotate-tenant-key` (admin role) re-wraps the DEK with a new KEK version.
-   - Background task to re-encrypt old data on a configurable cadence.
-6. Add tests: round-trip, tampered ciphertext, wrong tenant DEK, key rotation, provider unavailable.
-7. Update Helm `Secret` schema and docs for KMS IRSA / Workload Identity / Vault auth.
+**Status: implemented.** `pkg/encryption` provides:
+
+1. `EncryptionProvider` trait with `encrypt`, `decrypt`, `name`.
+2. `DASH_ENCRYPTION_PROVIDER=none|env|aws-kms`.
+3. `env` provider: 256-bit master key from `DASH_ENCRYPTION_MASTER_KEY` (hex or base64), AES-256-GCM with a random nonce.
+4. `aws-kms` provider (feature `aws-kms`): uses AWS KMS `GenerateDataKey`/`Decrypt` to unwrap a data key, then AES-256-GCM locally. Supports `DASH_AWS_KMS_KEY_ID`, `DASH_AWS_KMS_REGION`, and `DASH_ENCRYPTION_WRAPPED_KEY_FILE`.
+5. `FileWal` and `InMemoryStore` now use the configured provider to encrypt WAL/snapshot lines and decrypt on replay; plaintext `enc:` prefix makes encrypted lines self-describing and backward-compatible with unencrypted WALs.
+6. Tests: `encrypted_wal_round_trip_replays_claim`, `encrypted_wal_file_is_not_plaintext`, `encrypted_wal_without_provider_fails_to_replay`.
+
+Remaining follow-up:
+- Per-tenant DEK rotation.
+- Segment manifest encryption and wrapped-DEK storage for immutable segments.
 
 ### M11d — SOC 2 Type II readiness package (0.75 session)
 

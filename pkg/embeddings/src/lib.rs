@@ -15,9 +15,9 @@
 //! `tokio` dependency is gated behind the `async-runtime` feature and is
 //! reserved for future async wrappers.
 
-use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -121,7 +121,7 @@ fn hash_embed(text: &str, dimensions: usize) -> Vec<f32> {
     vector
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OllamaEmbeddingProvider {
     model: String,
     endpoint: String,
@@ -130,7 +130,7 @@ pub struct OllamaEmbeddingProvider {
 
 impl OllamaEmbeddingProvider {
     pub const DEFAULT_ENDPOINT: &'static str = "http://localhost:11434/api/embeddings";
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn new(model: String, endpoint: Option<String>) -> Self {
         Self {
@@ -354,7 +354,7 @@ fn http_post(
             EmbeddingError::Io(format!("no address for {}:{}", parsed.host, parsed.port))
         })?;
 
-    let stream =
+    let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_error(e, timeout))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
@@ -371,26 +371,138 @@ fn http_post(
     request.push_str("\r\n");
     request.push_str(body);
 
-    let mut stream = stream;
     stream
         .write_all(request.as_bytes())
         .map_err(|e| map_io_error(e, timeout))?;
-    stream.shutdown(Shutdown::Write).ok();
 
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| map_io_error(e, timeout))?;
+    let mut reader = BufReader::new(&stream);
+    let mut headers = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if n == 0 {
+            return Err(EmbeddingError::Parse(
+                "server closed connection before response headers".to_string(),
+            ));
+        }
+        headers.push_str(&line);
+        if headers.ends_with("\r\n\r\n") {
+            break;
+        }
+    }
 
-    let response_str = String::from_utf8(response)
+    let status = parse_status(&headers)?;
+    let content_length = parse_content_length(&headers);
+    let chunked = parse_transfer_encoding(&headers).is_some_and(|v| v == "chunked");
+
+    const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+    let mut body_bytes = Vec::new();
+    if chunked {
+        read_chunked_body(&mut reader, &mut body_bytes, timeout)?;
+    } else if let Some(len) = content_length {
+        if len > MAX_BODY_BYTES as usize {
+            return Err(EmbeddingError::Parse(format!(
+                "Content-Length {len} exceeds maximum allowed body size"
+            )));
+        }
+        if len > 0 {
+            body_bytes.resize(len, 0);
+            reader
+                .read_exact(&mut body_bytes)
+                .map_err(|e| map_io_error(e, timeout))?;
+        }
+    } else {
+        reader
+            .take(MAX_BODY_BYTES)
+            .read_to_end(&mut body_bytes)
+            .map_err(|e| map_io_error(e, timeout))?;
+    }
+
+    let body = String::from_utf8(body_bytes)
         .map_err(|e| EmbeddingError::Parse(format!("response is not utf-8: {e}")))?;
+    Ok((status, body))
+}
 
-    let (headers, body) = response_str.split_once("\r\n\r\n").ok_or_else(|| {
-        EmbeddingError::Parse("response missing header/body separator".to_string())
-    })?;
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    let prefix = format!("{}:", name.to_ascii_lowercase());
+    for line in headers.lines() {
+        if line.to_ascii_lowercase().starts_with(&prefix) {
+            return line.split_once(':').map(|x| x.1.trim().to_string());
+        }
+    }
+    None
+}
 
-    let status = parse_status(headers)?;
-    Ok((status, body.to_string()))
+fn parse_content_length(headers: &str) -> Option<usize> {
+    header_value(headers, "content-length")?.parse().ok()
+}
+
+fn parse_transfer_encoding(headers: &str) -> Option<String> {
+    header_value(headers, "transfer-encoding").map(|v| v.to_ascii_lowercase())
+}
+
+fn read_chunked_body<R: BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<(), EmbeddingError> {
+    const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+    let mut size_line = String::new();
+    loop {
+        size_line.clear();
+        let n = reader
+            .read_line(&mut size_line)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if n == 0 {
+            return Err(EmbeddingError::Parse(
+                "chunked body ended abruptly".to_string(),
+            ));
+        }
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| EmbeddingError::Parse(format!("invalid chunk size: {size_line}")))?;
+        if size == 0 {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader
+                    .read_line(&mut line)
+                    .map_err(|e| map_io_error(e, timeout))?;
+                if n == 0 {
+                    return Err(EmbeddingError::Parse(
+                        "chunked trailer ended abruptly".to_string(),
+                    ));
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            break;
+        }
+        if out.len() + size > MAX_BODY_BYTES {
+            return Err(EmbeddingError::Parse(
+                "chunked body exceeds 64 MiB limit".to_string(),
+            ));
+        }
+        let start = out.len();
+        out.resize(start + size, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .map_err(|e| map_io_error(e, timeout))?;
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|e| map_io_error(e, timeout))?;
+        if &crlf != b"\r\n" {
+            return Err(EmbeddingError::Parse(
+                "chunk data not followed by CRLF".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn map_io_error(err: std::io::Error, timeout: Duration) -> EmbeddingError {
@@ -589,30 +701,86 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
     }
 }
 
+/// Probe whether an HTTP endpoint is reachable by opening a TCP connection
+/// to its host and port. This is used during startup to decide whether an
+/// Ollama daemon is available before falling back to the hash provider.
+fn is_endpoint_reachable(endpoint: &str, timeout: Duration) -> bool {
+    let parsed = match parse_url(endpoint) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let addr = match (parsed.host.as_str(), parsed.port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+fn ollama_endpoint_from_env() -> Option<String> {
+    if let Ok(endpoint) = std::env::var("DASH_OLLAMA_ENDPOINT") {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            return Some(endpoint.to_string());
+        }
+    }
+    if let Ok(host) = std::env::var("OLLAMA_HOST") {
+        let host = host.trim();
+        if !host.is_empty() {
+            let base = host.trim_end_matches('/');
+            return Some(format!("{base}/api/embeddings"));
+        }
+    }
+    None
+}
+
 /// Build an [`EmbeddingProvider`] from the process environment. This is the
 /// single place service binaries read `DASH_EMBEDDING_PROVIDER` so the
 /// selection logic stays consistent between ingestion and retrieval.
 ///
 /// Reads:
-/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
-///   network), `"ollama"`, or `"openai"`. Unknown values fall back to `hash`
-///   with a warning.
-/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
+/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (deterministic, no network),
+///   `"ollama"`, or `"openai"`. When unset, the function probes Ollama
+///   (via `DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to `hash`
+///   with a warning if no HTTP embedding backend is reachable.
+/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434/api/embeddings`),
 ///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
 /// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
 ///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
 pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
     let provider = std::env::var("DASH_EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "hash".to_string())
-        .to_ascii_lowercase();
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| !s.trim().is_empty());
+
+    let provider = match provider {
+        Some(p) => p,
+        None => match ollama_endpoint_from_env() {
+            Some(endpoint) if is_endpoint_reachable(&endpoint, Duration::from_millis(200)) => {
+                return Box::new(OllamaEmbeddingProvider::new(
+                    std::env::var("DASH_OLLAMA_MODEL")
+                        .unwrap_or_else(|_| "nomic-embed-text".to_string()),
+                    Some(endpoint),
+                ));
+            }
+            _ => {
+                eprintln!(
+                    "dash: no DASH_EMBEDDING_PROVIDER set and no reachable Ollama endpoint; \
+                     falling back to hash embeddings. Set DASH_EMBEDDING_PROVIDER=ollama|openai for real vectors."
+                );
+                "hash".to_string()
+            }
+        },
+    };
 
     match provider.as_str() {
         "ollama" => {
-            let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let endpoint = ollama_endpoint_from_env();
             let model = std::env::var("DASH_OLLAMA_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string());
-            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
+            Box::new(OllamaEmbeddingProvider::new(model, endpoint))
         }
         "openai" => {
             let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
@@ -636,12 +804,64 @@ pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send 
     }
 }
 
-/// Returns the configured provider name (or `"hash"` when unset) without
-/// building the provider. Useful for startup banners and strict-mode checks.
+/// Returns the configured provider name (or `"hash"` when unset and no Ollama
+/// endpoint is reachable) without building the provider. Useful for startup
+/// banners and strict-mode checks.
 pub fn embedding_provider_name_from_env() -> String {
-    std::env::var("DASH_EMBEDDING_PROVIDER")
-        .unwrap_or_else(|_| "hash".to_string())
-        .to_ascii_lowercase()
+    match std::env::var("DASH_EMBEDDING_PROVIDER") {
+        Ok(value) if !value.trim().is_empty() => value.to_ascii_lowercase(),
+        _ => match ollama_endpoint_from_env() {
+            Some(endpoint) if is_endpoint_reachable(&endpoint, Duration::from_millis(200)) => {
+                "ollama".to_string()
+            }
+            _ => "hash".to_string(),
+        },
+    }
+}
+
+struct CachedProvider {
+    key: String,
+    provider: Arc<dyn EmbeddingProvider + Send + Sync + 'static>,
+}
+
+static SHARED_PROVIDER: OnceLock<Mutex<CachedProvider>> = OnceLock::new();
+
+fn provider_env_key() -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        std::env::var("DASH_EMBEDDING_PROVIDER").unwrap_or_default(),
+        std::env::var("DASH_OLLAMA_ENDPOINT").unwrap_or_default(),
+        std::env::var("OLLAMA_HOST").unwrap_or_default(),
+        std::env::var("DASH_OLLAMA_MODEL").unwrap_or_default(),
+        std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default(),
+        std::env::var("DASH_OPENAI_MODEL").unwrap_or_default(),
+    )
+}
+
+/// Returns a lazily initialized, shared embedding provider.
+///
+/// Services should prefer this over `select_embedding_provider_from_env()`
+/// to avoid recreating the provider (and re-probing the Ollama endpoint) on
+/// every request. The provider is cached by the current embedding-related
+/// environment variables, so changing env vars will invalidate the cache.
+pub fn shared_embedding_provider() -> Arc<dyn EmbeddingProvider + Send + Sync + 'static> {
+    let mut cached = SHARED_PROVIDER
+        .get_or_init(|| {
+            let provider: Arc<dyn EmbeddingProvider + Send + Sync + 'static> =
+                Arc::new(HashEmbeddingProvider::default());
+            Mutex::new(CachedProvider {
+                key: String::new(),
+                provider,
+            })
+        })
+        .lock()
+        .expect("embedding provider cache mutex poisoned");
+    let key = provider_env_key();
+    if cached.key != key {
+        cached.key = key;
+        cached.provider = Arc::from(select_embedding_provider_from_env());
+    }
+    Arc::clone(&cached.provider)
 }
 
 #[cfg(test)]
@@ -994,5 +1214,112 @@ mod tests {
         let wrapped = CircuitBreakerProvider::new(inner, Arc::clone(&breaker));
         assert_eq!(wrapped.dimensions(), 96);
         assert_eq!(wrapped.name(), "hash");
+    }
+
+    // -----------------------------------------------------------------
+    // Provider selection from environment
+    // -----------------------------------------------------------------
+
+    struct TempEnv(&'static str, Option<String>);
+
+    impl TempEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self(key, prev)
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self(key, prev)
+        }
+    }
+
+    impl Drop for TempEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn select_provider_defaults_to_ollama_when_reachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let body_json = r#"{"embedding":[0.1,0.2]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_json.len(),
+            body_json,
+        );
+        let port = spawn_mock_server(response.into_bytes());
+        let endpoint = format!("http://127.0.0.1:{port}/api/embeddings");
+        let _guard4 = TempEnv::set("DASH_OLLAMA_ENDPOINT", &endpoint);
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "ollama");
+    }
+
+    #[test]
+    fn select_provider_defaults_to_hash_when_ollama_unreachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn select_provider_explicit_hash() {
+        let _guard = TempEnv::set("DASH_EMBEDDING_PROVIDER", "hash");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn select_provider_unknown_falls_back_to_hash() {
+        let _guard = TempEnv::set("DASH_EMBEDDING_PROVIDER", "unknown-provider");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        let provider = select_embedding_provider_from_env();
+        assert_eq!(provider.name(), "hash");
+    }
+
+    #[test]
+    fn provider_name_from_env_defaults_to_hash_when_unreachable() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+        let _guard3 = TempEnv::unset("OLLAMA_HOST");
+
+        assert_eq!(embedding_provider_name_from_env(), "hash");
+    }
+
+    #[test]
+    fn provider_name_from_env_honors_ollama_host() {
+        let _guard = TempEnv::unset("DASH_EMBEDDING_PROVIDER");
+        let _guard2 = TempEnv::unset("DASH_OLLAMA_ENDPOINT");
+
+        let body_json = r#"{"embedding":[0.1]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body_json.len(),
+            body_json,
+        );
+        let port = spawn_mock_server(response.into_bytes());
+        let host = format!("http://127.0.0.1:{port}");
+        let _guard3 = TempEnv::set("OLLAMA_HOST", &host);
+
+        assert_eq!(embedding_provider_name_from_env(), "ollama");
     }
 }

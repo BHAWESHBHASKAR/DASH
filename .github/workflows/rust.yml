@@ -49,6 +49,9 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Build docs (all features)
+        run: cargo doc --workspace --all-features --no-deps
+
       - name: Run tests (all features)
         # Single-threaded: retrieval tests rely on process-global env
         # variables/locks that are not safe under the default runner.

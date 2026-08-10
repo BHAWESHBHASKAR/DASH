@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     time::Duration,
 };
 
@@ -588,6 +588,162 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn replica_ack_endpoints() -> Vec<(String, String)> {
+    env_with_fallback("DASH_REPLICA_ACK_ENDPOINTS", "EME_REPLICA_ACK_ENDPOINTS")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| {
+                    let part = part.trim();
+                    let (node_id, url) = part.split_once('=')?;
+                    let node_id = node_id.trim().to_string();
+                    let url = url.trim().trim_end_matches('/').to_string();
+                    if node_id.is_empty() || url.is_empty() {
+                        None
+                    } else {
+                        Some((node_id, url))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn quorum_sync_timeout() -> Duration {
+    env_with_fallback(
+        "DASH_INGEST_QUORUM_TIMEOUT_MS",
+        "EME_INGEST_QUORUM_TIMEOUT_MS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .map(Duration::from_millis)
+    .unwrap_or(Duration::from_millis(5000))
+}
+
+fn request_replication_source_with_timeout(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    timeout: Duration,
+) -> Result<ReplicationSourceResponse, String> {
+    let (authority, path) = parse_http_url(url)?;
+    let addrs: Vec<_> = authority
+        .to_socket_addrs()
+        .map_err(|err| format!("failed resolving replication authority '{authority}': {err}"))?
+        .collect();
+    let addr = addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no addresses for replication authority '{authority}'"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|err| format!("failed connecting replication source '{authority}': {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("failed setting read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("failed setting write timeout: {err}"))?;
+
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Length: 0\r\n"
+    );
+    if let Some(token) = token {
+        request.push_str(&format!("x-replication-token: {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("failed sending replication request: {err}"))?;
+    stream
+        .flush()
+        .map_err(|err| format!("failed flushing replication request: {err}"))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .map_err(|err| format!("failed reading replication response: {err}"))?;
+    let response_text = String::from_utf8(response_bytes)
+        .map_err(|_| "replication response is not valid UTF-8".to_string())?;
+    let (header_block, body) = response_text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "replication response missing HTTP header terminator".to_string())?;
+    let status_line = header_block
+        .lines()
+        .next()
+        .ok_or_else(|| "replication response missing status line".to_string())?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "replication response status line missing code".to_string())
+        .and_then(|value| {
+            value
+                .parse::<u16>()
+                .map_err(|_| "replication response has invalid status code".to_string())
+        })?;
+    Ok(ReplicationSourceResponse {
+        status,
+        body: body.to_string(),
+    })
+}
+
+pub(super) fn wait_for_follower_acks(
+    commit_id: &str,
+    ack_epoch: Option<u64>,
+    initial_ack_count: usize,
+    required_acks: usize,
+) -> usize {
+    if required_acks <= initial_ack_count {
+        return initial_ack_count;
+    }
+    let endpoints = replica_ack_endpoints();
+    if endpoints.is_empty() {
+        return initial_ack_count;
+    }
+    let timeout = quorum_sync_timeout();
+    if timeout.is_zero() {
+        return initial_ack_count;
+    }
+    let token = replication_token();
+    let commit_id = commit_id.to_string();
+    let epoch = ack_epoch.unwrap_or(0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = std::time::Instant::now();
+    for (node_id, base_url) in endpoints {
+        let commit_id = commit_id.clone();
+        let tx = tx.clone();
+        let token = token.clone();
+        std::thread::spawn(move || {
+            let url = format!(
+                "{}/internal/replication/ack?commit_id={}&replica_id={}&ack_epoch={}",
+                base_url,
+                url_encode_component(&commit_id),
+                url_encode_component(&node_id),
+                epoch
+            );
+            let ok = match request_replication_source_with_timeout(
+                &url,
+                token.as_deref(),
+                "POST",
+                timeout,
+            ) {
+                Ok(response) => response.status == 200,
+                Err(_) => false,
+            };
+            let _ = tx.send(ok);
+        });
+    }
+    let mut acks = initial_ack_count;
+    while acks < required_acks && start.elapsed() < timeout {
+        let remaining = timeout - start.elapsed();
+        if remaining.is_zero() {
+            break;
+        }
+        if let Ok(true) = rx.recv_timeout(remaining) {
+            acks += 1;
+        }
+    }
+    acks
 }
 
 #[cfg(test)]

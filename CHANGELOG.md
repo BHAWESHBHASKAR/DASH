@@ -13,6 +13,28 @@ to [Semantic Versioning](https://semver.org/).
   variable (`OPENAI_API_BASE=http://localhost:8080/v1`). 17 tests
   cover the wire-format compatibility, error envelope, and HTTP-level
   integration.
+- **OpenAI-compatible `/v1/models` endpoint** so OpenAI SDKs can
+  discover supported model names before calling `/v1/embeddings`.
+- **`GET /v1/tenants` on the ingestion service** to list tenant IDs
+  known to the runtime, a first admin-style collection listing API.
+- **Managed-cloud usage metering** — new `pkg/usage` crate with
+  `UsageCounters`/`UsageSnapshot`, `GET /v1/usage` on both ingestion
+  and retrieval, and per-tenant request/byte counters recorded on every
+  successful ingest and retrieve. Embeddings are tracked separately.
+- **Operational dashboard** — `GET /dashboard` on the retrieval
+  service serves an HTML dashboard with health, usage, models, and a
+  retrieve form.
+- **gRPC surface** — new `services/grpc` binary exposes `dash.v1.Dash`
+  with `Embed` and `ListModels` methods on `DASH_GRPC_BIND`
+  (default `127.0.0.1:50051`), backed by the same shared embedding
+  provider selection as the REST API.
+- **Multi-region synchronous quorum hardening** — `POST /v1/ingest`
+  with `write_consistency=quorum` now fan-outs `POST
+  /internal/replication/ack` to follower endpoints configured via
+  `DASH_REPLICA_ACK_ENDPOINTS` and waits up to
+  `DASH_INGEST_QUORUM_TIMEOUT_MS` (default 5000ms) before returning,
+  updating the real-time `ack_count` and `commit_status` in the
+  response.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.
@@ -33,7 +55,10 @@ to [Semantic Versioning](https://semver.org/).
 - **Real embedding integration** — env-driven provider selection
   (`DASH_EMBEDDING_PROVIDER=hash|ollama|openai`) so deployments
   can wire up real semantic embeddings instead of the
-  hash-based default.
+  hash-based default. Provider selection now auto-discovers a
+  reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or
+  `OLLAMA_HOST`) when `DASH_EMBEDDING_PROVIDER` is unset, falling
+  back to hash with a startup warning.
 - **Semantic-first retrieval** — new `InMemoryStore::retrieve_semantic`
   method. When the caller passes a pre-computed query vector, the
   dense-similarity score becomes the primary ranking signal (cosine
@@ -66,6 +91,26 @@ to [Semantic Versioning](https://semver.org/).
 - **`OpenAIErrorResponse`** with `DashError` interface and
   `DashAPIError`/`DashConnectionError` concrete types; `from_response`
   factory tolerates both OpenAI and ad-hoc error shapes.
+- **Customer-managed encryption keys** — `pkg/encryption` crate with
+  `EncryptionProvider` trait, AES-256-GCM `env` provider, AWS KMS-backed
+  `aws-kms` provider, and storage-line encryption wired into WAL/snapshot
+  read and write paths in `pkg/store`.
+- **OpenAPI 3.0 spec and SDK quick-start** — `docs/api/openapi.yaml`
+  covering all public endpoints and `docs/api/README.md` with curl
+  examples and SDK generation commands.
+- **Ollama overlay for real semantic embeddings** —
+  `deploy/container/docker-compose.ollama.yml` adds an `ollama` service
+  and defaults `DASH_EMBEDDING_PROVIDER=ollama` when the `ollama`
+  compose profile is active; `select_embedding_provider_from_env()` now
+  uses the correct `/api/embeddings` path by default.
+- **Prometheus + Grafana monitoring overlay** —
+  `deploy/container/docker-compose.monitoring.yml`, `monitoring/prometheus.yml`,
+  and `monitoring/grafana-dashboards/dash-overview.json` provide a
+  turn-key observability stack with the DASH metrics exported by
+  ingestion/retrieval.
+- **Makefile and PR/issue templates** — `Makefile` provides common
+  build/test/docker commands; `.github/PULL_REQUEST_TEMPLATE.md` and
+  `.github/ISSUE_TEMPLATE/*.md` standardize contributions.
 
 ### Changed
 - **JSON parsing in services/ingestion** — replaced 633 lines of

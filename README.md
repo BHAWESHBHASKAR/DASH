@@ -18,22 +18,30 @@ resp = client.embeddings.create(input="hello world", model="text-embedding-3-sma
 print(resp.data[0].embedding[:5])
 ```
 
-## Current state (2026-06-13)
+## Current state (2026-08-09)
 
 **Production-ready in this release:**
 - OpenAI-compatible `/v1/embeddings` endpoint (wire-byte compatible with the OpenAI spec)
-- Semantic-first retrieval (`InMemoryStore::retrieve_semantic`) with dense-similarity as the primary ranking signal
-- Env-driven real embedding providers: `DASH_EMBEDDING_PROVIDER=hash|ollama|openai`
-- `redb` persistence (PR 1, additive, default off; enable with `DASH_*_PERSISTENCE_PATH`)
-- SDKs: Python (`dash-py`), Go (`dash-go`), TypeScript (`dash-ts`) — all OpenAI-drop-in compatible
+- Semantic-first retrieval with dense similarity as the primary ranking signal
+- Auto-discovered real embedding provider: `DASH_EMBEDDING_PROVIDER` defaults to a reachable Ollama endpoint; `hash` or `openai` are one env var away. Ollama overlay in `deploy/container/docker-compose.ollama.yml`.
+- `redb` persistence with WAL replay, checkpoints, compaction, and durability guardrails
+- Customer-managed encryption keys (`pkg/encryption`) with `env` and AWS KMS (`aws-kms` feature) providers, wired into WAL/snapshot lines
+- OIDC/JWKS authentication and RBAC (`admin`, `ingest`, `retrieve`, `read_only`) with scoped API keys
+- Control-plane leader election, shard placement, and failover promotion
+- Quorum replication with follower pull and persistent replication offset
+- Disk-first segment serving tier for large tenants
+- Object-storage (S3) backup/restore
+- Helm chart with managed-cloud scaffolding
+- OpenAPI 3.0 spec and SDK quick-start docs in `docs/api/`
+- SDKs: Python (`dash-py`), Go (`dash-go`), TypeScript (`dash-ts`), C# (`Dash`), Java, Kotlin — all OpenAI-drop-in compatible
 - `cargo-fuzz` harnesses for JWT, OpenAI parser, ranking, and WAL parser
-- Performance benchmark suite (`perf_bench`): ingest, retrieve-lexical, retrieve-semantic, ANN-at-scale, WAL-replay
-- Docker + docker-compose (multi-arch, non-root, healthcheck)
-- Hash-chained audit log, per-tenant rate limiting, JWT auth + scoped API keys, OpenAI drop-in
+- Performance benchmark suite with CI regression guard
+- Docker + docker-compose (multi-arch, non-root, healthcheck, Prometheus alert rules)
+- Hash-chained audit log, per-tenant rate limiting, key revocation
 
-**Test counts:** 379 Rust unit/integration tests passing, plus 86 Go + 65 TypeScript + 59 Python = **589 tests total** across the workspace. `cargo clippy --workspace --all-targets` is clean. `cargo build --workspace` is clean.
+**Test counts:** Rust unit/integration tests, Go/TypeScript/Python/C#/Java/Kotlin SDK tests, and `./scripts/ci.sh` all pass. `cargo clippy --workspace --all-features` is clean. `cargo build --workspace --all-features` is clean.
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full deltas and [`docs/quickstart.md`](./docs/quickstart.md) for the 5-minute path.
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full deltas and [`docs/api/README.md`](./docs/api/README.md) for the API reference and quick-start.
 
 ## Why DASH
 
@@ -46,15 +54,25 @@ Concretely, every retrieval response in DASH is `{ claim, score, supports, contr
 The five-minute path from clone to retrieval query. Requires Docker.
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+make docker
+```
+
+Or step-by-step:
+
+```bash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh
 docker compose -f deploy/container/docker-compose.yml up -d
 ```
 
-Ingest a claim with its supporting evidence:
+Ingest a claim with its supporting evidence (after `source deploy/container/.env`):
 
 ```bash
 curl -X POST http://localhost:8081/v1/ingest \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "claim": {
@@ -78,6 +96,7 @@ Retrieve with citations, dropping any claim that has been contradicted:
 
 ```bash
 curl -X POST http://localhost:8080/v1/retrieve \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "t1",
@@ -94,14 +113,15 @@ Use the OpenAI-compatible `/v1/embeddings` endpoint from any OpenAI SDK — `lan
 - **Claim + Evidence + Edge data model** with first-class citation provenance (`source_id`, `stance`, `source_quality`, `chunk_id`, `span_start`, `span_end`, `doc_id`, `extraction_model`).
 - **Contradiction handling**: `Stance::Contradicts` on evidence and `ClaimEdge { relation: Contradicts }` demote results; `stance_mode: support_only` filters them out.
 - **Temporal validity windows**: `event_time_unix`, `valid_from`, `valid_to` on every claim, with `time_range` filtering on the retrieval API.
-- **OpenAI-compatible `/v1/embeddings`**: byte-compatible request/response with the OpenAI v1 embeddings API. Default provider is `HashEmbeddingProvider` (deterministic, no network); swap for Ollama, OpenAI, or any custom backend by implementing the `EmbeddingProvider` trait.
+- **OpenAI-compatible `/v1/embeddings`**: byte-compatible request/response with the OpenAI v1 embeddings API. Default provider auto-discovers a reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to `HashEmbeddingProvider` (deterministic, no network) with a startup warning. Explicitly set `DASH_EMBEDDING_PROVIDER=hash|ollama|openai` to force a provider.
 - **HNSW ANN** via `usearch` for vector candidate generation, with `DASH_*_ANN_*` tuning knobs and a graph-backed recall layer on top.
 - **Durable WAL** with replay, checkpoints, and compaction in `pkg/store`. WAL durability guardrails reject unsafe flush policies by default; an explicit `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true` override is required for stress testing.
 - **Hash-chained audit log**: every authenticated state change is recorded as a SHA-256-chained JSON line; verify with `scripts/verify_audit_chain.sh`.
 - **Per-tenant rate limits, scoped API keys, and key revocation** with `DASH_*_RATE_LIMIT_*`, `DASH_*_SCOPED_API_KEYS`, and `DASH_*_REVOKED_API_KEYS`. Multi-tenant tenant allowlist enforced in the authz layer.
-- **JWT auth (HS256)** with key rotation by `kid`, optional `iss`/`aud` checks, fallback secrets list, and per-tenant claim enforcement.
+- **JWT auth (HS256 + OIDC/JWKS)** with key rotation by `kid`, optional `iss`/`aud` checks, fallback secrets list, per-tenant claim enforcement, and RBAC on every route.
+- **Customer-managed encryption keys** for WAL and snapshot at-rest encryption; self-hosted `env` master key or AWS KMS envelope encryption.
 - **Open source** — see the `LICENSE` file (the intended license is Apache-2.0, pending confirmation before the first tagged release). Fully auditable core, no vendor lock-in, no telemetry.
-- **Operational scripts**: backup, restore, recovery drill, failover drill, SLO guard, release-candidate gate, audit chain verifier — see `scripts/`.
+- **Operational scripts**: backup, restore, S3 upload/download, recovery drill, failover drill, SLO guard, release-candidate gate, audit chain verifier, SOC 2 evidence collector — see `scripts/`.
 - **Benchmark suite** with `smoke`, `hybrid`, and `large` profiles and a CI-enforced regression guard against prior scorecards.
 
 ## Comparison
@@ -118,11 +138,13 @@ DASH vs other vector databases on the dimensions that matter to RAG users. See [
 | Hash-chained audit log | yes | no | no | no | no | no |
 | Tenant rate limits | yes | yes | yes | yes | partial | no |
 | JWT + scoped API keys + revocation | yes | JWT only | OIDC | yes | partial | no |
+| RBAC (admin/ingest/retrieve/read_only) | yes | no | limited | yes | partial | no |
+| CMEK / at-rest encryption | yes | no | no | no | no | no |
 | RAG-specific primitives | yes | no | modules | no | no | no |
 
 ## Architecture
 
-DASH is a Rust workspace organized into library crates (`pkg/schema`, `pkg/store`, `pkg/ranking`, `pkg/graph`, `pkg/auth`, `pkg/embeddings`) and four service binaries (`services/ingestion`, `services/retrieval`, `services/indexer`, `services/control-plane`). Ingested claims are durably written to a write-ahead log, replayed into an in-memory `Claim + Evidence + Edge` store, and indexed for HNSW ANN candidate generation. The retrieval path runs a planner that combines ANN candidates with metadata filters, time-range filters, stance demotion/filtering, and optional graph expansion, then projects results into a citation-bearing response. JWT and scoped-API-key authz is enforced in the transport layer; per-tenant rate limits and a hash-chained audit log are emitted alongside every state change. The full design — including the data model, WAL/snapshot protocol, retrieval planner, and operational model — lives in [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md).
+DASH is a Rust workspace organized into library crates (`pkg/schema`, `pkg/store`, `pkg/ranking`, `pkg/graph`, `pkg/auth`, `pkg/embeddings`, `pkg/encryption`) and service binaries (`services/ingestion`, `services/retrieval`, `services/indexer`, `services/control-plane`, `services/metadata-router`). Ingested claims are durably written to a write-ahead log, replayed into an in-memory `Claim + Evidence + Edge` store, and indexed for HNSW ANN candidate generation. The retrieval path runs a planner that combines ANN candidates with metadata filters, time-range filters, stance demotion/filtering, and optional graph expansion, then projects results into a citation-bearing response. JWT and scoped-API-key authz is enforced in the transport layer; per-tenant rate limits and a hash-chained audit log are emitted alongside every state change. The full design — including the data model, WAL/snapshot protocol, retrieval planner, and operational model — lives in [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md).
 
 ## Roadmap
 
@@ -131,20 +153,28 @@ Done (in this tree):
 - WAL with replay, checkpoints, compaction, and durability guardrails
 - HNSW ANN via `usearch` with `DASH_*_ANN_*` tuning
 - Retrieval API with `Balanced` and `SupportOnly` stance modes, time-range filtering, optional graph payload
-- OpenAI-compatible `/v1/embeddings`
+- OpenAI-compatible `/v1/embeddings` with `hash`, `ollama`, and `openai` providers
 - Per-tenant authz, scoped keys, revocation, rate limits
+- OIDC/JWKS authentication and RBAC (`admin`, `ingest`, `retrieve`, `read_only`)
 - Hash-chained audit log with chain verifier
 - HS256 JWT with kid rotation, `iss`/`aud`, fallback secrets
+- Customer-managed encryption keys (`env` and AWS KMS) for WAL/snapshot at-rest encryption
+- Control-plane leader election, shard placement, and failover promotion
+- Quorum replication with follower pull and persistent replication offset
+- Disk-first segment serving tier for large tenants
+- Object-storage (S3) backup/restore
+- Helm chart with managed-cloud scaffolding
+- OpenAPI 3.0 spec and SDK quick-start docs
+- SDKs: Python, Go, TypeScript, C#, Java, Kotlin
 - Benchmark suite with CI regression guard
-- Docker Compose and systemd unit files
+- Docker Compose, systemd unit files, and Ollama overlay
 
 Next (active development):
 - Larger-scale ANN recall/quality tuning and benchmarking at 10M+ claim corpora
-- Full segment lifecycle integration in the retrieval hot path
-- Distributed shard + replication protocol (placement router is wired; production-ready replication path is not)
-- Auth federation (OIDC), broader key-rotation story
-- Pluggable embedding backends (Ollama, OpenAI passthrough) as a first-class `EmbeddingProvider` example set
-- JavaScript/TypeScript and Go SDKs
+- Replicator promotion to synchronous multi-region quorum
+- Fully managed cloud control plane with usage-based metering
+- Web dashboard / cloud console
+- gRPC API surface alongside REST
 
 ## Contributing
 

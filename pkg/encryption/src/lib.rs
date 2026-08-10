@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "aws-kms")]
+pub mod aws_kms;
+#[cfg(feature = "aws-kms")]
+pub use aws_kms::AwsKmsProvider;
+
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -25,6 +30,60 @@ pub trait EncryptionProvider: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+pub const ENCRYPTED_LINE_PREFIX: &str = "enc:";
+
+/// Legacy AAD used by the first implementation of encrypted WAL lines. Kept so
+/// old `enc:<base64>` lines can still be replayed after the format gained an
+/// embedded AAD field.
+const LEGACY_AAD: &[u8] = b"DASH_WAL";
+
+pub fn encrypt_storage_line(
+    provider: &dyn EncryptionProvider,
+    plaintext: &str,
+    aad: &str,
+) -> Result<String, EncryptionError> {
+    let ciphertext = provider.encrypt(plaintext.as_bytes(), aad.as_bytes())?;
+    let aad_b64 = base64::engine::general_purpose::STANDARD.encode(aad.as_bytes());
+    let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+    Ok(format!("{ENCRYPTED_LINE_PREFIX}{aad_b64}:{ciphertext_b64}"))
+}
+
+pub fn decrypt_storage_line(
+    provider: &dyn EncryptionProvider,
+    line: &str,
+) -> Result<String, EncryptionError> {
+    let Some(payload) = line.strip_prefix(ENCRYPTED_LINE_PREFIX) else {
+        return Ok(line.to_string());
+    };
+
+    if let Some((aad_b64, ciphertext_b64)) = payload.split_once(':') {
+        let aad = base64::engine::general_purpose::STANDARD
+            .decode(aad_b64)
+            .map_err(|_| {
+                EncryptionError::Config("storage line AAD is not valid base64".to_string())
+            })?;
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(ciphertext_b64)
+            .map_err(|_| {
+                EncryptionError::Config("storage line ciphertext is not valid base64".to_string())
+            })?;
+        let plaintext = provider.decrypt(&ciphertext, &aad)?;
+        String::from_utf8(plaintext).map_err(|_| {
+            EncryptionError::Config("decrypted storage line is not valid UTF-8".to_string())
+        })
+    } else {
+        // Backward-compatible path for `enc:<base64>` lines written before the
+        // AAD field was embedded.
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|_| EncryptionError::Config("storage line is not valid base64".to_string()))?;
+        let plaintext = provider.decrypt(&ciphertext, LEGACY_AAD)?;
+        String::from_utf8(plaintext).map_err(|_| {
+            EncryptionError::Config("decrypted storage line is not valid UTF-8".to_string())
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub provider: String,
@@ -45,6 +104,12 @@ pub fn provider_from_env() -> Result<Arc<dyn EncryptionProvider>, EncryptionErro
         .unwrap_or_else(|_| "none".to_string());
     match provider.trim().to_ascii_lowercase().as_str() {
         "none" | "" => Ok(Arc::new(NoOpProvider)),
+        #[cfg(feature = "aws-kms")]
+        "aws-kms" => Ok(Arc::new(AwsKmsProvider::new_from_env()?)),
+        #[cfg(not(feature = "aws-kms"))]
+        "aws-kms" => Err(EncryptionError::Config(
+            "aws-kms provider requires the aws-kms feature".to_string(),
+        )),
         "env" => {
             let raw = std::env::var("DASH_ENCRYPTION_MASTER_KEY")
                 .or_else(|_| std::env::var("EME_ENCRYPTION_MASTER_KEY"))

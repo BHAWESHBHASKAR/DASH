@@ -97,22 +97,41 @@ pub(super) fn handle_ingest_post(
                 match guard.ensure_local_write_route_for_claim(&api_req.claim, write_consistency) {
                     Ok(route_resolution) => match guard.ingest(api_req) {
                         Ok(mut resp) => {
-                            resp.commit_epoch = if route_resolution.epoch > 0 {
+                            let commit_id = resp.ingested_claim_id.clone();
+                            let commit_epoch = if route_resolution.epoch > 0 {
                                 Some(route_resolution.epoch)
                             } else {
                                 None
                             };
-                            resp.ack_count = route_resolution.ack_count;
-                            resp.required_acks = route_resolution.required_acks;
+                            let required_acks = route_resolution.required_acks;
+                            drop(guard);
+                            let ack_count = super::replication::wait_for_follower_acks(
+                                &commit_id,
+                                commit_epoch,
+                                route_resolution.ack_count,
+                                required_acks,
+                            );
+                            guard = match runtime.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    audit_reason =
+                                        "failed to re-acquire ingestion runtime lock".to_string();
+                                    return HttpResponse::internal_server_error(&audit_reason);
+                                }
+                            };
+                            resp.commit_epoch = commit_epoch;
+                            resp.ack_count = ack_count;
+                            resp.required_acks = required_acks;
                             resp.commit_status =
                                 commit_status_for_progress(resp.ack_count, resp.required_acks)
                                     .to_string();
                             guard.record_commit_status(
-                                &resp.ingested_claim_id,
+                                &commit_id,
                                 resp.commit_epoch,
                                 resp.ack_count,
                                 resp.required_acks,
                             );
+                            guard.record_tenant_usage(&tenant_id, request.body.len());
                             audit_status = 200;
                             audit_outcome = "success";
                             audit_reason = "ingest accepted".to_string();
@@ -335,6 +354,7 @@ pub(super) fn handle_ingest_raw_post(
                         checkpoint_truncated_wal_records: batch_resp
                             .checkpoint_truncated_wal_records,
                     };
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     audit_status = 200;
                     audit_outcome = "success";
                     audit_reason = format!(
@@ -507,6 +527,7 @@ pub(super) fn handle_ingest_batch_post(
                         resp.ack_count,
                         resp.required_acks,
                     );
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     audit_status = 200;
                     audit_outcome = "success";
                     audit_reason = format!("ingest batch accepted (commit_id={})", resp.commit_id);
@@ -705,6 +726,7 @@ pub(super) fn handle_ingest_document_post(
                         batch_resp.ack_count,
                         batch_resp.required_acks,
                     );
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     let document_resp = IngestDocumentApiResponse {
                         document_id,
                         mime_type: parsed_mime_type,

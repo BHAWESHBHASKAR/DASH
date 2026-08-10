@@ -10,18 +10,21 @@ Five minutes from `git clone` to a working retrieval query against DASH.
 
 ## Option 1: Docker (recommended)
 
-Clone the repo and start the two-service stack (ingestion on `:8081`, retrieval on `:8080`):
+Clone the repo, generate strong secrets, and start the two-service stack (ingestion on `:8081`, retrieval on `:8080`):
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh
 docker compose -f deploy/container/docker-compose.yml up -d
 ```
 
-The compose file mounts a `dash_data` volume for the WAL and segments, and sets safe defaults for the WAL durability guardrails. Both services come up healthy; confirm with:
+The compose file mounts a `dash-state` volume for the WAL and segments, and sets safe defaults for the WAL durability guardrails. Both services come up healthy; confirm with:
 
 ```bash
+source deploy/container/.env
 curl http://localhost:8080/health
+curl -H "x-api-key: $DASH_RETRIEVAL_API_KEY" http://localhost:8080/health
 curl http://localhost:8081/health
 ```
 
@@ -31,11 +34,33 @@ To stop and remove the stack:
 docker compose -f deploy/container/docker-compose.yml down
 ```
 
+### Optional compose overlays
+
+- **Real semantic embeddings** — start an Ollama sidecar. DASH auto-discovers
+  a reachable Ollama endpoint by default; the compose overlay wires it explicitly:
+
+  ```bash
+  docker compose \
+    -f deploy/container/docker-compose.yml \
+    -f deploy/container/docker-compose.ollama.yml \
+    --profile ollama up -d
+  ```
+
+- **Monitoring** — start Prometheus and Grafana with a pre-loaded DASH
+  dashboard:
+
+  ```bash
+  docker compose \
+    -f deploy/container/docker-compose.yml \
+    -f deploy/container/docker-compose.monitoring.yml \
+    --profile monitoring up -d
+  ```
+
 ## Option 2: Build from source
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
 
 # Build the two services you'll run for ingestion and retrieval.
 cargo build --release -p ingestion -p retrieval
@@ -66,6 +91,7 @@ A DASH claim is `{ claim, evidence[], edges[] }`. The claim is the atomic assert
 
 ```bash
 curl -X POST http://localhost:8081/v1/ingest \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "claim": {
@@ -95,6 +121,7 @@ Retrieve returns ranked claims with their supporting/contradicting evidence as i
 
 ```bash
 curl -X POST http://localhost:8080/v1/retrieve \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "t1",
@@ -126,12 +153,13 @@ You can also constrain the result set to a temporal window with `time_range: { "
 
 ## Use the OpenAI-compatible API
 
-DASH exposes `POST /v1/embeddings` with a request and response shape that is byte-compatible with the OpenAI v1 embeddings API. The default embedding backend is the deterministic `HashEmbeddingProvider` (no network, no API key required) so the endpoint works out of the box; swap in Ollama, OpenAI, or a custom model by implementing the `EmbeddingProvider` trait.
+DASH exposes `POST /v1/embeddings` with a request and response shape that is byte-compatible with the OpenAI v1 embeddings API. The default backend auto-discovers a reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to the deterministic `HashEmbeddingProvider` (no network, no API key) with a startup warning. Force a provider with `DASH_EMBEDDING_PROVIDER=hash|ollama|openai`, or implement the `EmbeddingProvider` trait for a custom backend.
 
 From `curl`:
 
 ```bash
 curl -X POST http://localhost:8080/v1/embeddings \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"input": "Company X acquired Company Y", "model": "text-embedding-3-small"}'
 ```
@@ -139,11 +167,12 @@ curl -X POST http://localhost:8080/v1/embeddings \
 From the OpenAI Python SDK — point `base_url` at the DASH retrieval service and DASH is a drop-in replacement:
 
 ```python
+import os
 import openai
 
 client = openai.OpenAI(
     base_url="http://localhost:8080/v1",
-    api_key="not-needed",
+    api_key=os.environ["DASH_RETRIEVAL_API_KEY"],
 )
 response = client.embeddings.create(
     input="hello world",

@@ -61,6 +61,27 @@ pub(super) fn handle_get_request(
             }
         },
         "/debug/document-parser" => HttpResponse::ok_json(render_document_parser_debug_json()),
+        "/v1/tenants" => match runtime.lock() {
+            Ok(rt) => {
+                let tenants = rt.tenant_ids();
+                match serde_json::to_string(&tenants) {
+                    Ok(body) => HttpResponse::ok_json(body),
+                    Err(_) => HttpResponse::internal_server_error("failed to serialize tenants"),
+                }
+            }
+            Err(_) => {
+                HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+            }
+        },
+        "/v1/usage" => match runtime.lock() {
+            Ok(rt) => match serde_json::to_string(&rt.usage_snapshot()) {
+                Ok(body) => HttpResponse::ok_json(body),
+                Err(_) => HttpResponse::internal_server_error("failed to serialize usage"),
+            },
+            Err(_) => {
+                HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+            }
+        },
         "/internal/replication/wal" => handle_replication_wal_get(runtime, request, query),
         "/internal/replication/export" => handle_replication_export_get(runtime, request),
         "/internal/replication/commit-status" => {

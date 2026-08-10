@@ -1,0 +1,50 @@
+# Optional Ollama overlay for real semantic embeddings.
+#
+# Usage:
+#   docker compose \
+#     -f deploy/container/docker-compose.yml \
+#     -f deploy/container/docker-compose.ollama.yml \
+#     --profile ollama up
+#
+# This adds an `ollama` container and switches `ingestion` and `retrieval`
+# to `DASH_EMBEDDING_PROVIDER=ollama` with the nomic-embed-text model.
+# The first embedding request will pull the model; subsequent calls are fast.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dash-ollama
+    profiles: [ollama]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    healthcheck:
+      test: ["CMD-SHELL", "ollama --version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  ingestion:
+    environment:
+      DASH_EMBEDDING_PROVIDER: ${DASH_EMBEDDING_PROVIDER:-ollama}
+      DASH_OLLAMA_ENDPOINT: ${DASH_OLLAMA_ENDPOINT:-http://ollama:11434/api/embeddings}
+      DASH_OLLAMA_MODEL: ${DASH_OLLAMA_MODEL:-nomic-embed-text}
+
+  retrieval:
+    environment:
+      DASH_EMBEDDING_PROVIDER: ${DASH_EMBEDDING_PROVIDER:-ollama}
+      DASH_OLLAMA_ENDPOINT: ${DASH_OLLAMA_ENDPOINT:-http://ollama:11434/api/embeddings}
+      DASH_OLLAMA_MODEL: ${DASH_OLLAMA_MODEL:-nomic-embed-text}
+
+volumes:
+  ollama-models:
+    name: dash-ollama-models
+    driver: local

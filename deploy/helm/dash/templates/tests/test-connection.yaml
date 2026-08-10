@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "dash.fullname" . }}-test-connection"
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: retrieval
+      image: busybox:1.36
+      command: ['wget']
+      args:
+        - '--spider'
+        - 'http://{{ include "dash.fullname" . }}-retrieval:8080/health'
+    - name: ingestion
+      image: busybox:1.36
+      command: ['wget']
+      args:
+        - '--spider'
+        - 'http://{{ include "dash.fullname" . }}-ingestion:8081/health'
+    - name: control-plane
+      image: busybox:1.36
+      command: ['wget']
+      args:
+        - '--spider'
+        - 'http://{{ include "dash.fullname" . }}-control-plane:8090/v1/control-plane/health'

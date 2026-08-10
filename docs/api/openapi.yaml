@@ -1,0 +1,1302 @@
+openapi: 3.0.3
+info:
+  title: DASH API
+  description: |
+    Evidence-first vector database API. The ingestion service writes claims,
+    evidence and claim edges to a persistent WAL. The retrieval service runs
+    citation-grade semantic + lexical search with contradiction and temporal
+    filters. The control-plane service coordinates shard placement and leader
+    election.
+  version: 0.1.0
+  contact:
+    name: DASH Authors
+    url: https://github.com/BHAWESHBHASKAR/DASH
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8081
+    description: Ingestion service
+  - url: http://localhost:8080
+    description: Retrieval service
+  - url: http://localhost:8082
+    description: Control-plane service
+
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
+paths:
+  # Ingestion service
+  /v1/ingest:
+    post:
+      tags: [Ingest]
+      summary: Ingest a claim with optional evidence and edges
+      description: |
+        Accepts a single claim plus related evidence and claim edges. The
+        request is validated, appended to the WAL, and applied to the
+        in-memory store.
+      operationId: ingestClaim
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestApiRequest'
+      responses:
+        '200':
+          description: Ingest succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/ingest/raw:
+    post:
+      tags: [Ingest]
+      summary: Extract claims from raw text
+      description: |
+        Splits a document into sentences and ingests each sentence as a claim.
+      operationId: ingestRaw
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRawApiRequest'
+      responses:
+        '200':
+          description: Extraction and ingest succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestRawApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/ingest/document:
+    post:
+      tags: [Ingest]
+      summary: Ingest a document (text or base64 content)
+      description: |
+        Accepts a document body either as `text` or base64-encoded `content_base64`.
+      operationId: ingestDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestDocumentApiRequest'
+      responses:
+        '200':
+          description: Document parsed and ingested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestDocumentApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/ingest/batch:
+    post:
+      tags: [Ingest]
+      summary: Batch ingest claims
+      description: |
+        Ingests many claims atomically. All items must share the same tenant.
+      operationId: ingestBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestBatchApiRequest'
+      responses:
+        '200':
+          description: Batch ingest succeeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /internal/replication/wal:
+    get:
+      tags: [Replication]
+      summary: Read the WAL tail for replication
+      description: |
+        Returns a range of WAL lines to downstream retrieval followers.
+        Internal endpoint; not exposed publicly.
+      operationId: replicationWal
+      parameters:
+        - name: after
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: WAL chunk
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /internal/replication/export:
+    get:
+      tags: [Replication]
+      summary: Export full WAL snapshot for a new follower
+      description: |
+        Returns the current WAL contents as a snapshot for new followers.
+      operationId: replicationExport
+      responses:
+        '200':
+          description: WAL snapshot
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /internal/replication/ack:
+    post:
+      tags: [Replication]
+      summary: Acknowledge a replicated commit
+      description: |
+        Replicas acknowledge a commit so the leader can advance its quorum.
+      operationId: replicationAck
+      parameters:
+        - name: commit_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: replica_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: ack_epoch
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Ack recorded
+
+  /internal/replication/commit-status:
+    get:
+      tags: [Replication]
+      summary: Check commit status
+      operationId: replicationCommitStatus
+      parameters:
+        - name: commit_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Commit status
+
+  /health:
+    get:
+      tags: [Diagnostics]
+      summary: Health check
+      operationId: ingestionHealth
+      responses:
+        '200':
+          description: Healthy
+
+  /v1/health:
+    get:
+      tags: [Diagnostics]
+      summary: Health check
+      operationId: ingestionV1Health
+      responses:
+        '200':
+          description: Healthy
+
+  /live:
+    get:
+      tags: [Diagnostics]
+      summary: Liveness probe
+      operationId: ingestionLive
+      responses:
+        '200':
+          description: Alive
+
+  /v1/live:
+    get:
+      tags: [Diagnostics]
+      summary: Liveness probe
+      operationId: ingestionV1Live
+      responses:
+        '200':
+          description: Alive
+
+  /ready:
+    get:
+      tags: [Diagnostics]
+      summary: Readiness probe
+      operationId: ingestionReady
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Not ready
+
+  /v1/ready:
+    get:
+      tags: [Diagnostics]
+      summary: Readiness probe
+      operationId: ingestionV1Ready
+      responses:
+        '200':
+          description: Ready
+        '503':
+          description: Not ready
+
+  /metrics:
+    get:
+      tags: [Diagnostics]
+      summary: Prometheus metrics
+      operationId: ingestionMetrics
+      responses:
+        '200':
+          description: Prometheus text
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /debug/placement:
+    get:
+      tags: [Diagnostics]
+      summary: Placement debug snapshot
+      operationId: ingestionDebugPlacement
+      responses:
+        '200':
+          description: Placement JSON
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /debug/document-parser:
+    get:
+      tags: [Diagnostics]
+      summary: Document parser debug output
+      operationId: ingestionDebugDocumentParser
+      responses:
+        '200':
+          description: Debug JSON
+
+  /v1/tenants:
+    get:
+      tags: [Ingest]
+      summary: List tenant IDs known to the ingestion service
+      operationId: listTenants
+      responses:
+        '200':
+          description: Sorted JSON array of tenant IDs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+
+  # Retrieval service
+  /v1/retrieve:
+    get:
+      tags: [Retrieve]
+      summary: Search claims (query parameters)
+      operationId: retrieveGet
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: top_k
+          in: query
+          schema:
+            type: integer
+            default: 5
+        - name: stance_mode
+          in: query
+          schema:
+            $ref: '#/components/schemas/StanceMode'
+            default: balanced
+        - name: query_embedding
+          in: query
+          description: Comma-separated f32 values
+          schema:
+            type: string
+        - name: entity_filters
+          in: query
+          description: Comma-separated entity names
+          schema:
+            type: string
+        - name: embedding_id_filters
+          in: query
+          description: Comma-separated embedding IDs
+          schema:
+            type: string
+        - name: return_graph
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - name: read_consistency
+          in: query
+          schema:
+            type: string
+            enum: [one, quorum, all]
+            default: one
+        - name: from_unix
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: to_unix
+          in: query
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetrieveApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Retrieve]
+      summary: Search claims (JSON body)
+      operationId: retrievePost
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetrieveApiRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetrieveApiResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /v1/models:
+    get:
+      tags: [Embeddings]
+      summary: OpenAI-compatible model list
+      description: |
+        Lists the embedding models available through `POST /v1/embeddings`.
+        Compatible with the OpenAI `/v1/models` endpoint so drop-in SDKs
+        can discover supported model names.
+      operationId: openaiModels
+      responses:
+        '200':
+          description: List of available embedding models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIModelsResponse'
+
+  /dashboard:
+    get:
+      tags: [Retrieve]
+      summary: Operational dashboard
+      operationId: dashboard
+      responses:
+        '200':
+          description: HTML operational dashboard
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /v1/usage:
+    get:
+      tags: [Usage]
+      summary: Managed-cloud usage snapshot
+      description: |
+        Ingestion returns per-tenant request/byte counters for ingested data.
+        Retrieval returns the same counters plus aggregate embedding request
+        and byte counters.
+      operationId: usageSnapshot
+      responses:
+        '200':
+          description: Per-tenant request and byte counters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSnapshot'
+
+  /v1/embeddings:
+    post:
+      tags: [Embeddings]
+      summary: OpenAI-compatible embeddings endpoint
+      description: |
+        Accepts OpenAI `/v1/embeddings` compatible requests and returns
+        embeddings from the configured provider. Useful for any client that
+        points `OPENAI_API_BASE` at a DASH retrieval service.
+      operationId: openaiEmbeddings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenAIEmbeddingsRequest'
+      responses:
+        '200':
+          description: Embeddings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIEmbeddingsResponse'
+        '400':
+          description: Invalid request
+
+  /debug/planner:
+    get:
+      tags: [Diagnostics]
+      summary: Planner debug snapshot
+      operationId: retrievalDebugPlanner
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Planner debug JSON
+
+  /debug/storage-visibility:
+    get:
+      tags: [Diagnostics]
+      summary: Storage visibility debug snapshot
+      operationId: retrievalDebugStorageVisibility
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: query
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Storage visibility JSON
+
+  # Control-plane service
+  /v1/control-plane/health:
+    get:
+      tags: [ControlPlane]
+      summary: Health check
+      operationId: controlPlaneV1Health
+      responses:
+        '200':
+          description: Healthy
+
+  /v1/control-plane/ready:
+    get:
+      tags: [ControlPlane]
+      summary: Readiness probe
+      operationId: controlPlaneV1Ready
+      responses:
+        '200':
+          description: Ready
+
+  /v1/control-plane/leader:
+    get:
+      tags: [ControlPlane]
+      summary: Get current leader
+      operationId: getLeader
+      responses:
+        '200':
+          description: Leader info
+
+  /v1/control-plane/leader/acquire:
+    post:
+      tags: [ControlPlane]
+      summary: Acquire or renew leader lease
+      operationId: acquireLeader
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Lease acquired or renewed
+
+  /v1/control-plane/placement:
+    get:
+      tags: [ControlPlane]
+      summary: Get shard placement CSV
+      operationId: getPlacement
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [csv, json]
+            default: csv
+      responses:
+        '200':
+          description: Placement CSV or JSON
+
+    put:
+      tags: [ControlPlane]
+      summary: Update shard placement
+      operationId: putPlacement
+      parameters:
+        - name: expected_epoch
+          in: query
+          schema:
+            type: integer
+            format: uint64
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+              description: CSV rows of tenant,shard_id,replica_count,node_id,role,health
+      responses:
+        '200':
+          description: Placement updated
+
+  /v1/control-plane/failover/promote:
+    post:
+      tags: [ControlPlane]
+      summary: Promote a replica to leader
+      operationId: promoteReplica
+      parameters:
+        - name: node_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: expected_epoch
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: uint64
+      responses:
+        '200':
+          description: Replica promoted
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: Missing or invalid authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: Insufficient role or tenant scope
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string
+
+    Stance:
+      type: string
+      enum: [supports, contradicts, neutral]
+
+    Relation:
+      type: string
+      enum: [supports, contradicts, refines, duplicates, depends_on]
+
+    StanceMode:
+      type: string
+      enum: [balanced, support_only]
+
+    ClaimType:
+      type: string
+      enum: [factual, opinion, prediction, temporal, causal]
+
+    TimeRange:
+      type: object
+      properties:
+        from_unix:
+          type: integer
+          format: int64
+        to_unix:
+          type: integer
+          format: int64
+
+    Claim:
+      type: object
+      required: [claim_id, tenant_id, canonical_text, confidence]
+      properties:
+        claim_id:
+          type: string
+        tenant_id:
+          type: string
+        canonical_text:
+          type: string
+        confidence:
+          type: number
+          format: float
+        event_time_unix:
+          type: integer
+          format: int64
+        entities:
+          type: array
+          items:
+            type: string
+        embedding_ids:
+          type: array
+          items:
+            type: string
+        claim_type:
+          $ref: '#/components/schemas/ClaimType'
+        valid_from:
+          type: integer
+          format: int64
+        valid_to:
+          type: integer
+          format: int64
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+
+    Evidence:
+      type: object
+      required: [evidence_id, claim_id, source_id, stance, source_quality]
+      properties:
+        evidence_id:
+          type: string
+        claim_id:
+          type: string
+        source_id:
+          type: string
+        stance:
+          $ref: '#/components/schemas/Stance'
+        source_quality:
+          type: number
+          format: float
+        chunk_id:
+          type: string
+        span_start:
+          type: integer
+        span_end:
+          type: integer
+        doc_id:
+          type: string
+        extraction_model:
+          type: string
+        ingested_at:
+          type: integer
+          format: int64
+
+    ClaimEdge:
+      type: object
+      required: [edge_id, from_claim_id, to_claim_id, relation, strength]
+      properties:
+        edge_id:
+          type: string
+        from_claim_id:
+          type: string
+        to_claim_id:
+          type: string
+        relation:
+          $ref: '#/components/schemas/Relation'
+        strength:
+          type: number
+          format: float
+        reason_codes:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: integer
+          format: int64
+
+    IngestApiRequest:
+      type: object
+      required: [claim]
+      properties:
+        claim:
+          $ref: '#/components/schemas/Claim'
+        claim_embedding:
+          type: array
+          items:
+            type: number
+            format: float
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClaimEdge'
+
+    IngestBatchApiRequest:
+      type: object
+      required: [items]
+      properties:
+        commit_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestApiRequest'
+
+    IngestRawApiRequest:
+      type: object
+      required: [tenant_id, document_id, source_id, text]
+      properties:
+        tenant_id:
+          type: string
+        document_id:
+          type: string
+        source_id:
+          type: string
+        text:
+          type: string
+        extraction_model:
+          type: string
+        claim_confidence:
+          type: number
+          format: float
+        source_quality:
+          type: number
+          format: float
+        min_sentence_chars:
+          type: integer
+        max_claims:
+          type: integer
+        generate_embeddings:
+          type: boolean
+        embedding_model:
+          type: string
+
+    IngestDocumentApiRequest:
+      type: object
+      required: [tenant_id, document_id, source_id, mime_type]
+      properties:
+        tenant_id:
+          type: string
+        document_id:
+          type: string
+        source_id:
+          type: string
+        mime_type:
+          type: string
+        text:
+          type: string
+        content_base64:
+          type: string
+        extraction_model:
+          type: string
+        claim_confidence:
+          type: number
+          format: float
+        source_quality:
+          type: number
+          format: float
+        min_sentence_chars:
+          type: integer
+        max_claims:
+          type: integer
+        generate_embeddings:
+          type: boolean
+        embedding_model:
+          type: string
+
+    IngestApiResponse:
+      type: object
+      required: [ingested_claim_id, claims_total, ack_count, required_acks, commit_status, checkpoint_triggered]
+      properties:
+        ingested_claim_id:
+          type: string
+        claims_total:
+          type: integer
+        commit_epoch:
+          type: integer
+          format: uint64
+        ack_count:
+          type: integer
+        required_acks:
+          type: integer
+        commit_status:
+          type: string
+        checkpoint_triggered:
+          type: boolean
+        checkpoint_snapshot_records:
+          type: integer
+        checkpoint_truncated_wal_records:
+          type: integer
+
+    IngestBatchApiResponse:
+      type: object
+      required: [commit_id, idempotent_replay, ingested_claim_ids, batch_size, claims_total, ack_count, required_acks, commit_status, checkpoint_triggered]
+      properties:
+        commit_id:
+          type: string
+        idempotent_replay:
+          type: boolean
+        ingested_claim_ids:
+          type: array
+          items:
+            type: string
+        batch_size:
+          type: integer
+        claims_total:
+          type: integer
+        commit_epoch:
+          type: integer
+          format: uint64
+        ack_count:
+          type: integer
+        required_acks:
+          type: integer
+        commit_status:
+          type: string
+        checkpoint_triggered:
+          type: boolean
+        checkpoint_snapshot_records:
+          type: integer
+        checkpoint_truncated_wal_records:
+          type: integer
+
+    IngestRawApiResponse:
+      type: object
+      required: [document_id, commit_id, idempotent_replay, extracted_count, embedding_provider, embeddings_generated, ingested_claim_ids, claims_total, ack_count, required_acks, commit_status, checkpoint_triggered]
+      properties:
+        document_id:
+          type: string
+        commit_id:
+          type: string
+        idempotent_replay:
+          type: boolean
+        extracted_count:
+          type: integer
+        embedding_provider:
+          type: string
+        embeddings_generated:
+          type: integer
+        embedding_dimensions:
+          type: integer
+        ingested_claim_ids:
+          type: array
+          items:
+            type: string
+        claims_total:
+          type: integer
+        commit_epoch:
+          type: integer
+          format: uint64
+        ack_count:
+          type: integer
+        required_acks:
+          type: integer
+        commit_status:
+          type: string
+        checkpoint_triggered:
+          type: boolean
+        checkpoint_snapshot_records:
+          type: integer
+        checkpoint_truncated_wal_records:
+          type: integer
+
+    IngestDocumentApiResponse:
+      type: object
+      required: [document_id, mime_type, parser_provider, commit_id, idempotent_replay, extracted_count, embedding_provider, embeddings_generated, ingested_claim_ids, claims_total, ack_count, required_acks, commit_status, checkpoint_triggered]
+      properties:
+        document_id:
+          type: string
+        mime_type:
+          type: string
+        parser_provider:
+          type: string
+        commit_id:
+          type: string
+        idempotent_replay:
+          type: boolean
+        extracted_count:
+          type: integer
+        embedding_provider:
+          type: string
+        embeddings_generated:
+          type: integer
+        embedding_dimensions:
+          type: integer
+        ingested_claim_ids:
+          type: array
+          items:
+            type: string
+        claims_total:
+          type: integer
+        commit_epoch:
+          type: integer
+          format: uint64
+        ack_count:
+          type: integer
+        required_acks:
+          type: integer
+        commit_status:
+          type: string
+        checkpoint_triggered:
+          type: boolean
+        checkpoint_snapshot_records:
+          type: integer
+        checkpoint_truncated_wal_records:
+          type: integer
+
+    Citation:
+      type: object
+      required: [evidence_id, source_id, stance, source_quality]
+      properties:
+        evidence_id:
+          type: string
+        source_id:
+          type: string
+        stance:
+          $ref: '#/components/schemas/Stance'
+        source_quality:
+          type: number
+          format: float
+        chunk_id:
+          type: string
+        span_start:
+          type: integer
+        span_end:
+          type: integer
+        doc_id:
+          type: string
+        extraction_model:
+          type: string
+        ingested_at:
+          type: integer
+          format: int64
+
+    EvidenceNode:
+      type: object
+      required: [claim_id, canonical_text, score, supports, contradicts, citations]
+      properties:
+        claim_id:
+          type: string
+        canonical_text:
+          type: string
+        score:
+          type: number
+          format: float
+        claim_confidence:
+          type: number
+          format: float
+        confidence_band:
+          type: string
+        dominant_stance:
+          type: string
+        contradiction_risk:
+          type: number
+          format: float
+        graph_score:
+          type: number
+          format: float
+        support_path_count:
+          type: integer
+        contradiction_chain_depth:
+          type: integer
+        supports:
+          type: integer
+        contradicts:
+          type: integer
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        event_time_unix:
+          type: integer
+          format: int64
+        temporal_match_mode:
+          type: string
+        temporal_in_range:
+          type: boolean
+        claim_type:
+          type: string
+        valid_from:
+          type: integer
+          format: int64
+        valid_to:
+          type: integer
+          format: int64
+        created_at:
+          type: integer
+          format: int64
+        updated_at:
+          type: integer
+          format: int64
+
+    EvidenceGraphEdge:
+      type: object
+      required: [from_claim_id, to_claim_id, relation, strength]
+      properties:
+        from_claim_id:
+          type: string
+        to_claim_id:
+          type: string
+        relation:
+          type: string
+        strength:
+          type: number
+          format: float
+
+    EvidenceGraph:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvidenceNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvidenceGraphEdge'
+
+    RetrieveApiRequest:
+      type: object
+      required: [tenant_id, query]
+      properties:
+        tenant_id:
+          type: string
+        query:
+          type: string
+        query_embedding:
+          type: array
+          items:
+            type: number
+            format: float
+        entity_filters:
+          type: array
+          items:
+            type: string
+        embedding_id_filters:
+          type: array
+          items:
+            type: string
+        top_k:
+          type: integer
+          default: 5
+        stance_mode:
+          $ref: '#/components/schemas/StanceMode'
+          default: balanced
+        return_graph:
+          type: boolean
+          default: false
+        read_consistency:
+          type: string
+          enum: [one, quorum, all]
+          default: one
+        time_range:
+          $ref: '#/components/schemas/TimeRange'
+
+    RetrieveApiResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvidenceNode'
+        graph:
+          $ref: '#/components/schemas/EvidenceGraph'
+        read_policy:
+          type: string
+        read_quorum_met:
+          type: boolean
+        serving_replica:
+          type: string
+
+    OpenAIEmbeddingsInput:
+      oneOf:
+        - type: string
+        - type: array
+          items:
+            type: string
+
+    OpenAIEmbeddingsRequest:
+      type: object
+      required: [input, model]
+      properties:
+        input:
+          $ref: '#/components/schemas/OpenAIEmbeddingsInput'
+        model:
+          type: string
+        user:
+          type: string
+        encoding_format:
+          type: string
+          enum: [float, base64]
+          default: float
+
+    OpenAIEmbeddingData:
+      type: object
+      properties:
+        object:
+          type: string
+        index:
+          type: integer
+        embedding:
+          oneOf:
+            - type: array
+              items:
+                type: number
+                format: float
+            - type: string
+
+    OpenAIUsage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+    OpenAIModel:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        owned_by:
+          type: string
+
+    OpenAIModelsResponse:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenAIModel'
+
+    OpenAIEmbeddingsResponse:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenAIEmbeddingData'
+        model:
+          type: string
+        usage:
+          $ref: '#/components/schemas/OpenAIUsage'
+
+    UsageCounters:
+      type: object
+      properties:
+        requests_total:
+          type: integer
+          format: uint64
+        bytes_total:
+          type: integer
+          format: uint64
+
+    UsageSnapshot:
+      type: object
+      properties:
+        tenants:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/UsageCounters'
+        embeddings:
+          type: object
+          properties:
+            requests_total:
+              type: integer
+              format: uint64
+            bytes_total:
+              type: integer
+              format: uint64

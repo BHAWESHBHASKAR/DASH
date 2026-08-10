@@ -22,6 +22,14 @@ fn main() {
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");
 
+    let encryption_provider = match encryption::provider_from_env() {
+        Ok(provider) => provider,
+        Err(err) => {
+            tracing::error!("retrieval failed to load encryption provider: {err:?}");
+            std::process::exit(1);
+        }
+    };
+
     if let Err(reason) = validate_startup_secrets() {
         if dash_common::strict_secrets_enabled() {
             tracing::error!("retrieval startup secret validation failed: {reason}");
@@ -49,7 +57,7 @@ fn main() {
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
         let wal = match FileWal::open(&wal_path) {
-            Ok(wal) => wal,
+            Ok(wal) => wal.with_encryption(Arc::clone(&encryption_provider)),
             Err(err) => {
                 tracing::error!("retrieval failed opening WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
@@ -74,13 +82,15 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        store = store.with_encryption(Arc::clone(&encryption_provider));
         if !disk_disabled {
             store = attach_disk(store, &disk_path);
         }
         tracing::info!("retrieval ready: claims={}", store.claims_len());
         store
     } else {
-        let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning)
+            .with_encryption(Arc::clone(&encryption_provider));
         store
             .ingest_bundle(
                 Claim {

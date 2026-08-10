@@ -63,6 +63,7 @@ use store::{
     CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
     WalReplicationExport, batch_commit_payload_fingerprint,
 };
+use usage::UsageSnapshot;
 
 use crate::{
     IngestInput,
@@ -134,6 +135,7 @@ pub struct IngestionRuntime {
     replication_last_error: Option<String>,
     replication_commit_status: HashMap<String, ReplicationCommitStatus>,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
+    tenant_usage: UsageSnapshot,
     started_at: Instant,
 }
 
@@ -241,6 +243,7 @@ impl IngestionRuntime {
             replication_last_error: None,
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
+            tenant_usage: UsageSnapshot::default(),
             started_at: Instant::now(),
         }
     }
@@ -303,12 +306,40 @@ impl IngestionRuntime {
             replication_last_error: None,
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
+            tenant_usage: UsageSnapshot::default(),
             started_at: Instant::now(),
         }
     }
 
     pub fn claims_len(&self) -> usize {
         self.store.claims_len()
+    }
+
+    /// Return the tenant IDs known to the ingestion runtime, sorted for
+    /// stable output.
+    pub fn tenant_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.store.tenant_ids().into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Record a billable operation for `tenant_id`.
+    pub fn record_tenant_usage(&mut self, tenant_id: &str, bytes: usize) {
+        self.tenant_usage.record(tenant_id, bytes);
+    }
+
+    /// Return a point-in-time usage snapshot for all tenants.
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.tenant_usage.clone()
+    }
+
+    /// Total number of billable requests across all tenants.
+    pub fn total_tenant_requests(&self) -> u64 {
+        self.tenant_usage
+            .tenants
+            .values()
+            .map(|c| c.requests_total)
+            .sum()
     }
 
     pub fn placement_routing_error(&self) -> Option<&str> {
@@ -507,6 +538,10 @@ impl IngestionRuntime {
         }
 
         let commit_ts_unix_ms = unix_timestamp_millis();
+        let batch_tenant_id = inputs
+            .first()
+            .map(|i| i.claim.tenant_id.clone())
+            .unwrap_or_default();
         if let Some(wal) = self.wal.as_mut() {
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
@@ -518,6 +553,7 @@ impl IngestionRuntime {
                     ingested_claim_ids.len(),
                     commit_ts_unix_ms,
                     &ingested_claim_ids,
+                    &batch_tenant_id,
                 )?;
                 Ok::<(), StoreError>(())
             })();
@@ -922,7 +958,11 @@ impl IngestionRuntime {
 
     fn apply_replication_export(&mut self, export: WalReplicationExport) -> Result<(), StoreError> {
         let ann_tuning = self.store.ann_tuning().clone();
-        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning).with_encryption(
+            self.store
+                .encryption()
+                .unwrap_or_else(|| Arc::new(encryption::NoOpProvider)),
+        );
         for line in &export.snapshot_lines {
             rebuilt_store.apply_persisted_record_line(line)?;
         }

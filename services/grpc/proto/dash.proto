@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package dash.v1;
+
+// OpenAI-compatible gRPC embeddings and model listing surface.
+service Dash {
+  rpc Embed (EmbedRequest) returns (EmbedResponse);
+  rpc ListModels (ListModelsRequest) returns (ListModelsResponse);
+}
+
+message EmbedRequest {
+  string model = 1;
+  repeated string input = 2;
+  bool normalize = 3;
+}
+
+message EmbedResponse {
+  string object = 1;
+  repeated EmbeddingData data = 2;
+  string model = 3;
+  Usage usage = 4;
+}
+
+message EmbeddingData {
+  string object = 1;
+  int32 index = 2;
+  repeated float embedding = 3;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 total_tokens = 2;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  string object = 1;
+  repeated ModelData data = 2;
+}
+
+message ModelData {
+  string id = 1;
+  string object = 2;
+  int64 created = 3;
+  string owned_by = 4;
+}
