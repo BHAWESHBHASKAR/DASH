@@ -325,19 +325,6 @@ paths:
                 items:
                   type: string
 
-  /v1/usage:
-    get:
-      tags: [Ingest]
-      summary: Managed-cloud usage snapshot for ingestion
-      operationId: ingestUsage
-      responses:
-        '200':
-          description: Per-tenant request and byte counters
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UsageSnapshot'
-
   # Retrieval service
   /v1/retrieve:
     get:
@@ -471,12 +458,16 @@ paths:
 
   /v1/usage:
     get:
-      tags: [Retrieve]
-      summary: Managed-cloud usage snapshot for retrieval
-      operationId: retrieveUsage
+      tags: [Usage]
+      summary: Managed-cloud usage snapshot
+      description: |
+        Ingestion returns per-tenant request/byte counters for ingested data.
+        Retrieval returns the same counters plus aggregate embedding request
+        and byte counters.
+      operationId: usageSnapshot
       responses:
         '200':
-          description: Per-tenant retrieve and aggregate embedding counters
+          description: Per-tenant request and byte counters
           content:
             application/json:
               schema:

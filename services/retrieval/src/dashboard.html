@@ -67,7 +67,7 @@
     }
     async function refresh() {
       try {
-        const health = await get('/v1/health');
+        await get('/v1/health');
         document.getElementById('health').innerHTML = '<span class="status"></span>healthy';
         document.getElementById('http-status').textContent = '200 OK';
       } catch (e) {

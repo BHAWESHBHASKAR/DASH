@@ -110,6 +110,22 @@ impl Dash for DashService {
     }
 }
 
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dash_common::init_logging();
+    let bind = std::env::var("DASH_GRPC_BIND").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
+    let provider = shared_embedding_provider();
+    let service = DashService::new(provider);
+
+    tracing::info!("dash grpc server listening on {}", bind);
+    Server::builder()
+        .add_service(DashServer::new(service))
+        .serve(bind.parse()?)
+        .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,20 +159,4 @@ mod tests {
         assert_eq!(response.get_ref().data.len(), 2);
         assert!(!response.get_ref().data[0].embedding.is_empty());
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dash_common::init_logging();
-    let bind = std::env::var("DASH_GRPC_BIND").unwrap_or_else(|_| "127.0.0.1:50051".to_string());
-    let provider = shared_embedding_provider();
-    let service = DashService::new(provider);
-
-    tracing::info!("dash grpc server listening on {}", bind);
-    Server::builder()
-        .add_service(DashServer::new(service))
-        .serve(bind.parse()?)
-        .await?;
-
-    Ok(())
 }
