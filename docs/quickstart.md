@@ -36,8 +36,8 @@ docker compose -f deploy/container/docker-compose.yml down
 
 ### Optional compose overlays
 
-- **Real semantic embeddings** — start an Ollama sidecar and switch the
-  embedding provider to `nomic-embed-text`:
+- **Real semantic embeddings** — start an Ollama sidecar. DASH auto-discovers
+  a reachable Ollama endpoint by default; the compose overlay wires it explicitly:
 
   ```bash
   docker compose \
@@ -153,7 +153,7 @@ You can also constrain the result set to a temporal window with `time_range: { "
 
 ## Use the OpenAI-compatible API
 
-DASH exposes `POST /v1/embeddings` with a request and response shape that is byte-compatible with the OpenAI v1 embeddings API. The default embedding backend is the deterministic `HashEmbeddingProvider` (no network, no API key required) so the endpoint works out of the box; swap in Ollama, OpenAI, or a custom model by implementing the `EmbeddingProvider` trait.
+DASH exposes `POST /v1/embeddings` with a request and response shape that is byte-compatible with the OpenAI v1 embeddings API. The default backend auto-discovers a reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to the deterministic `HashEmbeddingProvider` (no network, no API key) with a startup warning. Force a provider with `DASH_EMBEDDING_PROVIDER=hash|ollama|openai`, or implement the `EmbeddingProvider` trait for a custom backend.
 
 From `curl`:
 

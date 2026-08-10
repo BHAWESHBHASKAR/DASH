@@ -23,7 +23,7 @@ print(resp.data[0].embedding[:5])
 **Production-ready in this release:**
 - OpenAI-compatible `/v1/embeddings` endpoint (wire-byte compatible with the OpenAI spec)
 - Semantic-first retrieval with dense similarity as the primary ranking signal
-- Env-driven real embedding providers: `DASH_EMBEDDING_PROVIDER=hash|ollama|openai` (Ollama overlay in `deploy/container/docker-compose.ollama.yml`)
+- Auto-discovered real embedding provider: `DASH_EMBEDDING_PROVIDER` defaults to a reachable Ollama endpoint; `hash` or `openai` are one env var away. Ollama overlay in `deploy/container/docker-compose.ollama.yml`.
 - `redb` persistence with WAL replay, checkpoints, compaction, and durability guardrails
 - Customer-managed encryption keys (`pkg/encryption`) with `env` and AWS KMS (`aws-kms` feature) providers, wired into WAL/snapshot lines
 - OIDC/JWKS authentication and RBAC (`admin`, `ingest`, `retrieve`, `read_only`) with scoped API keys
@@ -113,7 +113,7 @@ Use the OpenAI-compatible `/v1/embeddings` endpoint from any OpenAI SDK — `lan
 - **Claim + Evidence + Edge data model** with first-class citation provenance (`source_id`, `stance`, `source_quality`, `chunk_id`, `span_start`, `span_end`, `doc_id`, `extraction_model`).
 - **Contradiction handling**: `Stance::Contradicts` on evidence and `ClaimEdge { relation: Contradicts }` demote results; `stance_mode: support_only` filters them out.
 - **Temporal validity windows**: `event_time_unix`, `valid_from`, `valid_to` on every claim, with `time_range` filtering on the retrieval API.
-- **OpenAI-compatible `/v1/embeddings`**: byte-compatible request/response with the OpenAI v1 embeddings API. Default provider is `HashEmbeddingProvider` (deterministic, no network); swap for Ollama, OpenAI, or any custom backend by implementing the `EmbeddingProvider` trait.
+- **OpenAI-compatible `/v1/embeddings`**: byte-compatible request/response with the OpenAI v1 embeddings API. Default provider auto-discovers a reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or `OLLAMA_HOST`) and falls back to `HashEmbeddingProvider` (deterministic, no network) with a startup warning. Explicitly set `DASH_EMBEDDING_PROVIDER=hash|ollama|openai` to force a provider.
 - **HNSW ANN** via `usearch` for vector candidate generation, with `DASH_*_ANN_*` tuning knobs and a graph-backed recall layer on top.
 - **Durable WAL** with replay, checkpoints, and compaction in `pkg/store`. WAL durability guardrails reject unsafe flush policies by default; an explicit `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true` override is required for stress testing.
 - **Hash-chained audit log**: every authenticated state change is recorded as a SHA-256-chained JSON line; verify with `scripts/verify_audit_chain.sh`.

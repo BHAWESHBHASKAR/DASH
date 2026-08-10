@@ -33,7 +33,10 @@ to [Semantic Versioning](https://semver.org/).
 - **Real embedding integration** — env-driven provider selection
   (`DASH_EMBEDDING_PROVIDER=hash|ollama|openai`) so deployments
   can wire up real semantic embeddings instead of the
-  hash-based default.
+  hash-based default. Provider selection now auto-discovers a
+  reachable Ollama endpoint (`DASH_OLLAMA_ENDPOINT` or
+  `OLLAMA_HOST`) when `DASH_EMBEDDING_PROVIDER` is unset, falling
+  back to hash with a startup warning.
 - **Semantic-first retrieval** — new `InMemoryStore::retrieve_semantic`
   method. When the caller passes a pre-computed query vector, the
   dense-similarity score becomes the primary ranking signal (cosine
