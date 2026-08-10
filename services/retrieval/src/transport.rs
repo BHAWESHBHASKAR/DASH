@@ -1512,6 +1512,13 @@ fn handle_request_with_metrics_and_reload(
                 }
             }
         }
+        ("GET", "/v1/models") => {
+            // OpenAI-compatible model list. Returns the models that can be
+            // passed to `POST /v1/embeddings`.
+            let resp = crate::openai_embeddings::handle_openai_models_request();
+            let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
+            HttpResponse::ok_json(body)
+        }
         ("POST", "/v1/embeddings") => {
             // OpenAI-compatible embeddings endpoint. No auth required at the
             // HTTP layer (it accepts only the request body); a future
@@ -1550,6 +1557,7 @@ fn handle_request_with_metrics_and_reload(
         }
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
         (_, "/v1/embeddings") => HttpResponse::method_not_allowed("only POST is supported"),
+        (_, "/v1/models") => HttpResponse::method_not_allowed("only GET is supported"),
         (_, "/health")
         | (_, "/v1/health")
         | (_, "/live")

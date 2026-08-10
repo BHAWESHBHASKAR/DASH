@@ -287,6 +287,59 @@ pub fn handle_openai_embeddings_with_provider(
     })
 }
 
+/// OpenAI-compatible `/v1/models` response entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIModel {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: &'static str,
+}
+
+/// OpenAI-compatible `/v1/models` list response.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAIModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<OpenAIModel>,
+}
+
+/// Return the list of models exposed by the OpenAI-compatible API.
+///
+/// DASH delegates the actual embedding computation to the configured
+/// `EmbeddingProvider`, but the `/v1/models` endpoint advertises the
+/// model names that clients can pass to `/v1/embeddings`.
+pub fn handle_openai_models_request() -> OpenAIModelsResponse {
+    OpenAIModelsResponse {
+        object: "list",
+        data: vec![
+            OpenAIModel {
+                id: "dash-hash".to_string(),
+                object: "model",
+                created: 0,
+                owned_by: "dash",
+            },
+            OpenAIModel {
+                id: "nomic-embed-text".to_string(),
+                object: "model",
+                created: 0,
+                owned_by: "ollama",
+            },
+            OpenAIModel {
+                id: "text-embedding-3-small".to_string(),
+                object: "model",
+                created: 0,
+                owned_by: "openai",
+            },
+            OpenAIModel {
+                id: "text-embedding-3-large".to_string(),
+                object: "model",
+                created: 0,
+                owned_by: "openai",
+            },
+        ],
+    }
+}
+
 /// Convert a provider-returned float vector to the wire format
 /// requested by the client. `Float` passes through unchanged; `Base64`
 /// packs the float32 values as little-endian bytes and base64-encodes
@@ -751,6 +804,21 @@ mod tests {
         match &resp.data[0].embedding {
             EmbeddingValue::Float(v) => assert_eq!(v.len(), 384),
             other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_openai_models_returns_compatible_list() {
+        let resp = handle_openai_models_request();
+        assert_eq!(resp.object, "list");
+        let ids: Vec<&str> = resp.data.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"dash-hash"));
+        assert!(ids.contains(&"nomic-embed-text"));
+        assert!(ids.contains(&"text-embedding-3-small"));
+        assert!(ids.contains(&"text-embedding-3-large"));
+        for model in &resp.data {
+            assert_eq!(model.object, "model");
+            assert!(!model.owned_by.is_empty());
         }
     }
 }

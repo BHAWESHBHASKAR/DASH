@@ -89,9 +89,13 @@ curl $OPENAI_API_BASE/embeddings \
   }'
 ```
 
-DASH accepts the OpenAI wire format but ignores the model value; the actual
-embedding provider is selected by `DASH_EMBEDDING_PROVIDER` (`hash`, `ollama`,
-`openai`).
+DASH accepts the OpenAI wire format. The model name is accepted and echoed but
+the active embedding provider is selected by `DASH_EMBEDDING_PROVIDER`
+(`hash`, `ollama`, `openai`). List supported model names with:
+
+```bash
+curl $OPENAI_API_BASE/models -H "Authorization: Bearer $OPENAI_API_KEY"
+```
 
 ### Running with real semantic embeddings (Ollama)
 

@@ -190,6 +190,23 @@ fn transport_metrics_endpoint_returns_prometheus_payload() {
 }
 
 #[test]
+fn transport_models_endpoint_returns_openai_compatible_list() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let store = sample_store();
+    let request = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = retrieval::transport::handle_http_request_bytes(&store, request)
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("Content-Type: application/json"));
+    assert!(response.contains("\"object\":\"list\""));
+    assert!(response.contains("\"id\":\"dash-hash\""));
+    assert!(response.contains("\"id\":\"nomic-embed-text\""));
+    assert!(response.contains("\"id\":\"text-embedding-3-small\""));
+}
+
+#[test]
 fn transport_rejects_oversized_body_via_content_length_guard() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let store = sample_store();

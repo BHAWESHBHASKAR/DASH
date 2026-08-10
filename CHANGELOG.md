@@ -13,6 +13,8 @@ to [Semantic Versioning](https://semver.org/).
   variable (`OPENAI_API_BASE=http://localhost:8080/v1`). 17 tests
   cover the wire-format compatibility, error envelope, and HTTP-level
   integration.
+- **OpenAI-compatible `/v1/models` endpoint** so OpenAI SDKs can
+  discover supported model names before calling `/v1/embeddings`.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.

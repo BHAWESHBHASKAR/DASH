@@ -411,6 +411,23 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  /v1/models:
+    get:
+      tags: [Embeddings]
+      summary: OpenAI-compatible model list
+      description: |
+        Lists the embedding models available through `POST /v1/embeddings`.
+        Compatible with the OpenAI `/v1/models` endpoint so drop-in SDKs
+        can discover supported model names.
+      operationId: openaiModels
+      responses:
+        '200':
+          description: List of available embedding models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenAIModelsResponse'
+
   /v1/embeddings:
     post:
       tags: [Embeddings]
@@ -1175,6 +1192,28 @@ components:
           type: integer
         total_tokens:
           type: integer
+
+    OpenAIModel:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        owned_by:
+          type: string
+
+    OpenAIModelsResponse:
+      type: object
+      properties:
+        object:
+          type: string
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/OpenAIModel'
 
     OpenAIEmbeddingsResponse:
       type: object
