@@ -311,6 +311,14 @@ impl IngestionRuntime {
         self.store.claims_len()
     }
 
+    /// Return the tenant IDs known to the ingestion runtime, sorted for
+    /// stable output.
+    pub fn tenant_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.store.tenant_ids().into_iter().collect();
+        ids.sort();
+        ids
+    }
+
     pub fn placement_routing_error(&self) -> Option<&str> {
         self.placement_routing.as_ref().err().map(String::as_str)
     }

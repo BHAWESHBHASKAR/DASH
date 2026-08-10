@@ -15,6 +15,8 @@ to [Semantic Versioning](https://semver.org/).
   integration.
 - **OpenAI-compatible `/v1/models` endpoint** so OpenAI SDKs can
   discover supported model names before calling `/v1/embeddings`.
+- **`GET /v1/tenants` on the ingestion service** to list tenant IDs
+  known to the runtime, a first admin-style collection listing API.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.

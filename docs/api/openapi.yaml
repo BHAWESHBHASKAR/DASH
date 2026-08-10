@@ -310,6 +310,21 @@ paths:
         '200':
           description: Debug JSON
 
+  /v1/tenants:
+    get:
+      tags: [Ingest]
+      summary: List tenant IDs known to the ingestion service
+      operationId: listTenants
+      responses:
+        '200':
+          description: Sorted JSON array of tenant IDs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+
   # Retrieval service
   /v1/retrieve:
     get:

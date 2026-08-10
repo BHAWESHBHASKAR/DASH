@@ -58,6 +58,7 @@ pub(super) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
         | (_, "/ready")
         | (_, "/v1/ready")
         | (_, "/metrics")
+        | (_, "/v1/tenants")
         | (_, "/debug/placement")
         | (_, "/debug/document-parser")
         | (_, "/internal/replication/wal")

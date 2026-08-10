@@ -57,6 +57,13 @@ curl -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
+### List tenants
+
+```bash
+curl http://localhost:8081/v1/tenants \
+  -H 'x-api-key: $INGEST_API_KEY'
+```
+
 ### Retrieve with citations
 
 ```bash
