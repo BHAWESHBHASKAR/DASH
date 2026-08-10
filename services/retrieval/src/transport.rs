@@ -1528,7 +1528,7 @@ fn handle_request_with_metrics_and_reload(
                 Ok(text) => text,
                 Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
             };
-            let provider = embeddings::select_embedding_provider_from_env();
+            let provider = embeddings::shared_embedding_provider();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
                 body,
                 provider.as_ref(),
@@ -1648,7 +1648,7 @@ fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), String> {
     if req.query_embedding.is_some() {
         return Ok(());
     }
-    let provider = embeddings::select_embedding_provider_from_env();
+    let provider = embeddings::shared_embedding_provider();
     let vectors = provider
         .embed(std::slice::from_ref(&req.query))
         .map_err(|e| format!("embedding failed: {e}"))?;

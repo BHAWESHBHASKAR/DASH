@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -705,6 +705,51 @@ pub fn embedding_provider_name_from_env() -> String {
             _ => "hash".to_string(),
         },
     }
+}
+
+struct CachedProvider {
+    key: String,
+    provider: Arc<dyn EmbeddingProvider + Send + Sync + 'static>,
+}
+
+static SHARED_PROVIDER: OnceLock<Mutex<CachedProvider>> = OnceLock::new();
+
+fn provider_env_key() -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        std::env::var("DASH_EMBEDDING_PROVIDER").unwrap_or_default(),
+        std::env::var("DASH_OLLAMA_ENDPOINT").unwrap_or_default(),
+        std::env::var("OLLAMA_HOST").unwrap_or_default(),
+        std::env::var("DASH_OLLAMA_MODEL").unwrap_or_default(),
+        std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default(),
+        std::env::var("DASH_OPENAI_MODEL").unwrap_or_default(),
+    )
+}
+
+/// Returns a lazily initialized, shared embedding provider.
+///
+/// Services should prefer this over `select_embedding_provider_from_env()`
+/// to avoid recreating the provider (and re-probing the Ollama endpoint) on
+/// every request. The provider is cached by the current embedding-related
+/// environment variables, so changing env vars will invalidate the cache.
+pub fn shared_embedding_provider() -> Arc<dyn EmbeddingProvider + Send + Sync + 'static> {
+    let mut cached = SHARED_PROVIDER
+        .get_or_init(|| {
+            let provider: Arc<dyn EmbeddingProvider + Send + Sync + 'static> =
+                Arc::new(HashEmbeddingProvider::default());
+            Mutex::new(CachedProvider {
+                key: String::new(),
+                provider,
+            })
+        })
+        .lock()
+        .expect("embedding provider cache mutex poisoned");
+    let key = provider_env_key();
+    if cached.key != key {
+        cached.key = key;
+        cached.provider = Arc::from(select_embedding_provider_from_env());
+    }
+    Arc::clone(&cached.provider)
 }
 
 #[cfg(test)]

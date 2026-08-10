@@ -200,7 +200,7 @@ pub fn handle_openai_embeddings(
     let encoding = EncodingFormat::from_request_str(req.encoding_format.as_deref())
         .map_err(OpenAIErrorResponse::invalid_request)?;
 
-    let provider = embeddings::select_embedding_provider_from_env();
+    let provider = embeddings::shared_embedding_provider();
     let texts: Vec<String> = req.input.texts().iter().map(|s| s.to_string()).collect();
     let embeddings = provider
         .embed(&texts)
