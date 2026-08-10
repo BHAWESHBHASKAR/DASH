@@ -10,18 +10,21 @@ Five minutes from `git clone` to a working retrieval query against DASH.
 
 ## Option 1: Docker (recommended)
 
-Clone the repo and start the two-service stack (ingestion on `:8081`, retrieval on `:8080`):
+Clone the repo, generate strong secrets, and start the two-service stack (ingestion on `:8081`, retrieval on `:8080`):
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh
 docker compose -f deploy/container/docker-compose.yml up -d
 ```
 
-The compose file mounts a `dash_data` volume for the WAL and segments, and sets safe defaults for the WAL durability guardrails. Both services come up healthy; confirm with:
+The compose file mounts a `dash-state` volume for the WAL and segments, and sets safe defaults for the WAL durability guardrails. Both services come up healthy; confirm with:
 
 ```bash
+source deploy/container/.env
 curl http://localhost:8080/health
+curl -H "x-api-key: $DASH_RETRIEVAL_API_KEY" http://localhost:8080/health
 curl http://localhost:8081/health
 ```
 
@@ -31,11 +34,33 @@ To stop and remove the stack:
 docker compose -f deploy/container/docker-compose.yml down
 ```
 
+### Optional compose overlays
+
+- **Real semantic embeddings** — start an Ollama sidecar and switch the
+  embedding provider to `nomic-embed-text`:
+
+  ```bash
+  docker compose \
+    -f deploy/container/docker-compose.yml \
+    -f deploy/container/docker-compose.ollama.yml \
+    --profile ollama up -d
+  ```
+
+- **Monitoring** — start Prometheus and Grafana with a pre-loaded DASH
+  dashboard:
+
+  ```bash
+  docker compose \
+    -f deploy/container/docker-compose.yml \
+    -f deploy/container/docker-compose.monitoring.yml \
+    --profile monitoring up -d
+  ```
+
 ## Option 2: Build from source
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
 
 # Build the two services you'll run for ingestion and retrieval.
 cargo build --release -p ingestion -p retrieval
@@ -66,6 +91,7 @@ A DASH claim is `{ claim, evidence[], edges[] }`. The claim is the atomic assert
 
 ```bash
 curl -X POST http://localhost:8081/v1/ingest \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "claim": {
@@ -95,6 +121,7 @@ Retrieve returns ranked claims with their supporting/contradicting evidence as i
 
 ```bash
 curl -X POST http://localhost:8080/v1/retrieve \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "t1",
@@ -132,6 +159,7 @@ From `curl`:
 
 ```bash
 curl -X POST http://localhost:8080/v1/embeddings \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"input": "Company X acquired Company Y", "model": "text-embedding-3-small"}'
 ```
@@ -139,11 +167,12 @@ curl -X POST http://localhost:8080/v1/embeddings \
 From the OpenAI Python SDK — point `base_url` at the DASH retrieval service and DASH is a drop-in replacement:
 
 ```python
+import os
 import openai
 
 client = openai.OpenAI(
     base_url="http://localhost:8080/v1",
-    api_key="not-needed",
+    api_key=os.environ["DASH_RETRIEVAL_API_KEY"],
 )
 response = client.embeddings.create(
     input="hello world",
