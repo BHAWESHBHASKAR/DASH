@@ -922,7 +922,11 @@ impl IngestionRuntime {
 
     fn apply_replication_export(&mut self, export: WalReplicationExport) -> Result<(), StoreError> {
         let ann_tuning = self.store.ann_tuning().clone();
-        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning).with_encryption(
+            self.store
+                .encryption()
+                .unwrap_or_else(|| Arc::new(encryption::NoOpProvider)),
+        );
         for line in &export.snapshot_lines {
             rebuilt_store.apply_persisted_record_line(line)?;
         }

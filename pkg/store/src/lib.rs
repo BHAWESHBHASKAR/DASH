@@ -10,6 +10,8 @@ use schema::{
     ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
 };
 
+use encryption::{EncryptionProvider, decrypt_storage_line};
+
 mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
@@ -117,6 +119,7 @@ pub struct InMemoryStore {
     wal: Vec<WalEvent>,
     disk: Option<Arc<disk::DiskBackedStore>>,
     disk_status: disk::DiskStatus,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
 }
 
 impl InMemoryStore {
@@ -132,6 +135,25 @@ impl InMemoryStore {
             vector_backend_runtime,
             ..Self::default()
         }
+    }
+
+    pub fn with_encryption(mut self, provider: Arc<dyn EncryptionProvider>) -> Self {
+        self.encryption = Some(provider);
+        self
+    }
+
+    pub fn encryption(&self) -> Option<Arc<dyn EncryptionProvider>> {
+        self.encryption.clone()
+    }
+
+    fn storage_line_to_record(&self, line: &str) -> Result<PersistedRecord, StoreError> {
+        let plaintext = if let Some(provider) = self.encryption.as_ref() {
+            decrypt_storage_line(provider.as_ref(), line)
+                .map_err(|e| StoreError::Parse(e.to_string()))?
+        } else {
+            line.to_string()
+        };
+        line_to_record(&plaintext)
     }
 
     pub fn ann_tuning(&self) -> &AnnTuningConfig {
@@ -416,7 +438,7 @@ impl InMemoryStore {
     }
 
     pub fn apply_persisted_record_line(&mut self, line: &str) -> Result<(), StoreError> {
-        self.apply_persisted_record(line_to_record(line)?)
+        self.apply_persisted_record(self.storage_line_to_record(line)?)
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {

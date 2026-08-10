@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ingestion::{
     IngestInput, ingest_document, ingest_document_persistent_with_policy,
     transport::IngestionRuntime, transport::serve_http_with_workers,
@@ -164,6 +166,14 @@ fn main() {
             );
         }
 
+        let encryption_provider = match encryption::provider_from_env() {
+            Ok(provider) => provider,
+            Err(err) => {
+                tracing::error!("ingestion failed to load encryption provider: {err:?}");
+                std::process::exit(1);
+            }
+        };
+
         let mut wal = match FileWal::open_with_policy(
             &wal_path,
             WalWritePolicy {
@@ -173,7 +183,7 @@ fn main() {
                 background_flush_only: wal_background_flush_only,
             },
         ) {
-            Ok(wal) => wal,
+            Ok(wal) => wal.with_encryption(Arc::clone(&encryption_provider)),
             Err(err) => {
                 tracing::error!("ingestion failed opening WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
@@ -189,6 +199,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        store = store.with_encryption(Arc::clone(&encryption_provider));
         // Default-on disk persistence (redb PR 2). The
         // `DASH_INGEST_PERSISTENCE_PATH` env var overrides the path;
         // setting `DASH_INGEST_PERSISTENCE_DISABLE=1` reverts to the

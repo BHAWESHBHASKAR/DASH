@@ -18,6 +18,9 @@
 
 use std::fs::{OpenOptions, create_dir_all, rename};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
+
+use encryption::{EncryptionProvider, decrypt_storage_line, encrypt_storage_line};
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";
 use std::path::{Path, PathBuf};
@@ -110,6 +113,7 @@ pub struct FileWal {
     append_buffer: Vec<String>,
     pub(crate) unsynced_records: usize,
     last_sync_at: Instant,
+    encryption: Option<Arc<dyn EncryptionProvider>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +181,41 @@ impl FileWal {
             append_buffer: Vec::new(),
             unsynced_records: 0,
             last_sync_at: Instant::now(),
+            encryption: None,
         })
+    }
+
+    pub fn with_encryption(mut self, provider: Arc<dyn EncryptionProvider>) -> Self {
+        self.encryption = Some(provider);
+        self
+    }
+
+    fn aad_for_record(record: &PersistedRecord) -> &str {
+        match record {
+            PersistedRecord::Claim(claim) => &claim.tenant_id,
+            _ => "",
+        }
+    }
+
+    fn record_to_storage_line(&self, record: &PersistedRecord) -> Result<String, StoreError> {
+        let plaintext = record_to_line(record);
+        if let Some(provider) = self.encryption.as_ref() {
+            let aad = Self::aad_for_record(record);
+            encrypt_storage_line(provider.as_ref(), &plaintext, aad)
+                .map_err(|e| StoreError::Io(e.to_string()))
+        } else {
+            Ok(plaintext)
+        }
+    }
+
+    fn storage_line_to_record(&self, line: &str) -> Result<PersistedRecord, StoreError> {
+        let plaintext = if let Some(provider) = self.encryption.as_ref() {
+            decrypt_storage_line(provider.as_ref(), line)
+                .map_err(|e| StoreError::Parse(e.to_string()))?
+        } else {
+            line.to_string()
+        };
+        line_to_record(&plaintext)
     }
 
     pub fn path(&self) -> &Path {
@@ -302,7 +340,7 @@ impl FileWal {
                 "raw WAL record line must not be empty".to_string(),
             ));
         }
-        let _ = line_to_record(line)?;
+        let _ = self.storage_line_to_record(line)?;
         self.append_raw_record_line_unchecked(line.to_string())
     }
 
@@ -348,10 +386,10 @@ impl FileWal {
     ) -> Result<(), StoreError> {
         self.flush_pending_sync()?;
         for line in &export.snapshot_lines {
-            let _ = line_to_record(line)?;
+            let _ = self.storage_line_to_record(line)?;
         }
         for line in &export.wal_lines {
-            let _ = line_to_record(line)?;
+            let _ = self.storage_line_to_record(line)?;
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
@@ -364,7 +402,7 @@ impl FileWal {
     }
 
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
-        self.append_raw_record_line_unchecked(record_to_line(record))
+        self.append_raw_record_line_unchecked(self.record_to_storage_line(record)?)
     }
 
     fn append_raw_record_line_unchecked(&mut self, line: String) -> Result<(), StoreError> {
@@ -446,7 +484,7 @@ impl FileWal {
         let mut wal_records = self.replay_wal_records()?;
         if !self.append_buffer.is_empty() {
             for line in &self.append_buffer {
-                wal_records.push(line_to_record(line)?);
+                wal_records.push(self.storage_line_to_record(line)?);
             }
         }
         let stats = WalReplayStats {
@@ -462,7 +500,7 @@ impl FileWal {
     fn replay_snapshot_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
         self.replay_snapshot_lines_raw()?
             .into_iter()
-            .map(|line| line_to_record(&line))
+            .map(|line| self.storage_line_to_record(&line))
             .collect()
     }
 
@@ -508,7 +546,7 @@ impl FileWal {
     fn replay_wal_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
         self.replay_wal_lines_raw()?
             .into_iter()
-            .map(|line| line_to_record(&line))
+            .map(|line| self.storage_line_to_record(&line))
             .collect()
     }
 
@@ -527,7 +565,11 @@ impl FileWal {
     }
 
     fn write_snapshot_records(&self, records: &[PersistedRecord]) -> Result<(), StoreError> {
-        self.write_snapshot_lines_raw(&records.iter().map(record_to_line).collect::<Vec<String>>())
+        let mut lines = Vec::with_capacity(records.len());
+        for record in records {
+            lines.push(self.record_to_storage_line(record)?);
+        }
+        self.write_snapshot_lines_raw(&lines)
     }
 
     fn write_snapshot_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
@@ -1072,5 +1114,76 @@ fn str_to_relation(raw: &str) -> Result<Relation, StoreError> {
         "duplicates" => Ok(Relation::Duplicates),
         "depends_on" => Ok(Relation::DependsOn),
         _ => Err(StoreError::Parse("invalid relation in wal".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use encryption::EnvProvider;
+
+    use super::*;
+
+    fn sample_claim() -> Claim {
+        Claim {
+            claim_id: "claim-1".to_string(),
+            tenant_id: "tenant-1".to_string(),
+            canonical_text: "DASH encrypts WAL records at rest".to_string(),
+            confidence: 0.95,
+            event_time_unix: None,
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: None,
+            valid_to: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn encrypted_wal_round_trip_replays_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let provider: Arc<dyn EncryptionProvider> = Arc::new(EnvProvider::new([0x42; 32]));
+        let mut wal = FileWal::open(&path).unwrap().with_encryption(provider);
+        let claim = sample_claim();
+        wal.append_claim(&claim).unwrap();
+        wal.flush_pending_sync().unwrap();
+
+        let (records, _) = wal.replay_records_with_stats().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(&records[0], PersistedRecord::Claim(c) if c.claim_id == claim.claim_id));
+    }
+
+    #[test]
+    fn encrypted_wal_file_is_not_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let provider: Arc<dyn EncryptionProvider> = Arc::new(EnvProvider::new([0x43; 32]));
+        let mut wal = FileWal::open(&path).unwrap().with_encryption(provider);
+        let claim = sample_claim();
+        wal.append_claim(&claim).unwrap();
+        wal.flush_pending_sync().unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.starts_with("enc:"));
+        assert!(!raw.contains(&claim.claim_id));
+    }
+
+    #[test]
+    fn encrypted_wal_without_provider_fails_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let provider: Arc<dyn EncryptionProvider> = Arc::new(EnvProvider::new([0x44; 32]));
+        {
+            let mut wal = FileWal::open(&path).unwrap().with_encryption(provider);
+            wal.append_claim(&sample_claim()).unwrap();
+            wal.flush_pending_sync().unwrap();
+        }
+
+        let wal = FileWal::open(&path).unwrap();
+        assert!(wal.replay_records_with_stats().is_err());
     }
 }
