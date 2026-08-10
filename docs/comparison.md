@@ -22,11 +22,21 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Scoped API keys | yes (`key:tenant[,tenant...]`) | limited | yes | yes | limited | no |
 | API key revocation (hot reload) | yes | yes | yes | yes | partial | no |
 | JWT auth (HS256) with kid rotation | yes | JWT only | yes (OIDC) | yes | partial | no |
+| OIDC / JWKS authentication | yes | no | yes | partial | no | no |
+| RBAC (admin/ingest/retrieve/read_only) | yes | no | limited | yes | partial | no |
 | Durable WAL with replay + checkpoints | yes, built-in | managed | yes | yes | yes | no |
 | Backpressure-aware HTTP transport | yes (queue + 503) | managed | yes | yes | yes | no |
 | Docker Compose / systemd units | yes | n/a | yes | yes | yes | no |
 | Benchmark suite with CI regression guard | yes | n/a | partial | yes | partial | no |
-| Managed cloud option | no (self-hosted) | yes | yes | yes | yes | yes |
+| Customer-managed encryption keys (CMEK) | yes (`env` + AWS KMS) | no | no | no | no | no |
+| Object-storage backup / restore | yes (S3) | managed | yes | yes | yes | no |
+| Control-plane leader election + failover | yes | managed | no | yes | no | no |
+| Quorum replication | follower pull + offset persistence | managed | yes | yes | yes | no |
+| Helm chart | yes | n/a | yes | yes | yes | no |
+| Prometheus / Grafana monitoring | yes | managed | yes | yes | yes | no |
+| OpenAPI 3.0 spec | yes | no | yes | partial | no | no |
+| Client SDKs | Python, Go, TypeScript, C#, Java, Kotlin | yes | yes | yes | yes | yes |
+| Managed cloud option | no (self-hosted; Helm scaffolding) | yes | yes | yes | yes | yes |
 | Backing storage | local WAL + segments | managed | pluggable (disk, S3, GCS, MinIO) | pluggable (disk, S3, GCS, MinIO) | local or S3-compatible | in-memory or local |
 
 ## When to use DASH
