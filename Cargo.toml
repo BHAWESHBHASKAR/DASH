@@ -4,6 +4,7 @@ members = [
   "pkg/embeddings",
   "pkg/encryption",
   "pkg/schema",
+  "pkg/usage",
   "pkg/ranking",
   "pkg/graph",
   "pkg/store",

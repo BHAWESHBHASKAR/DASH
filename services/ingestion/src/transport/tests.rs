@@ -373,6 +373,31 @@ fn handle_request_post_tenants_returns_method_not_allowed() {
 }
 
 #[test]
+fn handle_request_get_usage_reflects_tenant_ingest() {
+    let runtime = sample_runtime();
+    let ingest = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{"claim":{"claim_id":"c1","tenant_id":"tenant-a","canonical_text":"Company X acquired Company Y","confidence":0.9},"evidence":[{"evidence_id":"e1","claim_id":"c1","source_id":"source://doc","stance":"supports","source_quality":0.95}]}"#.to_vec(),
+    };
+    let response = handle_request(&runtime, &ingest);
+    assert_eq!(response.status, 200);
+
+    let get = HttpRequest {
+        method: "GET".to_string(),
+        target: "/v1/usage".to_string(),
+        headers: HashMap::new(),
+        body: Vec::new(),
+    };
+    let response = handle_request(&runtime, &get);
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("tenant-a"));
+    assert!(response.body.contains("\"requests_total\":1"));
+    assert!(response.body.contains("\"bytes_total\":"));
+}
+
+#[test]
 fn handle_request_post_ingest_raw_extracts_sentence_claims() {
     let runtime = sample_runtime();
     let request = HttpRequest {

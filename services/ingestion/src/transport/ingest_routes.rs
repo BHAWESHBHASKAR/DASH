@@ -113,6 +113,7 @@ pub(super) fn handle_ingest_post(
                                 resp.ack_count,
                                 resp.required_acks,
                             );
+                            guard.record_tenant_usage(&tenant_id, request.body.len());
                             audit_status = 200;
                             audit_outcome = "success";
                             audit_reason = "ingest accepted".to_string();
@@ -335,6 +336,7 @@ pub(super) fn handle_ingest_raw_post(
                         checkpoint_truncated_wal_records: batch_resp
                             .checkpoint_truncated_wal_records,
                     };
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     audit_status = 200;
                     audit_outcome = "success";
                     audit_reason = format!(
@@ -507,6 +509,7 @@ pub(super) fn handle_ingest_batch_post(
                         resp.ack_count,
                         resp.required_acks,
                     );
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     audit_status = 200;
                     audit_outcome = "success";
                     audit_reason = format!("ingest batch accepted (commit_id={})", resp.commit_id);
@@ -705,6 +708,7 @@ pub(super) fn handle_ingest_document_post(
                         batch_resp.ack_count,
                         batch_resp.required_acks,
                     );
+                    guard.record_tenant_usage(&tenant_id, request.body.len());
                     let document_resp = IngestDocumentApiResponse {
                         document_id,
                         mime_type: parsed_mime_type,

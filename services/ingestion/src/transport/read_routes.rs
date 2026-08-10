@@ -73,6 +73,15 @@ pub(super) fn handle_get_request(
                 HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
             }
         },
+        "/v1/usage" => match runtime.lock() {
+            Ok(rt) => match serde_json::to_string(&rt.usage_snapshot()) {
+                Ok(body) => HttpResponse::ok_json(body),
+                Err(_) => HttpResponse::internal_server_error("failed to serialize usage"),
+            },
+            Err(_) => {
+                HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
+            }
+        },
         "/internal/replication/wal" => handle_replication_wal_get(runtime, request, query),
         "/internal/replication/export" => handle_replication_export_get(runtime, request),
         "/internal/replication/commit-status" => {

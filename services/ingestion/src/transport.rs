@@ -63,6 +63,7 @@ use store::{
     CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
     WalReplicationExport, batch_commit_payload_fingerprint,
 };
+use usage::UsageSnapshot;
 
 use crate::{
     IngestInput,
@@ -134,6 +135,7 @@ pub struct IngestionRuntime {
     replication_last_error: Option<String>,
     replication_commit_status: HashMap<String, ReplicationCommitStatus>,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
+    tenant_usage: UsageSnapshot,
     started_at: Instant,
 }
 
@@ -241,6 +243,7 @@ impl IngestionRuntime {
             replication_last_error: None,
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
+            tenant_usage: UsageSnapshot::default(),
             started_at: Instant::now(),
         }
     }
@@ -303,6 +306,7 @@ impl IngestionRuntime {
             replication_last_error: None,
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
+            tenant_usage: UsageSnapshot::default(),
             started_at: Instant::now(),
         }
     }
@@ -317,6 +321,25 @@ impl IngestionRuntime {
         let mut ids: Vec<String> = self.store.tenant_ids().into_iter().collect();
         ids.sort();
         ids
+    }
+
+    /// Record a billable operation for `tenant_id`.
+    pub fn record_tenant_usage(&mut self, tenant_id: &str, bytes: usize) {
+        self.tenant_usage.record(tenant_id, bytes);
+    }
+
+    /// Return a point-in-time usage snapshot for all tenants.
+    pub fn usage_snapshot(&self) -> UsageSnapshot {
+        self.tenant_usage.clone()
+    }
+
+    /// Total number of billable requests across all tenants.
+    pub fn total_tenant_requests(&self) -> u64 {
+        self.tenant_usage
+            .tenants
+            .values()
+            .map(|c| c.requests_total)
+            .sum()
     }
 
     pub fn placement_routing_error(&self) -> Option<&str> {

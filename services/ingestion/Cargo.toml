@@ -11,6 +11,7 @@ model-extraction-adapter = []
 auth = { path = "../../pkg/auth" }
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
+usage = { path = "../../pkg/usage" }
 encryption = { path = "../../pkg/encryption" }
 indexer = { path = "../indexer" }
 metadata-router = { path = "../metadata-router" }

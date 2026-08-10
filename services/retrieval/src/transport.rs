@@ -18,6 +18,7 @@ use metadata_router::{
 };
 use schema::StanceMode;
 use store::InMemoryStore;
+use usage::UsageSnapshot;
 
 #[cfg(test)]
 use crate::api::STORAGE_MERGE_MODEL;
@@ -266,6 +267,9 @@ pub(crate) struct TransportMetrics {
     storage_promotion_boundary_replay_only_total: u64,
     storage_promotion_boundary_segment_plus_wal_delta_total: u64,
     storage_promotion_boundary_segment_fully_promoted_total: u64,
+    tenant_usage: UsageSnapshot,
+    embedding_requests_total: u64,
+    embedding_bytes_total: u64,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
 }
 
@@ -322,6 +326,9 @@ impl Default for TransportMetrics {
             storage_promotion_boundary_replay_only_total: 0,
             storage_promotion_boundary_segment_plus_wal_delta_total: 0,
             storage_promotion_boundary_segment_fully_promoted_total: 0,
+            tenant_usage: UsageSnapshot::default(),
+            embedding_requests_total: 0,
+            embedding_bytes_total: 0,
             transport_backpressure: None,
         }
     }
@@ -391,6 +398,25 @@ impl TransportMetrics {
         if write_error {
             self.audit_write_error_total += 1;
         }
+    }
+
+    fn record_retrieve_usage(&mut self, tenant_id: &str, bytes: usize) {
+        self.tenant_usage.record(tenant_id, bytes);
+    }
+
+    fn record_embedding_usage(&mut self, bytes: usize) {
+        self.embedding_requests_total = self.embedding_requests_total.saturating_add(1);
+        self.embedding_bytes_total = self.embedding_bytes_total.saturating_add(bytes as u64);
+    }
+
+    fn usage_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tenants": self.tenant_usage.tenants,
+            "embeddings": {
+                "requests_total": self.embedding_requests_total,
+                "bytes_total": self.embedding_bytes_total,
+            }
+        })
     }
 
     fn observe_read_route_resolution(&mut self, routed: &RoutedReplica) {
@@ -951,6 +977,18 @@ pub fn handle_http_request_bytes(
     store: &InMemoryStore,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
+    handle_http_request_bytes_with_metrics(
+        store,
+        raw_request,
+        &Arc::new(Mutex::new(TransportMetrics::default())),
+    )
+}
+
+pub(crate) fn handle_http_request_bytes_with_metrics(
+    store: &InMemoryStore,
+    raw_request: &[u8],
+    metrics: &Arc<Mutex<TransportMetrics>>,
+) -> Result<Vec<u8>, String> {
     let request_text =
         std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
     let (header_block, body) = request_text
@@ -995,7 +1033,6 @@ pub fn handle_http_request_bytes(
         headers,
         body: body.as_bytes().to_vec(),
     };
-    let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
     let mut placement_routing = PlacementRoutingState::from_env()?;
     let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
         state.maybe_refresh();
@@ -1009,7 +1046,7 @@ pub fn handle_http_request_bytes(
     let response = handle_request_with_metrics_and_reload(
         store,
         &request,
-        &metrics,
+        metrics,
         routing_snapshot.as_ref(),
         Some(&reload_snapshot),
     );
@@ -1383,6 +1420,7 @@ fn handle_request_with_metrics_and_reload(
                             transport_req.read_consistency,
                             metrics,
                             placement_routing,
+                            request.body.len(),
                         );
                         let (outcome, reason) = if response.status < 400 {
                             ("success", "retrieve accepted")
@@ -1485,6 +1523,7 @@ fn handle_request_with_metrics_and_reload(
                                 transport_req.read_consistency,
                                 metrics,
                                 placement_routing,
+                                request.body.len(),
                             );
                             let (outcome, reason) = if response.status < 400 {
                                 ("success", "retrieve accepted")
@@ -1519,6 +1558,16 @@ fn handle_request_with_metrics_and_reload(
             let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
             HttpResponse::ok_json(body)
         }
+        ("GET", "/v1/usage") => {
+            let usage = match metrics.lock() {
+                Ok(guard) => guard.usage_snapshot(),
+                Err(_) => {
+                    return HttpResponse::internal_server_error("failed to acquire metrics lock");
+                }
+            };
+            let body = serde_json::to_string(&usage).unwrap_or_else(|_| "{}".to_string());
+            HttpResponse::ok_json(body)
+        }
         ("POST", "/v1/embeddings") => {
             // OpenAI-compatible embeddings endpoint. No auth required at the
             // HTTP layer (it accepts only the request body); a future
@@ -1541,6 +1590,9 @@ fn handle_request_with_metrics_and_reload(
                 provider.as_ref(),
             ) {
                 Ok(resp) => {
+                    if let Ok(mut guard) = metrics.lock() {
+                        guard.record_embedding_usage(request.body.len());
+                    }
                     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
                     HttpResponse::ok_json(body)
                 }
@@ -1558,6 +1610,7 @@ fn handle_request_with_metrics_and_reload(
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
         (_, "/v1/embeddings") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/v1/models") => HttpResponse::method_not_allowed("only GET is supported"),
+        (_, "/v1/usage") => HttpResponse::method_not_allowed("only GET is supported"),
         (_, "/health")
         | (_, "/v1/health")
         | (_, "/live")
@@ -1670,6 +1723,7 @@ fn execute_retrieve_and_observe(
     read_consistency: ReadConsistencyPolicy,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
+    request_bytes: usize,
 ) -> HttpResponse {
     let mut serving_replica: Option<String> = None;
     if let Some(routing) = placement_routing {
@@ -1701,6 +1755,7 @@ fn execute_retrieve_and_observe(
 
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_retrieve(200, latency_ms, result_count, ingest_to_visible_lag_ms);
+        guard.record_retrieve_usage(&tenant_id, request_bytes);
         guard.observe_storage_merge_execution(&merge_snapshot);
     }
 
@@ -3600,5 +3655,45 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert_eq!(second_prev, first_hash);
 
         let _ = std::fs::remove_file(audit_path);
+    }
+
+    #[test]
+    fn transport_usage_endpoint_returns_empty_snapshot_by_default() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/usage".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response = handle_request_with_metrics(&store, &request, &metrics);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"tenants\":{}"));
+        assert!(response.body.contains("\"requests_total\":0"));
+    }
+
+    #[test]
+    fn transport_usage_endpoint_tracks_retrieve_requests() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let get_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let _ = handle_request_with_metrics(&store, &get_request, &metrics);
+
+        let usage_request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/v1/usage".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let response = handle_request_with_metrics(&store, &usage_request, &metrics);
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"tenant-a\""));
+        assert!(response.body.contains("\"requests_total\":1"));
     }
 }

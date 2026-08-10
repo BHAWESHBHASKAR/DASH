@@ -325,6 +325,19 @@ paths:
                 items:
                   type: string
 
+  /v1/usage:
+    get:
+      tags: [Ingest]
+      summary: Managed-cloud usage snapshot for ingestion
+      operationId: ingestUsage
+      responses:
+        '200':
+          description: Per-tenant request and byte counters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSnapshot'
+
   # Retrieval service
   /v1/retrieve:
     get:
@@ -442,6 +455,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OpenAIModelsResponse'
+
+  /v1/usage:
+    get:
+      tags: [Retrieve]
+      summary: Managed-cloud usage snapshot for retrieval
+      operationId: retrieveUsage
+      responses:
+        '200':
+          description: Per-tenant retrieve and aggregate embedding counters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSnapshot'
 
   /v1/embeddings:
     post:
@@ -1243,3 +1269,30 @@ components:
           type: string
         usage:
           $ref: '#/components/schemas/OpenAIUsage'
+
+    UsageCounters:
+      type: object
+      properties:
+        requests_total:
+          type: integer
+          format: uint64
+        bytes_total:
+          type: integer
+          format: uint64
+
+    UsageSnapshot:
+      type: object
+      properties:
+        tenants:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/UsageCounters'
+        embeddings:
+          type: object
+          properties:
+            requests_total:
+              type: integer
+              format: uint64
+            bytes_total:
+              type: integer
+              format: uint64

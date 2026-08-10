@@ -7,6 +7,7 @@ edition = "2024"
 auth = { path = "../../pkg/auth" }
 schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
+usage = { path = "../../pkg/usage" }
 encryption = { path = "../../pkg/encryption" }
 graph = { path = "../../pkg/graph" }
 indexer = { path = "../indexer" }

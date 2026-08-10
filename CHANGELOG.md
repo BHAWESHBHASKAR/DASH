@@ -17,6 +17,10 @@ to [Semantic Versioning](https://semver.org/).
   discover supported model names before calling `/v1/embeddings`.
 - **`GET /v1/tenants` on the ingestion service** to list tenant IDs
   known to the runtime, a first admin-style collection listing API.
+- **Managed-cloud usage metering** — new `pkg/usage` crate with
+  `UsageCounters`/`UsageSnapshot`, `GET /v1/usage` on both ingestion
+  and retrieval, and per-tenant request/byte counters recorded on every
+  successful ingest and retrieve. Embeddings are tracked separately.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.
