@@ -1,7 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::File,
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
     sync::{Mutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -492,4 +492,45 @@ fn transport_openai_embeddings_get_method_returns_405() {
 
     assert!(response.starts_with("HTTP/1.1 405"));
     assert!(response.contains("only POST is supported"));
+}
+
+#[test]
+fn transport_openai_embeddings_uses_ollama_provider_when_configured() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _provider_guard = EnvVarGuard::set("DASH_EMBEDDING_PROVIDER", OsStr::new("ollama"));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock listener");
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://127.0.0.1:{port}/api/embeddings");
+    let _endpoint_guard = EnvVarGuard::set("DASH_OLLAMA_ENDPOINT", OsStr::new(&endpoint));
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("mock server should accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let response = r#"{"embedding":[0.1,0.2,0.3]}"#;
+        let http = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        );
+        let _ = stream.write_all(http.as_bytes());
+    });
+
+    let store = sample_store();
+    let body = r#"{"input":"hello world","model":"nomic-embed-text"}"#;
+    let request = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+        .expect("request should parse and return response");
+    let response = String::from_utf8(response).expect("response should be UTF-8");
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("\"model\":\"nomic-embed-text\""));
+    assert!(response.contains("\"embedding\":[0.1,0.2,0.3]"));
+    assert!(response.contains("\"index\":0"));
 }

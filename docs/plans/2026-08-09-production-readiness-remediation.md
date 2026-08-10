@@ -87,9 +87,11 @@ A production-ready DASH deployment must guarantee:
 12. **OpenAPI 3 spec + SDK/client docs** — **DONE**
     - Add `docs/api/openapi.yaml` covering ingestion, retrieval, embeddings, diagnostics, and control-plane endpoints, plus `docs/api/README.md` with curl examples and SDK generation commands.
 
-13. **Real HTTP embedding provider default + integration test** — **BACKLOG**
-    - Make `ollama` or `openai` the default in `docker-compose.yml` when `DASH_EMBEDDING_PROVIDER` is unset, and add a CI integration test that runs against a real (or mock) HTTP embedding endpoint.
-    - Acceptance: `docker compose up` with an Ollama sidecar produces semantically meaningful vectors by default.
+13. **Real HTTP embedding provider default + integration test** — **DONE**
+    - Fix `select_embedding_provider_from_env()` to use the correct Ollama `/api/embeddings` endpoint and honor `DASH_OLLAMA_ENDPOINT`.
+    - Add `services/retrieval/tests/transport_http.rs::transport_openai_embeddings_uses_ollama_provider_when_configured` that verifies the `/v1/embeddings` path calls an HTTP Ollama-compatible backend.
+    - Provide `deploy/container/docker-compose.ollama.yml` so `docker compose --profile ollama up` defaults `DASH_EMBEDDING_PROVIDER=ollama` with `nomic-embed-text`.
+    - Acceptance: `cargo test -p retrieval` Ollama integration test passes; compose overlay is documented in `docs/api/README.md`.
 
 ## 4. Suggested first milestones
 
@@ -109,7 +111,7 @@ A production-ready DASH deployment must guarantee:
 | M10 | Helm control-plane + managed cloud scaffolding | Done | 0.75 session |
 | M11 | RBAC/OIDC, CMEK, SOC 2 readiness | In progress — see [M11 completion plan](./2026-08-09-m11-completion-plan.md) | 4–5 sessions |
 | M12 | OpenAPI 3 spec + SDK/client docs | Done | 0.5 session |
-| M13 | real HTTP embedding provider default + integration test | Backlog | 0.75 session |
+| M13 | real HTTP embedding provider default + integration test | Done | 0.75 session |
 
 ## 5. Risk register
 

@@ -597,7 +597,7 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
 /// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
 ///   network), `"ollama"`, or `"openai"`. Unknown values fall back to `hash`
 ///   with a warning.
-/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
+/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434/api/embeddings`),
 ///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
 /// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
 ///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
@@ -609,10 +609,11 @@ pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send 
     match provider.as_str() {
         "ollama" => {
             let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                .ok()
+                .filter(|value| !value.trim().is_empty());
             let model = std::env::var("DASH_OLLAMA_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string());
-            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
+            Box::new(OllamaEmbeddingProvider::new(model, endpoint))
         }
         "openai" => {
             let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();

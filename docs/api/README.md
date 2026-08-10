@@ -93,6 +93,19 @@ DASH accepts the OpenAI wire format but ignores the model value; the actual
 embedding provider is selected by `DASH_EMBEDDING_PROVIDER` (`hash`, `ollama`,
 `openai`).
 
+### Running with real semantic embeddings (Ollama)
+
+```bash
+# Start the stack with the Ollama overlay
+docker compose \
+  -f deploy/container/docker-compose.yml \
+  -f deploy/container/docker-compose.ollama.yml \
+  --profile ollama up
+```
+
+This starts an `ollama` container and sets `DASH_EMBEDDING_PROVIDER=ollama`
+with `nomic-embed-text`. The model is pulled on the first embedding request.
+
 ## Customer-managed encryption keys
 
 Set `DASH_ENCRYPTION_PROVIDER=env` and `DASH_ENCRYPTION_MASTER_KEY` to encrypt
