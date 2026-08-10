@@ -1,7 +1,7 @@
 use super::*;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
 use metadata_router::{ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -1769,6 +1769,93 @@ fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack(
     );
     assert!(duplicate_ack_response.body.contains("\"ack_count\":2"));
     assert!(!duplicate_ack_response.body.contains("\"ack_count\":3"));
+}
+
+#[test]
+fn handle_request_write_consistency_quorum_synchronous_fan_out_reaches_quorum() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let previous_endpoints = std::env::var_os("DASH_REPLICA_ACK_ENDPOINTS");
+    let previous_timeout = std::env::var_os("DASH_INGEST_QUORUM_TIMEOUT_MS");
+    let previous_token = std::env::var_os("DASH_INGEST_REPLICATION_TOKEN");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("mock follower should bind a random local port");
+    let address = listener
+        .local_addr()
+        .expect("mock follower should have local address");
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("mock follower should accept connection");
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nstatus=ok\n";
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    set_env_var_for_tests(
+        "DASH_REPLICA_ACK_ENDPOINTS",
+        &format!("node-b=http://{address}"),
+    );
+    set_env_var_for_tests("DASH_INGEST_QUORUM_TIMEOUT_MS", "2000");
+    restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", None);
+
+    let placement = ShardPlacement {
+        tenant_id: "tenant-a".to_string(),
+        shard_id: 0,
+        epoch: 10,
+        replicas: vec![
+            ReplicaPlacement {
+                node_id: "node-a".to_string(),
+                role: ReplicaRole::Leader,
+                health: ReplicaHealth::Healthy,
+            },
+            ReplicaPlacement {
+                node_id: "node-b".to_string(),
+                role: ReplicaRole::Follower,
+                health: ReplicaHealth::Healthy,
+            },
+        ],
+    };
+    let runtime = Arc::new(Mutex::new(
+        IngestionRuntime::in_memory(InMemoryStore::new()).with_placement_runtime_for_tests(Ok(
+            Some(PlacementRoutingRuntime {
+                local_node_id: "node-a".to_string(),
+                router_config: RouterConfig {
+                    shard_ids: vec![0],
+                    virtual_nodes_per_shard: 16,
+                    replica_count: 2,
+                },
+                placements: vec![placement],
+            }),
+        )),
+    ));
+
+    let ingest_request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest?write_consistency=quorum".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: br#"{"claim":{"claim_id":"c-quorum-sync","tenant_id":"tenant-a","canonical_text":"sync quorum","confidence":0.9}}"#.to_vec(),
+    };
+    let ingest_response = handle_request(&runtime, &ingest_request);
+    assert_eq!(ingest_response.status, 200, "{}", ingest_response.body);
+    assert!(
+        ingest_response.body.contains("\"ack_count\":2"),
+        "{}",
+        ingest_response.body
+    );
+    assert!(
+        ingest_response
+            .body
+            .contains("\"commit_status\":\"replication_quorum_met\"")
+    );
+
+    restore_env_var_for_tests("DASH_REPLICA_ACK_ENDPOINTS", previous_endpoints.as_deref());
+    restore_env_var_for_tests("DASH_INGEST_QUORUM_TIMEOUT_MS", previous_timeout.as_deref());
+    restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", previous_token.as_deref());
 }
 
 #[test]

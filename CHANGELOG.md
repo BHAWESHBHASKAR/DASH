@@ -28,6 +28,13 @@ to [Semantic Versioning](https://semver.org/).
   with `Embed` and `ListModels` methods on `DASH_GRPC_BIND`
   (default `127.0.0.1:50051`), backed by the same shared embedding
   provider selection as the REST API.
+- **Multi-region synchronous quorum hardening** — `POST /v1/ingest`
+  with `write_consistency=quorum` now fan-outs `POST
+  /internal/replication/ack` to follower endpoints configured via
+  `DASH_REPLICA_ACK_ENDPOINTS` and waits up to
+  `DASH_INGEST_QUORUM_TIMEOUT_MS` (default 5000ms) before returning,
+  updating the real-time `ack_count` and `commit_status` in the
+  response.
 - **Python SDK** `dash-py` — idiomatic Python client with sync + async,
   typed dataclasses, OpenAI drop-in examples, RAG example showing
   the Claim + Evidence + Contradiction differentiator. 59 tests pass.

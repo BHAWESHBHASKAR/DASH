@@ -57,6 +57,16 @@ curl -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
+Use `?write_consistency=quorum` (or `all`) and set `DASH_REPLICA_ACK_ENDPOINTS`
+to make the leader wait for synchronous follower acks before returning.
+
+```bash
+curl -X POST 'http://localhost:8081/v1/ingest?write_consistency=quorum' \
+  -H 'x-api-key: $INGEST_API_KEY' \
+  -H 'content-type: application/json' \
+  -d '{"claim":{"claim_id":"c1","tenant_id":"tenant-a","canonical_text":"quorum write","confidence":0.9}}'
+```
+
 ### List tenants and usage
 
 ```bash

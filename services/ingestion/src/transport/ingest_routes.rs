@@ -97,18 +97,36 @@ pub(super) fn handle_ingest_post(
                 match guard.ensure_local_write_route_for_claim(&api_req.claim, write_consistency) {
                     Ok(route_resolution) => match guard.ingest(api_req) {
                         Ok(mut resp) => {
-                            resp.commit_epoch = if route_resolution.epoch > 0 {
+                            let commit_id = resp.ingested_claim_id.clone();
+                            let commit_epoch = if route_resolution.epoch > 0 {
                                 Some(route_resolution.epoch)
                             } else {
                                 None
                             };
-                            resp.ack_count = route_resolution.ack_count;
-                            resp.required_acks = route_resolution.required_acks;
+                            let required_acks = route_resolution.required_acks;
+                            drop(guard);
+                            let ack_count = super::replication::wait_for_follower_acks(
+                                &commit_id,
+                                commit_epoch,
+                                route_resolution.ack_count,
+                                required_acks,
+                            );
+                            guard = match runtime.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    audit_reason =
+                                        "failed to re-acquire ingestion runtime lock".to_string();
+                                    return HttpResponse::internal_server_error(&audit_reason);
+                                }
+                            };
+                            resp.commit_epoch = commit_epoch;
+                            resp.ack_count = ack_count;
+                            resp.required_acks = required_acks;
                             resp.commit_status =
                                 commit_status_for_progress(resp.ack_count, resp.required_acks)
                                     .to_string();
                             guard.record_commit_status(
-                                &resp.ingested_claim_id,
+                                &commit_id,
                                 resp.commit_epoch,
                                 resp.ack_count,
                                 resp.required_acks,

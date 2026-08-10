@@ -7,9 +7,9 @@ pub mod dash {
 }
 
 use dash::{
+    EmbedRequest, EmbedResponse, EmbeddingData as GrpcEmbeddingData, ListModelsRequest,
+    ListModelsResponse, ModelData as GrpcModelData, Usage as GrpcUsage,
     dash_server::{Dash, DashServer},
-    EmbedRequest, EmbedResponse, EmbeddingData as GrpcEmbeddingData,
-    ListModelsRequest, ListModelsResponse, ModelData as GrpcModelData, Usage as GrpcUsage,
 };
 
 pub struct DashService {
@@ -24,7 +24,10 @@ impl DashService {
 
 #[tonic::async_trait]
 impl Dash for DashService {
-    async fn embed(&self, request: Request<EmbedRequest>) -> Result<Response<EmbedResponse>, Status> {
+    async fn embed(
+        &self,
+        request: Request<EmbedRequest>,
+    ) -> Result<Response<EmbedResponse>, Status> {
         let req = request.into_inner();
         let texts: Vec<String> = req.input.into_iter().collect();
         let vectors = self
@@ -117,7 +120,12 @@ mod tests {
         let service = DashService::new(provider);
         let request = tonic::Request::new(ListModelsRequest {});
         let response = service.list_models(request).await.unwrap();
-        let ids: Vec<_> = response.get_ref().data.iter().map(|m| m.id.as_str()).collect();
+        let ids: Vec<_> = response
+            .get_ref()
+            .data
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         assert!(ids.contains(&"dash-hash"));
         assert!(ids.contains(&"nomic-embed-text"));
     }
