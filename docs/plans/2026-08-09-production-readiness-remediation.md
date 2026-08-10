@@ -1,7 +1,7 @@
 # DASH Production-Readiness Remediation Plan
 
 Date: 2026-08-09  
-Status: M1–M13 implemented; remaining multi-region quorum, managed-cloud metering, gRPC surface, and web dashboard in backlog.  
+Status: M1–M13 implemented; remaining multi-region quorum, managed-cloud metering, gRPC surface, and web dashboard are now implemented.  
 Target: make the DASH vector/RAG engine safe to run in a production environment.
 
 ## 1. What "production ready" means for DASH
