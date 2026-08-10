@@ -66,6 +66,18 @@ to [Semantic Versioning](https://semver.org/).
 - **`OpenAIErrorResponse`** with `DashError` interface and
   `DashAPIError`/`DashConnectionError` concrete types; `from_response`
   factory tolerates both OpenAI and ad-hoc error shapes.
+- **Customer-managed encryption keys** — `pkg/encryption` crate with
+  `EncryptionProvider` trait, AES-256-GCM `env` provider, AWS KMS-backed
+  `aws-kms` provider, and storage-line encryption wired into WAL/snapshot
+  read and write paths in `pkg/store`.
+- **OpenAPI 3.0 spec and SDK quick-start** — `docs/api/openapi.yaml`
+  covering all public endpoints and `docs/api/README.md` with curl
+  examples and SDK generation commands.
+- **Ollama overlay for real semantic embeddings** —
+  `deploy/container/docker-compose.ollama.yml` adds an `ollama` service
+  and defaults `DASH_EMBEDDING_PROVIDER=ollama` when the `ollama`
+  compose profile is active; `select_embedding_provider_from_env()` now
+  uses the correct `/api/embeddings` path by default.
 
 ### Changed
 - **JSON parsing in services/ingestion** — replaced 633 lines of
