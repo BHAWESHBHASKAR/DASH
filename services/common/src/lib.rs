@@ -61,3 +61,89 @@ pub fn wait_for_drain(graceful_deadline: Duration) -> Duration {
     }
     start.elapsed()
 }
+
+const PLACEHOLDER_PATTERNS: &[&str] = &[
+    "change-me",
+    "placeholder",
+    "replace-me",
+    "example",
+    "sample",
+];
+
+/// Minimum secret length enforced in strict mode.
+pub const SECRET_MIN_LENGTH: usize = 16;
+
+/// Validate that a secret is non-empty, is not a known placeholder,
+/// and meets a minimum length. Returns an error string describing
+/// the first problem found.
+pub fn validate_secret(value: &str, name: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{name} is empty"));
+    }
+    let lower = trimmed.to_lowercase();
+    for pattern in PLACEHOLDER_PATTERNS {
+        if lower == *pattern || lower.starts_with(&format!("{pattern}-")) || lower.contains(pattern)
+        {
+            return Err(format!(
+                "{name} appears to be a placeholder value ('{trimmed}')"
+            ));
+        }
+    }
+    if trimmed.len() < SECRET_MIN_LENGTH {
+        return Err(format!(
+            "{name} is too short ({len} chars, minimum {SECRET_MIN_LENGTH})",
+            len = trimmed.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a comma-separated list of secrets, skipping empty entries.
+pub fn validate_secret_csv(values: Option<&str>, name: &str) -> Result<(), String> {
+    if let Some(raw) = values {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                validate_secret(trimmed, name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when `DASH_STRICT_SECRETS` is set to `1` or `true`.
+/// In strict mode services should refuse to start with weak or
+/// placeholder secrets; in non-strict mode they should emit a warning
+/// and continue so local development is not blocked.
+pub fn strict_secrets_enabled() -> bool {
+    matches!(
+        std::env::var("DASH_STRICT_SECRETS").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}
+
+/// Initialize a `tracing` subscriber for the service.
+///
+/// When `DASH_LOG_FORMAT` is `json`, events are emitted as JSON lines;
+/// otherwise a compact human-readable format is used. The default
+/// `RUST_LOG` filter is applied from the environment.
+pub fn init_logging() {
+    let json_logs = std::env::var("DASH_LOG_FORMAT")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("json");
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Ignore "already initialized" so tests that spawn multiple service
+    // binaries in the same process do not panic.
+    if json_logs {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+}

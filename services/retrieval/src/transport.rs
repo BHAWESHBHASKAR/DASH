@@ -4,7 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -39,7 +39,7 @@ mod payload;
 use audit::{AuditEvent, append_audit_record};
 #[cfg(test)]
 use audit::{audit_chain_states, is_sha256_hex};
-use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
+pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
@@ -345,7 +345,9 @@ impl TransportMetrics {
     fn observe_http(&mut self, path: &str) {
         self.http_requests_total += 1;
         match path {
-            "/health" => self.health_requests_total += 1,
+            "/health" | "/v1/health" | "/live" | "/v1/live" | "/ready" | "/v1/ready" => {
+                self.health_requests_total += 1;
+            }
             "/metrics" => self.metrics_requests_total += 1,
             _ => {}
         }
@@ -512,7 +514,11 @@ impl TransportMetrics {
         values[idx]
     }
 
-    fn render_prometheus(&self, placement_routing: Option<&PlacementRoutingRuntime>) -> String {
+    fn render_prometheus(
+        &self,
+        placement_routing: Option<&PlacementRoutingRuntime>,
+        disk_status: &store::DiskStatus,
+    ) -> String {
         let retrieve_latency_p50 = Self::quantile(&self.retrieve_latency_ms_window, 0.50);
         let retrieve_latency_p95 = Self::quantile(&self.retrieve_latency_ms_window, 0.95);
         let retrieve_latency_p99 = Self::quantile(&self.retrieve_latency_ms_window, 0.99);
@@ -549,6 +555,11 @@ impl TransportMetrics {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (disk_unavailable, disk_recovering) = match disk_status {
+            store::DiskStatus::Unavailable { .. } => (1, 0),
+            store::DiskStatus::Recovering => (0, 1),
+            store::DiskStatus::Available => (0, 0),
+        };
 
         format!(
             "# TYPE dash_http_requests_total counter\n\
@@ -691,6 +702,10 @@ dash_retrieve_segment_fallback_missing_manifest_total {}\n\
 dash_retrieve_segment_fallback_manifest_error_total {}\n\
 # TYPE dash_retrieve_segment_fallback_segment_error_total counter\n\
 dash_retrieve_segment_fallback_segment_error_total {}\n\
+# TYPE dash_disk_unavailable gauge\n\
+dash_disk_unavailable {}\n\
+# TYPE dash_disk_recovering gauge\n\
+dash_disk_recovering {}\n\
 # TYPE dash_transport_uptime_seconds gauge\n\
 dash_transport_uptime_seconds {:.4}\n",
             self.http_requests_total,
@@ -763,6 +778,8 @@ dash_transport_uptime_seconds {:.4}\n",
             segment_cache_metrics.fallback_missing_manifest,
             segment_cache_metrics.fallback_manifest_errors,
             segment_cache_metrics.fallback_segment_errors,
+            disk_unavailable,
+            disk_recovering,
             uptime_seconds
         )
     }
@@ -798,13 +815,13 @@ fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
     stream.write_all(response.as_bytes())
 }
 
-pub fn serve_http(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+pub fn serve_http(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let shutdown = dash_common::ShutdownSignal::install();
     serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
 }
 
 pub fn serve_http_with_workers(
-    store: &InMemoryStore,
+    store: Arc<RwLock<InMemoryStore>>,
     bind_addr: &str,
     worker_count: usize,
     shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
@@ -834,6 +851,7 @@ pub fn serve_http_with_workers(
             let rx = Arc::clone(&rx);
             let placement_routing = Arc::clone(&placement_routing);
             let backpressure_metrics = Arc::clone(&backpressure_metrics);
+            let store = Arc::clone(&store);
             scope.spawn(move || {
                 loop {
                     let stream = {
@@ -849,7 +867,8 @@ pub fn serve_http_with_workers(
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) = handle_connection(store, stream, &metrics, &placement_routing)
+                    if let Err(err) =
+                        handle_connection(&store, stream, &metrics, &placement_routing)
                     {
                         eprintln!("retrieval transport error: {err}");
                     }
@@ -861,7 +880,9 @@ pub fn serve_http_with_workers(
         // accept() calls with shutdown-flag polling. The 50ms
         // sleep caps shutdown latency at ~50ms p99 and bounds
         // CPU usage in the idle case.
-        listener.set_nonblocking(true).expect("set listener non-blocking");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
         loop {
             if shutdown.is_triggered() {
                 eprintln!("retrieval: shutdown signal received, draining in-flight requests");
@@ -904,13 +925,13 @@ pub fn serve_http_with_workers(
     Ok(())
 }
 
-pub fn serve_http_once(store: &InMemoryStore, bind_addr: &str) -> std::io::Result<()> {
+pub fn serve_http_once(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
     serve_http_once_with_listener(store, listener)
 }
 
 pub fn serve_http_once_with_listener(
-    store: &InMemoryStore,
+    store: Arc<RwLock<InMemoryStore>>,
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -923,7 +944,7 @@ pub fn serve_http_once_with_listener(
         },
     )?));
     let (stream, _) = listener.accept()?;
-    handle_connection(store, stream, &metrics, &placement_routing)
+    handle_connection(&store, stream, &metrics, &placement_routing)
 }
 
 pub fn handle_http_request_bytes(
@@ -996,7 +1017,7 @@ pub fn handle_http_request_bytes(
 }
 
 fn handle_connection(
-    store: &InMemoryStore,
+    store: &Arc<RwLock<InMemoryStore>>,
     mut stream: TcpStream,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
@@ -1033,8 +1054,9 @@ fn handle_connection(
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_placement_reload_snapshot(&reload_snapshot);
     }
+    let store_guard = store.read().unwrap_or_else(|p| p.into_inner());
     let response = handle_request_with_metrics_and_reload(
-        store,
+        &store_guard,
         &request,
         metrics,
         routing_snapshot.as_ref(),
@@ -1139,21 +1161,36 @@ fn handle_request_with_metrics_and_reload(
         }
         // Readiness probe: the process is up AND can serve traffic.
         // Kubernetes removes the pod from the service if this fails.
-        // We check that the in-memory store can be reached (cheap
-        // pointer check) — if the store is unhealthy, fail readiness.
+        // We check that the in-memory store can be reached and that
+        // disk persistence is healthy when a persistence path was
+        // configured.
         ("GET", "/ready") | ("GET", "/v1/ready") => {
-            // The store is held by the SharedRuntime; if the
-            // mutex is poisoned, something else is very wrong.
-            match metrics.lock() {
-                Ok(_) => HttpResponse::ok_json("{\"status\":\"ready\"}".to_string()),
-                Err(_) => HttpResponse::internal_server_error(
-                    "metrics mutex poisoned",
-                ),
+            if let Err(poisoned) = metrics.lock() {
+                return HttpResponse::internal_server_error(
+                    format!("metrics mutex poisoned: {poisoned}").as_str(),
+                );
+            }
+            match store.disk_status() {
+                store::DiskStatus::Available | store::DiskStatus::Recovering => {
+                    HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                }
+                store::DiskStatus::Unavailable { reason } => {
+                    if persistence_path_configured() {
+                        HttpResponse::error_with_status(
+                            503,
+                            &format!(
+                                "{{\"status\":\"not_ready\",\"reason\":\"disk unavailable: {reason}\"}}"
+                            ),
+                        )
+                    } else {
+                        HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                    }
+                }
             }
         }
         ("GET", "/metrics") => {
             let body = if let Ok(guard) = metrics.lock() {
-                guard.render_prometheus(placement_routing)
+                guard.render_prometheus(placement_routing, store.disk_status())
             } else {
                 "dash_transport_metrics_unavailable 1\n".to_string()
             };
@@ -1167,7 +1204,12 @@ fn handle_request_with_metrics_and_reload(
         ("GET", "/debug/planner") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::ReadOnly,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         emit_audit_event(
@@ -1215,7 +1257,12 @@ fn handle_request_with_metrics_and_reload(
         ("GET", "/debug/storage-visibility") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::ReadOnly,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         emit_audit_event(
@@ -1285,9 +1332,17 @@ fn handle_request_with_metrics_and_reload(
         },
         ("GET", "/v1/retrieve") => match build_retrieve_transport_request_from_query(&query) {
             Ok(transport_req) => {
-                let req = transport_req.request;
+                let mut req = transport_req.request;
+                if let Err(err) = embed_query_if_missing(&mut req) {
+                    return HttpResponse::bad_request(&err);
+                }
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                match authorize_request_for_tenant(
+                    request,
+                    &tenant_id,
+                    &auth_policy,
+                    Role::Retrieve,
+                ) {
                     AuthDecision::Unauthorized(reason) => {
                         observe_auth_failure(metrics);
                         if let Ok(mut guard) = metrics.lock() {
@@ -1379,9 +1434,17 @@ fn handle_request_with_metrics_and_reload(
             };
             match build_retrieve_transport_request_from_json(body) {
                 Ok(transport_req) => {
-                    let req = transport_req.request;
+                    let mut req = transport_req.request;
+                    if let Err(err) = embed_query_if_missing(&mut req) {
+                        return HttpResponse::bad_request(&err);
+                    }
                     let tenant_id = req.tenant_id.clone();
-                    match authorize_request_for_tenant(request, &tenant_id, &auth_policy) {
+                    match authorize_request_for_tenant(
+                        request,
+                        &tenant_id,
+                        &auth_policy,
+                        Role::Retrieve,
+                    ) {
                         AuthDecision::Unauthorized(reason) => {
                             observe_auth_failure(metrics);
                             if let Ok(mut guard) = metrics.lock() {
@@ -1463,18 +1526,15 @@ fn handle_request_with_metrics_and_reload(
             // vectors are semantically meaningful.
             let body = match std::str::from_utf8(&request.body) {
                 Ok(text) => text,
-                Err(_) => {
-                    return HttpResponse::bad_request("request body must be valid UTF-8")
-                }
+                Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
             };
-            let provider = crate::openai_embeddings::select_provider_from_env();
+            let provider = embeddings::select_embedding_provider_from_env();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
                 body,
                 provider.as_ref(),
             ) {
                 Ok(resp) => {
-                    let body = serde_json::to_string(&resp)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
                     HttpResponse::ok_json(body)
                 }
                 Err(err) => {
@@ -1491,6 +1551,11 @@ fn handle_request_with_metrics_and_reload(
         (_, "/v1/retrieve") => HttpResponse::method_not_allowed("only GET and POST are supported"),
         (_, "/v1/embeddings") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/health")
+        | (_, "/v1/health")
+        | (_, "/live")
+        | (_, "/v1/live")
+        | (_, "/ready")
+        | (_, "/v1/ready")
         | (_, "/metrics")
         | (_, "/debug/placement")
         | (_, "/debug/planner")
@@ -1505,6 +1570,20 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+/// True when a persistence path was explicitly configured and disk
+/// persistence was not disabled. Used by the /ready probe to decide
+/// whether an `Unavailable` disk status should fail readiness.
+fn persistence_path_configured() -> bool {
+    let disabled = std::env::var("DASH_RETRIEVAL_PERSISTENCE_DISABLE")
+        .ok()
+        .or_else(|| std::env::var("EME_RETRIEVAL_PERSISTENCE_DISABLE").ok())
+        .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes"));
+    let path_set = std::env::var("DASH_RETRIEVAL_PERSISTENCE_PATH")
+        .or_else(|_| std::env::var("EME_RETRIEVAL_PERSISTENCE_PATH"))
+        .is_ok_and(|value| !value.trim().is_empty());
+    !disabled && path_set
 }
 
 fn observe_auth_success(metrics: &Arc<Mutex<TransportMetrics>>) {
@@ -1560,6 +1639,21 @@ fn emit_audit_event(
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_audit_event(write_error);
     }
+}
+
+/// Embed the retrieve query text using the configured `DASH_EMBEDDING_PROVIDER`
+/// when the caller did not supply an explicit `query_embedding`. This makes
+/// semantic retrieval work out of the box for SDKs and curl clients.
+fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), String> {
+    if req.query_embedding.is_some() {
+        return Ok(());
+    }
+    let provider = embeddings::select_embedding_provider_from_env();
+    let vectors = provider
+        .embed(std::slice::from_ref(&req.query))
+        .map_err(|e| format!("embedding failed: {e}"))?;
+    req.query_embedding = vectors.into_iter().next();
+    Ok(())
 }
 
 fn execute_retrieve_and_observe(
@@ -3327,7 +3421,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a,tenant-b".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-b", &policy),
+            authorize_request_for_tenant(&request, "tenant-b", &policy, Role::Retrieve),
             AuthDecision::Allowed
         );
     }
@@ -3343,7 +3437,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
         let policy =
             AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-z", &policy),
+            authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Retrieve),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
         );
     }
@@ -3364,7 +3458,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a,tenant-b".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
         );
     }
@@ -3379,7 +3473,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
         };
         let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
         );
     }
@@ -3400,7 +3494,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             None,
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Allowed
         );
     }
@@ -3421,7 +3515,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             Some("scope-a:tenant-a".to_string()),
         );
         assert_eq!(
-            authorize_request_for_tenant(&request, "tenant-a", &policy),
+            authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("API key revoked")
         );
     }

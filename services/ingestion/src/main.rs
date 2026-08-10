@@ -28,6 +28,7 @@ struct WalDurabilityConfig {
 }
 
 fn main() {
+    dash_common::init_logging();
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass
     // `--cli` or `--no-serve` to run the one-shot path without
@@ -64,7 +65,7 @@ fn main() {
     ) {
         Ok(value) => value.unwrap_or(false),
         Err(reason) => {
-            eprintln!("ingestion invalid WAL durability override env: {reason}");
+            tracing::error!("ingestion invalid WAL durability override env: {reason}");
             std::process::exit(2);
         }
     };
@@ -74,17 +75,28 @@ fn main() {
     ) {
         Ok(value) => value.unwrap_or(false),
         Err(reason) => {
-            eprintln!("ingestion invalid WAL background flush env: {reason}");
+            tracing::error!("ingestion invalid WAL background flush env: {reason}");
             std::process::exit(2);
         }
     };
     let wal_async_flush_setting = match parse_wal_async_flush_setting() {
         Ok(value) => value,
         Err(reason) => {
-            eprintln!("ingestion invalid WAL async flush env: {reason}");
+            tracing::error!("ingestion invalid WAL async flush env: {reason}");
             std::process::exit(2);
         }
     };
+
+    if let Err(reason) = validate_startup_secrets() {
+        if dash_common::strict_secrets_enabled() {
+            tracing::error!("ingestion startup secret validation failed: {reason}");
+            std::process::exit(2);
+        } else {
+            tracing::error!(
+                "ingestion startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)"
+            );
+        }
+    }
 
     let input = IngestInput {
         claim: Claim {
@@ -135,7 +147,7 @@ fn main() {
             allow_unsafe_override: allow_unsafe_wal_durability,
         };
         if let Err(reason) = validate_wal_durability_guardrails(&wal_durability_config) {
-            eprintln!("ingestion WAL durability config rejected: {reason}");
+            tracing::error!("ingestion WAL durability config rejected: {reason}");
             std::process::exit(2);
         }
         let guardrail_violations = wal_durability_guardrail_violations(
@@ -146,7 +158,7 @@ fn main() {
             wal_durability_config.background_flush_only,
         );
         if allow_unsafe_wal_durability && !guardrail_violations.is_empty() {
-            eprintln!(
+            tracing::error!(
                 "ingestion WAL durability guardrails overridden via DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true: {}",
                 guardrail_violations.join("; ")
             );
@@ -163,7 +175,7 @@ fn main() {
         ) {
             Ok(wal) => wal,
             Err(err) => {
-                eprintln!("ingestion failed opening WAL '{wal_path}': {err:?}");
+                tracing::error!("ingestion failed opening WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
@@ -173,7 +185,7 @@ fn main() {
         ) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("ingestion failed replaying WAL '{wal_path}': {err:?}");
+                tracing::error!("ingestion failed replaying WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
@@ -188,7 +200,7 @@ fn main() {
             "EME_INGEST_PERSISTENCE_DISABLE",
         )
         .as_deref()
-        == Some("1");
+            == Some("1");
         let disk_path = env_with_fallback(
             "DASH_INGEST_PERSISTENCE_PATH",
             "EME_INGEST_PERSISTENCE_PATH",
@@ -205,13 +217,11 @@ fn main() {
                     match updated.disk_status() {
                         store::DiskStatus::Unavailable { reason } => {
                             tracing::error!(
-                                disk_path = %disk_path,
-                                error = %reason,
-                                "ingestion redb open failed; falling back to in-memory mode"
+                                "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
                             );
                         }
                         _ => {
-                            println!("ingestion persistence: disk={disk_path}");
+                            tracing::info!("ingestion persistence: disk={disk_path}");
                         }
                     }
                     updated
@@ -222,9 +232,7 @@ fn main() {
                     // a disk-less store with Unavailable status so
                     // the rest of the function has a usable store.
                     tracing::error!(
-                        disk_path = %disk_path,
-                        error = %err,
-                        "ingestion redb open failed; falling back to in-memory mode"
+                        "ingestion redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
                     );
                     // We can't reconstruct the original (it was
                     // moved into with_disk). In practice this is
@@ -236,7 +244,7 @@ fn main() {
                 }
             };
         }
-        println!(
+        tracing::info!(
             "ingestion startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
             load_stats.claims_loaded,
             load_stats.evidence_loaded,
@@ -245,7 +253,7 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
-        println!(
+        tracing::info!(
             "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, async_flush_interval_ms={}, background_flush_only={}, unsafe_override={}",
             wal.sync_every_records(),
             wal.append_buffer_max_records(),
@@ -268,9 +276,9 @@ fn main() {
         };
 
         if serve_mode {
-            println!("ingestion transport listening on http://{bind_addr}");
-            println!("ingestion transport workers: {http_workers}");
-            println!(
+            tracing::info!("ingestion transport listening on http://{bind_addr}");
+            tracing::info!("ingestion transport workers: {http_workers}");
+            tracing::info!(
                 "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
                 store.ann_tuning().max_neighbors_base,
                 store.ann_tuning().max_neighbors_upper,
@@ -278,31 +286,35 @@ fn main() {
                 store.ann_tuning().search_expansion_min,
                 store.ann_tuning().search_expansion_max
             );
-            println!("ingestion health endpoint: http://{bind_addr}/health");
-            println!("ingestion metrics endpoint: http://{bind_addr}/metrics");
-            println!("ingestion placement debug endpoint: http://{bind_addr}/debug/placement");
-            println!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
+            tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
+            tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
+            tracing::info!(
+                "ingestion placement debug endpoint: http://{bind_addr}/debug/placement"
+            );
+            tracing::info!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
             if let Some(segment_dir) = segment_dir.as_deref() {
-                println!("ingestion segment publish dir: {segment_dir}");
+                tracing::info!("ingestion segment publish dir: {segment_dir}");
             }
             let runtime = IngestionRuntime::persistent(store, wal, policy);
             if let Some(reason) = runtime.placement_routing_error() {
-                eprintln!("ingestion placement routing configuration error: {reason}");
+                tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);
             }
             if let Some(summary) = runtime.placement_routing_summary() {
-                println!("ingestion placement routing: {summary}");
+                tracing::info!("ingestion placement routing: {summary}");
             }
             // Graceful shutdown: install SIGTERM/SIGINT handlers.
             let shutdown = dash_common::ShutdownSignal::install();
-            eprintln!("ingestion: serving on http://{bind_addr} (--cli to run without a port)");
+            tracing::error!(
+                "ingestion: serving on http://{bind_addr} (--cli to run without a port)"
+            );
             if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers, shutdown) {
-                eprintln!("ingestion transport failed: {err}");
+                tracing::error!("ingestion transport failed: {err}");
                 std::process::exit(1);
             }
         } else {
             match ingest_document_persistent_with_policy(&mut store, &mut wal, &policy, input) {
-                Ok(Some(stats)) => println!(
+                Ok(Some(stats)) => tracing::info!(
                     "ingestion ready: claims={}, wal={}, snapshot={}, checkpoint_records={}, truncated_wal_records={}",
                     store.claims_len(),
                     wal.path().display(),
@@ -310,20 +322,20 @@ fn main() {
                     stats.snapshot_records,
                     stats.truncated_wal_records
                 ),
-                Ok(None) => println!(
+                Ok(None) => tracing::info!(
                     "ingestion ready: claims={}, wal={}, checkpoint_triggered=false",
                     store.claims_len(),
                     wal.path().display()
                 ),
-                Err(err) => eprintln!("ingestion failed: {err:?}"),
+                Err(err) => tracing::error!("ingestion failed: {err:?}"),
             }
         }
     } else {
         let store = InMemoryStore::new_with_ann_tuning(ann_tuning);
         if serve_mode {
-            println!("ingestion transport listening on http://{bind_addr}");
-            println!("ingestion transport workers: {http_workers}");
-            println!(
+            tracing::info!("ingestion transport listening on http://{bind_addr}");
+            tracing::info!("ingestion transport workers: {http_workers}");
+            tracing::info!(
                 "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
                 store.ann_tuning().max_neighbors_base,
                 store.ann_tuning().max_neighbors_upper,
@@ -331,36 +343,40 @@ fn main() {
                 store.ann_tuning().search_expansion_min,
                 store.ann_tuning().search_expansion_max
             );
-            println!("ingestion health endpoint: http://{bind_addr}/health");
-            println!("ingestion metrics endpoint: http://{bind_addr}/metrics");
-            println!("ingestion placement debug endpoint: http://{bind_addr}/debug/placement");
-            println!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
+            tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
+            tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
+            tracing::info!(
+                "ingestion placement debug endpoint: http://{bind_addr}/debug/placement"
+            );
+            tracing::info!("ingestion API endpoint: http://{bind_addr}/v1/ingest");
             if let Some(segment_dir) = segment_dir.as_deref() {
-                println!("ingestion segment publish dir: {segment_dir}");
+                tracing::info!("ingestion segment publish dir: {segment_dir}");
             }
             let runtime = IngestionRuntime::in_memory(store);
             if let Some(reason) = runtime.placement_routing_error() {
-                eprintln!("ingestion placement routing configuration error: {reason}");
+                tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);
             }
             if let Some(summary) = runtime.placement_routing_summary() {
-                println!("ingestion placement routing: {summary}");
+                tracing::info!("ingestion placement routing: {summary}");
             }
             // Graceful shutdown: install SIGTERM/SIGINT handlers.
             let shutdown = dash_common::ShutdownSignal::install();
-            eprintln!("ingestion: serving on http://{bind_addr} (--cli to run without a port)");
+            tracing::error!(
+                "ingestion: serving on http://{bind_addr} (--cli to run without a port)"
+            );
             if let Err(err) = serve_http_with_workers(runtime, &bind_addr, http_workers, shutdown) {
-                eprintln!("ingestion transport failed: {err}");
+                tracing::error!("ingestion transport failed: {err}");
                 std::process::exit(1);
             }
         } else {
             let mut store = store;
             match ingest_document(&mut store, input) {
-                Ok(()) => println!(
+                Ok(()) => tracing::info!(
                     "ingestion ready: claims={} (set DASH_INGEST_WAL_PATH for persistent mode)",
                     store.claims_len()
                 ),
-                Err(err) => eprintln!("ingestion failed: {err:?}"),
+                Err(err) => tracing::error!("ingestion failed: {err:?}"),
             }
         }
     }
@@ -370,6 +386,41 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn validate_startup_secrets() -> Result<(), String> {
+    let api_key = env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY");
+    let api_keys = env_with_fallback("DASH_INGEST_API_KEYS", "EME_INGEST_API_KEYS");
+    let jwt_secret = env_with_fallback(
+        "DASH_INGEST_JWT_HS256_SECRET",
+        "EME_INGEST_JWT_HS256_SECRET",
+    );
+    let jwt_secrets = env_with_fallback(
+        "DASH_INGEST_JWT_HS256_SECRETS",
+        "EME_INGEST_JWT_HS256_SECRETS",
+    );
+
+    if let Some(value) = api_key.as_deref() {
+        dash_common::validate_secret(value, "DASH_INGEST_API_KEY")?;
+    }
+    if let Some(value) = api_keys.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_API_KEYS")?;
+    }
+    if let Some(value) = jwt_secret.as_deref() {
+        dash_common::validate_secret(value, "DASH_INGEST_JWT_HS256_SECRET")?;
+    }
+    if let Some(value) = jwt_secrets.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_JWT_HS256_SECRETS")?;
+    }
+
+    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
+        return Err(
+            "DASH_STRICT_SECRETS=1 requires at least one ingest API key (DASH_INGEST_API_KEY or DASH_INGEST_API_KEYS)"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_env_with_fallback<T>(primary: &str, fallback: &str) -> Option<T>

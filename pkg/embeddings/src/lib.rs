@@ -171,8 +171,7 @@ impl EmbeddingProvider for OllamaEmbeddingProvider {
                 "prompt": text,
             })
             .to_string();
-            let (status, response_body) =
-                http_post(&self.endpoint, &body, &[], self.timeout)?;
+            let (status, response_body) = http_post(&self.endpoint, &body, &[], self.timeout)?;
             if !(200..300).contains(&status) {
                 return Err(EmbeddingError::Http {
                     status,
@@ -275,7 +274,11 @@ impl EmbeddingProvider for OpenAIEmbeddingProvider {
                 response.data.len()
             )));
         }
-        Ok(response.data.into_iter().map(|item| item.embedding).collect())
+        Ok(response
+            .data
+            .into_iter()
+            .map(|item| item.embedding)
+            .collect())
     }
 }
 
@@ -302,9 +305,9 @@ struct ParsedUrl {
 }
 
 fn parse_url(url: &str) -> Result<ParsedUrl, EmbeddingError> {
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
-        EmbeddingError::InvalidConfig(format!("url missing scheme: {url}"))
-    })?;
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| EmbeddingError::InvalidConfig(format!("url missing scheme: {url}")))?;
 
     let (authority, path) = match rest.find('/') {
         Some(idx) => (&rest[..idx], &rest[idx..]),
@@ -314,9 +317,9 @@ fn parse_url(url: &str) -> Result<ParsedUrl, EmbeddingError> {
     let (host, port) = match authority.rfind(':') {
         Some(idx) => {
             let port_str = &authority[idx + 1..];
-            let port = port_str.parse::<u16>().map_err(|_| {
-                EmbeddingError::InvalidConfig(format!("invalid port: {port_str}"))
-            })?;
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| EmbeddingError::InvalidConfig(format!("invalid port: {port_str}")))?;
             (&authority[..idx], port)
         }
         None => {
@@ -345,19 +348,14 @@ fn http_post(
 
     let addr = (parsed.host.as_str(), parsed.port)
         .to_socket_addrs()
-        .map_err(|e| {
-            EmbeddingError::Io(format!(
-                "resolve {}:{}: {}",
-                parsed.host, parsed.port, e
-            ))
-        })?
+        .map_err(|e| EmbeddingError::Io(format!("resolve {}:{}: {}", parsed.host, parsed.port, e)))?
         .next()
         .ok_or_else(|| {
             EmbeddingError::Io(format!("no address for {}:{}", parsed.host, parsed.port))
         })?;
 
-    let stream = TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|e| map_io_error(e, timeout))?;
+    let stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_error(e, timeout))?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
 
@@ -387,9 +385,9 @@ fn http_post(
     let response_str = String::from_utf8(response)
         .map_err(|e| EmbeddingError::Parse(format!("response is not utf-8: {e}")))?;
 
-    let (headers, body) = response_str
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| EmbeddingError::Parse("response missing header/body separator".to_string()))?;
+    let (headers, body) = response_str.split_once("\r\n\r\n").ok_or_else(|| {
+        EmbeddingError::Parse("response missing header/body separator".to_string())
+    })?;
 
     let status = parse_status(headers)?;
     Ok((status, body.to_string()))
@@ -591,6 +589,61 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
     }
 }
 
+/// Build an [`EmbeddingProvider`] from the process environment. This is the
+/// single place service binaries read `DASH_EMBEDDING_PROVIDER` so the
+/// selection logic stays consistent between ingestion and retrieval.
+///
+/// Reads:
+/// - `DASH_EMBEDDING_PROVIDER` — `"hash"` (default, deterministic, no
+///   network), `"ollama"`, or `"openai"`. Unknown values fall back to `hash`
+///   with a warning.
+/// - For `ollama`: `DASH_OLLAMA_ENDPOINT` (default `http://localhost:11434`),
+///   `DASH_OLLAMA_MODEL` (default `nomic-embed-text`).
+/// - For `openai`: `DASH_OPENAI_API_KEY` (required; error if missing),
+///   `DASH_OPENAI_MODEL` (default `text-embedding-3-small`).
+pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
+    let provider = std::env::var("DASH_EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "hash".to_string())
+        .to_ascii_lowercase();
+
+    match provider.as_str() {
+        "ollama" => {
+            let endpoint = std::env::var("DASH_OLLAMA_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let model = std::env::var("DASH_OLLAMA_MODEL")
+                .unwrap_or_else(|_| "nomic-embed-text".to_string());
+            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
+        }
+        "openai" => {
+            let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
+            let model = std::env::var("DASH_OPENAI_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
+            match OpenAIEmbeddingProvider::new(model, key) {
+                Ok(p) => Box::new(p),
+                Err(e) => {
+                    eprintln!(
+                        "dash: failed to build OpenAI embedding provider ({e}); falling back to hash"
+                    );
+                    Box::new(HashEmbeddingProvider::default())
+                }
+            }
+        }
+        "hash" => Box::new(HashEmbeddingProvider::default()),
+        other => {
+            eprintln!("dash: unknown DASH_EMBEDDING_PROVIDER='{other}'; falling back to hash");
+            Box::new(HashEmbeddingProvider::default())
+        }
+    }
+}
+
+/// Returns the configured provider name (or `"hash"` when unset) without
+/// building the provider. Useful for startup banners and strict-mode checks.
+pub fn embedding_provider_name_from_env() -> String {
+    std::env::var("DASH_EMBEDDING_PROVIDER")
+        .unwrap_or_else(|_| "hash".to_string())
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,21 +736,17 @@ mod tests {
 
     #[test]
     fn openai_provider_rejects_empty_api_key() {
-        let err = OpenAIEmbeddingProvider::new(
-            "text-embedding-3-small".to_string(),
-            "".to_string(),
-        )
-        .unwrap_err();
+        let err =
+            OpenAIEmbeddingProvider::new("text-embedding-3-small".to_string(), "".to_string())
+                .unwrap_err();
         match err {
             EmbeddingError::InvalidConfig(_) => {}
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
 
-        let err_whitespace = OpenAIEmbeddingProvider::new(
-            "text-embedding-3-small".to_string(),
-            "   ".to_string(),
-        )
-        .unwrap_err();
+        let err_whitespace =
+            OpenAIEmbeddingProvider::new("text-embedding-3-small".to_string(), "   ".to_string())
+                .unwrap_err();
         match err_whitespace {
             EmbeddingError::InvalidConfig(_) => {}
             other => panic!("expected InvalidConfig, got {other:?}"),
@@ -706,8 +755,7 @@ mod tests {
 
     #[test]
     fn openai_provider_parses_valid_response() {
-        let body_json =
-            r#"{"data":[{"embedding":[0.1,0.2,0.3]},{"embedding":[0.4,0.5,0.6]}]}"#;
+        let body_json = r#"{"data":[{"embedding":[0.1,0.2,0.3]},{"embedding":[0.4,0.5,0.6]}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body_json.len(),
@@ -757,7 +805,11 @@ mod tests {
     }
 
     impl CountingProvider {
-        fn new(name: &'static str, dims: usize, outcomes: Vec<Result<Vec<Vec<f32>>, EmbeddingError>>) -> Self {
+        fn new(
+            name: &'static str,
+            dims: usize,
+            outcomes: Vec<Result<Vec<Vec<f32>>, EmbeddingError>>,
+        ) -> Self {
             Self {
                 name,
                 dims,
@@ -778,7 +830,8 @@ mod tests {
             self.dims
         }
         fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut outcomes = self.outcomes.lock().expect("outcomes mutex poisoned");
             if outcomes.is_empty() {
                 panic!("CountingProvider ran out of scripted outcomes");
@@ -883,7 +936,9 @@ mod tests {
 
         // Now the breaker is open, the third call should be short-circuited
         // and return CircuitOpen without consulting the inner provider.
-        let err3 = wrapped.embed(&["c".to_string()]).expect_err("third short-circuits");
+        let err3 = wrapped
+            .embed(&["c".to_string()])
+            .expect_err("third short-circuits");
         match err3 {
             EmbeddingError::CircuitOpen { .. } => {}
             other => panic!("expected CircuitOpen, got {other:?}"),
@@ -918,9 +973,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         // Probe call: breaker is half-open, allows the call, inner succeeds,
         // breaker closes.
-        let r = wrapped
-            .embed(&["c".to_string()])
-            .expect("probe succeeds");
+        let r = wrapped.embed(&["c".to_string()]).expect("probe succeeds");
         assert_eq!(r, vec![vec![1.0, 0.0, 0.0, 0.0]]);
         assert_eq!(breaker.state(), CircuitState::Closed);
 

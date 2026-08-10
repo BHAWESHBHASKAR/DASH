@@ -1,0 +1,47 @@
+groups:
+  - name: dash
+    rules:
+      - alert: DashDiskUnavailable
+        expr: dash_disk_unavailable == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH node {{ $labels.instance }} has lost disk persistence"
+          description: "The redb-backed disk store is unavailable; the node is running in-memory only."
+
+      - alert: DashIngestToVisibleLagHigh
+        expr: dash_ingest_to_visible_lag_ms_p95 > 5000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH retrieval is lagging behind ingestion"
+          description: "95th percentile ingest-to-visible lag is {{ $value }}ms."
+
+      - alert: DashStorageDivergenceWarn
+        expr: dash_retrieve_storage_last_divergence_warn == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH retrieval storage divergence detected"
+          description: "Segment and WAL delta counts differ beyond the configured threshold."
+
+      - alert: DashRetrieveServerErrorRate
+        expr: rate(dash_retrieve_server_error_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH retrieval server error rate is high"
+          description: "Server error rate is {{ $value }} per second."
+
+      - alert: DashReadyProbeFailing
+        expr: up{job=~"dash-.*"} == 1 and probe_success{job=~"dash-.*ready"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH /ready probe is failing"
+          description: "The service is up but failing readiness checks (disk unavailable or other dependency broken)."

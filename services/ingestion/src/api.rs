@@ -36,6 +36,26 @@ pub struct IngestApiRequest {
     pub edges: Vec<ClaimEdge>,
 }
 
+impl IngestApiRequest {
+    /// Compute a claim embedding using the configured `DASH_EMBEDDING_PROVIDER`
+    /// when the caller did not supply one. This lets clients ingest raw claim
+    /// text and still get semantic retrieval without calling `/v1/embeddings`
+    /// first.
+    pub fn embed_claim_if_missing(&mut self) -> Result<(), String> {
+        if self.claim_embedding.is_some() {
+            return Ok(());
+        }
+        let provider = embeddings::select_embedding_provider_from_env();
+        let vectors = provider
+            .embed(std::slice::from_ref(&self.claim.canonical_text))
+            .map_err(|e| format!("embedding failed: {e}"))?;
+        if let Some(vector) = vectors.into_iter().next() {
+            self.claim_embedding = Some(vector);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct IngestBatchApiRequest {
     pub commit_id: Option<String>,
@@ -125,9 +145,7 @@ impl IngestBatchApiRequestWire {
             let req = item.into_runtime()?;
             if let Some(tenant_id) = expected_tenant.as_deref() {
                 if tenant_id != req.claim.tenant_id {
-                    return Err(
-                        "all batch items must share the same claim.tenant_id".to_string(),
-                    );
+                    return Err("all batch items must share the same claim.tenant_id".to_string());
                 }
             } else {
                 expected_tenant = Some(req.claim.tenant_id.clone());
@@ -196,14 +214,10 @@ impl ClaimWire {
 
         if let Some(vector) = &self.embedding_vector {
             if vector.is_empty() {
-                return Err(
-                    "claim.embedding_vector must not be empty when provided".to_string(),
-                );
+                return Err("claim.embedding_vector must not be empty when provided".to_string());
             }
             if !vector.iter().all(|v| v.is_finite()) {
-                return Err(
-                    "claim.embedding_vector values must be finite numbers".to_string(),
-                );
+                return Err("claim.embedding_vector values must be finite numbers".to_string());
             }
         }
 
@@ -259,9 +273,7 @@ impl EvidenceWire {
             "contradicts" => Stance::Contradicts,
             "neutral" => Stance::Neutral,
             _ => {
-                return Err(
-                    "evidence.stance must be supports, contradicts, or neutral".to_string(),
-                );
+                return Err("evidence.stance must be supports, contradicts, or neutral".to_string());
             }
         };
         Ok(Evidence {

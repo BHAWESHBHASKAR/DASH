@@ -3,11 +3,11 @@
 Production-grade Helm chart for the DASH vector store.
 
 DASH exposes an OpenAI-compatible `/v1/embeddings` surface and a
-parallel ingestion API. The chart deploys two workloads backed by
-redb persistence: `retrieval` (serves `/v1/*`) and `ingestion`
-(writes only). Each workload is a `StatefulSet` with per-pod
-`ReadWriteOnce` PVCs so the redb store survives pod restarts and
-re-scheduling.
+parallel ingestion API. The chart deploys three workloads backed by
+per-pod persistence: `retrieval` (serves `/v1/*`), `ingestion`
+(writes only), and `control-plane` (shard placement and leader
+election). Each workload is a `StatefulSet` with per-pod
+`ReadWriteOnce` PVCs so state survives pod restarts and re-scheduling.
 
 ## TL;DR
 
@@ -23,8 +23,8 @@ helm install dash ./deploy/helm/dash \
 The install will:
 
 1. Create the `dash-system` namespace (`--create-namespace`).
-2. Render a `ConfigMap` and two per-service `Secret`s.
-3. Create two `StatefulSet`s, each with a headless identity service
+2. Render a `ConfigMap` and per-service `Secret`s.
+3. Create three `StatefulSet`s, each with a headless identity service
    and a `ClusterIP` fronting service.
 4. Attach a `PodDisruptionBudget`, `HorizontalPodAutoscaler`, and
    `NetworkPolicy` set to each workload.

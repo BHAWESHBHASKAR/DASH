@@ -18,8 +18,11 @@ x-rest-base: &rest-base
 # vars on top of these defaults.
 x-base-env: &base-env
   RUST_LOG: ${RUST_LOG:-info,dash=debug}
+  DASH_STRICT_SECRETS: "1"
   DASH_HOME: /opt/dash
   DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
+  DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
+  DASH_RETRIEVAL_PERSISTENCE_PATH: /var/lib/dash/state/retrieval.redb
   # WAL durability knobs that ingestion and retrieval both honor.
   # Override per-service if you need to tune.
   DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
@@ -57,8 +60,8 @@ services:
       DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
       DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
       DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
-      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:-change-me-ingest-key}
-      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:-change-me-ingest-jwt}
+      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:?DASH_INGEST_API_KEY must be set (see deploy/container/.env.example)}
+      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:?DASH_INGEST_JWT_HS256_SECRET must be set}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -86,10 +89,12 @@ services:
       DASH_BIN: retrieval
       DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
       DASH_RETRIEVAL_BIND: 0.0.0.0:8080
-      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/wal/retrieval.wal
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
-      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:-change-me-retrieval-key}
-      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:-change-me-retrieval-jwt}
+      DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081
+      DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
+      DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: /var/lib/dash/state/retrieval-replication.offset
+      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:?DASH_RETRIEVAL_API_KEY must be set (see deploy/container/.env.example)}
+      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:?DASH_RETRIEVAL_JWT_HS256_SECRET must be set}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -102,6 +107,37 @@ services:
     mem_limit: 2g
     pids_limit: 2048
 
+  control-plane:
+    <<: *rest-base
+    build:
+      context: ../..
+      dockerfile: deploy/container/Dockerfile
+      target: runtime
+    image: dash/control-plane:latest
+    container_name: dash-control-plane
+    command: ["--serve"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - dash-state:/var/lib/dash
+    environment:
+      <<: *base-env
+      DASH_BIN: control-plane
+      DASH_HEALTHCHECK_URL: http://127.0.0.1:8090/v1/control-plane/health
+      DASH_CONTROL_PLANE_BIND: 0.0.0.0:8090
+      DASH_CONTROL_PLANE_NODE_ID: control-plane
+      DASH_CONTROL_PLANE_STATE_PATH: /var/lib/dash/state/control-plane.csv
+      DASH_CONTROL_PLANE_STATE_SHA256_PATH: /var/lib/dash/state/control-plane.csv.sha256
+      DASH_CONTROL_PLANE_LEASE_PATH: /var/lib/dash/state/control-plane.lease
+    healthcheck:
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    mem_limit: 256m
+    pids_limit: 256
+
   segment-maintenance:
     <<: *rest-base
     build:
@@ -110,8 +146,8 @@ services:
       target: runtime
     image: dash/segment-maintenance:latest
     container_name: dash-segment-maintenance
-    # segment-maintenance-daemon runs its own loop; pass no --serve flag.
-    command: []
+    # segment-maintenance-daemon runs its own loop; no command override
+    # is needed (and no --serve flag is passed).
     volumes:
       - dash-state:/var/lib/dash
     environment:

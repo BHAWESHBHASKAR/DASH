@@ -65,6 +65,11 @@ app.kubernetes.io/component: retrieval
 app.kubernetes.io/component: ingestion
 {{- end -}}
 
+{{- define "dash.controlPlaneSelectorLabels" -}}
+{{ include "dash.selectorLabels" . }}
+app.kubernetes.io/component: control-plane
+{{- end -}}
+
 {{/* ServiceAccount name for a component. Caller-provided
    .Values.serviceAccount.<component>.name wins; otherwise the
    chart-assigned name is used (the corresponding SA is only
@@ -77,6 +82,10 @@ app.kubernetes.io/component: ingestion
 {{- default (include "dash.componentName" (list . "ingestion")) .Values.serviceAccount.ingestion.name -}}
 {{- end -}}
 
+{{- define "dash.controlPlaneServiceAccountName" -}}
+{{- default (include "dash.componentName" (list . "control-plane")) .Values.serviceAccount.controlPlane.name -}}
+{{- end -}}
+
 {{/* Image reference for a component. */}}
 {{- define "dash.retrievalImage" -}}
 {{- $repo := .Values.image.retrieval.repository | default (printf "%s/%s" .Values.image.repository "retrieval") -}}
@@ -87,6 +96,12 @@ app.kubernetes.io/component: ingestion
 {{- define "dash.ingestionImage" -}}
 {{- $repo := .Values.image.ingestion.repository | default (printf "%s/%s" .Values.image.repository "ingestion") -}}
 {{- $tag := .Values.image.ingestion.tag | default .Values.image.tag -}}
+{{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
+{{- end -}}
+
+{{- define "dash.controlPlaneImage" -}}
+{{- $repo := .Values.image.controlPlane.repository | default (printf "%s/%s" .Values.image.repository "control-plane") -}}
+{{- $tag := .Values.image.controlPlane.tag | default .Values.image.tag -}}
 {{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
 {{- end -}}
 

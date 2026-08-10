@@ -1,7 +1,7 @@
 #!/bin/sh
 # DASH container entrypoint.
 # Dispatches to the right service binary based on the DASH_BIN env var
-# (one of: ingestion, retrieval, segment-maintenance-daemon).
+# (one of: ingestion, retrieval, control-plane, segment-maintenance-daemon).
 # All other arguments are forwarded as-is.
 set -eu
 
@@ -15,11 +15,14 @@ case "$DASH_BIN" in
     retrieval)
         BIN="$DASH_HOME/bin/retrieval"
         ;;
+    control-plane)
+        BIN="$DASH_HOME/bin/control-plane"
+        ;;
     segment-maintenance-daemon)
         BIN="$DASH_HOME/bin/segment-maintenance-daemon"
         ;;
     *)
-        echo "dash-entrypoint: unknown DASH_BIN='$DASH_BIN' (expected: ingestion | retrieval | segment-maintenance-daemon)" >&2
+        echo "dash-entrypoint: unknown DASH_BIN='$DASH_BIN' (expected: ingestion | retrieval | control-plane | segment-maintenance-daemon)" >&2
         exit 2
         ;;
 esac

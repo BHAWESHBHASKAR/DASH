@@ -10,6 +10,7 @@ SEGMENT_DIR="${DASH_INGEST_SEGMENT_DIR:-${DASH_RETRIEVAL_SEGMENT_DIR:-}}"
 PLACEMENT_FILE="${DASH_ROUTER_PLACEMENT_FILE:-}"
 FORCE_OVERWRITE="false"
 VERIFY_ONLY="false"
+REMOTE_BUNDLE_TMP=""
 
 usage() {
   cat <<'USAGE'
@@ -18,7 +19,7 @@ Usage: scripts/restore_state_bundle.sh [options]
 Restore a backup bundle created by scripts/backup_state_bundle.sh.
 
 Options:
-  --bundle PATH              Backup bundle tar.gz path (required)
+  --bundle PATH              Backup bundle tar.gz path or s3:// URI (required)
   --wal-path PATH            WAL restore target path
   --segment-dir PATH         Segment restore target root (required when bundle includes segments)
   --placement-file PATH      Placement restore target file (required when bundle includes placement)
@@ -70,6 +71,17 @@ if [[ -z "${BUNDLE_PATH}" ]]; then
   echo "bundle path is required (--bundle)" >&2
   exit 2
 fi
+if [[ "${BUNDLE_PATH}" =~ ^s3:// ]]; then
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "aws CLI is required for S3 bundle restore" >&2
+    exit 1
+  fi
+  REMOTE_BUNDLE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/dash-restore-s3-XXXXXX")"
+  LOCAL_BUNDLE_PATH="${REMOTE_BUNDLE_TMP}/bundle.tar.gz"
+  echo "[restore] downloading bundle from ${BUNDLE_PATH}"
+  aws s3 cp "${BUNDLE_PATH}" "${LOCAL_BUNDLE_PATH}"
+  BUNDLE_PATH="${LOCAL_BUNDLE_PATH}"
+fi
 if [[ ! -f "${BUNDLE_PATH}" ]]; then
   echo "bundle file not found: ${BUNDLE_PATH}" >&2
   exit 1
@@ -101,7 +113,7 @@ ensure_writable_target() {
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dash-restore-XXXXXX")"
 cleanup() {
-  rm -rf "${TMP_DIR}"
+  rm -rf "${TMP_DIR}" "${REMOTE_BUNDLE_TMP}"
 }
 trap cleanup EXIT
 

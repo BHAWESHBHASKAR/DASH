@@ -28,11 +28,13 @@ use crate::{BatchCommitMetadata, InMemoryStore, StoreIndexStats};
 const TABLE_CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_claims");
 const TABLE_EVIDENCE: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_evidence");
 const TABLE_EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_edges");
-const TABLE_CLAIM_VECTORS: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_claim_vectors");
+const TABLE_CLAIM_VECTORS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("dash_claim_vectors");
 const TABLE_TENANT_DIMS: TableDefinition<&str, u64> = TableDefinition::new("dash_tenant_dims");
 const TABLE_TENANT_CLAIMS_SET: TableDefinition<(&str, &str), ()> =
     TableDefinition::new("dash_tenant_claims_set");
-const TABLE_BATCH_COMMITS: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_batch_commits");
+const TABLE_BATCH_COMMITS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("dash_batch_commits");
 const TABLE_STATS: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_stats");
 const TABLE_HWM: TableDefinition<&str, u64> = TableDefinition::new("dash_hwm");
 
@@ -69,10 +71,7 @@ fn map_bincode_err(ctx: &str, e: bincode::Error) -> String {
     format!("bincode {ctx}: {e}")
 }
 
-fn read_bytes<V: serde::de::DeserializeOwned>(
-    bytes: Vec<u8>,
-    ctx: &str,
-) -> Result<V, String> {
+fn read_bytes<V: serde::de::DeserializeOwned>(bytes: Vec<u8>, ctx: &str) -> Result<V, String> {
     bincode::deserialize(&bytes).map_err(|e| map_bincode_err(ctx, e))
 }
 
@@ -124,7 +123,9 @@ impl DiskBackedStore {
     pub fn set_high_water_mark(&self, hwm: u64) -> Result<(), String> {
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
-            let mut table = txn.open_table(TABLE_HWM).map_err(|e| err("open hwm table", e))?;
+            let mut table = txn
+                .open_table(TABLE_HWM)
+                .map_err(|e| err("open hwm table", e))?;
             table
                 .insert(HWM_KEY, hwm)
                 .map_err(|e| err("write hwm", e))?;
@@ -139,7 +140,9 @@ impl DiskBackedStore {
         let bytes = bincode::serialize(claim).map_err(|e| map_bincode_err("serialize claim", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
-            let mut table = txn.open_table(TABLE_CLAIMS).map_err(|e| err("open claims", e))?;
+            let mut table = txn
+                .open_table(TABLE_CLAIMS)
+                .map_err(|e| err("open claims", e))?;
             table
                 .insert(claim.claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write claim", e))?;
@@ -170,11 +173,13 @@ impl DiskBackedStore {
     /// Persist the full evidence blob for a claim. Replaces any prior
     /// evidence list for the same `claim_id` atomically.
     pub fn put_evidence_blob(&self, claim_id: &str, evidence: &[Evidence]) -> Result<(), String> {
-        let bytes = bincode::serialize(evidence)
-            .map_err(|e| map_bincode_err("serialize evidence", e))?;
+        let bytes =
+            bincode::serialize(evidence).map_err(|e| map_bincode_err("serialize evidence", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
-            let mut table = txn.open_table(TABLE_EVIDENCE).map_err(|e| err("open evidence", e))?;
+            let mut table = txn
+                .open_table(TABLE_EVIDENCE)
+                .map_err(|e| err("open evidence", e))?;
             table
                 .insert(claim_id, bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -206,11 +211,12 @@ impl DiskBackedStore {
     /// Persist the full edge blob for a source claim. Replaces any
     /// prior edge list for the same `from` atomically.
     pub fn put_edge_blob(&self, from: &str, edges: &[ClaimEdge]) -> Result<(), String> {
-        let bytes = bincode::serialize(edges)
-            .map_err(|e| map_bincode_err("serialize edges", e))?;
+        let bytes = bincode::serialize(edges).map_err(|e| map_bincode_err("serialize edges", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
-            let mut table = txn.open_table(TABLE_EDGES).map_err(|e| err("open edges", e))?;
+            let mut table = txn
+                .open_table(TABLE_EDGES)
+                .map_err(|e| err("open edges", e))?;
             table
                 .insert(from, bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;
@@ -242,8 +248,8 @@ impl DiskBackedStore {
     /// Persist an embedding vector for a claim. Replaces any prior
     /// vector for the same `claim_id` atomically.
     pub fn put_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), String> {
-        let bytes = bincode::serialize(vector)
-            .map_err(|e| map_bincode_err("serialize vector", e))?;
+        let bytes =
+            bincode::serialize(vector).map_err(|e| map_bincode_err("serialize vector", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -280,8 +286,8 @@ impl DiskBackedStore {
     /// Persist batch-commit metadata. Replaces any prior entry with
     /// the same `commit_id` atomically.
     pub fn put_batch_commit(&self, commit: &BatchCommitMetadata) -> Result<(), String> {
-        let bytes = bincode::serialize(commit)
-            .map_err(|e| map_bincode_err("serialize batch_commit", e))?;
+        let bytes =
+            bincode::serialize(commit).map_err(|e| map_bincode_err("serialize batch_commit", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -357,7 +363,8 @@ impl DiskBackedStore {
                 .insert(key, ())
                 .map_err(|e| err("write tenant_claims_set", e))?;
         }
-        txn.commit().map_err(|e| err("commit tenant_claims_set", e))?;
+        txn.commit()
+            .map_err(|e| err("commit tenant_claims_set", e))?;
         Ok(())
     }
 
@@ -394,9 +401,7 @@ impl DiskBackedStore {
         // "prefix matches first element" range, so this is the
         // most portable approach for the small N of typical
         // tenant/claim sets.
-        let iter = table
-            .iter()
-            .map_err(|e| err("iter tenant_claims_set", e))?;
+        let iter = table.iter().map_err(|e| err("iter tenant_claims_set", e))?;
         for entry in iter {
             let entry = entry.map_err(|e| err("scan tenant_claims_set", e))?;
             let key = entry.0.value();
@@ -410,11 +415,12 @@ impl DiskBackedStore {
 
     /// Persist the index stats singleton.
     pub fn set_stats(&self, stats: &StoreIndexStats) -> Result<(), String> {
-        let bytes = bincode::serialize(stats)
-            .map_err(|e| map_bincode_err("serialize stats", e))?;
+        let bytes = bincode::serialize(stats).map_err(|e| map_bincode_err("serialize stats", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
-            let mut table = txn.open_table(TABLE_STATS).map_err(|e| err("open stats", e))?;
+            let mut table = txn
+                .open_table(TABLE_STATS)
+                .map_err(|e| err("open stats", e))?;
             table
                 .insert(STATS_KEY, bytes.as_slice())
                 .map_err(|e| err("write stats", e))?;
@@ -468,8 +474,8 @@ impl DiskBackedStore {
             for entry in iter {
                 let entry = entry.map_err(|e| err("scan claims", e))?;
                 let value = entry.1.value().to_vec();
-                let claim: Claim =
-                    bincode::deserialize(&value).map_err(|e| map_bincode_err("deserialize claim", e))?;
+                let claim: Claim = bincode::deserialize(&value)
+                    .map_err(|e| map_bincode_err("deserialize claim", e))?;
                 dest.apply_claim_for_load(claim)
                     .map_err(|e| format!("apply_claim_for_load: {e:?}"))?;
                 claims_loaded += 1;
@@ -597,8 +603,8 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIMS)
                 .map_err(|e| err("open claims", e))?;
             for claim in store.claims_iter() {
-                let bytes = bincode::serialize(claim)
-                    .map_err(|e| map_bincode_err("serialize claim", e))?;
+                let bytes =
+                    bincode::serialize(claim).map_err(|e| map_bincode_err("serialize claim", e))?;
                 claims_table
                     .insert(claim.claim_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write claim", e))?;
@@ -615,10 +621,12 @@ impl DiskBackedStore {
                     .map_err(|e| err("write evidence", e))?;
             }
 
-            let mut edges_table = txn.open_table(TABLE_EDGES).map_err(|e| err("open edges", e))?;
+            let mut edges_table = txn
+                .open_table(TABLE_EDGES)
+                .map_err(|e| err("open edges", e))?;
             for (from, edges) in store.edges_iter() {
-                let bytes = bincode::serialize(edges)
-                    .map_err(|e| map_bincode_err("serialize edges", e))?;
+                let bytes =
+                    bincode::serialize(edges).map_err(|e| map_bincode_err("serialize edges", e))?;
                 edges_table
                     .insert(from, bytes.as_slice())
                     .map_err(|e| err("write edges", e))?;

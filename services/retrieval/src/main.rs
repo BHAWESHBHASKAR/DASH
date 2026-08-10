@@ -1,8 +1,13 @@
-use retrieval::{retrieve_for_rag, transport::serve_http_with_workers};
+use std::sync::{Arc, RwLock};
+
+use retrieval::{
+    replication::spawn_replication_follower, retrieve_for_rag, transport::serve_http_with_workers,
+};
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
 use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
 fn main() {
+    dash_common::init_logging();
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass
     // `--cli` or `--no-serve` to run the one-shot path without
@@ -17,27 +22,50 @@ fn main() {
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");
 
+    if let Err(reason) = validate_startup_secrets() {
+        if dash_common::strict_secrets_enabled() {
+            tracing::error!("retrieval startup secret validation failed: {reason}");
+            std::process::exit(2);
+        } else {
+            tracing::error!(
+                "retrieval startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)"
+            );
+        }
+    }
+
+    let disk_disabled = env_with_fallback(
+        "DASH_RETRIEVAL_PERSISTENCE_DISABLE",
+        "EME_RETRIEVAL_PERSISTENCE_DISABLE",
+    )
+    .as_deref()
+        == Some("1");
+    let disk_path = env_with_fallback(
+        "DASH_RETRIEVAL_PERSISTENCE_PATH",
+        "EME_RETRIEVAL_PERSISTENCE_PATH",
+    )
+    .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
+
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
         let wal = match FileWal::open(&wal_path) {
             Ok(wal) => wal,
             Err(err) => {
-                eprintln!("retrieval failed opening WAL '{wal_path}': {err:?}");
+                tracing::error!("retrieval failed opening WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
-        let (store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
+        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
             &wal,
             ann_tuning.clone(),
         ) {
             Ok(result) => result,
             Err(err) => {
-                eprintln!("retrieval failed replaying WAL '{wal_path}': {err:?}");
+                tracing::error!("retrieval failed replaying WAL '{wal_path}': {err:?}");
                 std::process::exit(1);
             }
         };
-        println!(
+        tracing::info!(
             "retrieval startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
             load_stats.claims_loaded,
             load_stats.evidence_loaded,
@@ -46,52 +74,11 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
-        // Default-on disk persistence (redb PR 2). Override via
-        // `DASH_RETRIEVAL_PERSISTENCE_PATH`, disable via
-        // `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`.
-        let disk_disabled = env_with_fallback(
-            "DASH_RETRIEVAL_PERSISTENCE_DISABLE",
-            "EME_RETRIEVAL_PERSISTENCE_DISABLE",
-        )
-        .as_deref()
-        == Some("1");
-        let disk_path = env_with_fallback(
-            "DASH_RETRIEVAL_PERSISTENCE_PATH",
-            "EME_RETRIEVAL_PERSISTENCE_PATH",
-        )
-        .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
         if !disk_disabled {
-            // `with_disk` always returns Ok(self); on open failure
-            // the in-memory state is preserved and `disk_status` is
-            // set to `Unavailable`. We inspect the result to log.
-            let store = match store.with_disk(&disk_path) {
-                Ok(updated) => {
-                    match updated.disk_status() {
-                        store::DiskStatus::Unavailable { reason } => {
-                            eprintln!(
-                                "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                            );
-                        }
-                        _ => {
-                            println!("retrieval persistence: disk={disk_path}");
-                        }
-                    }
-                    updated
-                }
-                Err(err) => {
-                    // Unreachable: `with_disk` always returns Ok.
-                    eprintln!(
-                        "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
-                    );
-                    unreachable!("with_disk always returns Ok");
-                }
-            };
-            println!("retrieval ready: claims={}", store.claims_len());
-            store
-        } else {
-            println!("retrieval ready: claims={}", store.claims_len());
-            store
+            store = attach_disk(store, &disk_path);
         }
+        tracing::info!("retrieval ready: claims={}", store.claims_len());
+        store
     } else {
         let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
         store
@@ -136,24 +123,36 @@ fn main() {
                 stance_mode: StanceMode::Balanced,
             },
         );
-        println!("retrieval ready: results={}", results.len());
+        tracing::info!("retrieval ready: results={}", results.len());
+        if !disk_disabled {
+            store = attach_disk(store, &disk_path);
+        }
         store
     };
 
+    let shared_store = Arc::new(RwLock::new(store));
+    spawn_replication_follower(Arc::clone(&shared_store));
+
     if serve_mode {
-        println!("retrieval transport listening on http://{bind_addr}");
-        println!("retrieval transport workers: {http_workers}");
-        println!(
-            "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-            store.ann_tuning().max_neighbors_base,
-            store.ann_tuning().max_neighbors_upper,
-            store.ann_tuning().search_expansion_factor,
-            store.ann_tuning().search_expansion_min,
-            store.ann_tuning().search_expansion_max
-        );
-        println!("retrieval vector backend: {}", store.vector_backend_label());
-        if let Some(segment_dir) = segment_dir.as_deref() {
-            println!("retrieval segment read dir: {segment_dir}");
+        {
+            let store_guard = shared_store.read().unwrap_or_else(|p| p.into_inner());
+            tracing::info!("retrieval transport listening on http://{bind_addr}");
+            tracing::info!("retrieval transport workers: {http_workers}");
+            tracing::info!(
+                "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
+                store_guard.ann_tuning().max_neighbors_base,
+                store_guard.ann_tuning().max_neighbors_upper,
+                store_guard.ann_tuning().search_expansion_factor,
+                store_guard.ann_tuning().search_expansion_min,
+                store_guard.ann_tuning().search_expansion_max
+            );
+            tracing::info!(
+                "retrieval vector backend: {}",
+                store_guard.vector_backend_label()
+            );
+            if let Some(segment_dir) = segment_dir.as_deref() {
+                tracing::info!("retrieval segment read dir: {segment_dir}");
+            }
         }
         if let Some(placement_file) =
             env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
@@ -170,22 +169,26 @@ fn main() {
                 "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
             )
             .unwrap_or_else(|| "0".to_string());
-            println!(
+            tracing::info!(
                 "retrieval placement routing: file={}, local_node_id={}, read_preference={}, reload_interval_ms={}",
-                placement_file, local_node, read_preference, reload_interval_ms
+                placement_file,
+                local_node,
+                read_preference,
+                reload_interval_ms
             );
         }
-        println!("retrieval health endpoint: http://{bind_addr}/health");
-        println!("retrieval metrics endpoint: http://{bind_addr}/metrics");
-        println!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
+        tracing::info!("retrieval health endpoint: http://{bind_addr}/health");
+        tracing::info!("retrieval metrics endpoint: http://{bind_addr}/metrics");
+        tracing::info!("retrieval placement debug endpoint: http://{bind_addr}/debug/placement");
         // Install SIGTERM/SIGINT handlers that set a flag the
         // accept loop polls every 50ms. This gives us sub-second
         // graceful shutdown: in-flight requests drain, the worker
         // threads finish, then the process exits cleanly.
         let shutdown = dash_common::ShutdownSignal::install();
-        eprintln!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
-        if let Err(err) = serve_http_with_workers(&store, &bind_addr, http_workers, shutdown) {
-            eprintln!("retrieval transport failed: {err}");
+        tracing::error!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
+        if let Err(err) = serve_http_with_workers(shared_store, &bind_addr, http_workers, shutdown)
+        {
+            tracing::error!("retrieval transport failed: {err}");
             std::process::exit(1);
         }
     }
@@ -195,6 +198,41 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
+}
+
+fn validate_startup_secrets() -> Result<(), String> {
+    let api_key = env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY");
+    let api_keys = env_with_fallback("DASH_RETRIEVAL_API_KEYS", "EME_RETRIEVAL_API_KEYS");
+    let jwt_secret = env_with_fallback(
+        "DASH_RETRIEVAL_JWT_HS256_SECRET",
+        "EME_RETRIEVAL_JWT_HS256_SECRET",
+    );
+    let jwt_secrets = env_with_fallback(
+        "DASH_RETRIEVAL_JWT_HS256_SECRETS",
+        "EME_RETRIEVAL_JWT_HS256_SECRETS",
+    );
+
+    if let Some(value) = api_key.as_deref() {
+        dash_common::validate_secret(value, "DASH_RETRIEVAL_API_KEY")?;
+    }
+    if let Some(value) = api_keys.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_RETRIEVAL_API_KEYS")?;
+    }
+    if let Some(value) = jwt_secret.as_deref() {
+        dash_common::validate_secret(value, "DASH_RETRIEVAL_JWT_HS256_SECRET")?;
+    }
+    if let Some(value) = jwt_secrets.as_deref() {
+        dash_common::validate_secret_csv(Some(value), "DASH_RETRIEVAL_JWT_HS256_SECRETS")?;
+    }
+
+    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
+        return Err(
+            "DASH_STRICT_SECRETS=1 requires at least one retrieval API key (DASH_RETRIEVAL_API_KEY or DASH_RETRIEVAL_API_KEYS)"
+                .into(),
+        );
+    }
+
+    Ok(())
 }
 
 fn parse_http_workers() -> usize {
@@ -274,4 +312,28 @@ where
         }
     }
     None
+}
+
+fn attach_disk(store: InMemoryStore, disk_path: &str) -> InMemoryStore {
+    match store.with_disk(disk_path) {
+        Ok(updated) => {
+            match updated.disk_status() {
+                store::DiskStatus::Unavailable { reason } => {
+                    tracing::error!(
+                        "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
+                    );
+                }
+                _ => {
+                    tracing::info!("retrieval persistence: disk={disk_path}");
+                }
+            }
+            updated
+        }
+        Err(err) => {
+            tracing::error!(
+                "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+            );
+            unreachable!("with_disk always returns Ok")
+        }
+    }
 }

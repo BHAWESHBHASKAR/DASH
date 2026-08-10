@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 signal-hook = { workspace = true }
+tracing-subscriber = { workspace = true }

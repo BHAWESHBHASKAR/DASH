@@ -25,10 +25,13 @@ pub(super) fn handle_ingest_post(
         Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
     };
     match build_ingest_request_from_json(body) {
-        Ok(api_req) => {
+        Ok(mut api_req) => {
+            if let Err(err) = api_req.embed_claim_if_missing() {
+                return HttpResponse::bad_request(&err);
+            }
             let tenant_id = api_req.claim.tenant_id.clone();
             let claim_id = api_req.claim.claim_id.clone();
-            match authorize_request_for_tenant(request, &tenant_id, auth_policy) {
+            match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
                     emit_audit_event(
@@ -181,7 +184,7 @@ pub(super) fn handle_ingest_raw_post(
         Ok(api_req) => {
             let tenant_id = api_req.tenant_id.clone();
             let document_id = api_req.document_id.clone();
-            match authorize_request_for_tenant(request, &tenant_id, auth_policy) {
+            match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
                     emit_audit_event(
@@ -397,7 +400,7 @@ pub(super) fn handle_ingest_batch_post(
     match build_ingest_batch_request_from_json(body, max_items) {
         Ok(api_req) => {
             let tenant_id = api_req.items[0].claim.tenant_id.clone();
-            match authorize_request_for_tenant(request, &tenant_id, auth_policy) {
+            match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
                     emit_audit_event(
@@ -568,7 +571,7 @@ pub(super) fn handle_ingest_document_post(
             let tenant_id = api_req.tenant_id.clone();
             let document_id = api_req.document_id.clone();
             let requested_mime_type = api_req.mime_type.clone();
-            match authorize_request_for_tenant(request, &tenant_id, auth_policy) {
+            match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
                     emit_audit_event(

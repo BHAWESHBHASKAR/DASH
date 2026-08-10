@@ -11,9 +11,102 @@
 
 use std::collections::{HashMap, HashSet};
 
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+pub mod oidc;
+pub use oidc::{
+    OidcValidationConfig, clear_jwks_cache, verify_oidc_token_for_tenant,
+    verify_oidc_token_with_jwks,
+};
+
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    Admin,
+    Ingest,
+    Retrieve,
+    ReadOnly,
+}
+
+impl Role {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "admin" => Some(Role::Admin),
+            "ingest" => Some(Role::Ingest),
+            "retrieve" => Some(Role::Retrieve),
+            "read_only" | "read-only" | "readonly" => Some(Role::ReadOnly),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSet {
+    roles: HashSet<Role>,
+    allow_all: bool,
+}
+
+impl RoleSet {
+    pub fn all() -> Self {
+        Self {
+            roles: HashSet::new(),
+            allow_all: true,
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            roles: HashSet::new(),
+            allow_all: false,
+        }
+    }
+
+    pub fn from_roles(roles: impl Iterator<Item = Role>) -> Self {
+        Self {
+            roles: roles.collect(),
+            allow_all: false,
+        }
+    }
+
+    pub fn allows(&self, role: Role) -> bool {
+        self.allow_all || self.roles.contains(&role)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.allow_all && self.roles.is_empty()
+    }
+}
+
+pub fn parse_role_claim(claims: &Value, claim_name: &str) -> RoleSet {
+    let obj = match claims.as_object() {
+        Some(value) => value,
+        None => return RoleSet::empty(),
+    };
+    let value = match obj.get(claim_name) {
+        Some(value) => value,
+        None => return RoleSet::all(),
+    };
+    match value {
+        Value::String(raw) => RoleSet::from_roles(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .filter_map(Role::parse),
+        ),
+        Value::Array(items) => RoleSet::from_roles(
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .filter_map(Role::parse),
+        ),
+        _ => RoleSet::empty(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtValidationConfig {
@@ -48,6 +141,8 @@ pub enum JwtValidationError {
     InvalidClaimType(&'static str),
     #[error("unknown key id")]
     UnknownKeyId,
+    #[error("missing key id in token header")]
+    MissingKeyId,
     #[error("token expired")]
     Expired,
     #[error("token not yet valid")]
@@ -58,6 +153,8 @@ pub enum JwtValidationError {
     AudienceMismatch,
     #[error("tenant not allowed")]
     TenantNotAllowed,
+    #[error("OIDC provider error: {0}")]
+    OidcProviderError(String),
 }
 
 pub fn verify_hs256_token_for_tenant(
@@ -65,7 +162,7 @@ pub fn verify_hs256_token_for_tenant(
     tenant_id: &str,
     config: &JwtValidationConfig,
     now_unix_secs: u64,
-) -> Result<(), JwtValidationError> {
+) -> Result<Value, JwtValidationError> {
     let header = decode_header(token).map_err(map_jwt_error)?;
     if header.alg != Algorithm::HS256 {
         return Err(JwtValidationError::UnsupportedAlgorithm);
@@ -99,7 +196,8 @@ pub fn verify_hs256_token_for_tenant(
         match decode::<Value>(token, &key, &validation) {
             Ok(data) => {
                 check_time_bounds(&data.claims, config, now_unix_secs)?;
-                return check_tenant_allowlist(&data.claims, tenant_id);
+                check_tenant_allowlist(&data.claims, tenant_id)?;
+                return Ok(data.claims);
             }
             Err(e) => {
                 let mapped = map_jwt_error(e);
@@ -141,9 +239,10 @@ fn select_hs256_secrets_for_header<'a>(
     Ok(out)
 }
 
-fn check_time_bounds(
+pub(crate) fn check_time_bounds_value(
     claims: &Value,
-    config: &JwtValidationConfig,
+    leeway_secs: u64,
+    require_exp: bool,
     now_unix_secs: u64,
 ) -> Result<(), JwtValidationError> {
     let obj = claims.as_object().ok_or(JwtValidationError::InvalidJson)?;
@@ -152,11 +251,11 @@ fn check_time_bounds(
         let exp = exp_value
             .as_u64()
             .ok_or(JwtValidationError::InvalidClaimType("exp"))?;
-        let expiry = exp.saturating_add(config.leeway_secs);
+        let expiry = exp.saturating_add(leeway_secs);
         if now_unix_secs > expiry {
             return Err(JwtValidationError::Expired);
         }
-    } else if config.require_exp {
+    } else if require_exp {
         return Err(JwtValidationError::MissingClaim("exp"));
     }
 
@@ -164,7 +263,7 @@ fn check_time_bounds(
         let nbf = nbf_value
             .as_u64()
             .ok_or(JwtValidationError::InvalidClaimType("nbf"))?;
-        let now_with_leeway = now_unix_secs.saturating_add(config.leeway_secs);
+        let now_with_leeway = now_unix_secs.saturating_add(leeway_secs);
         if now_with_leeway < nbf {
             return Err(JwtValidationError::NotYetValid);
         }
@@ -173,7 +272,23 @@ fn check_time_bounds(
     Ok(())
 }
 
-fn check_tenant_allowlist(claims: &Value, tenant_id: &str) -> Result<(), JwtValidationError> {
+fn check_time_bounds(
+    claims: &Value,
+    config: &JwtValidationConfig,
+    now_unix_secs: u64,
+) -> Result<(), JwtValidationError> {
+    check_time_bounds_value(
+        claims,
+        config.leeway_secs,
+        config.require_exp,
+        now_unix_secs,
+    )
+}
+
+pub(crate) fn check_tenant_allowlist(
+    claims: &Value,
+    tenant_id: &str,
+) -> Result<(), JwtValidationError> {
     let tenants = extract_tenants(claims)?;
     if !tenants.contains("*") && !tenants.contains(tenant_id) {
         return Err(JwtValidationError::TenantNotAllowed);
@@ -181,7 +296,7 @@ fn check_tenant_allowlist(claims: &Value, tenant_id: &str) -> Result<(), JwtVali
     Ok(())
 }
 
-fn extract_tenants(claims: &Value) -> Result<HashSet<String>, JwtValidationError> {
+pub(crate) fn extract_tenants(claims: &Value) -> Result<HashSet<String>, JwtValidationError> {
     let obj = claims.as_object().ok_or(JwtValidationError::InvalidJson)?;
     let mut tenants = HashSet::new();
 
@@ -230,7 +345,7 @@ fn extract_tenants(claims: &Value) -> Result<HashSet<String>, JwtValidationError
     Ok(tenants)
 }
 
-fn map_jwt_error(err: jsonwebtoken::errors::Error) -> JwtValidationError {
+pub(crate) fn map_jwt_error(err: jsonwebtoken::errors::Error) -> JwtValidationError {
     use jsonwebtoken::errors::ErrorKind;
     match err.kind() {
         ErrorKind::InvalidToken => JwtValidationError::InvalidTokenFormat,
@@ -252,8 +367,14 @@ fn map_jwt_error(err: jsonwebtoken::errors::Error) -> JwtValidationError {
         ErrorKind::Utf8(_) => JwtValidationError::InvalidUtf8,
         ErrorKind::InvalidAlgorithm
         | ErrorKind::InvalidAlgorithmName
-        | ErrorKind::InvalidKeyFormat => JwtValidationError::UnsupportedAlgorithm,
-        ErrorKind::Crypto(_) => JwtValidationError::InvalidSignature,
+        | ErrorKind::InvalidKeyFormat
+        | ErrorKind::MissingAlgorithm
+        | ErrorKind::InvalidEcdsaKey
+        | ErrorKind::InvalidEddsaKey
+        | ErrorKind::InvalidRsaKey(_)
+        | ErrorKind::RsaFailedSigning
+        | ErrorKind::Signing(_) => JwtValidationError::UnsupportedAlgorithm,
+        ErrorKind::Provider(_) => JwtValidationError::InvalidSignature,
         _ => JwtValidationError::InvalidTokenFormat,
     }
 }
@@ -351,7 +472,10 @@ mod tests {
         .unwrap();
         let result =
             verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000_000_000);
-        assert!(result.is_ok(), "expected Ok on the good token, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok on the good token, got {result:?}"
+        );
         let mut parts = token
             .split('.')
             .map(ToString::to_string)
@@ -455,7 +579,10 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-b", &sample_config(), 1_000);
-        assert!(result.is_ok(), "expected Ok via tenants array, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok via tenants array, got {result:?}"
+        );
     }
 
     #[test]

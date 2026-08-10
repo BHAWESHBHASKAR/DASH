@@ -2,6 +2,7 @@
 members = [
   "pkg/auth",
   "pkg/embeddings",
+  "pkg/encryption",
   "pkg/schema",
   "pkg/ranking",
   "pkg/graph",
@@ -27,10 +28,10 @@ axum = { version = "0.7", features = ["json"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "1.0"
 anyhow = "1.0"
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", default-features = true, features = ["aws_lc_rs"] }
 base64 = "0.22"
 redb = "2"
 bincode = "1.3"

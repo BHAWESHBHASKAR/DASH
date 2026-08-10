@@ -1,5 +1,6 @@
 pub mod api;
 pub mod openai_embeddings;
+pub mod replication;
 pub mod transport;
 
 use schema::{RetrievalRequest, RetrievalResult};

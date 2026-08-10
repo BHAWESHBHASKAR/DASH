@@ -13,6 +13,7 @@ schema = { path = "../../pkg/schema" }
 store = { path = "../../pkg/store" }
 indexer = { path = "../indexer" }
 metadata-router = { path = "../metadata-router" }
+embeddings = { path = "../../pkg/embeddings" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

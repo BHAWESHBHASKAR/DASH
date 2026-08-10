@@ -4,10 +4,10 @@ version: 0.1.0
 appVersion: "0.2.0"
 type: application
 description: |
-  DASH - Declarative Augmented-memory for State and History. A vector
-  store with an OpenAI-compatible /v1/embeddings surface, supporting
-  ingestion of vectors, claims, and evidence, and retrieval with
-  multi-tenant isolation.
+  DASH - Declarative Augmented-memory for State and History. An
+  evidence-first vector database with claim/evidence/edge primitives,
+  OpenAI-compatible /v1/embeddings, multi-tenant auth, and a
+  control-plane for shard placement and leader election.
 home: https://github.com/bhaweshbhaskar/dash
 sources:
   - https://github.com/bhaweshbhaskar/dash

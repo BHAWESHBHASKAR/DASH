@@ -28,7 +28,7 @@ mod segment_runtime;
 mod server_runtime;
 
 use audit::{AuditEvent, emit_audit_event};
-use authz::{AuthDecision, AuthPolicy, authorize_request_for_tenant};
+pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
 use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
@@ -60,7 +60,7 @@ use request::{parse_query_usize, parse_request_line, read_http_request, split_ta
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
     WalReplicationExport, batch_commit_payload_fingerprint,
 };
 
@@ -949,6 +949,10 @@ impl IngestionRuntime {
     fn observe_replication_pull_failure(&mut self, error: String) {
         self.replication_pull_failure_total = self.replication_pull_failure_total.saturating_add(1);
         self.replication_last_error = Some(error);
+    }
+
+    pub fn disk_status(&self) -> &DiskStatus {
+        self.store.disk_status()
     }
 
     fn metrics_text(&self) -> String {
