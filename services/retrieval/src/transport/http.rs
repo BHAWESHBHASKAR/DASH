@@ -13,6 +13,9 @@ pub(super) const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
 pub(super) const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
 /// Maximum number of header fields.
 pub(super) const MAX_HEADER_COUNT: usize = 100;
+/// Credential headers that may appear at most once per request.
+const SINGLETON_CREDENTIAL_HEADERS: [&str; 3] =
+    ["authorization", "x-api-key", "x-replication-token"];
 /// Default whole-request read deadline.
 pub(super) const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 /// Upper bound on bytes allocated ahead of bytes actually received.
@@ -160,6 +163,13 @@ pub(super) fn read_http_request(
         {
             return Err(HttpReadError::bad_request(
                 "conflicting content-length headers",
+            ));
+        }
+        // A repeated credential header is ambiguous (last-wins differs between
+        // proxies and servers); refuse it instead of picking one.
+        if SINGLETON_CREDENTIAL_HEADERS.contains(&name.as_str()) && headers.contains_key(&name) {
+            return Err(HttpReadError::bad_request(
+                "duplicate credential header is not allowed",
             ));
         }
         headers.insert(name, value);

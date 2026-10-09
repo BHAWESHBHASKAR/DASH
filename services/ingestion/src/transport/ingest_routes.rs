@@ -28,6 +28,9 @@ pub(super) fn handle_ingest_post(
         Ok(mut api_req) => {
             let tenant_id = api_req.claim.tenant_id.clone();
             let claim_id = api_req.claim.claim_id.clone();
+            if let Some(rejected) = reject_oversized_identifiers(&[&tenant_id, &claim_id]) {
+                return rejected;
+            }
             match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
@@ -207,6 +210,9 @@ pub(super) fn handle_ingest_raw_post(
         Ok(api_req) => {
             let tenant_id = api_req.tenant_id.clone();
             let document_id = api_req.document_id.clone();
+            if let Some(rejected) = reject_oversized_identifiers(&[&tenant_id, &document_id]) {
+                return rejected;
+            }
             match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
@@ -445,6 +451,15 @@ pub(super) fn handle_ingest_batch_post(
     match build_ingest_batch_request_from_json(body, max_items) {
         Ok(api_req) => {
             let tenant_id = api_req.items[0].claim.tenant_id.clone();
+            let batch_ids: Vec<&str> = api_req
+                .items
+                .iter()
+                .flat_map(|item| [item.claim.tenant_id.as_str(), item.claim.claim_id.as_str()])
+                .chain(api_req.commit_id.as_deref())
+                .collect();
+            if let Some(rejected) = reject_oversized_identifiers(&batch_ids) {
+                return rejected;
+            }
             match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
                     observe_auth_failure(runtime);
@@ -635,6 +650,9 @@ pub(super) fn handle_ingest_document_post(
         Ok(api_req) => {
             let tenant_id = api_req.tenant_id.clone();
             let document_id = api_req.document_id.clone();
+            if let Some(rejected) = reject_oversized_identifiers(&[&tenant_id, &document_id]) {
+                return rejected;
+            }
             let requested_mime_type = api_req.mime_type.clone();
             match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
                 AuthDecision::Unauthorized(reason) => {
@@ -904,6 +922,21 @@ pub(super) fn observe_auth_success(runtime: &SharedRuntime) {
     if let Ok(mut guard) = runtime.lock() {
         guard.observe_auth_success();
     }
+}
+
+/// Identifiers (tenant, claim, document, commit) longer than this are
+/// rejected with 400 before authentication, so that an anonymous caller cannot
+/// push arbitrarily large values into denial audit records or logs.
+const MAX_IDENTIFIER_BYTES: usize = dash_common::audit::MAX_AUDIT_FIELD_BYTES;
+
+fn reject_oversized_identifiers(ids: &[&str]) -> Option<HttpResponse> {
+    ids.iter()
+        .any(|id| id.len() > MAX_IDENTIFIER_BYTES)
+        .then(|| {
+            HttpResponse::bad_request(&format!(
+                "identifiers must be at most {MAX_IDENTIFIER_BYTES} bytes"
+            ))
+        })
 }
 
 pub(super) fn observe_auth_failure(runtime: &SharedRuntime) {

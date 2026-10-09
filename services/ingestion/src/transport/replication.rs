@@ -472,11 +472,16 @@ where
 
 /// Replication endpoints expose every tenant's data and accept acks, so they
 /// are closed unless a replication token is configured and presented. With no
-/// token configured they stay closed, except in explicit dev mode
-/// (`DASH_INSECURE_DEV_MODE=1`). The token is compared in constant time.
-pub(super) fn is_replication_request_authorized(request: &HttpRequest) -> bool {
+/// token configured they stay closed, except on a service that runs in
+/// explicit dev mode (`DASH_INSECURE_DEV_MODE=1`) with no authentication
+/// configured at all: dev mode never bypasses a configured credential. The
+/// token is compared in constant time.
+pub(super) fn is_replication_request_authorized(
+    request: &HttpRequest,
+    auth_policy: &dash_common::AuthPolicy,
+) -> bool {
     let Some(expected_token) = replication_token() else {
-        return dash_common::insecure_dev_mode_enabled();
+        return auth_policy.is_open_dev_mode();
     };
     request
         .headers

@@ -585,3 +585,74 @@ fn ops_routes_need_admin_or_an_unscoped_credential() {
         );
     }
 }
+
+/// Sets an environment variable for the duration of a test and restores the
+/// previous value on drop (also when the test panics).
+struct ScopedEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnv {
+    #[allow(unused_unsafe)]
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnv {
+    #[allow(unused_unsafe)]
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+/// Review finding 1: oversized identifiers must be refused with 400 before
+/// authentication so that denial audit records stay small.
+#[test]
+fn unauthenticated_oversized_tenant_id_is_rejected_before_any_audit_record() {
+    let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!(
+            "dash-retrieve-review-{}-{nanos}.jsonl",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .to_string();
+    let _audit = ScopedEnv::set("DASH_RETRIEVAL_AUDIT_LOG_PATH", &path);
+    let policy = matrix_policy();
+    let huge = "T".repeat(1024 * 1024);
+    let post_body = format!("{{\"tenant_id\":\"{huge}\",\"query\":\"company x\",\"top_k\":1}}");
+    let get_target = format!("/v1/retrieve?tenant_id={huge}&query=company+x&top_k=1");
+    let planner_target = format!("/debug/planner?tenant_id={huge}&query=company+x&top_k=1");
+    for (method, target, body) in [
+        ("POST", "/v1/retrieve", Some(post_body.as_str())),
+        ("GET", get_target.as_str(), None),
+        ("GET", planner_target.as_str(), None),
+    ] {
+        let got = status(&policy, &request(method, target, body, &[]));
+        assert_eq!(got, 400, "{method} {}", &target[..target.len().min(40)]);
+    }
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(size, 0, "oversized tenant_id reached the audit log");
+
+    // At the limit the normal 401 + (bounded) audit record still happens.
+    let at_limit = "t".repeat(256);
+    let body = format!("{{\"tenant_id\":\"{at_limit}\",\"query\":\"company x\",\"top_k\":1}}");
+    assert_eq!(
+        status(&policy, &request("POST", "/v1/retrieve", Some(&body), &[])),
+        401
+    );
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    assert!(size > 0 && size < 2048, "audit record is {size} bytes");
+    let _ = std::fs::remove_file(&path);
+}

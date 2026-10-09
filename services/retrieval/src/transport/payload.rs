@@ -1,5 +1,19 @@
 use super::*;
 
+/// Longest accepted tenant id. Requests are parsed before authentication, so
+/// the bound keeps anonymous callers from pushing large values into denial
+/// audit records and logs.
+const MAX_TENANT_ID_BYTES: usize = dash_common::audit::MAX_AUDIT_FIELD_BYTES;
+
+fn check_tenant_id_length(tenant_id: &str) -> Result<(), String> {
+    if tenant_id.len() > MAX_TENANT_ID_BYTES {
+        return Err(format!(
+            "tenant_id must be at most {MAX_TENANT_ID_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn build_retrieve_transport_request_from_query(
     query: &HashMap<String, String>,
 ) -> Result<RetrieveTransportRequest, String> {
@@ -11,6 +25,7 @@ pub(super) fn build_retrieve_transport_request_from_query(
     if tenant_id.is_empty() {
         return Err("tenant_id cannot be empty".to_string());
     }
+    check_tenant_id_length(&tenant_id)?;
 
     let request_query = query
         .get("query")
@@ -114,6 +129,7 @@ pub(super) fn build_retrieve_transport_request_from_json(
     if tenant_id.trim().is_empty() {
         return Err("tenant_id cannot be empty".to_string());
     }
+    check_tenant_id_length(&tenant_id)?;
 
     let query = require_string(&object, "query")?;
     if query.trim().is_empty() {

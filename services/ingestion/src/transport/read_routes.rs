@@ -100,10 +100,14 @@ pub(super) fn handle_get_request(
             }
         },
         "/debug/document-parser" => HttpResponse::ok_json(render_document_parser_debug_json()),
-        "/internal/replication/wal" => handle_replication_wal_get(runtime, request, query),
-        "/internal/replication/export" => handle_replication_export_get(runtime, request),
+        "/internal/replication/wal" => {
+            handle_replication_wal_get(runtime, request, query, auth_policy)
+        }
+        "/internal/replication/export" => {
+            handle_replication_export_get(runtime, request, auth_policy)
+        }
         "/internal/replication/commit-status" => {
-            handle_replication_commit_status_get(runtime, request, query)
+            handle_replication_commit_status_get(runtime, request, query, auth_policy)
         }
         _ => HttpResponse::not_found("unknown path"),
     }
@@ -137,8 +141,9 @@ pub(super) fn handle_replication_ack_post(
     runtime: &SharedRuntime,
     request: &HttpRequest,
     query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
 ) -> HttpResponse {
-    if !is_replication_request_authorized(request) {
+    if !is_replication_request_authorized(request, auth_policy) {
         return HttpResponse::forbidden("replication request is not authorized");
     }
     let commit_id = match query.get("commit_id") {
@@ -169,8 +174,9 @@ fn handle_replication_wal_get(
     runtime: &SharedRuntime,
     request: &HttpRequest,
     query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
 ) -> HttpResponse {
-    if !is_replication_request_authorized(request) {
+    if !is_replication_request_authorized(request, auth_policy) {
         return HttpResponse::forbidden("replication request is not authorized");
     }
     let from_offset = match parse_query_usize(query, "from_offset") {
@@ -208,8 +214,12 @@ fn handle_replication_wal_get(
     }
 }
 
-fn handle_replication_export_get(runtime: &SharedRuntime, request: &HttpRequest) -> HttpResponse {
-    if !is_replication_request_authorized(request) {
+fn handle_replication_export_get(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
+    if !is_replication_request_authorized(request, auth_policy) {
         return HttpResponse::forbidden("replication request is not authorized");
     }
     match runtime.lock() {
@@ -230,8 +240,9 @@ fn handle_replication_commit_status_get(
     runtime: &SharedRuntime,
     request: &HttpRequest,
     query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
 ) -> HttpResponse {
-    if !is_replication_request_authorized(request) {
+    if !is_replication_request_authorized(request, auth_policy) {
         return HttpResponse::forbidden("replication request is not authorized");
     }
     let commit_id = match query.get("commit_id") {
