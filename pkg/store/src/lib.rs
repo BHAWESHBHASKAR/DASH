@@ -274,19 +274,25 @@ impl InMemoryStore {
     /// store is always returned (the caller's in-memory state is
     /// preserved).
     pub fn with_disk(self, path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        Ok(self.attach_disk(path))
+    }
+
+    /// Infallible form of [`InMemoryStore::with_disk`]: on open failure the
+    /// in-memory state is kept and [`InMemoryStore::disk_status`] reports
+    /// `Unavailable { reason }`, so callers inspect the status instead of a
+    /// `Result` that can never be `Err`.
+    pub fn attach_disk(self, path: impl AsRef<std::path::Path>) -> Self {
         match disk::DiskBackedStore::new(path) {
-            Ok(disk) => Ok(Self {
+            Ok(disk) => Self {
                 disk: Some(Arc::new(disk)),
                 disk_status: disk::DiskStatus::Available,
                 ..self
-            }),
-            Err(reason) => Ok(Self {
+            },
+            Err(reason) => Self {
                 disk: None,
-                disk_status: disk::DiskStatus::Unavailable {
-                    reason: reason.clone(),
-                },
+                disk_status: disk::DiskStatus::Unavailable { reason },
                 ..self
-            }),
+            },
         }
     }
 

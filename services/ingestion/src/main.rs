@@ -204,42 +204,20 @@ fn main() {
         )
         .unwrap_or_else(|| "./data/dash-ingestion.redb".to_string());
         if !disk_disabled {
-            // `with_disk` always returns Ok(self) — on open failure
-            // the in-memory state is preserved and `disk_status` is
-            // set to `Unavailable`. We still inspect the result to
-            // log the reason. Wrap the move+rebind in a block so
-            // the borrow checker sees the reassignment.
-            store = match store.with_disk(&disk_path) {
-                Ok(updated) => {
-                    match updated.disk_status() {
-                        store::DiskStatus::Unavailable { reason } => {
-                            tracing::error!(
-                                "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                            );
-                        }
-                        _ => {
-                            tracing::info!("ingestion persistence: disk={disk_path}");
-                        }
-                    }
-                    updated
-                }
-                Err(err) => {
-                    // Unreachable: `with_disk` always returns Ok.
-                    // Kept for defensive completeness. Reconstruct
-                    // a disk-less store with Unavailable status so
-                    // the rest of the function has a usable store.
+            // `attach_disk` never fails: on open failure the in-memory
+            // state is preserved and `disk_status` is `Unavailable`, which
+            // is logged here.
+            store = store.attach_disk(&disk_path);
+            match store.disk_status() {
+                store::DiskStatus::Unavailable { reason } => {
                     tracing::error!(
-                        "ingestion redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+                        "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
                     );
-                    // We can't reconstruct the original (it was
-                    // moved into with_disk). In practice this is
-                    // unreachable; the caller code below uses
-                    // `store` which is now in an unknown state.
-                    // To make the borrow checker happy, we panic
-                    // — this branch is unreachable in practice.
-                    unreachable!("with_disk always returns Ok");
                 }
-            };
+                _ => {
+                    tracing::info!("ingestion persistence: disk={disk_path}");
+                }
+            }
         }
         tracing::info!(
             "ingestion startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",

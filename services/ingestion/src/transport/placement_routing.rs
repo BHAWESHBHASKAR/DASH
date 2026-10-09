@@ -5,12 +5,17 @@ use std::{
 
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RouterConfig, ShardPlacement,
-    load_shard_placements_from_source, shard_ids_from_placements,
+    ensure_no_epoch_regression, load_shard_placements_from_source, shard_ids_from_placements,
 };
 use schema::Claim;
 
 use super::config::{env_with_fallback, parse_env_first_u64, parse_env_first_usize};
+use super::SharedRuntime;
 use crate::api::WriteConsistencyPolicy;
+
+/// How long writes keep being accepted on the last known placement after
+/// reloads started failing (`DASH_INGEST_PLACEMENT_STALE_GRACE_MS`).
+const DEFAULT_PLACEMENT_STALE_GRACE_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlacementRoutingRuntime {
@@ -29,6 +34,9 @@ pub(super) struct PlacementRoutingState {
 struct PlacementReloadRuntime {
     config: PlacementReloadConfig,
     next_reload_at: Instant,
+    /// When the in-memory placement was last confirmed by its source.
+    last_success_at: Instant,
+    stale_grace: Duration,
     attempt_total: u64,
     success_total: u64,
     failure_total: u64,
@@ -83,6 +91,12 @@ pub(super) enum WriteRouteError {
         epoch: u64,
         role: ReplicaRole,
     },
+    /// Placement reloads have been failing for longer than the grace; this
+    /// node can no longer prove it is still the leader (REP-08).
+    PlacementStale {
+        age_ms: u64,
+        grace_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +109,28 @@ pub(super) struct WriteRouteResolution {
 }
 
 impl PlacementRoutingRuntime {
+    /// Router config whose hash ring is built from the shards THIS tenant
+    /// actually has placements for (REP-09). A ring over every tenant's
+    /// shards would hash a key to a shard the tenant does not own and answer
+    /// `PlacementNotFound` for it.
+    pub(super) fn router_config_for_tenant(&self, tenant_id: &str) -> RouterConfig {
+        let mut shard_ids: Vec<u32> = self
+            .placements
+            .iter()
+            .filter(|placement| placement.tenant_id == tenant_id)
+            .map(|placement| placement.shard_id)
+            .collect();
+        shard_ids.sort_unstable();
+        shard_ids.dedup();
+        if shard_ids.is_empty() {
+            return self.router_config.clone();
+        }
+        RouterConfig {
+            shard_ids,
+            ..self.router_config.clone()
+        }
+    }
+
     pub(super) fn observability_snapshot(&self) -> PlacementObservabilitySnapshot {
         let mut snapshot = PlacementObservabilitySnapshot::default();
         for placement in &self.placements {
@@ -167,6 +203,10 @@ impl PlacementRoutingState {
             "EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS",
         ])
         .filter(|value| *value > 0);
+        let stale_grace = Duration::from_millis(
+            parse_env_first_u64(&["DASH_INGEST_PLACEMENT_STALE_GRACE_MS"])
+                .unwrap_or(DEFAULT_PLACEMENT_STALE_GRACE_MS),
+        );
         let reload = reload_interval_ms.map(|interval_ms| {
             let reload_interval = Duration::from_millis(interval_ms);
             PlacementReloadRuntime {
@@ -179,6 +219,8 @@ impl PlacementRoutingState {
                     reload_interval,
                 },
                 next_reload_at: Instant::now() + reload_interval,
+                last_success_at: Instant::now(),
+                stale_grace,
                 attempt_total: 0,
                 success_total: 0,
                 failure_total: 0,
@@ -219,26 +261,35 @@ impl PlacementRoutingState {
         }
     }
 
-    pub(super) fn maybe_refresh(&mut self) {
+    /// First phase of a reload, done under the runtime lock: decide whether
+    /// a reload is due and capture everything the fetch needs. The slow
+    /// fetch itself runs WITHOUT the lock (see [`refresh_placement`]).
+    pub(super) fn begin_refresh(&mut self) -> Option<PlacementRefreshJob> {
+        let reload = self.reload.as_mut()?;
+        let now = Instant::now();
+        if now < reload.next_reload_at {
+            return None;
+        }
+        reload.attempt_total = reload.attempt_total.saturating_add(1);
+        // Claim the slot so concurrent requests do not start a second fetch.
+        reload.next_reload_at = now + reload.config.reload_interval;
+        Some(PlacementRefreshJob {
+            config: reload.config.clone(),
+            local_node_id: self.runtime.local_node_id.clone(),
+            current: self.runtime.placements.clone(),
+        })
+    }
+
+    /// Last phase: swap in the fetched placement (or record the failure).
+    pub(super) fn finish_refresh(&mut self, result: Result<PlacementRoutingRuntime, String>) {
         let Some(reload) = self.reload.as_mut() else {
             return;
         };
-        let now = Instant::now();
-        if now < reload.next_reload_at {
-            return;
-        }
-        reload.attempt_total = reload.attempt_total.saturating_add(1);
-        match load_placement_routing_runtime(
-            reload.config.placement_file.as_deref(),
-            reload.config.control_plane_base_url.as_deref(),
-            &self.runtime.local_node_id,
-            reload.config.shard_ids_override.as_deref(),
-            reload.config.replica_count_override,
-            reload.config.virtual_nodes_per_shard,
-        ) {
+        match result {
             Ok(runtime) => {
                 self.runtime = runtime;
                 reload.success_total = reload.success_total.saturating_add(1);
+                reload.last_success_at = Instant::now();
                 reload.last_error = None;
             }
             Err(reason) => {
@@ -247,7 +298,65 @@ impl PlacementRoutingState {
                 eprintln!("ingestion placement reload failed: {reason}");
             }
         }
-        reload.next_reload_at = now + reload.config.reload_interval;
+    }
+
+    /// Writes are refused once reloads have been failing for longer than the
+    /// stale grace: a node that cannot reach the placement source can no
+    /// longer prove it is still the leader (REP-08).
+    pub(super) fn check_fresh(&self) -> Result<(), WriteRouteError> {
+        let Some(reload) = self.reload.as_ref() else {
+            return Ok(());
+        };
+        if reload.last_error.is_none() {
+            return Ok(());
+        }
+        let age = reload.last_success_at.elapsed();
+        if age > reload.stale_grace {
+            return Err(WriteRouteError::PlacementStale {
+                age_ms: age.as_millis() as u64,
+                grace_ms: reload.stale_grace.as_millis() as u64,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A placement reload prepared under the lock and executed outside it.
+pub(super) struct PlacementRefreshJob {
+    config: PlacementReloadConfig,
+    local_node_id: String,
+    current: Vec<ShardPlacement>,
+}
+
+impl PlacementRefreshJob {
+    /// Blocking fetch + validation. Rejects epoch regressions (REP-08).
+    pub(super) fn run(self) -> Result<PlacementRoutingRuntime, String> {
+        let runtime = load_placement_routing_runtime(
+            self.config.placement_file.as_deref(),
+            self.config.control_plane_base_url.as_deref(),
+            &self.local_node_id,
+            self.config.shard_ids_override.as_deref(),
+            self.config.replica_count_override,
+            self.config.virtual_nodes_per_shard,
+        )?;
+        ensure_no_epoch_regression(&self.current, &runtime.placements)?;
+        Ok(runtime)
+    }
+}
+
+/// Reload the placement if due WITHOUT holding the runtime mutex during the
+/// network fetch: lock briefly to plan, fetch, then lock briefly to swap.
+pub(super) fn refresh_placement(runtime: &SharedRuntime) {
+    let job = match runtime.lock() {
+        Ok(mut guard) => guard.begin_placement_refresh(),
+        Err(_) => return,
+    };
+    let Some(job) = job else {
+        return;
+    };
+    let result = job.run();
+    if let Ok(mut guard) = runtime.lock() {
+        guard.finish_placement_refresh(result);
     }
 }
 
@@ -350,6 +459,12 @@ pub(super) fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
                 healthy_replicas,
                 required_replicas,
                 total_replicas
+            ),
+        ),
+        WriteRouteError::PlacementStale { age_ms, grace_ms } => (
+            503,
+            format!(
+                "placement is stale: the placement source has been unreachable or invalid for {age_ms}ms (grace {grace_ms}ms); refusing writes until it recovers"
             ),
         ),
         WriteRouteError::WrongNode {

@@ -36,7 +36,8 @@ pub(super) fn serve_http_with_workers(
                         break;
                     };
                     guard.flush_wal_for_async_tick();
-                    guard.refresh_placement_if_due();
+                    drop(guard);
+                    refresh_placement(&runtime);
                 }
             });
         }
@@ -52,7 +53,8 @@ pub(super) fn serve_http_with_workers(
                         break;
                     };
                     guard.run_segment_maintenance_tick();
-                    guard.refresh_placement_if_due();
+                    drop(guard);
+                    refresh_placement(&runtime);
                 }
             });
         }

@@ -36,19 +36,84 @@ pub struct IngestApiRequest {
     pub edges: Vec<ClaimEdge>,
 }
 
+/// Failure to compute a claim embedding. Carries only a short machine code
+/// and the HTTP status to answer with; provider details (URLs, response
+/// bodies, key material) go to the server log, never to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedFailure {
+    pub status: u16,
+    pub code: &'static str,
+}
+
+impl EmbedFailure {
+    fn from_error(error: &embeddings::EmbeddingError) -> Self {
+        use embeddings::EmbeddingError as E;
+        match error {
+            E::Io(_) | E::Timeout(_) | E::CircuitOpen { .. } | E::InvalidConfig(_) => Self {
+                status: 503,
+                code: "embedding_unavailable",
+            },
+            E::Http { status, .. } if *status == 429 || *status >= 500 => Self {
+                status: 503,
+                code: "embedding_unavailable",
+            },
+            _ => Self {
+                status: 502,
+                code: "embedding_upstream_error",
+            },
+        }
+    }
+}
+
+type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
+
+/// Embedding provider shared by requests. It is rebuilt only when the
+/// provider-related environment changes, instead of on every request.
+fn shared_embedding_provider() -> SharedEmbeddingProvider {
+    use std::hash::{Hash, Hasher};
+    static CACHE: std::sync::Mutex<Option<(u64, SharedEmbeddingProvider)>> =
+        std::sync::Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "DASH_EMBEDDING_PROVIDER",
+        "DASH_OLLAMA_ENDPOINT",
+        "DASH_OLLAMA_BASE_URL",
+        "DASH_OLLAMA_MODEL",
+        "DASH_OPENAI_API_KEY",
+        "DASH_OPENAI_MODEL",
+        "DASH_EMBEDDING_ALLOW_INSECURE_HTTP",
+    ] {
+        std::env::var(name).ok().hash(&mut hasher);
+    }
+    let signature = hasher.finish();
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((cached, provider)) = cache.as_ref()
+        && *cached == signature
+    {
+        return std::sync::Arc::clone(provider);
+    }
+    let provider: SharedEmbeddingProvider =
+        std::sync::Arc::from(embeddings::select_embedding_provider_from_env());
+    *cache = Some((signature, std::sync::Arc::clone(&provider)));
+    provider
+}
+
 impl IngestApiRequest {
     /// Compute a claim embedding using the configured `DASH_EMBEDDING_PROVIDER`
     /// when the caller did not supply one. This lets clients ingest raw claim
     /// text and still get semantic retrieval without calling `/v1/embeddings`
     /// first.
-    pub fn embed_claim_if_missing(&mut self) -> Result<(), String> {
+    pub fn embed_claim_if_missing(&mut self) -> Result<(), EmbedFailure> {
         if self.claim_embedding.is_some() {
             return Ok(());
         }
-        let provider = embeddings::select_embedding_provider_from_env();
+        let provider = shared_embedding_provider();
         let vectors = provider
             .embed(std::slice::from_ref(&self.claim.canonical_text))
-            .map_err(|e| format!("embedding failed: {e}"))?;
+            .map_err(|error| {
+                eprintln!("ingestion embedding provider failed: {error}");
+                EmbedFailure::from_error(&error)
+            })?;
         if let Some(vector) = vectors.into_iter().next() {
             self.claim_embedding = Some(vector);
         }
@@ -138,6 +203,9 @@ impl IngestBatchApiRequestWire {
             .commit_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        if commit_id.as_deref().is_some_and(|id| id.starts_with('~')) {
+            return Err("commit_id must not start with '~' (reserved)".to_string());
+        }
 
         let mut items = Vec::with_capacity(self.items.len());
         let mut expected_tenant: Option<String> = None;

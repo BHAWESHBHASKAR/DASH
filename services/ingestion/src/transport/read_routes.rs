@@ -61,19 +61,21 @@ pub(super) fn handle_get_request(
             {
                 return denied;
             }
+            refresh_placement(runtime);
             let body = match runtime.lock() {
                 Ok(mut rt) => {
                     rt.flush_wal_if_due();
-                    rt.refresh_placement_if_due();
                     rt.metrics_text()
                 }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
             };
             HttpResponse::ok_text(body)
         }
-        "/debug/placement" => match runtime.lock() {
-            Ok(mut rt) => {
-                rt.refresh_placement_if_due();
+        "/debug/placement" => match {
+            refresh_placement(runtime);
+            runtime.lock()
+        } {
+            Ok(rt) => {
                 HttpResponse::ok_json(render_placement_debug_json(&rt, query))
             }
             Err(_) => {

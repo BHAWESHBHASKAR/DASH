@@ -55,6 +55,7 @@ use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
     PlacementRoutingState, WriteRouteError, WriteRouteResolution, map_write_route_error,
+    refresh_placement,
     write_entity_key_for_claim,
 };
 use replication::{
@@ -370,13 +371,14 @@ impl IngestionRuntime {
                 total_replicas: 1,
             });
         };
-        routing_state.maybe_refresh();
+        routing_state.check_fresh()?;
         let routing = routing_state.runtime();
         let entity_key = write_entity_key_for_claim(claim);
+        let tenant_router_config = routing.router_config_for_tenant(&claim.tenant_id);
         let routed = route_write_with_placement(
             &claim.tenant_id,
             entity_key,
-            &routing.router_config,
+            &tenant_router_config,
             &routing.placements,
         )
         .map_err(WriteRouteError::Placement)?;
@@ -438,10 +440,14 @@ impl IngestionRuntime {
             evidence: request.evidence,
             edges: request.edges,
         };
-        let (checkpoint_stats, checkpoint_deferred) = self.ingest_input_internal(input)?;
+        let (checkpoint_stats, checkpoint_deferred, applied) = self.ingest_input_internal(input)?;
 
         self.successful_ingests += 1;
-        self.publish_segments_for_tenant(&tenant_id);
+        // A retry that changed nothing must not re-scan the tenant's claims
+        // to rebuild segments.
+        if applied {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
         Ok(IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
@@ -630,10 +636,10 @@ impl IngestionRuntime {
     fn ingest_input_internal(
         &mut self,
         input: IngestInput,
-    ) -> Result<(Option<store::WalCheckpointStats>, bool), StoreError> {
+    ) -> Result<(Option<store::WalCheckpointStats>, bool, bool), StoreError> {
         let Some(wal) = self.wal.as_mut() else {
             ingest_document(&mut self.store, input)?;
-            return Ok((None, false));
+            return Ok((None, false, true));
         };
         let outcome = self.store.ingest_atomic_persistent(
             wal,
@@ -646,7 +652,8 @@ impl IngestionRuntime {
         if let Some(reason) = outcome.disk_error {
             eprintln!("ingestion redb mirror failed after WAL commit: {reason}");
         }
-        Ok(self.checkpoint_after_commit("ingest"))
+        let (stats, deferred) = self.checkpoint_after_commit("ingest");
+        Ok((stats, deferred, outcome.applied))
     }
 
     fn publish_segments_for_tenant(&mut self, tenant_id: &str) {
@@ -876,9 +883,21 @@ impl IngestionRuntime {
         self.transport_backpressure = Some(metrics);
     }
 
-    pub(crate) fn refresh_placement_if_due(&mut self) {
+    fn begin_placement_refresh(
+        &mut self,
+    ) -> Option<placement_routing::PlacementRefreshJob> {
+        match self.placement_routing.as_mut() {
+            Ok(Some(state)) => state.begin_refresh(),
+            _ => None,
+        }
+    }
+
+    fn finish_placement_refresh(
+        &mut self,
+        result: Result<placement_routing::PlacementRoutingRuntime, String>,
+    ) {
         if let Ok(Some(state)) = self.placement_routing.as_mut() {
-            state.maybe_refresh();
+            state.finish_refresh(result);
         }
     }
 
