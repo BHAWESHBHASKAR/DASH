@@ -10,19 +10,24 @@
 //!   line so health-class requests are routed to a small reserved lane that
 //!   is never queued behind slow work;
 //! * in that mode also closes sockets that send nothing within the
-//!   first-byte timeout, so idle sockets never occupy a worker.
+//!   first-byte timeout, so idle sockets never occupy a worker;
+//! * with TLS configured, drives every handshake non-blocking (the
+//!   first-byte timeout bounds it) and classifies on the decrypted request
+//!   line, so a slow handshake never reaches a worker either.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::ServerConfig;
+use crate::parse::Transport;
 use crate::server::HealthClassifier;
+use crate::tls::{self, TlsAcceptor, TlsInfo, TlsState, TlsStep};
 
 /// Bytes peeked to classify a request.
-const PEEK_BYTES: usize = 256;
+pub(crate) const PEEK_BYTES: usize = 256;
 /// How often the accept loop should poll while connections are pending.
 pub(crate) const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
@@ -62,6 +67,7 @@ pub struct Conn {
     pub stream: TcpStream,
     pub accepted_at: Instant,
     pub peer: SocketAddr,
+    tls: Option<Box<TlsState>>,
     _permit: Option<IpPermit>,
 }
 
@@ -73,8 +79,52 @@ impl Conn {
             stream,
             accepted_at: Instant::now(),
             peer,
+            tls: None,
             _permit: None,
         })
+    }
+
+    /// Run a blocking TLS handshake (one-shot mode). `false` means the
+    /// connection was refused or the handshake failed; drop it.
+    pub(crate) fn handshake_blocking(&mut self, acceptor: &TlsAcceptor, timeout: Duration) -> bool {
+        match tls::handshake_blocking(acceptor, &mut self.stream, timeout) {
+            Some(state) => {
+                self.tls = Some(Box::new(state));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// True when the connection speaks TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// TLS details (client certificate fingerprint), when the connection
+    /// speaks TLS.
+    pub fn tls_info(&self) -> Option<TlsInfo> {
+        self.tls.as_ref().and_then(|state| state.info.clone())
+    }
+
+    /// Reader/writer over the connection: plaintext, or decrypted TLS.
+    pub(crate) fn io(&mut self) -> ConnIo<'_> {
+        ConnIo {
+            sock: &mut self.stream,
+            tls: self.tls.as_deref_mut(),
+        }
+    }
+
+    /// Answer with `bytes` and close, without blocking the caller beyond the
+    /// socket's current mode (overload responses from the accept thread).
+    pub(crate) fn write_and_close(mut self, bytes: &[u8], write_timeout: Duration) {
+        let _ = self.stream.set_write_timeout(Some(write_timeout));
+        match self.tls.as_deref_mut() {
+            Some(state) => tls::write_and_close(state, &mut self.stream, bytes),
+            None => {
+                let _ = self.stream.write_all(bytes);
+            }
+        }
     }
 
     /// Whole-request deadline, measured from accept.
@@ -97,6 +147,7 @@ pub struct Rejected(pub TcpStream);
 #[derive(Debug)]
 pub struct ConnFrontend {
     first_byte_timeout: Duration,
+    tls: Option<TlsAcceptor>,
     max_per_ip: usize,
     max_pending: usize,
     /// Peek at request lines (health lane enabled).
@@ -112,6 +163,7 @@ impl ConnFrontend {
     pub fn new(cfg: &ServerConfig, classifier: HealthClassifier) -> Self {
         Self {
             first_byte_timeout: cfg.first_byte_timeout,
+            tls: cfg.tls.clone(),
             max_per_ip: cfg.max_conns_per_ip,
             max_pending: cfg.max_pending,
             peek: cfg.health_workers > 0,
@@ -158,23 +210,28 @@ impl ConnFrontend {
         } else {
             None
         };
-        if self.peek {
-            if stream.set_nonblocking(true).is_err() {
+        let tls = match self.tls.as_ref() {
+            Some(acceptor) => match TlsState::new(acceptor) {
+                Some(state) => Some(Box::new(state)),
+                None => return Ok(()),
+            },
+            None => None,
+        };
+        let conn = Conn {
+            stream,
+            accepted_at,
+            peer,
+            tls,
+            _permit: permit,
+        };
+        // TLS connections always wait here until their handshake is done.
+        if self.peek || conn.tls.is_some() {
+            if conn.stream.set_nonblocking(true).is_err() {
                 return Ok(());
             }
-            self.pending.push(Conn {
-                stream,
-                accepted_at,
-                peer,
-                _permit: permit,
-            });
+            self.pending.push(conn);
         } else {
-            self.immediate.push(Conn {
-                stream,
-                accepted_at,
-                peer,
-                _permit: permit,
-            });
+            self.immediate.push(conn);
         }
         Ok(())
     }
@@ -191,8 +248,22 @@ impl ConnFrontend {
         self.last_poll = Instant::now();
         let first_byte = self.first_byte_timeout;
         let mut still_pending = Vec::with_capacity(self.pending.len());
-        for conn in self.pending.drain(..) {
+        let classifier = self.peek.then_some(self.classifier);
+        for mut conn in self.pending.drain(..) {
             let age = conn.accepted_at.elapsed();
+            if let Some(state) = conn.tls.as_deref_mut() {
+                let step = match tls::advance(state, &mut conn.stream, classifier) {
+                    // Out of time: route a partial request, drop the rest.
+                    TlsStep::Pending if age >= first_byte => tls::partial_or_drop(state),
+                    step => step,
+                };
+                match step {
+                    TlsStep::Ready(lane) => ready.push((lane, conn)),
+                    TlsStep::Pending => still_pending.push(conn),
+                    TlsStep::Drop => {}
+                }
+                continue;
+            }
             let mut buf = [0u8; PEEK_BYTES];
             match conn.stream.peek(&mut buf) {
                 // Peer closed before sending anything.
@@ -213,6 +284,75 @@ impl ConnFrontend {
             }
         }
         self.pending = still_pending;
+    }
+}
+
+/// Reader/writer over an admitted connection. For TLS it first serves the
+/// plaintext the frontend decrypted while classifying, then decrypts from the
+/// socket. An unclean TLS EOF reads as EOF; request framing is checked by
+/// `Content-Length`, exactly as on a plaintext connection.
+pub(crate) struct ConnIo<'a> {
+    sock: &'a mut TcpStream,
+    tls: Option<&'a mut TlsState>,
+}
+
+impl ConnIo<'_> {
+    /// The underlying socket (timeouts, lingering close).
+    pub(crate) fn socket(&mut self) -> &mut TcpStream {
+        self.sock
+    }
+
+    /// Send `close_notify` (TLS) and half-close the socket.
+    pub(crate) fn finish(&mut self) {
+        if let Some(state) = self.tls.as_deref_mut() {
+            state.conn.send_close_notify();
+            let _ = rustls::Stream::new(&mut state.conn, &mut *self.sock).flush();
+        }
+        let _ = self.sock.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+impl Read for ConnIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(state) = self.tls.as_deref_mut() else {
+            return self.sock.read(buf);
+        };
+        if !state.prefix.is_empty() {
+            let n = buf.len().min(state.prefix.len());
+            buf[..n].copy_from_slice(&state.prefix[..n]);
+            state.prefix.drain(..n);
+            return Ok(n);
+        }
+        match rustls::Stream::new(&mut state.conn, &mut *self.sock).read(buf) {
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
+            other => other,
+        }
+    }
+}
+
+impl Write for ConnIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.tls.as_deref_mut() {
+            Some(state) => rustls::Stream::new(&mut state.conn, &mut *self.sock).write(buf),
+            None => self.sock.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.tls.as_deref_mut() {
+            Some(state) => rustls::Stream::new(&mut state.conn, &mut *self.sock).flush(),
+            None => self.sock.flush(),
+        }
+    }
+}
+
+impl Transport for ConnIo<'_> {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_write_timeout(timeout)
     }
 }
 
@@ -254,7 +394,7 @@ pub fn default_health_classifier(method: &str, path: &str) -> bool {
 
 /// `Some(lane)` once the request line is decidable, `None` if more bytes
 /// are needed.
-fn classify(buf: &[u8], classifier: HealthClassifier) -> Option<Lane> {
+pub(crate) fn classify(buf: &[u8], classifier: HealthClassifier) -> Option<Lane> {
     let first_space = buf.iter().position(|b| *b == b' ');
     let Some(first_space) = first_space else {
         // Method not complete yet (or a line without a space).

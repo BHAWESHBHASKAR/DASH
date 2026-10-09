@@ -7,3 +7,10 @@ publish.workspace = true
 description = "Shared std-thread HTTP/1.1 server and strict request parser for DASH services"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = { workspace = true }
+webpki-roots = "0.26"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+tempfile = "3"

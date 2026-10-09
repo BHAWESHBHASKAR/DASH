@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use crate::tls::TlsInfo;
+
 /// A fully read, validated request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -14,6 +16,9 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Remote address when the request came from a socket.
     pub peer: Option<SocketAddr>,
+    /// Set when the request arrived over TLS; carries the verified client
+    /// certificate fingerprint when there is one.
+    pub tls: Option<TlsInfo>,
 }
 
 impl Request {
@@ -172,6 +177,7 @@ mod tests {
             headers: HashMap::new(),
             body: Vec::new(),
             peer: None,
+            tls: None,
         };
         assert!(request("/x?a=%zz").try_query().is_err());
         assert_eq!(request("/x?a=%41").try_query().unwrap()["a"], "A");
