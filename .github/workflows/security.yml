@@ -64,7 +64,9 @@ jobs:
           mvn dependency:resolve -q
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        # Tracked follow-up (SEC-21): pin this to a verified commit SHA. The
+        # version tag 0.28.0 does not resolve, so the job never started.
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           ignore-unfixed: true
