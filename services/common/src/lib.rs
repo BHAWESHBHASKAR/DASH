@@ -17,8 +17,8 @@ pub mod audit;
 pub mod policy;
 
 pub use policy::{
-    AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, ServiceAuthEnv, TenantRateLimiter,
-    spawn_sighup_reload,
+    AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, RouteClass, ServiceAuthEnv,
+    TenantRateLimiter, spawn_sighup_reload,
 };
 
 pub struct ShutdownSignal {

@@ -11,11 +11,16 @@
 //! * If nothing is configured, every request is rejected unless
 //!   `DASH_INSECURE_DEV_MODE=1` is set. Startup refuses to proceed in that
 //!   situation (see [`AuthPolicy::build`]).
-//! * A per-tenant token bucket applies to every authenticated request
-//!   (API key, JWT and OIDC alike) and yields 429 with `Retry-After`.
+//! * A token bucket applies to every authenticated request (API key, JWT and
+//!   OIDC alike) and yields 429 with `Retry-After`. Buckets are keyed by the
+//!   credential (a salted HMAC, never the raw key), its tenant scope and the
+//!   route class ([`RouteClass`]), and their number is capped.
+//! * Tenant-less operations routes (`/metrics`, `/debug/*`) additionally
+//!   require the `admin` role or an unscoped credential
+//!   ([`AuthPolicy::authorize_ops`]).
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
@@ -28,6 +33,7 @@ use auth::{
     verify_hs256_token_for_tenant, verify_oidc_token, verify_oidc_token_for_tenant,
 };
 
+use crate::audit::{self, hex_lower, hmac_sha256, random_bytes};
 use crate::{
     JWT_SECRET_MIN_LENGTH, SECRET_MIN_LENGTH, constant_time_eq, strict_secrets_from,
     validate_secret_csv_min_len, validate_secret_min_len,
@@ -47,6 +53,28 @@ pub enum AuthDecision {
     RateLimited {
         retry_after_secs: u64,
     },
+}
+
+/// Route group used to give each class of endpoint its own rate-limit bucket
+/// so that, for example, a metrics scraper cannot starve data requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteClass {
+    /// Tenant-bound data routes (ingest, retrieve, reads).
+    Data,
+    /// Tenant-less embedding generation.
+    Embeddings,
+    /// Tenant-less operations routes (`/metrics`, `/debug/*`).
+    Ops,
+}
+
+impl RouteClass {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::Embeddings => "embeddings",
+            Self::Ops => "ops",
+        }
+    }
 }
 
 /// How a service names its environment variables and defaults.
@@ -214,6 +242,8 @@ pub struct AuthPolicy {
     revoked_jtis: HashSet<String>,
     jti_revocation_list: RevocationList,
     rate_limiter: Option<TenantRateLimiter>,
+    /// Per-process random salt for the credential component of rate-limit keys.
+    rate_salt: [u8; 32],
     revocation_list: RevocationList,
     insecure_dev: bool,
     metrics_public: bool,
@@ -259,6 +289,7 @@ impl AuthPolicy {
             revoked_jtis: HashSet::new(),
             jti_revocation_list: RevocationList::new(None),
             rate_limiter: None,
+            rate_salt: random_bytes::<32>(),
             revocation_list: RevocationList::new(None),
             insecure_dev: false,
             metrics_public: false,
@@ -349,7 +380,10 @@ impl AuthPolicy {
         Ok(Self {
             required_api_keys,
             revoked_api_keys,
-            allowed_tenants: parse_tenant_scope(raw.allowed_tenants.as_deref(), true),
+            allowed_tenants: parse_allowed_tenants(
+                &svc.dash("ALLOWED_TENANTS"),
+                raw.allowed_tenants.as_deref(),
+            )?,
             scoped_api_keys,
             jwt_validation,
             oidc_validation,
@@ -364,6 +398,7 @@ impl AuthPolicy {
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from),
             ),
+            rate_salt: random_bytes::<32>(),
             rate_limiter: TenantRateLimiter::from_raw(
                 raw.rate_limit_rps.as_deref(),
                 raw.rate_limit_burst.as_deref(),
@@ -407,18 +442,36 @@ impl AuthPolicy {
         tenant_id: &str,
         required_role: Role,
     ) -> AuthDecision {
-        self.authorize(headers, Some(tenant_id), required_role)
+        self.authorize(headers, Some(tenant_id), required_role, RouteClass::Data)
     }
 
-    /// Authorize a request that is not tenant-scoped (`/metrics`, debug,
-    /// `/v1/embeddings`). The caller must still present valid credentials
-    /// and hold `required_role`.
+    /// Authorize a tenant-less data-plane request (`/v1/embeddings`). The
+    /// caller must still present valid credentials and hold `required_role`.
     pub fn authorize_any_tenant(
         &self,
         headers: &HashMap<String, String>,
         required_role: Role,
     ) -> AuthDecision {
-        self.authorize(headers, None, required_role)
+        self.authorize(headers, None, required_role, RouteClass::Embeddings)
+    }
+
+    /// Authorize a tenant-less operations request (`/metrics`,
+    /// `/debug/placement`, `/debug/document-parser`). These routes expose
+    /// topology across all tenants, so on top of `required_role` the caller
+    /// must hold the `admin` role or present an unscoped credential (a legacy
+    /// key or a scoped key with tenant `*`). Tenant-scoped keys and JWTs
+    /// without the admin role are refused with 403.
+    pub fn authorize_ops(
+        &self,
+        headers: &HashMap<String, String>,
+        required_role: Role,
+    ) -> AuthDecision {
+        self.authorize(headers, None, required_role, RouteClass::Ops)
+    }
+
+    /// Salted keyed hash of a credential, used as the rate-limit subject.
+    fn rate_subject(&self, kind: &str, material: &str) -> String {
+        hex_lower(&hmac_sha256(&self.rate_salt, format!("{kind}:{material}").as_bytes())[..16])
     }
 
     fn authorize(
@@ -426,6 +479,7 @@ impl AuthPolicy {
         headers: &HashMap<String, String>,
         tenant_id: Option<&str>,
         required_role: Role,
+        class: RouteClass,
     ) -> AuthDecision {
         if self.config_error.is_some() {
             return AuthDecision::Unauthorized("authentication is misconfigured");
@@ -434,7 +488,7 @@ impl AuthPolicy {
             if !self.insecure_dev {
                 return AuthDecision::Unauthorized("authentication is not configured");
             }
-            return self.finish(tenant_id);
+            return self.finish(tenant_id, class, "dev", false);
         }
 
         let bearer = presented_bearer_token(headers);
@@ -444,18 +498,24 @@ impl AuthPolicy {
         //    when one is configured; it never falls through to API keys.
         if let Some(token) = jwt_candidate {
             if let Some(oidc) = self.oidc_validation.as_ref() {
+                audit::set_actor("oidc", token);
                 return self.finish_jwt(
                     verify_oidc(token, tenant_id, oidc),
+                    ("oidc", token),
                     tenant_id,
                     required_role,
+                    class,
                     "invalid OIDC token",
                 );
             }
             if let Some(jwt) = self.jwt_validation.as_ref() {
+                audit::set_actor("jwt", token);
                 return self.finish_jwt(
                     verify_hs256(token, tenant_id, jwt),
+                    ("jwt", token),
                     tenant_id,
                     required_role,
+                    class,
                     "invalid JWT",
                 );
             }
@@ -471,11 +531,13 @@ impl AuthPolicy {
         let Some(key) = presented else {
             return AuthDecision::Unauthorized("missing or invalid API key");
         };
+        // The audit actor is the credential that is actually evaluated here.
+        audit::set_actor("api_key", key);
         if self.revoked_api_keys.contains(key) || self.revocation_list.is_revoked(key) {
             return AuthDecision::Unauthorized("API key revoked");
         }
 
-        let roles = if let Some(scoped) = self
+        let (roles, unrestricted, tenant_bound) = if let Some(scoped) = self
             .scoped_api_keys
             .iter()
             .find(|scoped| constant_time_eq(scoped.key.as_bytes(), key.as_bytes()))
@@ -485,7 +547,8 @@ impl AuthPolicy {
             {
                 return AuthDecision::Forbidden("tenant is not allowed for this API key");
             }
-            &scoped.roles
+            let unrestricted = scoped.tenant_scope == TenantScope::Any;
+            (&scoped.roles, unrestricted, !unrestricted)
         } else if self
             .required_api_keys
             .iter()
@@ -493,7 +556,7 @@ impl AuthPolicy {
         {
             // Legacy unscoped key: an explicit, configurable default role set
             // (never "all roles").
-            &self.api_key_default_roles
+            (&self.api_key_default_roles, true, false)
         } else {
             return AuthDecision::Unauthorized("missing or invalid API key");
         };
@@ -501,14 +564,20 @@ impl AuthPolicy {
         if !roles.allows(required_role) {
             return AuthDecision::Forbidden("role is not allowed for this API key");
         }
-        self.finish(tenant_id)
+        if class == RouteClass::Ops && !roles.allows(Role::Admin) && !unrestricted {
+            return AuthDecision::Forbidden(OPS_SCOPE_DENIED);
+        }
+        let subject = self.rate_subject("api_key", key);
+        self.finish(tenant_id, class, &subject, tenant_bound)
     }
 
     fn finish_jwt(
         &self,
         verified: Result<serde_json::Value, JwtValidationError>,
+        (kind, token): (&str, &str),
         tenant_id: Option<&str>,
         required_role: Role,
+        class: RouteClass,
         invalid_message: &'static str,
     ) -> AuthDecision {
         match verified {
@@ -523,7 +592,18 @@ impl AuthPolicy {
                 if !roles.allows(required_role) {
                     return AuthDecision::Forbidden("role is not allowed for this JWT");
                 }
-                self.finish(tenant_id)
+                if class == RouteClass::Ops && !roles.allows(Role::Admin) {
+                    return AuthDecision::Forbidden(OPS_SCOPE_DENIED);
+                }
+                // Key the bucket on the verified subject so that re-issued
+                // tokens of one principal share a bucket.
+                let material = claims
+                    .get("sub")
+                    .and_then(|v| v.as_str())
+                    .filter(|sub| !sub.is_empty())
+                    .unwrap_or(token);
+                let subject = self.rate_subject(kind, material);
+                self.finish(tenant_id, class, &subject, false)
             }
             Err(JwtValidationError::TenantNotAllowed) => {
                 AuthDecision::Forbidden("tenant is not allowed for this JWT")
@@ -537,21 +617,39 @@ impl AuthPolicy {
     }
 
     /// Final stage shared by every credential type: service tenant policy,
-    /// then the per-tenant rate limit.
-    fn finish(&self, tenant_id: Option<&str>) -> AuthDecision {
+    /// then the rate limit. The bucket is keyed by the credential subject and
+    /// route class; the request's tenant only joins the key when the
+    /// credential is bound to a fixed tenant set (so a wildcard credential
+    /// cannot mint a fresh bucket by rotating tenant ids).
+    fn finish(
+        &self,
+        tenant_id: Option<&str>,
+        class: RouteClass,
+        subject: &str,
+        tenant_bound: bool,
+    ) -> AuthDecision {
         if let Some(tenant_id) = tenant_id
             && !self.allowed_tenants.allows(tenant_id)
         {
             return AuthDecision::Forbidden("tenant is not allowed by service policy");
         }
-        if let Some(limiter) = self.rate_limiter.as_ref()
-            && let Err(retry_after_secs) = limiter.check(tenant_id.unwrap_or("*"))
-        {
-            return AuthDecision::RateLimited { retry_after_secs };
+        if let Some(limiter) = self.rate_limiter.as_ref() {
+            let tenant = if tenant_bound {
+                tenant_id.unwrap_or("*")
+            } else {
+                "*"
+            };
+            let key = format!("{subject}|{}|{tenant}", class.tag());
+            if let Err(retry_after_secs) = limiter.check(&key) {
+                return AuthDecision::RateLimited { retry_after_secs };
+            }
         }
         AuthDecision::Allowed
     }
 }
+
+const OPS_SCOPE_DENIED: &str =
+    "operations endpoints require the admin role or an unscoped credential";
 
 fn verify_hs256(
     token: &str,
@@ -633,6 +731,22 @@ fn parse_tenant_scope(raw: Option<&str>, empty_means_any: bool) -> TenantScope {
         TenantScope::Any
     } else {
         TenantScope::Set(tenants)
+    }
+}
+
+/// `DASH_*_ALLOWED_TENANTS`: unset means any tenant. A value that is set but
+/// holds no tenant (empty, blank, only separators) is a configuration error
+/// instead of silently meaning "any".
+fn parse_allowed_tenants(name: &str, raw: Option<&str>) -> Result<TenantScope, String> {
+    let Some(value) = raw else {
+        return Ok(TenantScope::Any);
+    };
+    match parse_tenant_scope(Some(value), false) {
+        TenantScope::Set(tenants) if tenants.is_empty() => Err(format!(
+            "{name} is set but lists no tenant; unset it to allow every tenant or name the \
+             allowed tenants"
+        )),
+        scope => Ok(scope),
     }
 }
 
@@ -986,26 +1100,50 @@ impl RevocationList {
 struct Bucket {
     tokens: f64,
     updated: Instant,
+    generation: u64,
 }
 
-/// Per-tenant token bucket: refills at `rps` tokens per second up to `burst`.
+#[derive(Default)]
+struct LimiterState {
+    buckets: HashMap<String, Bucket>,
+    /// Creation order, oldest first; used for eviction at the capacity cap.
+    order: VecDeque<(String, u64)>,
+    next_generation: u64,
+    last_sweep: Option<Instant>,
+    /// Entries examined by idle sweeps (test/observability counter).
+    scanned: u64,
+}
+
+/// Token bucket per key: refills at `rps` tokens per second up to `burst`.
+/// Callers choose the key (see `AuthPolicy`: credential, tenant scope and
+/// route class). The number of buckets is capped; at the cap the oldest
+/// bucket is evicted rather than refusing the request, and idle buckets are
+/// swept on a timer, never per call.
 pub struct TenantRateLimiter {
     rps: f64,
     burst: f64,
-    state: Mutex<HashMap<String, Bucket>>,
+    capacity: usize,
+    state: Mutex<LimiterState>,
 }
 
 const BUCKET_IDLE_EVICT_SECS: u64 = 300;
-const BUCKET_SOFT_CAP: usize = 4096;
+const BUCKET_SWEEP_INTERVAL_SECS: u64 = 30;
+/// Hard cap on the number of live buckets.
+pub const BUCKET_CAPACITY: usize = 50_000;
 
 impl TenantRateLimiter {
     /// `rps == 0` is not meaningful here; callers that want "disabled" pass
     /// `None` instead of building a limiter.
     pub fn new(rps: u64, burst: u64) -> Self {
+        Self::with_capacity(rps, burst, BUCKET_CAPACITY)
+    }
+
+    pub fn with_capacity(rps: u64, burst: u64, capacity: usize) -> Self {
         Self {
             rps: rps.max(1) as f64,
             burst: burst.max(1) as f64,
-            state: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+            state: Mutex::new(LimiterState::default()),
         }
     }
 
@@ -1028,23 +1166,68 @@ impl TenantRateLimiter {
         Some(Self::new(rps, burst))
     }
 
-    /// Take one token for `tenant_id`. On exhaustion returns the number of
-    /// seconds (at least 1) after which a token will be available.
-    pub fn check(&self, tenant_id: &str) -> Result<(), u64> {
-        self.check_at(tenant_id, Instant::now())
+    /// Number of live buckets.
+    pub fn bucket_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buckets
+            .len()
     }
 
-    fn check_at(&self, tenant_id: &str, now: Instant) -> Result<(), u64> {
+    /// Total entries examined by idle sweeps so far.
+    pub fn sweep_scanned(&self) -> u64 {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).scanned
+    }
+
+    /// Take one token for `key`. On exhaustion returns the number of seconds
+    /// (at least 1) after which a token will be available.
+    pub fn check(&self, key: &str) -> Result<(), u64> {
+        self.check_at(key, Instant::now())
+    }
+
+    fn check_at(&self, key: &str, now: Instant) -> Result<(), u64> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.len() > BUCKET_SOFT_CAP {
-            state.retain(|_, bucket| {
+        let state = &mut *state;
+        let last_sweep = *state.last_sweep.get_or_insert(now);
+        if now.saturating_duration_since(last_sweep).as_secs() >= BUCKET_SWEEP_INTERVAL_SECS {
+            state.last_sweep = Some(now);
+            state.scanned += state.buckets.len() as u64;
+            state.buckets.retain(|_, bucket| {
                 now.saturating_duration_since(bucket.updated).as_secs() < BUCKET_IDLE_EVICT_SECS
             });
+            state.scanned += state.order.len() as u64;
+            let buckets = &state.buckets;
+            state.order.retain(|(k, generation)| {
+                buckets.get(k).is_some_and(|b| b.generation == *generation)
+            });
         }
-        let bucket = state.entry(tenant_id.to_string()).or_insert(Bucket {
-            tokens: self.burst,
-            updated: now,
-        });
+        if !state.buckets.contains_key(key) {
+            while state.buckets.len() >= self.capacity {
+                let Some((oldest, generation)) = state.order.pop_front() else {
+                    break;
+                };
+                if state
+                    .buckets
+                    .get(&oldest)
+                    .is_some_and(|b| b.generation == generation)
+                {
+                    state.buckets.remove(&oldest);
+                }
+            }
+            state.next_generation += 1;
+            let generation = state.next_generation;
+            state.order.push_back((key.to_string(), generation));
+            state.buckets.insert(
+                key.to_string(),
+                Bucket {
+                    tokens: self.burst,
+                    updated: now,
+                    generation,
+                },
+            );
+        }
+        let bucket = state.buckets.get_mut(key).expect("bucket exists");
         let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.rps).min(self.burst);
         bucket.updated = now;
@@ -1255,6 +1438,9 @@ fn env_fingerprint(svc: &ServiceAuthEnv) -> u64 {
 
 #[cfg(test)]
 mod hardening_tests;
+
+#[cfg(test)]
+mod review_tests;
 
 #[cfg(test)]
 mod tests {

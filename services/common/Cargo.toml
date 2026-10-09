@@ -7,6 +7,8 @@ edition = "2024"
 auth = { path = "../../pkg/auth" }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
 signal-hook = { workspace = true }
 tracing-subscriber = { workspace = true }
 

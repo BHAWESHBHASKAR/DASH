@@ -130,6 +130,9 @@ fn authz_decision_matrix_covers_every_route_and_credential_type() {
     let tenant_scoped = [401, 401, 403, 200, 401, 401, 200];
     // Not tenant-scoped: any authenticated principal with the role may call.
     let any_tenant = [401, 401, 200, 200, 401, 401, 200];
+    // Tenant-less operations routes expose all-tenant topology: tenant-scoped
+    // keys and non-admin JWTs are refused (see the dedicated ops test below).
+    let ops = [401, 401, 403, 403, 401, 401, 403];
     let open = [200; 7];
 
     let routes = [
@@ -166,14 +169,14 @@ fn authz_decision_matrix_covers_every_route_and_credential_type() {
             method: "GET",
             target: "/metrics",
             body: None,
-            expected: any_tenant,
+            expected: ops,
         },
         Route {
             name: "GET /debug/placement",
             method: "GET",
             target: "/debug/placement",
             body: None,
-            expected: any_tenant,
+            expected: ops,
         },
         Route {
             name: "GET /health",
@@ -547,4 +550,38 @@ fn legacy_unscoped_keys_get_an_explicit_default_role_set() {
         legacy(Some("not-a-role")).is_err(),
         "unknown role is a startup error"
     );
+}
+
+#[test]
+fn ops_routes_need_admin_or_an_unscoped_credential() {
+    let _env = env_lock().lock().expect("env lock");
+    const WILD: &str = "key-for-all-tenants-2c7e91d0a4b83f65";
+    const ADMIN: &str = "admin-key-for-tenant-a-7d41e8a0c9b2f365";
+    let policy = policy_from_raw(RawAuthConfig {
+        api_key_scopes: Some(format!(
+            "{KEY_TENANT_A}:tenant-a:retrieve,read_only;{WILD}:*:read_only;{ADMIN}:tenant-a:admin"
+        )),
+        strict_secrets: true,
+        ..Default::default()
+    })
+    .expect("policy");
+    for target in ["/metrics", "/debug/placement"] {
+        let get = |auth: &[(&str, String)]| status(&policy, &request("GET", target, None, auth));
+        assert_eq!(get(&[]), 401, "{target} anonymous");
+        assert_eq!(
+            get(&[("x-api-key", KEY_TENANT_A.into())]),
+            403,
+            "{target} tenant-scoped read_only key"
+        );
+        assert_eq!(
+            get(&[("x-api-key", WILD.into())]),
+            200,
+            "{target} wildcard key"
+        );
+        assert_eq!(
+            get(&[("x-api-key", ADMIN.into())]),
+            200,
+            "{target} admin key"
+        );
+    }
 }

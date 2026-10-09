@@ -11,7 +11,7 @@ pub(super) fn handle_get_request(
     if matches!(path, "/debug/placement" | "/debug/document-parser")
         && let Some(denied) = deny_unless_allowed(
             runtime,
-            authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+            authorize_request_ops(request, auth_policy, Role::ReadOnly),
         )
     {
         return denied;
@@ -76,7 +76,7 @@ pub(super) fn handle_get_request(
             if !auth_policy.metrics_public()
                 && let Some(denied) = deny_unless_allowed(
                     runtime,
-                    authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                    authorize_request_ops(request, auth_policy, Role::ReadOnly),
                 )
             {
                 return denied;

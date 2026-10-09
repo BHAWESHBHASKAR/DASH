@@ -31,12 +31,14 @@
 //! naive edits, not a writer with file access who recomputes every hash. See
 //! `docs/operations/audit-chain.md` for the exact guarantees.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use auth::sha256_hex;
 use serde_json::{Map, Value};
@@ -47,6 +49,17 @@ pub const CHAIN_RESTART_ACTION: &str = "chain_restart";
 
 static RECORDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DENIALS_DROPPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Longest request-derived string stored verbatim in an audit record. Longer
+/// values are replaced by a bounded prefix plus their length and a SHA-256
+/// prefix, so an unauthenticated caller cannot inflate the log.
+pub const MAX_AUDIT_FIELD_BYTES: usize = 256;
+
+/// Number of denial records dropped by the throttle in this process.
+pub fn denials_dropped_total() -> u64 {
+    DENIALS_DROPPED_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Number of audit records successfully appended by this process.
 pub fn records_total() -> u64 {
@@ -62,9 +75,11 @@ pub fn write_failures_total() -> u64 {
 pub fn render_prometheus_counters() -> String {
     format!(
         "# TYPE dash_audit_records_total counter\ndash_audit_records_total {}\n\
-# TYPE dash_audit_write_failures_total counter\ndash_audit_write_failures_total {}\n",
+# TYPE dash_audit_write_failures_total counter\ndash_audit_write_failures_total {}\n\
+# TYPE dash_audit_denials_dropped_total counter\ndash_audit_denials_dropped_total {}\n",
         records_total(),
-        write_failures_total()
+        write_failures_total(),
+        denials_dropped_total()
     )
 }
 
@@ -111,6 +126,36 @@ impl AuditOptions {
     }
 }
 
+/// Startup warning text when an audit log is configured but failures to write
+/// it do not stop requests (`DASH_<PREFIX>_AUDIT_FAIL_CLOSED` off).
+pub fn fail_open_warning(
+    prefix: &str,
+    log_configured: bool,
+    opts: &AuditOptions,
+) -> Option<String> {
+    (log_configured && !opts.fail_closed).then(|| {
+        format!(
+            "DASH_{prefix}_AUDIT_LOG_PATH is set but DASH_{prefix}_AUDIT_FAIL_CLOSED is off: \
+             requests keep being served when the audit log cannot be written (failures are \
+             only logged and counted). Set DASH_{prefix}_AUDIT_FAIL_CLOSED=1 for production."
+        )
+    })
+}
+
+/// Log [`fail_open_warning`] for the service with env infix `prefix` (`INGEST`,
+/// `RETRIEVAL`). Call once at startup.
+pub fn warn_if_fail_open(prefix: &str) {
+    let configured = [
+        format!("DASH_{prefix}_AUDIT_LOG_PATH"),
+        format!("EME_{prefix}_AUDIT_LOG_PATH"),
+    ]
+    .iter()
+    .any(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()));
+    if let Some(message) = fail_open_warning(prefix, configured, &AuditOptions::from_env(prefix)) {
+        tracing::warn!("{message}");
+    }
+}
+
 /// Who performed the action. `kind` is one of `api_key`, `jwt`, `oidc`, `none`.
 /// `id` is a short credential fingerprint (never the credential) or a subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,9 +164,94 @@ pub struct Actor {
     pub id: Option<String>,
 }
 
-/// First 8 hex chars of SHA-256 of a presented credential.
+/// HMAC-SHA256 (RFC 2104) built on SHA-256.
+pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+/// Lower-case hex of `bytes`.
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)] as char);
+        out.push(DIGITS[usize::from(b & 0x0f)] as char);
+    }
+    out
+}
+
+/// Fill an array from the operating system's CSPRNG.
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
+    use rand::RngCore;
+    let mut buf = [0u8; N];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf
+}
+
+/// Key used for credential fingerprints.
+#[derive(Clone)]
+pub struct FingerprintKey {
+    key: Vec<u8>,
+    /// True when the key came from `DASH_AUDIT_FINGERPRINT_KEY` (fingerprints
+    /// correlate across restarts and replicas); false for a random per-process key.
+    pub configured: bool,
+}
+
+impl FingerprintKey {
+    /// A configured key (`Some` non-blank value) or a fresh random one.
+    pub fn resolve(configured: Option<&str>) -> Self {
+        match configured.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => Self {
+                key: value.as_bytes().to_vec(),
+                configured: true,
+            },
+            None => Self {
+                key: random_bytes::<32>().to_vec(),
+                configured: false,
+            },
+        }
+    }
+
+    /// 16 hex chars of HMAC-SHA256(key, secret).
+    pub fn fingerprint(&self, secret: &str) -> String {
+        hex_lower(&hmac_sha256(&self.key, secret.as_bytes())[..8])
+    }
+}
+
+fn process_fingerprint_key() -> &'static FingerprintKey {
+    static KEY: OnceLock<FingerprintKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let key =
+            FingerprintKey::resolve(std::env::var("DASH_AUDIT_FINGERPRINT_KEY").ok().as_deref());
+        if !key.configured {
+            tracing::warn!(
+                "DASH_AUDIT_FINGERPRINT_KEY is not set: audit credential fingerprints use a \
+                 random per-process key and cannot be correlated across restarts or replicas"
+            );
+        }
+        key
+    })
+}
+
+/// Keyed credential fingerprint (16 hex chars of HMAC-SHA256 under the
+/// deployment's audit key). Never an unsalted hash of the credential.
 pub fn key_fingerprint(secret: &str) -> String {
-    sha256_hex(secret.as_bytes())[..8].to_string()
+    process_fingerprint_key().fingerprint(secret)
 }
 
 /// Per-request audit context, installed by the request entry point.
@@ -134,6 +264,7 @@ pub struct AuditContext {
 
 thread_local! {
     static CONTEXT: RefCell<AuditContext> = RefCell::new(AuditContext::default());
+    static CONTEXT_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Restores the previous context on drop.
@@ -143,6 +274,7 @@ pub struct AuditContextGuard {
 
 impl Drop for AuditContextGuard {
     fn drop(&mut self) {
+        CONTEXT_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         let previous = std::mem::take(&mut self.previous);
         CONTEXT.with(|c| *c.borrow_mut() = previous);
     }
@@ -151,7 +283,22 @@ impl Drop for AuditContextGuard {
 /// Installs `ctx` for the current thread until the guard is dropped.
 pub fn enter_context(ctx: AuditContext) -> AuditContextGuard {
     let previous = CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx));
+    CONTEXT_DEPTH.with(|d| d.set(d.get() + 1));
     AuditContextGuard { previous }
+}
+
+/// Replace the actor of the context installed on this thread with the
+/// credential that the authorization policy actually evaluated. A no-op when
+/// no context is installed, so state never leaks between requests.
+pub fn set_actor(kind: &str, credential: &str) {
+    if CONTEXT_DEPTH.with(Cell::get) == 0 {
+        return;
+    }
+    let actor = Actor {
+        kind: kind.to_string(),
+        id: Some(key_fingerprint(credential)),
+    };
+    CONTEXT.with(|c| c.borrow_mut().actor = Some(actor));
 }
 
 /// The context installed on this thread (default when none).
@@ -159,10 +306,12 @@ pub fn current_context() -> AuditContext {
     CONTEXT.with(|c| c.borrow().clone())
 }
 
-/// Derives the request context from (lower-cased) request headers. The actor
-/// describes the credential *presented*, whether or not it was accepted. JWTs
-/// are fingerprinted rather than decoded (their `sub` is unverified here);
-/// OIDC cannot be told apart from JWT without the policy, so both are `jwt`.
+/// Best-effort request context from (lower-cased) request headers, installed
+/// before authorization. It mirrors the policy's credential precedence (a
+/// JWT-shaped bearer, then `x-api-key`, then any other bearer token); once the
+/// policy evaluates the request it replaces the actor with the credential that
+/// actually authenticated it (see [`set_actor`]). JWTs are fingerprinted
+/// rather than decoded (their `sub` is unverified here).
 pub fn context_from_headers(headers: &HashMap<String, String>) -> AuditContext {
     let bearer = headers.get("authorization").and_then(|v| {
         let (scheme, token) = v.split_once(' ')?;
@@ -171,14 +320,20 @@ pub fn context_from_headers(headers: &HashMap<String, String>) -> AuditContext {
             .then(|| token.trim())
             .filter(|t| !t.is_empty())
     });
-    let actor = if let Some(token) = bearer {
+    let jwt_bearer = bearer.filter(|token| {
         let parts: Vec<&str> = token.split('.').collect();
-        let jwt = parts.len() == 3 && parts.iter().all(|p| !p.is_empty());
+        parts.len() == 3 && parts.iter().all(|p| !p.is_empty())
+    });
+    let api_key = headers
+        .get("x-api-key")
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty());
+    let actor = if let Some(token) = jwt_bearer {
         Actor {
-            kind: if jwt { "jwt" } else { "api_key" }.to_string(),
+            kind: "jwt".to_string(),
             id: Some(key_fingerprint(token)),
         }
-    } else if let Some(key) = headers.get("x-api-key").filter(|k| !k.is_empty()) {
+    } else if let Some(key) = api_key.or(bearer) {
         Actor {
             kind: "api_key".to_string(),
             id: Some(key_fingerprint(key)),
@@ -537,16 +692,114 @@ fn recover_tail(file: &mut File) -> Result<Tail, String> {
     }
 }
 
+/// Bound a request-derived string: values longer than
+/// [`MAX_AUDIT_FIELD_BYTES`] become a short prefix plus their byte length and
+/// a SHA-256 prefix.
+pub fn bound_field(raw: &str) -> String {
+    if raw.len() <= MAX_AUDIT_FIELD_BYTES {
+        return raw.to_string();
+    }
+    let mut cut = 64;
+    while !raw.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let digest = sha256_hex(raw.as_bytes());
+    format!(
+        "{}...[len={} sha256={}]",
+        &raw[..cut],
+        raw.len(),
+        &digest[..16]
+    )
+}
+
+fn bound_opt(raw: Option<&str>) -> Option<String> {
+    raw.map(bound_field)
+}
+
+/// Token bucket for denial records of one audit file.
+struct DenialBucket {
+    tokens: f64,
+    updated: Instant,
+    last_summary: Instant,
+    dropped_since_summary: u64,
+}
+
+fn denial_limits() -> (f64, f64) {
+    let rate = std::env::var("DASH_AUDIT_DENIAL_MAX_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(50.0);
+    (rate, (rate * 10.0).max(1.0))
+}
+
+/// Decide whether a denial record may be written now. Returns false (and
+/// counts the drop) once the file's denial budget is exhausted; a single
+/// summary line is logged at most every 10 seconds.
+fn denial_allowed(path: &str, now: Instant, rate: f64, burst: f64) -> bool {
+    if rate <= 0.0 {
+        return true;
+    }
+    static BUCKETS: OnceLock<Mutex<HashMap<String, DenialBucket>>> = OnceLock::new();
+    let mut map = BUCKETS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if map.len() > 64 && !map.contains_key(path) {
+        map.clear();
+    }
+    let bucket = map.entry(path.to_string()).or_insert(DenialBucket {
+        tokens: burst,
+        updated: now,
+        last_summary: now,
+        dropped_since_summary: 0,
+    });
+    let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
+    bucket.updated = now;
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        return true;
+    }
+    DENIALS_DROPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    bucket.dropped_since_summary += 1;
+    if now.saturating_duration_since(bucket.last_summary).as_secs() >= 10 {
+        tracing::warn!(
+            dropped = bucket.dropped_since_summary,
+            "audit denial records throttled (DASH_AUDIT_DENIAL_MAX_PER_SEC={rate}); \
+             see dash_audit_denials_dropped_total"
+        );
+        bucket.last_summary = now;
+        bucket.dropped_since_summary = 0;
+    }
+    false
+}
+
+fn is_denial(input: &AuditInput<'_>) -> bool {
+    matches!(input.status, 401 | 403 | 429) || input.outcome == "denied"
+}
+
 fn open_locked(path: &str) -> Result<File, String> {
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
     {
-        create_dir_all(parent).map_err(|e| format!("creating audit directory failed: {e}"))?;
+        let mut dirs = DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dirs.mode(0o700);
+        }
+        dirs.create(parent)
+            .map_err(|e| format!("creating audit directory failed: {e}"))?;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(path)
         .map_err(|e| format!("opening audit file failed: {e}"))?;
     file.lock()
@@ -563,6 +816,12 @@ pub fn append_record(
     timestamp_ms: u64,
     opts: &AuditOptions,
 ) -> Result<(), String> {
+    if is_denial(input) {
+        let (rate, burst) = denial_limits();
+        if !denial_allowed(path, Instant::now(), rate, burst) {
+            return Ok(());
+        }
+    }
     let result = append_inner(path, input, timestamp_ms, opts);
     match &result {
         Ok(()) => {
@@ -615,12 +874,12 @@ fn append_inner(
         seq,
         ts_unix_ms: timestamp_ms,
         service: input.service.to_string(),
-        action: input.action.to_string(),
-        tenant_id: input.tenant_id.map(str::to_string),
-        claim_id: input.claim_id.map(str::to_string),
+        action: bound_field(input.action),
+        tenant_id: bound_opt(input.tenant_id),
+        claim_id: bound_opt(input.claim_id),
         status: u64::from(input.status),
-        outcome: input.outcome.to_string(),
-        reason: input.reason.to_string(),
+        outcome: bound_field(input.outcome),
+        reason: bound_field(input.reason),
         actor: ctx.actor,
         request_id: ctx.request_id,
         client_ip: ctx.client_ip,
@@ -1027,4 +1286,212 @@ pub fn verify_bytes(data: &[u8], opts: &VerifyOptions) -> Result<VerifyReport, V
     report.last_seq = seq;
     report.last_hash = hash;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input<'a>(tenant: &'a str, status: u16, outcome: &'a str) -> AuditInput<'a> {
+        AuditInput {
+            service: "ingestion",
+            action: "ingest",
+            tenant_id: Some(tenant),
+            claim_id: Some(tenant),
+            status,
+            outcome,
+            reason: "no credentials",
+        }
+    }
+
+    fn log_path(dir: &tempfile::TempDir) -> String {
+        dir.path().join("audit.jsonl").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn hmac_matches_rfc4231_case_1() {
+        let mac = hmac_sha256(&[0x0b; 20], b"Hi There");
+        assert_eq!(
+            hex_lower(&mac),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // A key longer than the block size is hashed first (RFC 4231 case 6).
+        let mac = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        assert_eq!(
+            hex_lower(&mac),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_keyed_16_hex_and_not_plain_sha256() {
+        let a = FingerprintKey::resolve(Some("deployment-key-a"));
+        let b = FingerprintKey::resolve(Some("deployment-key-b"));
+        assert!(a.configured);
+        let fp = a.fingerprint("api-key-123");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, a.fingerprint("api-key-123"));
+        assert_ne!(fp, b.fingerprint("api-key-123"));
+        let plain = sha256_hex(b"api-key-123");
+        assert!(!plain.starts_with(&fp) && !plain.starts_with(&fp[..8]));
+        // Without a configured key each resolution is random and flagged.
+        let r1 = FingerprintKey::resolve(None);
+        let r2 = FingerprintKey::resolve(Some("  "));
+        assert!(!r1.configured && !r2.configured);
+        assert_ne!(r1.fingerprint("x"), r2.fingerprint("x"));
+        // The process-wide helper is keyed too.
+        assert_eq!(key_fingerprint("x").len(), 16);
+        assert_ne!(key_fingerprint("x"), sha256_hex(b"x")[..16].to_string());
+    }
+
+    #[test]
+    fn oversized_request_fields_are_bounded_in_the_record() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = log_path(&dir);
+        let huge = "T".repeat(1024 * 1024);
+        append_record(
+            &path,
+            &input(&huge, 401, "denied"),
+            1,
+            &AuditOptions::default(),
+        )
+        .expect("append");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.len() < 2048, "record is {} bytes", text.len());
+        assert!(text.contains("len=1048576"), "{text}");
+        assert!(text.contains("sha256="), "{text}");
+        let bounded = bound_field(&huge);
+        assert!(bounded.len() < MAX_AUDIT_FIELD_BYTES);
+        assert_eq!(bound_field("short"), "short");
+        // Exactly at the limit is stored verbatim.
+        let edge = "e".repeat(MAX_AUDIT_FIELD_BYTES);
+        assert_eq!(bound_field(&edge), edge);
+        // Multi-byte input is cut on a char boundary.
+        let wide = "é".repeat(500);
+        assert!(bound_field(&wide).contains("len=1000"));
+        // The bounded log still verifies.
+        verify_file(&path, &VerifyOptions::default()).expect("verifies");
+    }
+
+    #[test]
+    fn denial_records_are_throttled_and_counted() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = log_path(&dir);
+        let before = denials_dropped_total();
+        let opts = AuditOptions {
+            fsync: false,
+            fail_closed: false,
+        };
+        for i in 0..700u64 {
+            append_record(&path, &input("t", 401, "denied"), i, &opts).expect("append");
+        }
+        let lines = std::fs::read_to_string(&path)
+            .expect("read")
+            .lines()
+            .count();
+        assert!(lines <= 520, "{lines} denial records written");
+        assert!(lines >= 400, "{lines}");
+        assert!(denials_dropped_total() - before >= 150);
+        assert!(render_prometheus_counters().contains("dash_audit_denials_dropped_total"));
+        // Non-denial records are never throttled.
+        let path2 = dir.path().join("ok.jsonl").to_string_lossy().to_string();
+        for i in 0..700u64 {
+            append_record(&path2, &input("t", 200, "success"), i, &opts).expect("append");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path2)
+                .expect("read")
+                .lines()
+                .count(),
+            700
+        );
+    }
+
+    #[test]
+    fn denial_bucket_refills_over_time() {
+        let t0 = Instant::now();
+        let path = "throttle-refill-test";
+        for _ in 0..10 {
+            assert!(denial_allowed(path, t0, 1.0, 10.0));
+        }
+        assert!(!denial_allowed(path, t0, 1.0, 10.0));
+        assert!(denial_allowed(
+            path,
+            t0 + std::time::Duration::from_secs(3),
+            1.0,
+            10.0
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_file_is_private_and_created_directory_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let nested = dir.path().join("new-audit-dir");
+        let path = nested.join("audit.jsonl").to_string_lossy().to_string();
+        append_record(
+            &path,
+            &input("t", 200, "success"),
+            1,
+            &AuditOptions::default(),
+        )
+        .expect("append");
+        let file_mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(&nested)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn fail_open_audit_configuration_warns() {
+        let off = AuditOptions {
+            fsync: true,
+            fail_closed: false,
+        };
+        let on = AuditOptions {
+            fail_closed: true,
+            ..off
+        };
+        let warning = fail_open_warning("INGEST", true, &off).expect("warning");
+        assert!(warning.contains("DASH_INGEST_AUDIT_FAIL_CLOSED=1"));
+        assert!(fail_open_warning("INGEST", true, &on).is_none());
+        assert!(fail_open_warning("INGEST", false, &off).is_none());
+    }
+
+    #[test]
+    fn set_actor_only_applies_inside_a_context() {
+        set_actor("api_key", "ignored");
+        assert_eq!(current_context().actor, None);
+        {
+            let _guard = enter_context(AuditContext::default());
+            set_actor("jwt", "tok");
+            let actor = current_context().actor.expect("actor");
+            assert_eq!(actor.kind, "jwt");
+            assert_eq!(actor.id, Some(key_fingerprint("tok")));
+        }
+        assert_eq!(current_context().actor, None);
+    }
+
+    #[test]
+    fn context_follows_policy_credential_precedence() {
+        let mut h = HashMap::new();
+        h.insert("x-api-key".to_string(), "the-api-key".to_string());
+        h.insert("authorization".to_string(), "Bearer other-key".to_string());
+        let actor = context_from_headers(&h).actor.expect("actor");
+        assert_eq!(actor.kind, "api_key");
+        assert_eq!(actor.id, Some(key_fingerprint("the-api-key")));
+        h.insert("authorization".to_string(), "Bearer a.b.c".to_string());
+        let actor = context_from_headers(&h).actor.expect("actor");
+        assert_eq!(actor.kind, "jwt");
+        assert_eq!(actor.id, Some(key_fingerprint("a.b.c")));
+    }
 }

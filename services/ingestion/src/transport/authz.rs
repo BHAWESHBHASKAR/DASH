@@ -26,6 +26,7 @@ static POLICY: PolicyCell = PolicyCell::new();
 pub fn initialize_auth_policy() -> Result<(), String> {
     POLICY.pin(&SERVICE_AUTH)?;
     validate_replication_config()?;
+    dash_common::audit::warn_if_fail_open("INGEST");
     // On unix the policy is rebuilt on SIGHUP (see `PolicyCell::reload`).
     dash_common::spawn_sighup_reload(&POLICY, SERVICE_AUTH);
     Ok(())
@@ -89,13 +90,14 @@ pub(crate) fn authorize_request_for_tenant(
     policy.authorize_for_tenant(&request.headers, tenant_id, required_role)
 }
 
-/// Authorize a request that is not scoped to a tenant (`/metrics`, debug).
-pub(crate) fn authorize_request_any_tenant(
+/// Authorize a tenant-less operations request (`/metrics`, debug). Requires
+/// the admin role or an unscoped credential, see `AuthPolicy::authorize_ops`.
+pub(crate) fn authorize_request_ops(
     request: &HttpRequest,
     policy: &AuthPolicy,
     required_role: Role,
 ) -> AuthDecision {
-    policy.authorize_any_tenant(&request.headers, required_role)
+    policy.authorize_ops(&request.headers, required_role)
 }
 
 /// Build a policy from explicit values (no environment, no strict secret

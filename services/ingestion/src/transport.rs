@@ -30,7 +30,7 @@ mod server_runtime;
 use audit::{AuditEvent, emit_audit_event};
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
-    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
+    AuthDecision, Role, authorize_request_ops, authorize_request_for_tenant,
     shared_auth_policy,
 };
 use config::{
