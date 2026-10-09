@@ -48,14 +48,15 @@ pub(crate) use authz::{
     authorize_request_ops, shared_auth_policy,
 };
 use dash_common::AuthPolicy;
+use dash_common::conn::{Conn, ConnConfig, ConnFrontend, Lane, PENDING_POLL_INTERVAL, Rejected};
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
     resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
 };
 use http::{
-    parse_request_line, read_http_request, render_response_text, resolve_request_timeout,
-    split_target, write_response,
+    parse_request_line, query_encoding_is_invalid, read_http_request_until, render_response_text,
+    resolve_request_timeout, split_target, write_response,
 };
 #[cfg(test)]
 use payload::build_retrieve_request_from_json;
@@ -70,6 +71,9 @@ const METRICS_WINDOW_SIZE: usize = 2048;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
+/// Workers reserved for health-class requests (`/health`, `/live`, ...).
+const HEALTH_WORKERS: usize = 2;
+const HEALTH_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT: usize = 1_000;
 const DEFAULT_STORAGE_DIVERGENCE_WARN_RATIO: f64 = 0.25;
@@ -80,6 +84,9 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
+    /// Requests that failed while being read (408/413/431/400/...), by status class.
+    pub(crate) read_error_4xx_total: AtomicU64,
+    pub(crate) read_error_5xx_total: AtomicU64,
 }
 
 impl TransportBackpressureMetrics {
@@ -88,6 +95,8 @@ impl TransportBackpressureMetrics {
             queue_depth: AtomicUsize::new(0),
             queue_capacity,
             queue_full_reject_total: AtomicU64::new(0),
+            read_error_4xx_total: AtomicU64::new(0),
+            read_error_5xx_total: AtomicU64::new(0),
         }
     }
 
@@ -105,6 +114,15 @@ impl TransportBackpressureMetrics {
 
     pub(crate) fn observe_rejected(&self) {
         self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_read_error(&self, status: u16) {
+        let counter = if status >= 500 {
+            &self.read_error_5xx_total
+        } else {
+            &self.read_error_4xx_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -656,6 +674,16 @@ impl TransportMetrics {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (read_error_4xx, read_error_5xx) = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| {
+                (
+                    metrics.read_error_4xx_total.load(Ordering::Relaxed),
+                    metrics.read_error_5xx_total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         let (disk_unavailable, disk_recovering) = match disk_status {
             store::DiskStatus::Unavailable { .. } => (1, 0),
             store::DiskStatus::Recovering => (0, 1),
@@ -693,6 +721,9 @@ dash_retrieve_transport_queue_capacity {}\n\
 dash_retrieve_transport_queue_depth {}\n\
 # TYPE dash_retrieve_transport_queue_full_reject_total counter\n\
 dash_retrieve_transport_queue_full_reject_total {}\n\
+# TYPE dash_retrieve_transport_read_error_total counter\n\
+dash_retrieve_transport_read_error_total{{status_class=\"4xx\"}} {}\n\
+dash_retrieve_transport_read_error_total{{status_class=\"5xx\"}} {}\n\
 # TYPE dash_retrieve_placement_enabled gauge\n\
 dash_retrieve_placement_enabled {}\n\
 # TYPE dash_retrieve_placement_route_reject_total counter\n\
@@ -824,6 +855,8 @@ dash_transport_uptime_seconds {:.4}\n",
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            read_error_4xx,
+            read_error_5xx,
             placement_enabled,
             self.placement_route_reject_total,
             placement_last_shard_id,
@@ -958,34 +991,53 @@ pub fn serve_http_with_workers(
             )
         },
     )?));
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
+    let (tx, rx) = mpsc::sync_channel::<Conn>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
+    // Reserved lane for health-class requests so slow work can never starve
+    // liveness/readiness probes.
+    let (health_tx, health_rx) =
+        mpsc::sync_channel::<Conn>(queue_capacity.min(HEALTH_QUEUE_CAPACITY));
+    let health_rx = Arc::new(Mutex::new(health_rx));
+    let request_timeout = resolve_request_timeout();
 
     std::thread::scope(|scope| {
-        for _ in 0..worker_count {
+        for lane_rx in std::iter::repeat_n(&rx, worker_count)
+            .chain(std::iter::repeat_n(&health_rx, HEALTH_WORKERS))
+        {
             let metrics = Arc::clone(&metrics);
-            let rx = Arc::clone(&rx);
+            let rx = Arc::clone(lane_rx);
             let placement_routing = Arc::clone(&placement_routing);
             let backpressure_metrics = Arc::clone(&backpressure_metrics);
             let store = Arc::clone(&store);
             scope.spawn(move || {
                 loop {
-                    let stream = {
+                    let mut conn = {
                         let guard = match rx.lock() {
                             Ok(guard) => guard,
                             Err(_) => break,
                         };
                         match guard.recv() {
-                            Ok(stream) => {
+                            Ok(conn) => {
                                 backpressure_metrics.observe_dequeued();
-                                stream
+                                conn
                             }
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) =
-                        handle_connection(&store, stream, &metrics, &placement_routing)
-                    {
+                    // A connection that already waited out its request
+                    // deadline in the queue is closed without any work.
+                    if conn.is_stale(request_timeout) {
+                        continue;
+                    }
+                    let deadline = conn.deadline(request_timeout);
+                    if let Err(err) = handle_connection(
+                        &store,
+                        &mut conn.stream,
+                        deadline,
+                        &metrics,
+                        &placement_routing,
+                        &backpressure_metrics,
+                    ) {
                         eprintln!("retrieval transport error: {err}");
                     }
                 }
@@ -1000,21 +1052,28 @@ pub fn serve_http_with_workers(
             .set_nonblocking(true)
             .expect("set listener non-blocking");
         let mut accept_error_streak: u32 = 0;
+        let mut frontend = ConnFrontend::new(ConnConfig::from_env());
+        let mut ready: Vec<(Lane, Conn)> = Vec::new();
         loop {
             if shutdown.is_triggered() {
                 eprintln!("retrieval: shutdown signal received, draining in-flight requests");
                 break;
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    accept_error_streak = 0;
+            if frontend.has_pending() && frontend.poll_due() {
+                frontend.poll(&mut ready);
+                for (lane, conn) in ready.drain(..) {
                     backpressure_metrics.observe_enqueued();
-                    match tx.try_send(stream) {
+                    let target = if lane == Lane::Health {
+                        &health_tx
+                    } else {
+                        &tx
+                    };
+                    match target.try_send(conn) {
                         Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(stream)) => {
+                        Err(mpsc::TrySendError::Full(conn)) => {
                             backpressure_metrics.observe_dequeued();
                             backpressure_metrics.observe_rejected();
-                            if let Err(err) = write_backpressure_response(stream) {
+                            if let Err(err) = write_backpressure_response(conn.stream) {
                                 eprintln!(
                                     "retrieval transport backpressure response failed: {err}"
                                 );
@@ -1023,12 +1082,28 @@ pub fn serve_http_with_workers(
                         Err(mpsc::TrySendError::Disconnected(_)) => {
                             backpressure_metrics.observe_dequeued();
                             eprintln!("retrieval transport worker queue closed");
-                            break;
+                        }
+                    }
+                }
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accept_error_streak = 0;
+                    if let Err(Rejected(stream)) = frontend.admit(stream) {
+                        // Per-IP cap or pending bound exceeded.
+                        backpressure_metrics.observe_rejected();
+                        if let Err(err) = write_backpressure_response(stream) {
+                            eprintln!("retrieval transport backpressure response failed: {err}");
                         }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    let nap = if frontend.has_pending() {
+                        PENDING_POLL_INTERVAL
+                    } else {
+                        Duration::from_millis(50)
+                    };
+                    std::thread::sleep(nap);
                     continue;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1044,6 +1119,7 @@ pub fn serve_http_with_workers(
             }
         }
         drop(tx);
+        drop(health_tx);
     });
 
     Ok(())
@@ -1067,8 +1143,16 @@ pub fn serve_http_once_with_listener(
             )
         },
     )?));
-    let (stream, _) = listener.accept()?;
-    handle_connection(&store, stream, &metrics, &placement_routing)
+    let (mut stream, _) = listener.accept()?;
+    let deadline = Instant::now() + resolve_request_timeout();
+    handle_connection(
+        &store,
+        &mut stream,
+        deadline,
+        &metrics,
+        &placement_routing,
+        &TransportBackpressureMetrics::default(),
+    )
 }
 
 pub fn handle_http_request_bytes(
@@ -1142,23 +1226,29 @@ pub fn handle_http_request_bytes(
 
 fn handle_connection(
     store: &Arc<RwLock<InMemoryStore>>,
-    mut stream: TcpStream,
+    stream: &mut TcpStream,
+    deadline: Instant,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
+    backpressure: &TransportBackpressureMetrics,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
 
     // The read deadline covers the whole request (headers and body), not
-    // each individual read, so slow-trickle clients are dropped.
-    let request = match read_http_request(&mut stream, resolve_request_timeout()) {
+    // each individual read, so slow-trickle clients are dropped. It is
+    // measured from accept, so queue wait counts against it.
+    let request = match read_http_request_until(stream, deadline) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(err) => {
-            return write_response(
-                &mut stream,
+            backpressure.observe_read_error(err.status);
+            let result = write_response(
+                stream,
                 HttpResponse::error_with_status(err.status, &err.message),
             );
+            dash_common::conn::linger_close(stream);
+            return result;
         }
     };
 
@@ -1173,7 +1263,7 @@ fn handle_connection(
         }
         Err(_) => {
             return write_response(
-                &mut stream,
+                stream,
                 HttpResponse::internal_server_error(
                     "failed to acquire retrieval placement routing lock",
                 ),
@@ -1193,7 +1283,7 @@ fn handle_connection(
         routing_snapshot.as_ref(),
         Some(&reload_snapshot),
     );
-    write_response(&mut stream, response)
+    write_response(stream, response)
 }
 
 #[cfg(test)]
@@ -1321,6 +1411,9 @@ fn route_request<S: StoreAccess + ?Sized>(
     auth_policy: &AuthPolicy,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
+    if query_encoding_is_invalid(&request.target) {
+        return HttpResponse::bad_request("invalid percent-encoding in query");
+    }
     let audit_log_path = env_with_fallback(
         "DASH_RETRIEVAL_AUDIT_LOG_PATH",
         "EME_RETRIEVAL_AUDIT_LOG_PATH",
@@ -1619,7 +1712,9 @@ fn route_request<S: StoreAccess + ?Sized>(
                     let (status, err) = classify_openai_embeddings_error(err);
                     let body = serde_json::to_string(&err)
                         .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
-                    HttpResponse::json_with_status(status, body)
+                    let mut response = HttpResponse::json_with_status(status, body);
+                    response.retry_after_secs = err.retry_after_secs;
+                    response
                 }
             }
         }
@@ -1651,7 +1746,12 @@ fn classify_openai_embeddings_error(
         return (400, err);
     }
     match err.error.code.as_deref() {
-        Some("embedding_unavailable") => (503, err),
+        Some("embedding_unavailable") => {
+            let retry = err.retry_after_secs.unwrap_or(1);
+            let mut err = err;
+            err.retry_after_secs = Some(retry);
+            (503, err)
+        }
         _ => (
             502,
             crate::openai_embeddings::OpenAIErrorResponse::server_error("embedding_provider_error"),
@@ -1772,8 +1872,8 @@ fn handle_authorized_retrieve<S: StoreAccess + ?Sized>(
         return denied;
     }
     // Embedding happens only after authorization and before any store lock.
-    if let Err(response) = embed_query_if_missing(&mut req) {
-        return response;
+    if let Err(failure) = embed_query_if_missing(&mut req) {
+        return failure.into_response();
     }
     let response = execute_retrieve_and_observe(
         store,
@@ -1816,19 +1916,8 @@ fn embedding_provider() -> SharedEmbeddingProvider {
     if let Some(provider) = PROVIDER_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return provider;
     }
-    use std::hash::{Hash, Hasher};
     static CACHE: Mutex<Option<(u64, SharedEmbeddingProvider)>> = Mutex::new(None);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for name in [
-        "DASH_EMBEDDING_PROVIDER",
-        "DASH_OLLAMA_ENDPOINT",
-        "DASH_OLLAMA_MODEL",
-        "DASH_OPENAI_API_KEY",
-        "DASH_OPENAI_MODEL",
-    ] {
-        std::env::var(name).ok().hash(&mut hasher);
-    }
-    let signature = hasher.finish();
+    let signature = embeddings::provider_env_signature();
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cached, provider)) = cache.as_ref()
         && *cached == signature
@@ -1878,10 +1967,26 @@ fn emit_audit_event(
     }
 }
 
+/// Embedding failure for the retrieve path: HTTP status, short machine code
+/// and (for 503) the `Retry-After` seconds.
+struct QueryEmbedFailure {
+    status: u16,
+    code: &'static str,
+    retry_after_secs: Option<u64>,
+}
+
+impl QueryEmbedFailure {
+    fn into_response(self) -> HttpResponse {
+        let mut response = HttpResponse::error_with_status(self.status, self.code);
+        response.retry_after_secs = self.retry_after_secs.or(response.retry_after_secs);
+        response
+    }
+}
+
 /// Embed the retrieve query text using the configured `DASH_EMBEDDING_PROVIDER`
 /// when the caller did not supply an explicit `query_embedding`. This makes
 /// semantic retrieval work out of the box for SDKs and curl clients.
-fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), HttpResponse> {
+fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), QueryEmbedFailure> {
     if req.query_embedding.is_some() {
         return Ok(());
     }
@@ -1892,13 +1997,15 @@ fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), HttpRespon
     )
     .map_err(|err| {
         let (status, err) = classify_openai_embeddings_error(err);
-        HttpResponse::error_with_status(
+        let code = match err.error.code.as_deref() {
+            Some("embedding_unavailable") => "embedding_unavailable",
+            _ => "embedding_provider_error",
+        };
+        QueryEmbedFailure {
             status,
-            err.error
-                .code
-                .as_deref()
-                .unwrap_or("embedding_provider_error"),
-        )
+            code,
+            retry_after_secs: err.retry_after_secs,
+        }
     })?;
     req.query_embedding = vectors.into_iter().next();
     Ok(())
@@ -2735,6 +2842,50 @@ mod tests {
         assert_eq!(path, "/v1/retrieve");
         assert_eq!(query.get("query").map(String::as_str), Some("company x"));
         assert_eq!(query.get("return_graph").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn invalid_percent_encoding_in_query_is_a_400_not_a_dropped_parameter() {
+        let store = sample_store();
+        for bad in [
+            "stance_mode=%FF",
+            "entity_filters=%FF",
+            "top_k=%zz",
+            "query=%4",
+            "%zz=1",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&query=company+x&{bad}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_eq!(response.status, 400, "{bad}: {}", response.body);
+            assert!(
+                response.body.contains("invalid percent-encoding in query"),
+                "{bad}: {}",
+                response.body
+            );
+        }
+        // Valid encodings, `+` and bare flags are unchanged.
+        for good in [
+            "stance_mode=balanced",
+            "query=company%20x",
+            "query=company+x&flag",
+            "entity_filters=a%2Cb",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&top_k=1&query=x&{good}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_ne!(response.status, 400, "{good}: {}", response.body);
+        }
+        assert!(!query_encoding_is_invalid("/x?a=b+c&d=%41&e"));
+        assert!(query_encoding_is_invalid("/x?a=%"));
     }
 
     #[test]
@@ -3649,6 +3800,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             queue_depth: AtomicUsize::new(3),
             queue_capacity: 8,
             queue_full_reject_total: AtomicU64::new(11),
+            ..TransportBackpressureMetrics::default()
         });
         {
             let mut guard = metrics.lock().expect("metrics lock should be available");
@@ -4266,11 +4418,25 @@ tenant-a,0,12,node-a,follower,healthy\n",
             4
         }
         fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+            let leak = "boom at http://127.0.0.1:11434/api/embed /var/lib/secret".to_string();
             Err(match &self.0 {
                 embeddings::EmbeddingError::Timeout(s) => embeddings::EmbeddingError::Timeout(*s),
+                embeddings::EmbeddingError::Io(_) => embeddings::EmbeddingError::Io(leak),
+                embeddings::EmbeddingError::Parse(_) => embeddings::EmbeddingError::Parse(leak),
+                embeddings::EmbeddingError::Overloaded => embeddings::EmbeddingError::Overloaded,
+                embeddings::EmbeddingError::Http {
+                    status,
+                    retry_after_secs,
+                    ..
+                } => embeddings::EmbeddingError::Http {
+                    status: *status,
+                    retry_after_secs: *retry_after_secs,
+                    body: leak,
+                },
                 _ => embeddings::EmbeddingError::Http {
+                    retry_after_secs: None,
                     status: 500,
-                    body: "boom at http://127.0.0.1:11434/api/embed /var/lib/secret".to_string(),
+                    body: leak,
                 },
             })
         }
@@ -4290,6 +4456,43 @@ tenant-a,0,12,node-a,follower,healthy\n",
                 embeddings::EmbeddingError::Parse(String::new()),
                 502,
                 "embedding_provider_error",
+            ),
+            (
+                embeddings::EmbeddingError::Io("connection refused".into()),
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 429,
+                    body: String::new(),
+                    retry_after_secs: Some(4),
+                },
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 500,
+                    body: String::new(),
+                    retry_after_secs: None,
+                },
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 400,
+                    body: String::new(),
+                    retry_after_secs: None,
+                },
+                502,
+                "embedding_provider_error",
+            ),
+            (
+                embeddings::EmbeddingError::Overloaded,
+                503,
+                "embedding_unavailable",
             ),
         ];
         for (error, status, code) in cases {
@@ -4312,6 +4515,11 @@ tenant-a,0,12,node-a,follower,healthy\n",
             for r in [&embeddings_response, &retrieve] {
                 assert_eq!(r.status, status, "{}", r.body);
                 assert!(r.body.contains(code), "{}", r.body);
+                assert_eq!(
+                    r.retry_after_secs.is_some(),
+                    status == 503,
+                    "503 carries Retry-After, 502 does not"
+                );
                 for leaked in ["127.0.0.1", "http", "/var/lib", "boom"] {
                     assert!(!r.body.contains(leaked), "{}", r.body);
                 }

@@ -91,7 +91,9 @@ pub(super) fn handle_ingest_post(
             // Only spend an embedding provider call once the caller is
             // authorized (and before the runtime lock is taken).
             if let Err(failure) = api_req.embed_claim_if_missing() {
-                return HttpResponse::error_with_status(failure.status, failure.code);
+                let mut response = HttpResponse::error_with_status(failure.status, failure.code);
+                response.retry_after_secs = failure.retry_after_secs.or(response.retry_after_secs);
+                return response;
             }
 
             let mut audit_status = 500;

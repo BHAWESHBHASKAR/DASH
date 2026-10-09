@@ -43,26 +43,84 @@ pub struct IngestApiRequest {
 pub struct EmbedFailure {
     pub status: u16,
     pub code: &'static str,
+    /// `Retry-After` seconds to send with a 503.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl EmbedFailure {
     fn from_error(error: &embeddings::EmbeddingError) -> Self {
-        use embeddings::EmbeddingError as E;
-        match error {
-            E::Io(_) | E::Timeout(_) | E::CircuitOpen { .. } | E::InvalidConfig(_) => Self {
+        match error.classify() {
+            embeddings::FailureClass::Unavailable { retry_after_secs } => Self {
                 status: 503,
                 code: "embedding_unavailable",
+                retry_after_secs: Some(retry_after_secs),
             },
-            E::Http { status, .. } if *status == 429 || *status >= 500 => Self {
-                status: 503,
-                code: "embedding_unavailable",
-            },
-            _ => Self {
-                status: 502,
-                code: "embedding_upstream_error",
-            },
+            embeddings::FailureClass::BadGateway => Self::bad_upstream_payload(),
         }
     }
+
+    fn bad_upstream_payload() -> Self {
+        Self {
+            status: 502,
+            code: "embedding_upstream_error",
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// A claim, its optional embedding and its edges, borrowed for validation.
+pub type IngestBundleRef<'a> = (&'a Claim, Option<&'a [f32]>, &'a [ClaimEdge]);
+
+/// Ingest-side checks that need the current store state, run before anything
+/// is written (and before the WAL append) so a rejected request leaves no
+/// trace:
+///
+/// * a claim embedding must be finite and have a non-zero norm, matching the
+///   query-vector validation (a zero vector has no direction and can never
+///   match);
+/// * an edge may not point at a claim that exists under a different tenant,
+///   in the store or earlier in the same batch. A target that does not exist
+///   yet is allowed, since edges may arrive before their targets.
+///
+/// The error never names the other tenant.
+pub fn validate_ingest_bundles(
+    store: &store::InMemoryStore,
+    bundles: &[IngestBundleRef<'_>],
+) -> Result<(), store::StoreError> {
+    for (claim, embedding, edges) in bundles {
+        if let Some(vector) = embedding {
+            if vector.iter().any(|v| !v.is_finite()) {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding values must be finite".to_string(),
+                ));
+            }
+            let norm_sq: f64 = vector.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            if !vector.is_empty() && norm_sq <= 0.0 {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding must have a non-zero norm".to_string(),
+                ));
+            }
+        }
+        for edge in *edges {
+            let target_tenant = bundles
+                .iter()
+                .find(|(other, _, _)| other.claim_id == edge.to_claim_id)
+                .map(|(other, _, _)| other.tenant_id.as_str())
+                .or_else(|| {
+                    store
+                        .claim_by_id(&edge.to_claim_id)
+                        .map(|existing| existing.tenant_id.as_str())
+                });
+            if let Some(tenant) = target_tenant
+                && tenant != claim.tenant_id
+            {
+                return Err(store::StoreError::Conflict(
+                    "edge target is not in this tenant".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
@@ -70,22 +128,9 @@ type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider 
 /// Embedding provider shared by requests. It is rebuilt only when the
 /// provider-related environment changes, instead of on every request.
 fn shared_embedding_provider() -> SharedEmbeddingProvider {
-    use std::hash::{Hash, Hasher};
     static CACHE: std::sync::Mutex<Option<(u64, SharedEmbeddingProvider)>> =
         std::sync::Mutex::new(None);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for name in [
-        "DASH_EMBEDDING_PROVIDER",
-        "DASH_OLLAMA_ENDPOINT",
-        "DASH_OLLAMA_BASE_URL",
-        "DASH_OLLAMA_MODEL",
-        "DASH_OPENAI_API_KEY",
-        "DASH_OPENAI_MODEL",
-        "DASH_EMBEDDING_ALLOW_INSECURE_HTTP",
-    ] {
-        std::env::var(name).ok().hash(&mut hasher);
-    }
-    let signature = hasher.finish();
+    let signature = embeddings::provider_env_signature();
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cached, provider)) = cache.as_ref()
         && *cached == signature
@@ -114,6 +159,10 @@ impl IngestApiRequest {
                 eprintln!("ingestion embedding provider failed: {error}");
                 EmbedFailure::from_error(&error)
             })?;
+        if let Err(error) = embeddings::validate_finite(&vectors) {
+            eprintln!("ingestion embedding provider failed: {error}");
+            return Err(EmbedFailure::bad_upstream_payload());
+        }
         if let Some(vector) = vectors.into_iter().next() {
             self.claim_embedding = Some(vector);
         }

@@ -34,6 +34,7 @@ type embeddingBody struct {
 	Model          string `json:"model"`
 	EncodingFormat string `json:"encoding_format,omitempty"`
 	User           string `json:"user,omitempty"`
+	Dimensions     int    `json:"dimensions,omitempty"`
 }
 
 // buildEmbeddingBody normalises an EmbeddingRequest into the wire
@@ -58,5 +59,6 @@ func buildEmbeddingBody(req EmbeddingRequest) (embeddingBody, error) {
 		Model:          model,
 		EncodingFormat: req.EncodingFormat,
 		User:           req.User,
+		Dimensions:     req.Dimensions,
 	}, nil
 }

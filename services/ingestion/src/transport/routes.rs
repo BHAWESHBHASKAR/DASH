@@ -33,6 +33,9 @@ pub(super) fn handle_request_with_policy(
     auth_policy: &AuthPolicy,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
+    if query_encoding_is_invalid(&request.target) {
+        return HttpResponse::bad_request("invalid percent-encoding in query");
+    }
     let audit_log_path =
         env_with_fallback("DASH_INGEST_AUDIT_LOG_PATH", "EME_INGEST_AUDIT_LOG_PATH");
     match (request.method.as_str(), path.as_str()) {

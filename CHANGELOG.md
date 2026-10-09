@@ -172,6 +172,21 @@ Do these in order. Environment variable meanings are in
   fail-closed gate (`DASH_*_AUDIT_FAIL_CLOSED`), and the shared verifier
   `tools/audit-verify` (SEC-17). The chain is still **unkeyed** (no HMAC).
 
+### Reliability
+- Network embedding providers are wrapped in a circuit breaker (transport
+  errors, timeouts and 5xx only) and a concurrency cap; outages answer 503
+  with `Retry-After` in both services.
+- Health probes use reserved workers; idle connections are closed after a
+  first-byte timeout, the request deadline starts at accept, and
+  `DASH_HTTP_MAX_CONNS_PER_IP` caps connections per client.
+- Stricter request parsing: invalid percent-encoding, malformed HTTP
+  versions, header folding, `Expect` and (retrieval) duplicate JSON keys
+  are rejected.
+- Non-finite provider output is rejected; ingest rejects cross-tenant edge
+  targets and all-zero claim embeddings.
+- Python, TypeScript and Go SDKs decode `encoding_format="base64"`
+  embeddings and expose `dimensions`.
+
 ### Data integrity and recovery
 - Evidence is upserted by `evidence_id` and edges by
   `(from, to, relation)` in memory, in redb, on bulk load and on replication

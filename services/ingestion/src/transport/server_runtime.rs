@@ -1,4 +1,5 @@
 use super::*;
+use dash_common::conn::{Conn, ConnConfig, ConnFrontend, Lane, PENDING_POLL_INTERVAL, Rejected};
 
 pub(super) fn serve_http_with_workers(
     runtime: IngestionRuntime,
@@ -22,8 +23,14 @@ pub(super) fn serve_http_with_workers(
     if let Ok(mut guard) = runtime.lock() {
         guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
     }
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
+    let (tx, rx) = mpsc::sync_channel::<Conn>(queue_capacity);
     let rx = Arc::new(Mutex::new(rx));
+    // Reserved lane for health-class requests so slow work can never starve
+    // liveness/readiness probes.
+    let (health_tx, health_rx) =
+        mpsc::sync_channel::<Conn>(queue_capacity.min(HEALTH_QUEUE_CAPACITY));
+    let health_rx = Arc::new(Mutex::new(health_rx));
+    let request_timeout = resolve_request_timeout();
     let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
     let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
     let (replication_shutdown_tx, replication_shutdown_rx) = mpsc::channel::<()>();
@@ -80,26 +87,39 @@ pub(super) fn serve_http_with_workers(
             });
         }
 
-        for _ in 0..worker_count {
+        for lane_rx in std::iter::repeat_n(&rx, worker_count)
+            .chain(std::iter::repeat_n(&health_rx, HEALTH_WORKERS))
+        {
             let runtime = Arc::clone(&runtime);
-            let rx = Arc::clone(&rx);
+            let rx = Arc::clone(lane_rx);
             let backpressure_metrics = Arc::clone(&backpressure_metrics);
             scope.spawn(move || {
                 loop {
-                    let stream = {
+                    let mut conn = {
                         let guard = match rx.lock() {
                             Ok(guard) => guard,
                             Err(_) => break,
                         };
                         match guard.recv() {
-                            Ok(stream) => {
+                            Ok(conn) => {
                                 backpressure_metrics.observe_dequeued();
-                                stream
+                                conn
                             }
                             Err(_) => break,
                         }
                     };
-                    if let Err(err) = handle_connection(&runtime, stream) {
+                    // A connection that already waited out its request
+                    // deadline in the queue is closed without any work.
+                    if conn.is_stale(request_timeout) {
+                        continue;
+                    }
+                    let deadline = conn.deadline(request_timeout);
+                    if let Err(err) = handle_connection(
+                        &runtime,
+                        &mut conn.stream,
+                        deadline,
+                        &backpressure_metrics,
+                    ) {
                         eprintln!("ingestion transport error: {err}");
                     }
                 }
@@ -110,22 +130,29 @@ pub(super) fn serve_http_with_workers(
             .set_nonblocking(true)
             .expect("set listener non-blocking");
         let mut accept_error_streak: u32 = 0;
+        let mut frontend = ConnFrontend::new(ConnConfig::from_env());
+        let mut ready: Vec<(Lane, Conn)> = Vec::new();
         loop {
             if shutdown.is_triggered() {
                 eprintln!("ingestion: shutdown signal received, draining in-flight requests");
                 break;
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    accept_error_streak = 0;
+            if frontend.has_pending() && frontend.poll_due() {
+                frontend.poll(&mut ready);
+                for (lane, conn) in ready.drain(..) {
                     backpressure_metrics.observe_enqueued();
-                    match tx.try_send(stream) {
+                    let target = if lane == Lane::Health {
+                        &health_tx
+                    } else {
+                        &tx
+                    };
+                    match target.try_send(conn) {
                         Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(stream)) => {
+                        Err(mpsc::TrySendError::Full(conn)) => {
                             backpressure_metrics.observe_dequeued();
                             backpressure_metrics.observe_rejected();
                             if let Err(err) =
-                                write_backpressure_response(stream, SOCKET_TIMEOUT_SECS)
+                                write_backpressure_response(conn.stream, SOCKET_TIMEOUT_SECS)
                             {
                                 eprintln!(
                                     "ingestion transport backpressure response failed: {err}"
@@ -135,12 +162,28 @@ pub(super) fn serve_http_with_workers(
                         Err(mpsc::TrySendError::Disconnected(_)) => {
                             backpressure_metrics.observe_dequeued();
                             eprintln!("ingestion transport worker queue closed");
-                            break;
+                        }
+                    }
+                }
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accept_error_streak = 0;
+                    if let Err(Rejected(stream)) = frontend.admit(stream) {
+                        // Per-IP cap or pending bound exceeded.
+                        backpressure_metrics.observe_rejected();
+                        if let Err(err) = write_backpressure_response(stream, SOCKET_TIMEOUT_SECS) {
+                            eprintln!("ingestion transport backpressure response failed: {err}");
                         }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    let nap = if frontend.has_pending() {
+                        PENDING_POLL_INTERVAL
+                    } else {
+                        Duration::from_millis(50)
+                    };
+                    std::thread::sleep(nap);
                     continue;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -159,6 +202,7 @@ pub(super) fn serve_http_with_workers(
         let _ = segment_shutdown_tx.send(());
         let _ = replication_shutdown_tx.send(());
         drop(tx);
+        drop(health_tx);
     });
 
     Ok(())
@@ -170,23 +214,32 @@ fn accept_error_backoff(streak: u32) -> Duration {
     Duration::from_millis(millis.min(100))
 }
 
-fn handle_connection(runtime: &SharedRuntime, mut stream: TcpStream) -> std::io::Result<()> {
+fn handle_connection(
+    runtime: &SharedRuntime,
+    stream: &mut TcpStream,
+    deadline: Instant,
+    backpressure: &TransportBackpressureMetrics,
+) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
 
     // The read deadline covers the whole request (headers and body), not
-    // each individual read, so slow-trickle clients are dropped.
-    let request = match read_http_request(&mut stream, resolve_request_timeout()) {
+    // each individual read, so slow-trickle clients are dropped. It is
+    // measured from accept, so queue wait counts against it.
+    let request = match read_http_request_until(stream, deadline) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(err) => {
-            return write_response(
-                &mut stream,
+            backpressure.observe_read_error(err.status);
+            let result = write_response(
+                stream,
                 HttpResponse::error_with_status(err.status, &err.message),
             );
+            dash_common::conn::linger_close(stream);
+            return result;
         }
     };
 
     let response = handle_request(runtime, &request);
-    write_response(&mut stream, response)
+    write_response(stream, response)
 }

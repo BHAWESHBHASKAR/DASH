@@ -185,11 +185,13 @@ pub(crate) fn render_response_text(response: &HttpResponse) -> String {
         408 => "408 Request Timeout",
         411 => "411 Length Required",
         413 => "413 Payload Too Large",
+        417 => "417 Expectation Failed",
         429 => "429 Too Many Requests",
         431 => "431 Request Header Fields Too Large",
         501 => "501 Not Implemented",
         502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
+        505 => "505 HTTP Version Not Supported",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
     };

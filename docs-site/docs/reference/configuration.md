@@ -47,6 +47,12 @@ The container image and compose file override the bind addresses to `0.0.0.0:<po
 | `DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY` | `workers * 64` | retrieval | Same, for retrieval. |
 | `DASH_HTTP_REQUEST_TIMEOUT_MS` | `10000` | ingestion, retrieval | Whole-request deadline for reading one request (headers plus body). A slow client gets 408 and is dropped. DASH only. |
 
+| `DASH_HTTP_REQUEST_TIMEOUT_MS` | `10000` | ingestion, retrieval | Whole-request deadline, measured from accept (queue wait counts). Connections that already waited it out in the queue are closed without work. |
+| `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS` | `2000` | ingestion, retrieval | A new connection that sends nothing within this time is closed before it reaches a worker. |
+| `DASH_HTTP_MAX_CONNS_PER_IP` | `64` | ingestion, retrieval | Concurrent connections allowed per client IP; excess connections get 503. `0` disables the cap. Raise it (or set `0`) behind a load balancer that presents a single source IP. |
+
+`/health`, `/live`, `/ready`, their `/v1/` forms and `/metrics` are served by two reserved workers, so slow requests cannot starve probes. Read-stage failures (400/408/413/417/431/501/505) are counted in `dash_*_transport_read_error_total{status_class}`.
+
 Fixed limits (compiled in, **not** configurable): request body cap 16 MiB (413), request line and each header line 8 KiB, header block 32 KiB, at most 100 headers (431), per-connection socket timeout 5 seconds, `Transfer-Encoding` is not supported (501). The control plane has its own limits (below).
 
 ### Control-plane HTTP server
@@ -268,6 +274,17 @@ Tenant directories under the segment root are named by an injective escaping of 
 | `DASH_EMBEDDING_MAX_TOTAL_CHARS` | `524288` | retrieval | Maximum total characters across all inputs of one `/v1/embeddings` request. |
 
 The provider clients use HTTPS (rustls) where the URL is `https://`, do not follow redirects, cap response bodies, retry with jittered backoff and sit behind a circuit breaker whose half-open state admits a single probe. The hash provider's default dimension is 384. Timeouts are compiled in (Ollama 5 s, OpenAI 30 s). There is no `DASH_EMBEDDING_MODEL`, `DASH_EMBEDDING_DIM`, `DASH_OPENAI_BASE_URL`, `DASH_OPENAI_TIMEOUT_MS` or `DASH_OLLAMA_TIMEOUT_MS`.
+
+Network providers (`ollama`, `openai`) are wrapped in a circuit breaker and a concurrency cap:
+
+| Variable | Default | Description |
+|---|---|---|
+| `DASH_EMBEDDING_MAX_CONCURRENCY` | `8` | Concurrent provider calls per process; `0` = unlimited. When no slot frees within the queue wait the call fails with 503 `embedding_unavailable` and `Retry-After`. |
+| `DASH_EMBEDDING_QUEUE_WAIT_MS` | `250` | How long a call waits for a slot. |
+| `DASH_EMBEDDING_BREAKER_THRESHOLD` | `5` | Consecutive upstream failures that open the breaker; `0` disables it. Only transport errors, timeouts and 5xx count; 4xx, 429 and payload/dimension errors never do. |
+| `DASH_EMBEDDING_BREAKER_RESET_MS` | `10000` | Time before one probe call is admitted. |
+
+Provider outages (breaker open, timeout, connection error, 429, 5xx, concurrency cap) answer 503 `embedding_unavailable` with `Retry-After` (the upstream's value when present, otherwise 1). Unusable provider output (non-finite values, wrong dimensions, malformed payload, other 4xx) answers 502 `embedding_provider_error` (retrieval) or `embedding_upstream_error` (ingestion).
 
 ### Ingestion extraction and parsing
 

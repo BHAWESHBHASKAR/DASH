@@ -164,6 +164,10 @@ pub struct OpenAIUsage {
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenAIErrorResponse {
     pub error: OpenAIErrorBody,
+    /// Seconds for the `Retry-After` header on 503 responses. Never part of
+    /// the JSON body.
+    #[serde(skip)]
+    pub retry_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +188,7 @@ impl OpenAIErrorResponse {
                 param: None,
                 code: None,
             },
+            retry_after_secs: None,
         }
     }
 
@@ -195,6 +200,7 @@ impl OpenAIErrorResponse {
                 param: Some(param.to_string()),
                 code: Some(code.to_string()),
             },
+            retry_after_secs: None,
         }
     }
 
@@ -208,7 +214,15 @@ impl OpenAIErrorResponse {
                 param: None,
                 code: Some(code.to_string()),
             },
+            retry_after_secs: None,
         }
+    }
+
+    /// `embedding_unavailable` with a `Retry-After` hint (503).
+    pub fn unavailable(retry_after_secs: u64) -> Self {
+        let mut err = Self::server_error("embedding_unavailable");
+        err.retry_after_secs = Some(retry_after_secs.max(1));
+        err
     }
 }
 
@@ -321,15 +335,23 @@ pub fn embed_texts_checked(
 ) -> Result<Vec<Vec<f32>>, OpenAIErrorResponse> {
     let vectors = provider.embed(texts).map_err(|err: EmbeddingError| {
         eprintln!("retrieval embedding provider failure: {err}");
-        match err {
-            EmbeddingError::CircuitOpen { .. }
-            | EmbeddingError::Timeout(_)
-            | EmbeddingError::InvalidConfig(_) => {
-                OpenAIErrorResponse::server_error("embedding_unavailable")
+        match err.classify() {
+            embeddings::FailureClass::Unavailable { retry_after_secs } => {
+                OpenAIErrorResponse::unavailable(retry_after_secs)
             }
-            _ => OpenAIErrorResponse::server_error("embedding_provider_error"),
+            embeddings::FailureClass::BadGateway => {
+                OpenAIErrorResponse::server_error("embedding_provider_error")
+            }
         }
     })?;
+    // A provider is not trusted to return finite numbers: JSON would render
+    // them as `null` and they would poison similarity scoring.
+    if let Err(err) = embeddings::validate_finite(&vectors) {
+        eprintln!("retrieval embedding provider failure: {err}");
+        return Err(OpenAIErrorResponse::server_error(
+            "embedding_provider_error",
+        ));
+    }
     if vectors.len() != texts.len() {
         eprintln!(
             "retrieval embedding count mismatch: expected {}, got {}",
@@ -374,18 +396,29 @@ pub fn handle_openai_embeddings_with_provider(
                 "invalid_encoding_format",
             )
         })?;
+    let unsupported_dimensions = |expected: usize| {
+        OpenAIErrorResponse::invalid_param(
+            format!("dimensions must be {expected} for this model"),
+            "dimensions",
+            "unsupported_dimensions",
+        )
+    };
+    // A provider that has not learned its dimensionality yet reports 0; the
+    // request is then validated against the first response instead.
     if let Some(dimensions) = req.dimensions {
         let provider_dims = provider.dimensions();
-        if usize::try_from(dimensions).ok() != Some(provider_dims) {
-            return Err(OpenAIErrorResponse::invalid_param(
-                format!("dimensions must be {provider_dims} for this model"),
-                "dimensions",
-                "unsupported_dimensions",
-            ));
+        if provider_dims != 0 && usize::try_from(dimensions).ok() != Some(provider_dims) {
+            return Err(unsupported_dimensions(provider_dims));
         }
     }
     let (texts, prompt_tokens) = resolve_input_texts(&req.input)?;
     let embeddings = embed_texts_checked(provider, &texts)?;
+    if let Some(dimensions) = req.dimensions
+        && let Some(first) = embeddings.first()
+        && usize::try_from(dimensions).ok() != Some(first.len())
+    {
+        return Err(unsupported_dimensions(first.len()));
+    }
 
     let data: Vec<OpenAIEmbeddingData> = embeddings
         .into_iter()
@@ -854,7 +887,7 @@ mod tests {
                 &self,
                 _texts: &[String],
             ) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
-                Ok(vec![vec![1.0, -2.0, 3.5, f32::NAN]])
+                Ok(vec![vec![1.0, -2.0, 3.5, 0.125]])
             }
         }
         let body = r#"{"input":"x","model":"m","encoding_format":"base64"}"#;
@@ -872,7 +905,62 @@ mod tests {
         assert_eq!(floats[0], 1.0);
         assert_eq!(floats[1], -2.0);
         assert_eq!(floats[2], 3.5);
-        assert!(floats[3].is_nan());
+        assert_eq!(floats[3], 0.125);
+    }
+
+    struct NonFiniteProvider(f32);
+    impl EmbeddingProvider for NonFiniteProvider {
+        fn name(&self) -> &str {
+            "non-finite"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+            Ok(vec![vec![1.0, self.0]; texts.len()])
+        }
+    }
+
+    #[test]
+    fn non_finite_provider_output_is_a_provider_error_not_null() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = handle_openai_embeddings_with_provider(
+                r#"{"input":"x","model":"m"}"#,
+                &NonFiniteProvider(bad),
+            )
+            .unwrap_err();
+            assert_eq!(err.error.code.as_deref(), Some("embedding_provider_error"));
+            let err = embed_texts_checked(&NonFiniteProvider(bad), &["x".to_string()]).unwrap_err();
+            assert_eq!(err.error.code.as_deref(), Some("embedding_provider_error"));
+        }
+    }
+
+    struct UnlearnedDims;
+    impl EmbeddingProvider for UnlearnedDims {
+        fn name(&self) -> &str {
+            "unlearned"
+        }
+        fn dimensions(&self) -> usize {
+            0
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+            Ok(vec![vec![0.5, 0.25, 0.125]; texts.len()])
+        }
+    }
+
+    #[test]
+    fn dimensions_param_is_not_rejected_while_provider_dimensions_are_unlearned() {
+        let ok = handle_openai_embeddings_with_provider(
+            r#"{"input":"x","model":"m","dimensions":3}"#,
+            &UnlearnedDims,
+        );
+        assert!(ok.is_ok(), "{:?}", ok.err());
+        let err = handle_openai_embeddings_with_provider(
+            r#"{"input":"x","model":"m","dimensions":7}"#,
+            &UnlearnedDims,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.code.as_deref(), Some("unsupported_dimensions"));
     }
 
     #[test]

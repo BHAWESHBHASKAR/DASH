@@ -35,6 +35,11 @@ export interface EmbeddingRequest {
   model?: string;
   encoding_format?: EncodingFormat;
   user?: string;
+  /**
+   * Expected embedding size. The server rejects values that differ from
+   * its provider's dimensionality.
+   */
+  dimensions?: number;
 }
 
 /**
@@ -227,7 +232,40 @@ export function embeddingRequestToBody(req: EmbeddingRequest): Record<string, un
   if (req.user !== undefined) {
     body.user = req.user;
   }
+  if (req.dimensions !== undefined) {
+    body.dimensions = req.dimensions;
+  }
   return body;
+}
+
+/**
+ * Decode the server's `encoding_format: "base64"` embedding: float32
+ * components packed little-endian, standard base64 alphabet.
+ *
+ * @throws TypeError when the input is not valid base64 or not a whole
+ *   number of float32 values.
+ */
+export function decodeBase64Embedding(encoded: string): number[] {
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch {
+    throw new TypeError('embedding is not valid base64');
+  }
+  if (binary.length % 4 !== 0) {
+    throw new TypeError(
+      `base64 embedding has ${binary.length} bytes, not a multiple of 4`,
+    );
+  }
+  const view = new DataView(new ArrayBuffer(binary.length));
+  for (let i = 0; i < binary.length; i++) {
+    view.setUint8(i, binary.charCodeAt(i));
+  }
+  const out: number[] = [];
+  for (let offset = 0; offset < binary.length; offset += 4) {
+    out.push(view.getFloat32(offset, true));
+  }
+  return out;
 }
 
 /**
@@ -280,10 +318,13 @@ export function parseEmbeddingResponse(raw: unknown): EmbeddingResponse {
   const dataRaw = Array.isArray(body.data) ? body.data : [];
   const data: EmbeddingData[] = dataRaw.map((d, fallbackIndex) => {
     const item = d as Record<string, unknown>;
-    const embeddingRaw = Array.isArray(item.embedding) ? item.embedding : [];
-    const embedding: number[] = embeddingRaw.map((v) =>
-      typeof v === 'number' ? v : Number(v),
-    );
+    // `encoding_format: "base64"` makes the server return a string.
+    const embedding: number[] =
+      typeof item.embedding === 'string'
+        ? decodeBase64Embedding(item.embedding)
+        : (Array.isArray(item.embedding) ? item.embedding : []).map((v) =>
+            typeof v === 'number' ? v : Number(v),
+          );
     return {
       object: 'embedding',
       embedding,
