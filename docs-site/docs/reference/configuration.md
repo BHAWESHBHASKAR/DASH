@@ -55,7 +55,7 @@ Ingestion variables use the `DASH_INGEST_` prefix; retrieval variables use `DASH
 | `_API_KEY` | unset | A single accepted API key. |
 | `_API_KEYS` | unset | Comma-separated accepted API keys. |
 | `_API_KEY_SCOPES` | unset | Scoped keys, entries separated by `;`, each `key:tenantA,tenantB[:role1,role2]`. A tenant of `*` means all tenants. Roles are `admin`, `ingest`, `retrieve`, `read_only`; if omitted the key has the service's default role. A scoped key that is not in `_API_KEYS` is still accepted. |
-| `_ALLOWED_TENANTS` | any tenant | Comma-separated tenant allowlist applied to every authenticated request; `*` or empty means any. |
+| `_ALLOWED_TENANTS` | any tenant | Comma-separated tenant allowlist applied to every authenticated request; `*` means any. Leave it unset for any tenant: a value that is set but empty or only separators is a startup error. |
 | `_REVOKED_API_KEYS` | unset | Comma-separated keys rejected with 401 `API key revoked`. |
 | `_REVOKED_KEYS_PATH` | unset | File with one revoked key per line, re-read on every request. |
 | `_AUDIT_LOG_PATH` | unset (audit off) | Path of the SHA-256 hash-chained JSON-lines audit log. See [Security audit](../operations/security-audit.md). |

@@ -87,7 +87,7 @@ print(resp.data[0].embedding[:5])
 
 ## 5. Persistence and real embeddings
 
-With a WAL path configured, ingestion keeps data across restarts (the compose file already sets one under the `dash-state` volume) and mirrors it into a redb file by default. For semantic embeddings, set `DASH_EMBEDDING_PROVIDER=ollama`, `DASH_OLLAMA_ENDPOINT` and `DASH_OLLAMA_MODEL` on the retrieval service (add them to its `environment` block in the compose file). The OpenAI provider needs v0.3.0 for TLS support.
+With a WAL path configured, ingestion keeps data across restarts (the compose file already sets one under the `dash-ingestion-state` volume) and mirrors it into a redb file by default. For semantic embeddings, set `DASH_EMBEDDING_PROVIDER=ollama`, `DASH_OLLAMA_ENDPOINT` and `DASH_OLLAMA_MODEL` on the retrieval service (add them to its `environment` block in the compose file). The OpenAI provider needs v0.3.0 for TLS support.
 
 To deploy beyond a single host, read [Deploy](operations/deploy.md) and [Scaling](operations/scaling.md); the Kubernetes and Helm manifests are being corrected in v0.3.0.
 

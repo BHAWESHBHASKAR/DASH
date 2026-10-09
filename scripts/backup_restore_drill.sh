@@ -120,10 +120,11 @@ docker compose up -d
 wait_ready "${INGEST_URL}"
 wait_ready "${RETRIEVE_URL}"
 
-# Restore the bundle into the state volume. The service containers run with
+# Restore the bundle into the ingestion state volume (each service has its
+# own volume; the WAL belongs to ingestion). The service containers run with
 # a read-only root filesystem (and `docker cp` cannot write into them), so
-# extract on the host and copy through a one-off container that mounts the
-# same volume.
+# extract on the host and copy through a one-off container of the ingestion
+# service, which mounts that same volume.
 RESTORE_DIR="$(mktemp -d /tmp/dash-drill-restore-XXXXXX)"
 tar -xzf "${BUNDLE}" -C "${RESTORE_DIR}"
 docker compose stop ingestion

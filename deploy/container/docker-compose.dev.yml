@@ -10,7 +10,7 @@
 #   - source code mounted at /build for hot-reload via cargo-watch
 #   - cargo home and target dir on named volumes (persist across restarts)
 #   - debug logging by default
-#   - isolated dev volumes so you don't clobber the prod dash-state
+#   - isolated dev volumes so you don't clobber the per-service prod volumes
 #   - per-service bind ports identical to prod
 #
 # UID/GID: by default the dev containers run as UID:GID = 1000:1000 (the

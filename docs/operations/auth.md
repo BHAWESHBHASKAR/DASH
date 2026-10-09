@@ -16,7 +16,38 @@ a fallback). The implementation is `services/common/src/policy.rs` and
 3. Otherwise the `x-api-key` header (or a non-JWT bearer token) is matched
    against scoped keys, then legacy keys. Revoked keys are rejected.
 4. The credential's roles must allow the route's required role (403 if not).
-5. The service tenant allowlist and the per-tenant rate limit (429) apply.
+   Tenant-less operations routes (`/metrics`, `/debug/*`) additionally need
+   the `admin` role or an unscoped credential, see below.
+5. The service tenant allowlist and the rate limit (429) apply.
+
+Requests that repeat a credential header (`Authorization`, `X-API-Key`,
+`X-Replication-Token`) are rejected with 400 by both HTTP parsers instead of
+picking one of the values. Tenant, claim, document and commit identifiers
+longer than 256 bytes are rejected with 400 before authentication.
+
+## Operations routes (`/metrics`, `/debug/*`)
+
+These routes expose topology and counters across all tenants, so a credential
+scoped to some tenants must not read them. On top of the `read_only` role they
+require one of:
+
+* the `admin` role (any credential type), or
+* an unscoped credential: a legacy key, or a scoped key whose tenant list is
+  `*`.
+
+A tenant-scoped key, or a JWT/OIDC token without the `admin` role, gets 403.
+`DASH_METRICS_PUBLIC=1` still exposes `/metrics` alone without credentials.
+
+## Rate limiting
+
+One token bucket per credential and route class: `data` (tenant-bound
+routes), `embeddings` and `ops`, so a metrics scraper cannot starve data
+requests. The bucket key is a per-process salted HMAC of the credential (the
+raw key is never stored), plus the tenant only when the credential is bound to
+a fixed tenant set. A wildcard or legacy key therefore has one bucket however
+many tenant ids it rotates through; a JWT is keyed by its verified `sub`. The
+number of buckets is capped at 50,000 (the oldest bucket is evicted at the
+cap) and idle buckets are swept on a 30 second timer, never per request.
 
 ## Roles
 
@@ -79,7 +110,9 @@ settings.
 | `DASH_INSECURE_DEV_MODE` | `0` | local development only |
 | `DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK` | `0` | with dev mode, allow a non-loopback bind |
 | `DASH_CONFIG_RELOAD_FILE` | unset | `KEY=VALUE` overlay file, see Reload |
-| `DASH_*_RATE_LIMIT_PER_TENANT_RPS`, `DASH_*_RATE_LIMIT_BURST` | per service | per-tenant token bucket (`rps=0` disables) |
+| `DASH_*_ALLOWED_TENANTS` | unset (any tenant) | comma separated service-wide tenant allowlist, or `*`. A value that is set but holds no tenant (empty, blank, only commas) is a **startup error**, never "any" |
+| `DASH_*_RATE_LIMIT_PER_TENANT_RPS`, `DASH_*_RATE_LIMIT_BURST` | per service | token bucket per credential and route class (`rps=0` disables) |
+| `DASH_AUDIT_FINGERPRINT_KEY` | random per process | key for audit credential fingerprints, see `audit-chain.md` |
 | `DASH_METRICS_PUBLIC` | `0` | expose `/metrics` without credentials |
 
 ## JWT checks (HS256 and OIDC)
@@ -121,6 +154,43 @@ With `DASH_INSECURE_DEV_MODE=1`, retrieval and ingestion bind to
 names, and log a warning. `DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK=1`
 disables the override. The control plane keeps its own rule (it forces
 loopback only when no token is configured).
+
+## Replication endpoints in dev mode
+
+`/internal/replication/*` needs `DASH_INGEST_REPLICATION_TOKEN`. Without a
+token only a service that runs in dev mode with **no authentication configured
+at all** serves them; setting any API key, scoped key or JWT secret keeps
+them closed (403) even with `DASH_INSECURE_DEV_MODE=1`.
+
+## Control plane
+
+`DASH_CONTROL_PLANE_TOKEN` must be at least 32 characters and not a
+placeholder while strict secrets are on (the default; relaxing needs
+`DASH_STRICT_SECRETS=0` together with dev mode). After 10 failed bearer
+attempts within a minute a peer address gets 429 with `Retry-After`.
+`DASH_CONTROL_PLANE_NODE_ID` is required outside dev mode and must be unique
+per node. The lease holder is the node id plus a random per-process instance
+id, so two processes sharing a node id are not both leader (after a restart the
+node waits for its old lease to lapse). The lease file and its lock are created
+0600 with a random temp name and no symlink following; a lease directory the
+service creates is 0700 and a group/world-writable one logs a warning. A lease
+record that expires further ahead than one lease duration plus the safety
+margin and a minute of skew (or has an absurd epoch) is treated as forged: the
+node refuses to run until an admin restarts it once with
+`DASH_CONTROL_PLANE_LEASE_RESET=1`, which discards that record.
+
+## Known limitations
+
+* A claim id used by one tenant is rejected for another tenant (409), which
+  lets a caller learn that the id exists elsewhere. Fixing this needs claim-id
+  namespacing in the storage engine.
+* Slow-header (slowloris) clients are bounded by the request deadline and
+  worker pool, but real protection belongs to the ingress in front of the
+  service.
+* Replication between ingestion and retrieval is plain HTTP with a bearer
+  token. Run it on a private network until mTLS is supported.
+* During an IdP outage cached OIDC keys are used for up to 24 hours, so a key
+  revoked at the IdP can keep verifying tokens for that long.
 
 ## Reload (SIGHUP)
 

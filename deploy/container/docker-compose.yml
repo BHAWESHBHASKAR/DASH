@@ -9,6 +9,12 @@ name: dash
 # other interfaces set DASH_PUBLISH_ADDR (for example 0.0.0.0) and put TLS in
 # front of it. The control plane is not started by default; enable it with
 # `--profile control-plane`.
+#
+# State: each service has its own named volume (dash-ingestion-state,
+# dash-retrieval-state, dash-control-plane-state). The segment-maintenance
+# daemon works on the ingestion segment directory and mounts the ingestion
+# volume. Upgrading from the single shared `dash-state` volume: see
+# deploy/container/README.md.
 
 # Hardening shared by every service. Anchored here and merged into each
 # service via YAML's `<<:` merge key.
@@ -54,7 +60,7 @@ services:
     ports:
       - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8081:8081"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-ingestion-state:/var/lib/dash
     environment:
       <<: *base-env
       DASH_BIN: ingestion
@@ -92,7 +98,7 @@ services:
     ports:
       - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-retrieval-state:/var/lib/dash
     environment:
       <<: *base-env
       DASH_BIN: retrieval
@@ -136,7 +142,7 @@ services:
     ports:
       - "127.0.0.1:8090:8090"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-control-plane-state:/var/lib/dash
     environment:
       RUST_LOG: ${RUST_LOG:-info,dash=debug}
       DASH_STRICT_SECRETS: "1"
@@ -168,8 +174,11 @@ services:
     container_name: dash-segment-maintenance
     # segment-maintenance-daemon runs its own loop; no command override
     # is needed (and no --serve flag is passed).
+    #
+    # It maintains the ingestion segment directory, so it belongs to the
+    # ingestion trust domain and mounts the ingestion volume (and nothing else).
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-ingestion-state:/var/lib/dash
     environment:
       RUST_LOG: ${RUST_LOG:-info,dash=debug}
       DASH_BIN: segment-maintenance-daemon
@@ -190,7 +199,17 @@ services:
     mem_limit: 512m
     pids_limit: 256
 
+# One named volume per service so a compromised container cannot rewrite
+# another service's WAL, audit log, lease or state. Retrieval follows
+# ingestion over HTTP and never reads its files; the control plane shares
+# nothing with the data plane.
 volumes:
-  dash-state:
-    name: dash-state
+  dash-ingestion-state:
+    name: dash-ingestion-state
+    driver: local
+  dash-retrieval-state:
+    name: dash-retrieval-state
+    driver: local
+  dash-control-plane-state:
+    name: dash-control-plane-state
     driver: local

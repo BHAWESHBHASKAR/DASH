@@ -7,7 +7,7 @@ DASH ships as four Linux binaries built from one workspace: `ingestion`, `retrie
 
 ## Docker Compose (recommended)
 
-The stack is `deploy/container/docker-compose.yml`. It builds the image locally, starts ingestion (`:8081`), retrieval (`:8080`), control-plane (`:8090`) and the segment-maintenance daemon, and shares one named volume (`dash-state`).
+The stack is `deploy/container/docker-compose.yml`. It builds the image locally, starts ingestion (`:8081`), retrieval (`:8080`), control-plane (`:8090`) and the segment-maintenance daemon, and gives each service its own named volume (`dash-ingestion-state`, `dash-retrieval-state`, `dash-control-plane-state`); the segment-maintenance daemon mounts the ingestion volume.
 
 ```bash
 git clone https://github.com/BHAWESHBHASKAR/DASH.git
