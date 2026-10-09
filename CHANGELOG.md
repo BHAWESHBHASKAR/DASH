@@ -6,6 +6,14 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **The metadata router no longer sends its control-plane token in clear
+  text to a remote host.** Its control-plane client speaks plain HTTP, so a
+  bearer token is now refused unless the control plane is on loopback or
+  `DASH_ROUTER_ALLOW_INSECURE_HTTP=1` is set. The control plane's
+  leader-acquired log line now says "epoch" for the lease epoch counter.
+
 ### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
 
 - **Semantic retrieval now finds the true nearest neighbours.** The in-repo

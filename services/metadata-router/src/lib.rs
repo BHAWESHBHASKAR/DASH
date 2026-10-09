@@ -310,6 +310,10 @@ pub struct PlacementSourceOptions {
     pub max_response_bytes: usize,
     /// Bearer token presented to the control plane.
     pub bearer_token: Option<String>,
+    /// Allow sending the bearer token over plain http to a non-loopback
+    /// control plane. Off by default: the token would cross the network in
+    /// clear text.
+    pub allow_insecure_http: bool,
 }
 
 impl Default for PlacementSourceOptions {
@@ -321,6 +325,7 @@ impl Default for PlacementSourceOptions {
             write_timeout: Duration::from_secs(5),
             max_response_bytes: 8 * 1024 * 1024,
             bearer_token: None,
+            allow_insecure_http: false,
         }
     }
 }
@@ -328,7 +333,7 @@ impl Default for PlacementSourceOptions {
 impl PlacementSourceOptions {
     /// Defaults plus environment overrides:
     /// `DASH_ROUTER_CONTROL_PLANE_TOKEN` (fallback `DASH_CONTROL_PLANE_TOKEN`),
-    /// `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`, and
+    /// `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`, `DASH_ROUTER_ALLOW_INSECURE_HTTP=1`, and
     /// `DASH_ROUTER_CONTROL_PLANE_{CONNECT,READ,WRITE}_TIMEOUT_MS`.
     pub fn from_env() -> Self {
         let mut options = Self {
@@ -336,6 +341,10 @@ impl PlacementSourceOptions {
                 .or_else(|| env_non_empty("DASH_CONTROL_PLANE_TOKEN")),
             allow_stale_placement: matches!(
                 env_non_empty("DASH_ROUTER_ALLOW_STALE_PLACEMENT").as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            ),
+            allow_insecure_http: matches!(
+                env_non_empty("DASH_ROUTER_ALLOW_INSECURE_HTTP").as_deref(),
                 Some("1") | Some("true") | Some("TRUE")
             ),
             ..Self::default()
@@ -503,11 +512,36 @@ impl HttpClientResponse {
 
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 
+/// True when `authority` (`host[:port]`) names the local machine.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn http_get(
     authority: &str,
     path: &str,
     options: &PlacementSourceOptions,
 ) -> Result<HttpClientResponse, String> {
+    if options.bearer_token.is_some()
+        && !options.allow_insecure_http
+        && !is_loopback_authority(authority)
+    {
+        return Err(format!(
+            "refusing to send the control-plane token over plain http to non-loopback host \
+             '{authority}'; keep the control plane on a trusted local link or set \
+             DASH_ROUTER_ALLOW_INSECURE_HTTP=1 to accept the exposure"
+        ));
+    }
     let addrs: Vec<_> = authority
         .to_socket_addrs()
         .map_err(|err| format!("failed resolving control-plane '{authority}': {err}"))?
@@ -1184,6 +1218,31 @@ mod hardening_tests {
             load_shard_placements_from_control_plane_with_options(&url, &options).unwrap_err();
         assert!(err.contains("exceeds limit"), "{err}");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn token_is_not_sent_in_clear_text_to_a_remote_host() {
+        let options = PlacementSourceOptions {
+            bearer_token: Some("s3cret".to_string()),
+            ..quick_options()
+        };
+        let err = http_get("192.0.2.10:9", "/v1/placement", &options)
+            .expect_err("plain http token to a remote host must be refused");
+        assert!(
+            err.contains("refusing to send the control-plane token"),
+            "{err}"
+        );
+        for local in ["127.0.0.1:80", "localhost:80", "[::1]:80", "LOCALHOST"] {
+            assert!(is_loopback_authority(local), "{local}");
+        }
+        for remote in [
+            "192.0.2.10:80",
+            "example.com:80",
+            "[2001:db8::1]:80",
+            "10.0.0.1",
+        ] {
+            assert!(!is_loopback_authority(remote), "{remote}");
+        }
     }
 
     #[test]

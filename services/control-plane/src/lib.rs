@@ -807,13 +807,14 @@ impl LeaseMaintainer {
         };
         match result {
             Ok(LeaseTick::Leader {
-                fencing_token,
+                fencing_token: lease_epoch,
                 newly_acquired,
             }) => {
                 if newly_acquired || self.was_leader != Some(true) {
+                    // The fencing value is a lease epoch counter, not a credential.
                     eprintln!(
-                        "control-plane acquired leader lease (fencing token {})",
-                        fencing_token.map_or("none".to_string(), |token| token.to_string())
+                        "control-plane acquired leader lease (epoch {})",
+                        lease_epoch.map_or_else(|| "none".to_string(), |epoch| epoch.to_string())
                     );
                 }
                 self.was_leader = Some(true);

@@ -155,6 +155,7 @@ Placement routing is enabled when `DASH_ROUTER_PLACEMENT_FILE` or `DASH_ROUTER_C
 | `DASH_ROUTER_PLACEMENT_FILE` | unset | path | CSV of shard placements. The control plane uses it as its initial state. | Read by ingestion, retrieval, control-plane. |
 | `DASH_ROUTER_CONTROL_PLANE_URL` | unset | URL | Fetch placement from the control plane. If it is configured and unreachable, the placement file is **not** used as a fallback unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT` is set. |  |
 | `DASH_ROUTER_ALLOW_STALE_PLACEMENT` | `off` | bool | `1` or `true`: when the control plane is configured but unreachable, fall back to `DASH_ROUTER_PLACEMENT_FILE`. Off by default because a stale file can name a deposed leader (split-brain writes). | DASH only. Enabled by `1`, `true`, `TRUE`. |
+| `DASH_ROUTER_ALLOW_INSECURE_HTTP` | `off` | bool | `1` or `true`: allow the router to send `DASH_ROUTER_CONTROL_PLANE_TOKEN` over plain http to a non-loopback control plane. Off by default, so the token never crosses the network in clear text. | DASH only. Enabled by `1`, `true`, `TRUE`. |
 | `DASH_ROUTER_CONTROL_PLANE_CONNECT_TIMEOUT_MS` | `2000` | milliseconds >= 1 | Connect timeout of the control-plane client. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_READ_TIMEOUT_MS` | `5000` | milliseconds >= 1 | Read timeout of the control-plane client. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_WRITE_TIMEOUT_MS` | `5000` | milliseconds >= 1 | Write timeout of the control-plane client. | DASH only. |

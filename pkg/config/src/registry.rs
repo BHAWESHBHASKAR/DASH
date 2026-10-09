@@ -653,6 +653,15 @@ pub static REGISTRY: &[Entry] = &[
     )
     .blank_ok(),
     Entry::new(
+        "DASH_ROUTER_ALLOW_INSECURE_HTTP",
+        Common,
+        T_PLACEMENT,
+        Kind::Bool(Honors::OneTrueCaps),
+        "off",
+        "`1` or `true`: allow the router to send `DASH_ROUTER_CONTROL_PLANE_TOKEN` over plain http to a non-loopback control plane. Off by default, so the token never crosses the network in clear text.",
+    )
+    .blank_ok(),
+    Entry::new(
         "DASH_ROUTER_CONTROL_PLANE_CONNECT_TIMEOUT_MS",
         Common,
         T_PLACEMENT,

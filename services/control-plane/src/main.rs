@@ -138,9 +138,11 @@ fn main() {
         // Acquire (and, if leader, reload persisted placements) before
         // serving anything.
         match state.try_acquire_and_sync() {
-            Ok(LeaderStatus::Leader { fencing_token }) => eprintln!(
-                "control-plane '{node_id}' acquired leader lease (fencing token {})",
-                fencing_token.unwrap_or(0)
+            Ok(LeaderStatus::Leader {
+                fencing_token: lease_epoch,
+            }) => eprintln!(
+                "control-plane '{node_id}' acquired leader lease (epoch {})",
+                lease_epoch.unwrap_or(0)
             ),
             Ok(LeaderStatus::Follower) => eprintln!(
                 "control-plane '{node_id}' started as follower; another node holds the lease"
