@@ -2,6 +2,7 @@ use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
 
 mod authz_matrix;
+mod group_commit;
 mod provider_cache;
 mod ready;
 mod review_fixes;
@@ -944,6 +945,7 @@ fn handle_request_post_batch_is_atomic_on_validation_failure() {
     let wal_records = guard
         .wal
         .as_ref()
+        .map(lock_wal)
         .expect("persistent runtime should have wal")
         .wal_record_count()
         .expect("wal record count should be readable");
@@ -998,6 +1000,7 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .path(),
     );
@@ -1005,6 +1008,7 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .snapshot_path(),
     );
@@ -1056,6 +1060,7 @@ fn handle_request_internal_replication_endpoints_require_token_when_configured()
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .path(),
     );
@@ -1063,6 +1068,7 @@ fn handle_request_internal_replication_endpoints_require_token_when_configured()
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .snapshot_path(),
     );

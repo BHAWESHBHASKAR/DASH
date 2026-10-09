@@ -32,6 +32,17 @@ pub(super) fn handle_get_request(
         // configured.
         "/ready" | "/v1/ready" => match runtime.lock() {
             Ok(rt) => {
+                // After a failed fsync the WAL refuses writes until a restart
+                // re-reads it from disk: fail closed and leave the pool.
+                if let Some(reason) = rt.wal_poisoned_reason() {
+                    eprintln!("ingestion /ready: WAL poisoned: {reason}");
+                    return HttpResponse {
+                        status: 503,
+                        content_type: "application/json",
+                        body: "{\"status\":\"not_ready\",\"reason\":\"wal_poisoned\"}".to_string(),
+                        retry_after_secs: None,
+                    };
+                }
                 // A follower that is lagging, stale or never synced serves
                 // outdated data and must leave the load balancer.
                 if let Some(Err(reason)) = rt.replication_readiness() {

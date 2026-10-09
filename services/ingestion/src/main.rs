@@ -285,6 +285,10 @@ fn main() {
                 tracing::info!("ingestion segment publish dir: {segment_dir}");
             }
             let runtime = IngestionRuntime::persistent(store, wal, policy);
+            match runtime.group_commit_summary() {
+                Some(summary) => tracing::info!("ingestion wal group commit: enabled, {summary}"),
+                None => tracing::info!("ingestion wal group commit: disabled"),
+            }
             if let Some(reason) = runtime.placement_routing_error() {
                 tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);

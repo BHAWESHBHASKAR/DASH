@@ -14,6 +14,7 @@ mod authz;
 mod commit_status;
 mod config;
 mod document_parser_debug;
+mod group_commit;
 mod http;
 mod ingest_routes;
 mod json;
@@ -34,7 +35,7 @@ pub(crate) use authz::{
 };
 pub use authz::{initialize_auth_policy, warn_replication_transport};
 use config::{
-    env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
+    env_with_fallback, generate_batch_commit_id, parse_env_first_u64, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
 };
 use dash_common::AuthPolicy;
@@ -86,9 +87,20 @@ use metadata_router::{RouterConfig, ShardPlacement};
 #[cfg(test)]
 use placement_routing::PlacementRoutingRuntime;
 
+/// The WAL, shared between the runtime and the group committer thread. Its
+/// mutex serializes every write; the runtime lock is always taken first.
+pub(crate) type SharedWal = Arc<Mutex<FileWal>>;
+
+/// Locks the WAL. A panic while holding it cannot leave the file half
+/// written in a way the WAL does not already handle, so poisoning is ignored.
+pub(crate) fn lock_wal(wal: &SharedWal) -> std::sync::MutexGuard<'_, FileWal> {
+    wal.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct IngestionRuntime {
     store: InMemoryStore,
-    wal: Option<FileWal>,
+    wal: Option<SharedWal>,
+    group_commit: Option<group_commit::GroupCommitPipeline>,
     wal_async_flush_interval: Option<Duration>,
     checkpoint_policy: CheckpointPolicy,
     segment_runtime: Option<SegmentRuntime>,
@@ -202,6 +214,7 @@ impl IngestionRuntime {
         Self {
             store,
             wal: None,
+            group_commit: None,
             wal_async_flush_interval: None,
             checkpoint_policy: CheckpointPolicy::default(),
             segment_runtime: SegmentRuntime::from_env(),
@@ -262,9 +275,22 @@ impl IngestionRuntime {
     ) -> Self {
         let wal_async_flush_interval =
             resolve_wal_async_flush_interval(Some(&wal), DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS);
+        let wal = Arc::new(Mutex::new(wal));
+        let group_commit = group_commit::resolve_group_commit_config().and_then(|config| {
+            match store::GroupCommitter::start(Arc::clone(&wal), config) {
+                Ok(committer) => Some(group_commit::GroupCommitPipeline::new(committer)),
+                Err(err) => {
+                    eprintln!(
+                        "ingestion could not start the WAL group committer ({err}); single ingests fsync one by one"
+                    );
+                    None
+                }
+            }
+        });
         Self {
             store,
             wal: Some(wal),
+            group_commit,
             wal_async_flush_interval,
             checkpoint_policy,
             segment_runtime: SegmentRuntime::from_env(),
@@ -459,7 +485,22 @@ impl IngestionRuntime {
         if applied {
             self.publish_segments_for_tenant(&tenant_id);
         }
-        Ok(IngestApiResponse {
+        Ok(self.ingest_response(
+            ingested_claim_id,
+            Some((checkpoint_stats, checkpoint_deferred)),
+        ))
+    }
+
+    /// Response of a committed single ingest. `checkpoint` is the outcome of
+    /// [`IngestionRuntime::checkpoint_after_commit`], `None` when no
+    /// checkpoint was considered.
+    fn ingest_response(
+        &self,
+        ingested_claim_id: String,
+        checkpoint: Option<(Option<store::WalCheckpointStats>, bool)>,
+    ) -> IngestApiResponse {
+        let (checkpoint_stats, checkpoint_deferred) = checkpoint.unwrap_or((None, false));
+        IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
             commit_epoch: None,
@@ -472,7 +513,30 @@ impl IngestionRuntime {
                 .as_ref()
                 .map(|s| s.truncated_wal_records),
             checkpoint_deferred,
-        })
+        }
+    }
+
+    /// `true` when single ingests go through the group committer.
+    pub(crate) fn group_commit_active(&self) -> bool {
+        self.group_commit.is_some()
+    }
+
+    /// One-line description of the group-commit settings for the startup
+    /// log, or `None` when group commit is off.
+    pub fn group_commit_summary(&self) -> Option<String> {
+        let config = self.group_commit.as_ref()?.committer().config();
+        Some(format!(
+            "max_wait_us={}, max_batch_bytes={}, queue_capacity={}",
+            config.max_wait.as_micros(),
+            config.max_batch_bytes,
+            config.queue_capacity
+        ))
+    }
+
+    /// Why the WAL refuses writes (after an fsync failure), if it does.
+    pub fn wal_poisoned_reason(&self) -> Option<String> {
+        let wal = self.wal.as_ref()?;
+        lock_wal(wal).poisoned_reason().map(str::to_string)
     }
 
     fn ingest_batch(
@@ -572,7 +636,9 @@ impl IngestionRuntime {
             &ingested_claim_ids,
         )?;
 
-        if let Some(wal) = self.wal.as_mut() {
+        if let Some(wal) = self.wal.as_ref() {
+            let mut wal = lock_wal(wal);
+            let wal = &mut *wal;
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
                 wal.begin_group(&wal_commit_id, commit_ts_unix_ms)?;
@@ -640,12 +706,13 @@ impl IngestionRuntime {
         &mut self,
         label: &str,
     ) -> (Option<store::WalCheckpointStats>, bool) {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             return (None, false);
         };
-        match should_checkpoint_now(&self.checkpoint_policy, wal) {
+        let mut wal = lock_wal(wal);
+        match should_checkpoint_now(&self.checkpoint_policy, &wal) {
             Ok(false) => (None, false),
-            Ok(true) => match self.store.checkpoint_and_compact(wal) {
+            Ok(true) => match self.store.checkpoint_and_compact(&mut wal) {
                 Ok(stats) => (Some(stats), false),
                 Err(err) => {
                     eprintln!("ingestion {label} checkpoint failed after commit: {err:?}");
@@ -663,12 +730,12 @@ impl IngestionRuntime {
         &mut self,
         input: IngestInput,
     ) -> Result<(Option<store::WalCheckpointStats>, bool, bool), StoreError> {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             ingest_document(&mut self.store, input)?;
             return Ok((None, false, true));
         };
         let outcome = self.store.ingest_atomic_persistent(
-            wal,
+            &mut lock_wal(wal),
             input.claim,
             input.evidence,
             input.edges,
@@ -822,15 +889,18 @@ impl IngestionRuntime {
     }
 
     fn flush_wal_if_due(&mut self) {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             return;
         };
+        let mut wal = lock_wal(wal);
         if wal.background_flush_only() {
             return;
         }
         let unsynced_before = wal.unsynced_record_count() as u64;
         let started = Instant::now();
-        match wal.flush_pending_sync_if_interval_elapsed() {
+        let result = wal.flush_pending_sync_if_interval_elapsed();
+        drop(wal);
+        match result {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
@@ -846,13 +916,16 @@ impl IngestionRuntime {
     }
 
     pub(crate) fn flush_wal_for_async_tick(&mut self) {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        self.wal_async_flush_tick_total += 1;
+        let mut wal = lock_wal(wal);
         let unsynced_before = wal.unsynced_record_count() as u64;
         let started = Instant::now();
-        match wal.flush_pending_sync_if_unsynced() {
+        let result = wal.flush_pending_sync_if_unsynced();
+        drop(wal);
+        self.wal_async_flush_tick_total += 1;
+        match result {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
@@ -937,10 +1010,10 @@ impl IngestionRuntime {
         from_offset: usize,
         max_records: usize,
     ) -> Result<WalReplicationFrame, StoreError> {
-        let wal = self.wal.as_mut().ok_or_else(|| {
+        let wal = self.wal.as_ref().ok_or_else(|| {
             StoreError::Io("replication source requires persistent WAL mode".to_string())
         })?;
-        wal.replication_frame_from(from_generation, from_offset, max_records)
+        lock_wal(wal).replication_frame_from(from_generation, from_offset, max_records)
     }
 
     /// Full export plus the WAL generation it was taken at (read under the
@@ -948,9 +1021,10 @@ impl IngestionRuntime {
     fn replication_export_for_followers(
         &mut self,
     ) -> Result<(WalReplicationExport, u64), StoreError> {
-        let wal = self.wal.as_mut().ok_or_else(|| {
+        let wal = self.wal.as_ref().ok_or_else(|| {
             StoreError::Io("replication source requires persistent WAL mode".to_string())
         })?;
+        let mut wal = lock_wal(wal);
         let export = wal.replication_export()?;
         Ok((export, wal.generation()))
     }
@@ -998,26 +1072,26 @@ impl IngestionRuntime {
             Some(ReplicaRole::Follower) => 2,
             None => 0,
         };
-        let wal_unsynced_records = self
-            .wal
-            .as_ref()
-            .map(FileWal::unsynced_record_count)
-            .unwrap_or(0);
-        let wal_buffered_records = self
-            .wal
-            .as_ref()
-            .map(FileWal::buffered_record_count)
-            .unwrap_or(0);
+        let (wal_unsynced_records, wal_buffered_records, wal_background_flush_only, wal_poisoned) =
+            self.wal
+                .as_ref()
+                .map(|wal| {
+                    let wal = lock_wal(wal);
+                    (
+                        wal.unsynced_record_count(),
+                        wal.buffered_record_count(),
+                        wal.background_flush_only(),
+                        wal.poisoned_reason().is_some(),
+                    )
+                })
+                .unwrap_or((0, 0, false, false));
+        let wal_background_flush_only = wal_background_flush_only as usize;
+        let wal_poisoned = wal_poisoned as usize;
         let wal_async_flush_enabled = self.wal_async_flush_interval.is_some() as usize;
         let wal_async_flush_interval_ms = self
             .wal_async_flush_interval
             .map(|value| value.as_millis() as u64)
             .unwrap_or(0);
-        let wal_background_flush_only = self
-            .wal
-            .as_ref()
-            .map(FileWal::background_flush_only)
-            .unwrap_or(false) as usize;
         let wal_flush_avg_synced_records = if self.wal_flush_success_total > 0 {
             self.wal_flush_synced_records_total as f64 / self.wal_flush_success_total as f64
         } else {
@@ -1164,6 +1238,8 @@ dash_ingest_wal_async_flush_interval_ms {}\n\
 dash_ingest_wal_async_flush_tick_total {}\n\
 # TYPE dash_ingest_wal_background_flush_only gauge\n\
 dash_ingest_wal_background_flush_only {}\n\
+# TYPE dash_ingest_wal_poisoned gauge\n\
+dash_ingest_wal_poisoned {}\n\
 # TYPE dash_ingest_transport_queue_capacity gauge\n\
 dash_ingest_transport_queue_capacity {}\n\
 # TYPE dash_ingest_transport_queue_depth gauge\n\
@@ -1244,6 +1320,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             wal_async_flush_interval_ms,
             self.wal_async_flush_tick_total,
             wal_background_flush_only,
+            wal_poisoned,
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
@@ -1257,7 +1334,16 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.replication_last_error.is_some() as usize,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
-        )
+        ) + &self.group_commit_metrics_text()
+    }
+
+    fn group_commit_metrics_text(&self) -> String {
+        match self.group_commit.as_ref() {
+            Some(pipeline) => pipeline.metrics_text(),
+            None => "# TYPE dash_ingest_wal_group_commit_enabled gauge\n\
+dash_ingest_wal_group_commit_enabled 0\n"
+                .to_string(),
+        }
     }
 }
 

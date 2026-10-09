@@ -8,6 +8,11 @@ pub(super) fn map_store_error(error: &StoreError) -> (u16, String) {
         StoreError::MissingClaim(claim_id) => (400, format!("missing claim: {claim_id}")),
         StoreError::Conflict(message) => (409, format!("state conflict: {message}")),
         StoreError::InvalidVector(message) => (400, format!("invalid vector: {message}")),
+        // A poisoned WAL refuses every write until restart: unavailable,
+        // not a per-request failure.
+        StoreError::Io(message) if message.starts_with(store::WAL_POISONED_PREFIX) => {
+            (503, store::WAL_POISONED_PREFIX.to_string())
+        }
         StoreError::Io(message) | StoreError::Parse(message) => {
             (500, format!("internal persistence error: {message}"))
         }

@@ -448,6 +448,13 @@ impl FileWal {
         self.poisoned.as_deref()
     }
 
+    /// Testing aid for crates that cannot reach the store's failpoints: puts
+    /// the WAL into the state a failed fsync leaves it in.
+    #[doc(hidden)]
+    pub fn poison_for_testing(&mut self, reason: &str) {
+        self.poisoned = Some(reason.to_string());
+    }
+
     fn ensure_writable(&self) -> Result<(), StoreError> {
         match &self.poisoned {
             Some(reason) => Err(StoreError::Io(format!(
