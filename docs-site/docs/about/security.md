@@ -13,7 +13,7 @@ Please include a description and impact, a reproducer, the affected version or c
 
 ## Supported versions
 
-See the table in `SECURITY.md`. DASH is pre-1.0; the current development line is 0.2.x and the hardening release is 0.3.0.
+See the table in `SECURITY.md`. DASH is pre-1.0; the current development tree is 0.3.0 (unreleased, the hardening release) and the last line before it is 0.2.x.
 
 ## Threat model
 

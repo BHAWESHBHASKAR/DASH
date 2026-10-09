@@ -18,9 +18,9 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Swap embedding provider | trait-based (`EmbeddingProvider`) | n/a | plugin-based | n/a | n/a | function-based |
 | HNSW-style ANN | yes (in-repo graph in `pkg/store/src/ann.rs`; not `usearch`; recall at scale unmeasured) | yes, proprietary | yes | yes | yes | yes |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
-| Hash-chained audit log | partial: unkeyed SHA-256 chain, off by default; ingestion's chain does not verify with the bundled script today | no | no | no | no | no |
-| Tenant isolation (strict authz) | partial: allowlist + scoped keys; known isolation gaps (register SEC-18, SEC-19) | yes | yes (OIDC) | yes | partial | no |
-| Per-tenant rate limits | configurable; not enforced in v0.2.x (enforced with HTTP 429 in v0.3.0) | yes | yes | yes | partial | no |
+| Hash-chained audit log | partial: unkeyed SHA-256 chain with a shared verifier (`tools/audit-verify`), off unless a path is configured | no | no | no | no | no |
+| Tenant isolation (strict authz) | partial: allowlist + scoped keys; one known isolation gap: the claim-id namespace is global (register SEC-18) | yes | yes (OIDC) | yes | partial | no |
+| Per-tenant rate limits | yes, per process, HTTP 429 with `Retry-After` (0.3.0) | yes | yes | yes | partial | no |
 | Scoped API keys | yes (`key:tenant[,tenant...]`) | limited | yes | yes | limited | no |
 | API key revocation (hot reload) | yes | yes | yes | yes | partial | no |
 | JWT auth (HS256) with kid rotation | yes | JWT only | yes (OIDC) | yes | partial | no |
@@ -38,7 +38,7 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 - You need the retrieval layer to know that a claim has been contradicted by another source and either demote or filter it (`stance_mode: support_only`).
 - You need temporal validity windows on claims (a fact is true between `valid_from` and `valid_to`; the API should be able to ask "what was true in Q3 2024?") rather than a metadata filter hack.
 - You want an audit trail with a hash chain (opt-in, unkeyed, so it detects accidental damage rather than a determined attacker; see the README Status section for current limits).
-- You need scoped API keys, key revocation and tenant allowlists in the same process (per-tenant rate limits are enforced from v0.3.0).
+- You need scoped API keys, key revocation and tenant allowlists in the same process (per-tenant rate limits are enforced as of 0.3.0).
 - You want to be able to audit the storage and retrieval path yourself — DASH's core is open source, with no managed-cloud component and no proprietary extension.
 
 ## When NOT to use DASH

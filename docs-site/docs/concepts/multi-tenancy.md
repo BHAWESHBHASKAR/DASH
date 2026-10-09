@@ -2,8 +2,8 @@
 
 DASH is multi-tenant by design: every `Claim` carries a `tenant_id`, evidence and edges hang off claims, and the retrieval path filters on the tenant. This page describes what is enforced today, what is not, and what is planned. Isolation is enforced by application code; there is no separate storage per tenant.
 
-!!! warning "Isolation has known gaps in v0.2.x"
-    The isolation guarantees below describe the intended model. The 2026-10 review found cases that weaken them (register items SEC-18, SEC-19 and others, listed under [Known gaps](#known-gaps)). Do not host mutually untrusted tenants on one deployment until they are closed.
+!!! warning "Isolation still has a known gap in 0.3.0"
+    The isolation guarantees below describe the intended model. Several 2026-10 findings are fixed (conflict errors no longer name the owning tenant, vector fallbacks are tenant-scoped, segment directories are collision-free), but the `claim_id` namespace is still global, which lets a caller probe whether another tenant has a given id (register SEC-18, see [Known gaps](#known-gaps)). Do not host mutually untrusted tenants on one deployment until it is closed.
 
 ## What is enforced
 
@@ -14,7 +14,7 @@ DASH is multi-tenant by design: every `Claim` carries a `tenant_id`, evidence an
 
 ## Where the tenant comes from
 
-The tenant is read from the **request** (`claim.tenant_id` for ingest, `tenant_id` for retrieve) and then checked against the credential. It is not taken solely from the token. A caller whose credential allows tenant `t1` and who names `t2` gets 403; a credential with a wildcard (`*`) or, today, an unconfigured service allows any tenant.
+The tenant is read from the **request** (`claim.tenant_id` for ingest, `tenant_id` for retrieve) and then checked against the credential. It is not taken solely from the token. A caller whose credential allows tenant `t1` and who names `t2` gets 403; a credential with a wildcard tenant (`*` in a scoped key) allows any tenant. A `*` tenant inside a JWT is honored only with `DASH_*_JWT_ALLOW_WILDCARD_TENANT=1`. A service started in dev mode (`DASH_INSECURE_DEV_MODE=1`) with no credentials allows any tenant.
 
 ## Tenant lifecycle
 
@@ -22,20 +22,18 @@ There is no tenant registry and no tenant API. A tenant comes into existence whe
 
 ## Rate limiting
 
-Per-tenant rate limits are configured with `DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS` / `DASH_INGEST_RATE_LIMIT_BURST` and the `DASH_RETRIEVAL_` equivalents (defaults 100 and 200). In v0.2.x these settings do **not** throttle: the limiter is rebuilt on every request, and a rejection would surface as 401. v0.3.0 enforces the limit and returns 429 (register SEC-06). There are no tenant tiers.
+Per-tenant rate limits are configured with `DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS` / `DASH_INGEST_RATE_LIMIT_BURST` and the `DASH_RETRIEVAL_` equivalents (defaults: ingestion 100 rps and burst 200, retrieval 500 rps and burst 1000; `0` disables). Since 0.3.0 the limit is enforced for API keys, JWTs and OIDC alike with a per-process token bucket, and an excess request gets HTTP 429 with `Retry-After` (register SEC-06). The bucket is keyed by the tenant in the request; it is not per IP and not shared between replicas. There are no tenant tiers.
 
 ## Storage layout
 
 - **WAL:** one append-only file per service, shared by all tenants. Records carry the tenant id inside the claim.
 - **redb:** `dash_claims`, `dash_evidence`, `dash_edges`, `dash_claim_vectors`, `dash_tenant_dims`, `dash_tenant_claims_set`, plus batch-commit records. Keys are strings; the tenant is part of the stored value and of the `(tenant, claim)` membership table, not a per-tenant database.
-- **Segments:** published per tenant under the segment directory, in a directory derived from the tenant id.
+- **Segments:** published per tenant under the segment directory, in a collision-free directory derived from the tenant id (bytes outside `a-z0-9-` are escaped as `_xx`; long ids get a hash suffix). Directories created by the older lossy sanitizer are renamed automatically on first use.
 
 ## Known gaps
 
-- Conflict errors name the owning tenant and the claim-id namespace is global, so a caller can learn whether another tenant has a given `claim_id` (SEC-18).
-- An edge's `to_claim_id` is not tenant-checked, and graph output can emit another tenant's ids (SEC-18).
-- Tenant ids are sanitized into directory names with collisions (`a.b` and `a_b` map to the same directory), so two tenants can share segment files (SEC-19, P0).
-- Roles have no hierarchy and a JWT without a roles claim is granted all roles (SEC-11).
-- There is no dedicated multi-tenant isolation test suite. The tests listed above cover the credential check; the store-level isolation is covered by unit tests only.
+- The claim-id namespace is global: writing a `claim_id` that another tenant owns is a 409, so a caller can learn that the id exists (SEC-18, planned P4). The conflict message no longer names the other tenant.
+- An edge's `to_claim_id` is not checked for existence or tenant at write time. Ranking ignores edges whose endpoints are missing or belong to another tenant. Whether graph output (`return_graph`) can still include another tenant's ids was not re-verified in the 0.3.0 documentation pass.
+- There is no dedicated multi-tenant isolation test suite. The credential check, the store-level isolation (per-tenant indexes, tenant-scoped vector fallbacks, cross-tenant edge handling) and the segment directory mapping are covered by unit and integration tests, not by a single end-to-end isolation suite.
 
 The full list, with severities and target phases, is in [`docs/plans/2026-10-09-issue-register.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/plans/2026-10-09-issue-register.md).

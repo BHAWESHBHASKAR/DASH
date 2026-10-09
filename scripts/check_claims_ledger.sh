@@ -9,7 +9,7 @@
 #   4. every `verified` row has at least one test reference, except rows whose
 #      only evidence is a static repository fact (for example the license file),
 #      which may cite `doc:` paths alone;
-#   5. the Rust test count printed in README.md matches the repository
+#   5. the Rust test count printed in README.md matches `cargo test --workspace -- --list`
 #      (skip with CLAIMS_LEDGER_SKIP_COUNTS=1).
 #
 # This proves the references are real, not that the tests pass; CI results
@@ -114,13 +114,25 @@ fi
 
 # README test count must match the repository.
 if [[ "${CLAIMS_LEDGER_SKIP_COUNTS:-0}" != "1" ]]; then
-  actual="$(grep -rE '#\[(tokio::)?test\]' --include='*.rs' \
-    --exclude-dir=target --exclude-dir=node_modules --exclude-dir=.git . | wc -l | tr -d ' ')"
   stated="$(grep -E '^\| Rust workspace' "${README}" | awk -F'|' '{gsub(/[ \t]/, "", $3); print $3}' | head -n 1)"
   if [[ -z "${stated}" ]]; then
     fail "could not find the 'Rust workspace' row in the ${README} test table"
-  elif [[ "${stated}" != "${actual}" ]]; then
-    fail "README states ${stated} Rust tests but the repository has ${actual}; update README.md (and CHANGELOG/ledger notes if needed)"
+  elif ! command -v cargo > /dev/null 2>&1; then
+    echo "WARN: cargo not found; skipping the Rust test count check" >&2
+  else
+    # Same method the README documents. Compiles the test targets, so the
+    # first run can take a while; honors CARGO_TARGET_DIR.
+    list_out="$(mktemp)"
+    if ! cargo test --workspace -- --list > "${list_out}" 2> /dev/null; then
+      rm -f "${list_out}"
+      fail "'cargo test --workspace -- --list' failed; fix the build or set CLAIMS_LEDGER_SKIP_COUNTS=1"
+    else
+      actual="$(grep -c ': test$' "${list_out}" || true)"
+      rm -f "${list_out}"
+      if [[ "${stated}" != "${actual}" ]]; then
+        fail "README states ${stated} Rust tests but 'cargo test --workspace -- --list' reports ${actual}; update README.md (and CHANGELOG/ledger notes if needed)"
+      fi
+    fi
   fi
 fi
 

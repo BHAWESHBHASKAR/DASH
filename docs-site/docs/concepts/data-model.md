@@ -36,7 +36,8 @@ A claim is an atomic, source-bound assertion and the primary data primitive.
 
 Field rules (from `validate_claim`):
 
-- `claim_id`, `tenant_id`, `canonical_text` are required and non-blank. `claim_id` is unique across the deployment's store (a different tenant reusing it gets a 409).
+- `claim_id`, `tenant_id`, `canonical_text` are required and non-blank. `claim_id` is unique across the deployment's store (a different tenant reusing it gets a 409 whose message does not name the other tenant). Re-ingesting a `claim_id` for the same tenant updates the claim.
+- Identifier-like fields (ids, tenant, entities, embedding ids, source ids) must not contain ASCII control characters.
 - `confidence` is in `[0, 1]`; out-of-range values are rejected.
 - `event_time_unix` is the time of the event the claim is about. Optional.
 - `valid_from` / `valid_to` define the temporal validity window (unix seconds). If both are set, `valid_from <= valid_to`. A `null` bound is open. A retrieval `time_range` filters on the event time and the window; see the tests `retrieve_with_time_range_*` in `pkg/store`.
@@ -69,11 +70,11 @@ Evidence ties a claim to a source. It is what makes the citation defensible.
 - `chunk_id` must be non-blank if present. `span_start` and `span_end` must both be present or both absent, with `span_start <= span_end`.
 - `source_id` is an opaque string. DASH does not parse it.
 - Evidence has no `tenant_id`; it belongs to the claim named by `claim_id`.
-- Evidence is not idempotent in v0.2.x (duplicates on retry and restart, register DATA-01). v0.3.0 makes writes upserts keyed by `evidence_id`.
+- Evidence is upserted by `evidence_id` (0.3.0, register DATA-01): re-ingesting, restarting, reloading the WAL and replication re-apply leave one copy. For ranking, evidence from the same `source_id` counts once; the `supports`/`contradicts` counters on a result stay raw.
 
 ## Vector
 
-An optional embedding per claim, supplied as `claim.embedding_vector` (or top-level `claim_embedding`) on ingest or computed by the configured provider. Vectors are stored in the WAL and redb as raw `f32` data and fed to the per-tenant ANN graph. The dimension is pinned per tenant when its first vector is stored; a later vector of a different dimension is rejected as an invalid vector (400). The default hash provider produces 384-dimension vectors; the ingestion-side `hash_vector` provider used by `/v1/ingest/raw` and `/v1/ingest/document` defaults to 64 dimensions (mixing the two for one tenant trips the dimension check). There is no 768-dimension default. Re-ingesting a claim currently drops its in-memory vector while redb keeps it (register DATA-04).
+An optional embedding per claim, supplied as `claim.embedding_vector` (or top-level `claim_embedding`) on ingest or computed by the configured provider. Vectors are stored in the WAL and redb as raw `f32` data and fed to the per-tenant ANN graph. The dimension is pinned per tenant when its first vector is stored; a later vector of a different dimension is rejected as an invalid vector (400). The default hash provider produces 384-dimension vectors; the ingestion-side `hash_vector` provider used by `/v1/ingest/raw` and `/v1/ingest/document` defaults to 64 dimensions (mixing the two for one tenant trips the dimension check). There is no 768-dimension default. Re-ingesting a claim keeps its vector and ANN entry (0.3.0, register DATA-04). Vectors are validated (finite values, tenant dimension, claim exists) before they are written to the WAL.
 
 ## Contradiction (derived)
 
@@ -95,7 +96,7 @@ A typed, weighted relationship from one claim to another.
 }
 ```
 
-`relation` is one of `supports`, `contradicts`, `refines`, `duplicates`, `depends_on` (there is no `supersedes`). `strength` is in `[0, 1]`. On ingest, `from_claim_id` must equal the claim in the request. `to_claim_id` is not checked for existence or tenant today, and edges are not idempotent in v0.2.x.
+`relation` is one of `supports`, `contradicts`, `refines`, `duplicates`, `depends_on` (there is no `supersedes`). `strength` is in `[0, 1]`. On ingest, `from_claim_id` must equal the claim in the request. `to_claim_id` is not required to exist at write time. Edges are upserted by `(from_claim_id, to_claim_id, relation)` (0.3.0). **Direction:** an edge `from supports to` is evidence for the **target** claim (`to`), and a `contradicts` edge counts against the target; edges whose endpoints are missing, belong to another tenant, or are self-edges are ignored for ranking, and each distinct source counts once (0.3.0, register IDX-05; 0.2.x credited the author).
 
 ## Audit record
 
@@ -117,7 +118,7 @@ When `DASH_INGEST_AUDIT_LOG_PATH` or `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set, the
 }
 ```
 
-`hash` is SHA-256 over the canonical JSON of the record (including `prev_hash`). The chain is **unkeyed**: it detects accidental edits but anyone who can rewrite the file can recompute it. There is no actor or principal field, no request or response hash, and no JWT `jti`. The ingestion service's chain hashes keys in sorted order while `scripts/verify_audit_chain.sh` hashes in insertion order, so ingestion logs do not verify (register SEC-17, fix planned). Audit is off unless the path variable is set.
+The record also carries `v` (encoding version 2), `actor` (`{kind, id}`: the credential kind and the first 8 hex characters of SHA-256 of the presented credential, never the credential), `request_id`, `client_ip` (not populated today) and, after a recovery, a `restart` object. `hash` is SHA-256 over a fixed canonical encoding of the record (including `prev_hash`), shared by both services and checked by `tools/audit-verify` (`scripts/verify_audit_chain.sh` wraps it). The chain is **unkeyed**: it detects accidental edits but anyone who can rewrite the file can recompute it. There is no request or response hash and no JWT `jti`. Audit is off unless the path variable is set. Details: the audit-chain operations guide (`docs/operations/audit-chain.md`).
 
 ## Relationships
 

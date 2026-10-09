@@ -16,14 +16,14 @@ docker compose -f deploy/container/docker-compose.yml up -d --build
 | --- | --- | --- |
 | ingestion | 8081 | `/v1/ingest`, `/v1/ingest/batch`, `/v1/ingest/raw`, `/v1/ingest/document`, health |
 | retrieval | 8080 | `/v1/retrieve`, `/v1/embeddings`, health |
-| control-plane | 8090 | placement and leader state (internal) |
+| control-plane | 8090 | placement and leader state (internal); optional, start it with `--profile control-plane` |
 
 ```bash
 curl -fsS http://localhost:8081/health     # {"status":"ok"}
 curl -fsS http://localhost:8080/health
 ```
 
-Building from source instead: use `cargo build --release -p ingestion -p retrieval` and the variables in [Configuration](reference/configuration.md). Ingestion binds `127.0.0.1:8081` and retrieval `127.0.0.1:8080` by default; retrieval needs `DASH_RETRIEVAL_REPLICATION_SOURCE_URL` to see ingestion's data. The Rust toolchain must support edition 2024 (1.85 or newer).
+Building from source instead: use `cargo build --release -p ingestion -p retrieval` and the variables in [Configuration](reference/configuration.md). Ingestion binds `127.0.0.1:8081` and retrieval `127.0.0.1:8080` by default. Each service exits unless a credential is configured (an API key of at least 16 characters, or for a throwaway local run `DASH_INSECURE_DEV_MODE=1`); retrieval needs `DASH_RETRIEVAL_REPLICATION_SOURCE_URL` and a replication token (`DASH_INGEST_REPLICATION_TOKEN` on ingestion, the same value as `DASH_RETRIEVAL_REPLICATION_TOKEN` on retrieval) to see ingestion's data. The Rust toolchain must support edition 2024 (1.85 or newer).
 
 ## 2. Ingest
 
@@ -51,7 +51,7 @@ curl -fsS -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
-The response is HTTP 200 with `ingested_claim_id` and commit fields. On v0.2.x, do not blindly retry ingest calls: re-sent evidence is duplicated (fixed in v0.3.0).
+The response is HTTP 200 with `ingested_claim_id` and commit fields. Since 0.3.0, retries are safe: evidence is upserted by `evidence_id`, so re-sending the same bundle leaves one copy.
 
 ## 3. Retrieve
 
@@ -83,13 +83,13 @@ resp = client.embeddings.create(input="hello world", model="text-embedding-3-sma
 print(resp.data[0].embedding[:5])
 ```
 
-`/v1/embeddings` requires authentication as of v0.3.0 (open in v0.2.x). The default provider is a deterministic hash embedder for development. See the [Embeddings guide](guides/embeddings.md).
+`/v1/embeddings` requires a credential with the `retrieve` role (it was open before 0.3.0). The default provider is a deterministic hash embedder for development. See the [Embeddings guide](guides/embeddings.md).
 
 ## 5. Persistence and real embeddings
 
-With a WAL path configured, ingestion keeps data across restarts (the compose file already sets one under the `dash-state` volume) and mirrors it into a redb file by default. For semantic embeddings, set `DASH_EMBEDDING_PROVIDER=ollama`, `DASH_OLLAMA_ENDPOINT` and `DASH_OLLAMA_MODEL` on the retrieval service (add them to its `environment` block in the compose file). The OpenAI provider needs v0.3.0 for TLS support.
+With a WAL path configured, ingestion keeps data across restarts (the compose file already sets one under the `dash-state` volume) and mirrors it into a redb file by default. For semantic embeddings, set `DASH_EMBEDDING_PROVIDER=ollama`, `DASH_OLLAMA_ENDPOINT` and `DASH_OLLAMA_MODEL` on the retrieval service (add them to its `environment` block in the compose file). The OpenAI provider (`DASH_EMBEDDING_PROVIDER=openai`, `DASH_OPENAI_API_KEY`) uses HTTPS.
 
-To deploy beyond a single host, read [Deploy](operations/deploy.md) and [Scaling](operations/scaling.md); the Kubernetes and Helm manifests are being corrected in v0.3.0.
+To deploy beyond a single host, read [Deploy](operations/deploy.md) and [Scaling](operations/scaling.md). Upgrading from 0.2.x: see the [upgrade guide](operations/upgrading.md).
 
 ## Next steps
 
