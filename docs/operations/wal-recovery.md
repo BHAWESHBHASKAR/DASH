@@ -35,6 +35,20 @@ Torn tail. If the final WAL line is incomplete or fails its checksum it is
 treated as an interrupted write: `FileWal::open` truncates it, prints a
 warning and counts it in `torn_tail_dropped`. A newline-terminated legacy
 line is never treated as a torn tail; it is handled by the rules below.
+The removed bytes are first copied (and fsynced) to `<wal>.truncated-<unix
+ms>`, so nothing is destroyed irrecoverably; for example, a flipped newline
+that joins the last two records makes the joined line look torn, and the
+earlier complete record is preserved in that sidecar.
+
+Unterminated commit group. A commit group (`B2 ~grp:` begin marker) that is
+never closed at the end of the log is a crash artifact: `FileWal::open`
+truncates it (again saving the removed bytes to a `<wal>.truncated-<unix
+ms>` sidecar). This only happens when every line of the open group parses.
+An interior `B2` line that fails to parse or verify its checksum, or any
+unreadable line inside the apparently open group, is never treated as
+"no marker": `FileWal::open` fails with an error naming the line (for
+example `wal line 14: wal record checksum mismatch`) and the WAL is left
+untouched, so acknowledged groups are never cut away by interior corruption.
 
 Lenient mode (default). Replay continues past records it cannot use, and
 the service starts:

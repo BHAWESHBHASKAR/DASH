@@ -458,7 +458,8 @@ fn collect_reachable_edges(
     max_hops: usize,
 ) -> Vec<schema::ClaimEdge> {
     let mut edges = Vec::new();
-    let mut seen_edges: HashSet<String> = HashSet::new();
+    // Keyed like the store: (from, to, relation), never by edge id alone.
+    let mut seen_edges: HashSet<(String, String, schema::Relation)> = HashSet::new();
     let mut visited: HashSet<String> = start_ids.iter().cloned().collect();
     let mut frontier: Vec<String> = visited.iter().cloned().collect();
     for _ in 0..max_hops {
@@ -474,7 +475,11 @@ fn collect_reachable_edges(
                 if visited.insert(edge.to_claim_id.clone()) {
                     next.push(edge.to_claim_id.clone());
                 }
-                if seen_edges.insert(edge.edge_id.clone()) {
+                if seen_edges.insert((
+                    edge.from_claim_id.clone(),
+                    edge.to_claim_id.clone(),
+                    edge.relation.clone(),
+                )) {
                     edges.push(edge);
                 }
             }
@@ -886,6 +891,40 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reachable_edges_are_keyed_by_endpoints_and_relation_not_edge_id() {
+        let mut store = InMemoryStore::new();
+        for id in ["a", "b", "c"] {
+            store
+                .ingest_bundle(schema::claim_builder(id, "t", id, 0.5), vec![], vec![])
+                .expect("claim");
+        }
+        for (to, relation) in [
+            ("b", Relation::Supports),
+            ("c", Relation::Supports),
+            ("b", Relation::Contradicts),
+        ] {
+            store
+                .ingest_bundle(
+                    schema::claim_builder("a", "t", "a", 0.5),
+                    vec![],
+                    vec![ClaimEdge {
+                        edge_id: "dup".to_string(),
+                        from_claim_id: "a".to_string(),
+                        to_claim_id: to.to_string(),
+                        relation,
+                        strength: 0.5,
+                        reason_codes: vec![],
+                        created_at: None,
+                    }],
+                )
+                .expect("edge");
+        }
+        assert_eq!(store.edges_for_claim("a").len(), 3);
+        let edges = collect_reachable_edges(&store, "t", &["a".to_string()], 1);
+        assert_eq!(edges.len(), 3, "{edges:?}");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let mut out = std::env::temp_dir();

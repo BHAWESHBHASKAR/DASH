@@ -637,6 +637,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-e2e"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rand 0.8.7",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

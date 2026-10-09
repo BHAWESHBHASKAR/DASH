@@ -1053,3 +1053,27 @@ fn failure_window_expires_and_peer_table_is_bounded() {
     }
     assert!(throttle.peers.lock().unwrap().len() <= 10_000);
 }
+
+#[test]
+fn duplicate_authorization_headers_are_rejected_with_400() {
+    let state = Arc::new(Mutex::new(
+        ControlPlanePlacementState::new(sample_placements(1)).with_auth_token(STRONG_TOKEN),
+    ));
+    let raw = format!(
+        "GET /v1/control-plane/placement HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {STRONG_TOKEN}\r\nauthorization: Bearer other\r\nContent-Length: 0\r\n\r\n"
+    );
+    // The library entry point refuses to parse it ...
+    assert!(handle_http_request_bytes(&state, raw.as_bytes()).is_err());
+    // ... and the real socket server answers 400.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _ = serve_listener(listener, server_state, ServerConfig::default());
+    });
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(raw.as_bytes()).unwrap();
+    let mut out = String::new();
+    stream.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+}

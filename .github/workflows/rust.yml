@@ -56,7 +56,7 @@ jobs:
       - name: Run tests (all features)
         # Single-threaded: retrieval tests rely on process-global env
         # variables/locks that are not safe under the default runner.
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo test --workspace --exclude dash-e2e --all-features -- --test-threads=1
 
       - name: Release build
         run: cargo build --workspace --release
@@ -243,3 +243,29 @@ jobs:
               done
               [ "$(id -u)" != 0 ]'
           done
+
+  e2e:
+    name: End-to-end (real binaries)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build service binaries
+        run: cargo build -p ingestion -p retrieval -p control-plane
+
+      - name: Run end-to-end suite
+        # Launches the compiled binaries as child processes on loopback with
+        # ephemeral ports and generated secrets (see scripts/e2e.sh).
+        env:
+          E2E_CRASH_CYCLES: "100"
+        run: cargo test -p dash-e2e

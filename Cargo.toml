@@ -13,6 +13,7 @@ members = [
   "services/indexer",
   "services/metadata-router",
   "tests/benchmarks",
+  "tests/e2e",
   "tools/audit-verify",
   "tools/wal-inspect",
 ]

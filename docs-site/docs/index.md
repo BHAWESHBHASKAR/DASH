@@ -10,7 +10,7 @@ hide:
 
 DASH is a pre-1.0 evidence-first vector database (not yet production-ready; see the README Status section) that stores atomic **claims** with their supporting **evidence** and recorded **contradictions**. Every retrieval result ships with the citations that justify it — the source identifier, the stance (supports / contradicts / neutral), the source quality, and an optional character span — so a downstream model or a downstream auditor can answer the question *"why did the system say that?"*.
 
-- **OpenAI-compatible embeddings** — `POST /v1/embeddings` follows the OpenAI v1 request and response shape. Point an OpenAI client at DASH by setting its base URL and API key (authentication is required from v0.3.0).
+- **OpenAI-compatible embeddings** — `POST /v1/embeddings` follows the OpenAI v1 request and response shape. Point an OpenAI client at DASH by setting its base URL and API key (a credential with the `retrieve` role is required).
 - **Semantic-first retrieval** — dense-similarity is the primary ranking signal; lexical/BM25 acts as a small tie-breaker. The result is a defensible ranking for retrieval-augmented generation.
 - **On-disk storage** — a write-ahead log with checkpoints, plus a `redb` mirror (on by default when a WAL path is set). Optional SHA-256 hash-chained audit log. Recovery is tested for the single-process case; known gaps are listed in the issue register.
 
@@ -93,8 +93,8 @@ Naive RAG ranks documents by vector similarity and returns the top *k* chunks. T
 
     ---
 
-    Open source under Apache 2.0. 379 Rust tests + 86 Go + 65 TypeScript
-    + 59 Python across the workspace.
+    Open source under Apache 2.0. 807 Rust tests plus SDK tests in six
+    languages (static counts in the README).
 
     [:octicons-arrow-right-24: BHAWESHBHASKAR/DASH](https://github.com/BHAWESHBHASKAR/DASH)
 

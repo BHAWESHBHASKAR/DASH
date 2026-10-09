@@ -33,11 +33,7 @@ COMPOSE_ONLY=(
 # Variables introduced by in-flight work that the Rust sources do not read yet
 # on this branch. Remove an entry when the code that reads it lands; the
 # script reports entries that are already read so stale ones are noticed.
-PENDING_CODE=(
-  DASH_CONTROL_PLANE_TOKEN
-  DASH_ROUTER_CONTROL_PLANE_TOKEN
-  DASH_INSECURE_DEV_MODE
-)
+PENDING_CODE=()
 
 DEPLOY_FILES=()
 while IFS= read -r f; do
@@ -57,6 +53,20 @@ mapfile -t used < <(
 
 # Names the Rust sources read (string literals).
 rust_names="$(grep -rhoE '"(DASH|EME)_[A-Z0-9_]+"' --include='*.rs' services pkg | tr -d '"' | sort -u)"
+
+# The shared auth policy (services/common/src/policy.rs) builds per-service
+# names at runtime as DASH_<PREFIX>_<SUFFIX>. Derive those names from the
+# suffix literals passed to svc.var()/svc.dash() and the service prefixes so
+# they are checked against real code instead of being allow-listed by hand.
+policy_suffixes="$(grep -ohE 'svc\.(var|dash)\([^"]*"[A-Z0-9_]+"' services/common/src/policy.rs | grep -oE '"[A-Z0-9_]+"' | tr -d '"' | sort -u)"
+policy_prefixes="$(grep -rhoE 'prefix: "[A-Z_]+"' --include='*.rs' services | grep -oE '"[A-Z_]+"' | tr -d '"' | grep -vE '^(TEST|CELLTEST)$' | sort -u)"
+derived_names=""
+for prefix in ${policy_prefixes}; do
+  for suffix in ${policy_suffixes}; do
+    derived_names+="DASH_${prefix}_${suffix}"$'\n'
+  done
+done
+rust_names="$(printf '%s\n%s\n' "${rust_names}" "${derived_names}" | sort -u)"
 
 # Names consumed by the container shell scripts.
 shell_names="$(grep -ohE '\b(DASH|EME)_[A-Z0-9_]*[A-Z0-9]\b' deploy/container/scripts/*.sh | sort -u)"

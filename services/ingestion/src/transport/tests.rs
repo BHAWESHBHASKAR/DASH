@@ -1650,7 +1650,8 @@ fn handle_request_write_route_reresolves_after_leader_promotion() {
 
 #[test]
 fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack() {
-    ensure_dev_mode_env();
+    // Replication endpoints read the token env var; serialize with tests that set it.
+    let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,

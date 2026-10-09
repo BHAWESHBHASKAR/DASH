@@ -6,16 +6,16 @@ Six client SDKs live under `sdks/` in the repository. None is published to a pac
 
 | SDK | Directory | Version | Embeddings | Retrieve | Ingest | Notes |
 |---|---|---|---|---|---|---|
-| Python (`dash-py`, import `dash`) | `sdks/python` | 0.1.0 | yes | yes | no (types only) | Sync `Client` and `AsyncClient`. |
-| Go | `sdks/go` | untagged | yes | yes | no | Module path in `go.mod` is `github.com/anomalyco/dash-go`; this does not match the repository owner, so `go get` from the repository URL does not work yet. |
-| TypeScript (`dash-ts`) | `sdks/typescript` | 0.1.0 | yes | yes | no | ESM, Node 18+. |
-| Java | `sdks/java` | 0.2.0 | yes | yes | yes | Also exposes `delete`, which calls `POST /v1/delete`. The server has no such route; do not use it. |
-| Kotlin | `sdks/kotlin` | 0.2.0 | yes | yes | yes | Suspend API. Same `delete` caveat. |
-| C# | `sdks/csharp` | 0.2.0 | yes | yes | yes | Same `delete` caveat. |
+| Python (`dash-py`, import `dash`) | `sdks/python` | 0.2.0 | yes | yes (full request and response contract) | no (types only) | Sync `Client` and `AsyncClient`. |
+| Go | `sdks/go` | untagged | yes | yes | no | Module path `github.com/BHAWESHBHASKAR/DASH/sdks/go` (it was `github.com/anomalyco/dash-go` before 0.3.0; update imports). The module lives in a subdirectory and is untagged, so pin a commit or use a `replace` directive. |
+| TypeScript (`dash-ts`) | `sdks/typescript` | 0.2.0 | yes | yes | no | ESM, Node 18+. |
+| Java | `sdks/java` | 0.2.0 | yes | yes | yes | Ingest targets the ingestion service through a separate base URL. `delete` was removed. |
+| Kotlin | `sdks/kotlin` | 0.2.0 | yes | yes | yes | Suspend API wrapping the Java client. `delete` was removed. |
+| C# | `sdks/csharp` | 0.2.0 | yes | yes | yes | Ingest uses the `IngestionBaseUrl` option. `DeleteAsync` was removed. |
 
-In v0.3.0 the Java, Kotlin and C# SDKs are fixed and unified at version 0.2.0 (see the [changelog](../about/changelog.md)); the ingest methods in particular should be re-checked against the [HTTP API](../reference/api.md#ingestion-service) request shape (`claim`, `evidence`, `edges`) until then. For ingest from Python, Go or TypeScript, call `POST /v1/ingest` directly.
+In 0.3.0 the Java, Kotlin and C# SDKs were fixed and unified at version 0.2.0 (see the [changelog](../about/changelog.md)): response bodies are read once, models follow the server contract, ingest targets the ingestion service, and retries are limited to idempotent requests or requests with an `Idempotency-Key`. The Python, TypeScript and Go SDKs send and decode the full retrieve contract (`query_embedding`, `entity_filters`, `embedding_id_filters`, `time_range`, `read_consistency`, `return_graph` and the graph and confidence fields), and all default `top_k` to 5 like the server. The unit tests use mock servers with server-shaped fixtures; no test in CI runs an SDK against a live DASH. For ingest from Python, Go or TypeScript, call `POST /v1/ingest` directly.
 
-Static test counts (declarations, including live-integration tests that need a running server): Python 64, Go 89, TypeScript 69, Java 21, Kotlin 12, C# 41.
+Static test counts (declarations, including live-integration tests that need a running server): Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 50.
 
 ## Authentication
 
@@ -62,11 +62,11 @@ Each SDK has a README with install-from-source instructions and examples:
 - Kotlin: `sdks/kotlin/README.md` (coroutines).
 - C#: `sdks/csharp/README.md` (`DashClient`, sync and async methods).
 
-Where an SDK README shows a `delete` call, an unpublished package registry install command, or the phrase "byte-for-byte compatible", read it with the caveats above.
+Where an SDK README shows an unpublished package registry install command or the phrase "byte-for-byte compatible", read it with the caveats above. There is no `delete` call in any SDK.
 
 ## OpenAI clients
 
-Any OpenAI embeddings client can use the retrieval service's `/v1/embeddings` by setting its base URL to `http://localhost:8080/v1` and its API key to your retrieval key. See the [Embeddings guide](embeddings.md) for provider selection and the v0.3.0 authentication change.
+Any OpenAI embeddings client can use the retrieval service's `/v1/embeddings` by setting its base URL to `http://localhost:8080/v1` and its API key to your retrieval key. See the [Embeddings guide](embeddings.md) for provider selection and the authentication requirement.
 
 ## Live integration tests
 

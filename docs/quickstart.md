@@ -40,12 +40,12 @@ cd DASH
 cargo build --release -p ingestion -p retrieval
 ```
 
-Generate keys (at least 32 characters is required by v0.3.0's strict validation):
+Generate keys (strict validation, on by default, needs at least 16 characters for keys and tokens and 32 for JWT secrets, and rejects placeholders):
 
 ```bash
-export DASH_INGEST_API_KEY=$(openssl rand -hex 16)
-export DASH_RETRIEVAL_API_KEY=$(openssl rand -hex 16)
-export DASH_INGEST_REPLICATION_TOKEN=$(openssl rand -hex 16)
+export DASH_INGEST_API_KEY=$(openssl rand -hex 32)
+export DASH_RETRIEVAL_API_KEY=$(openssl rand -hex 32)
+export DASH_INGEST_REPLICATION_TOKEN=$(openssl rand -hex 32)
 export DASH_RETRIEVAL_REPLICATION_TOKEN=$DASH_INGEST_REPLICATION_TOKEN
 mkdir -p data
 ```
@@ -68,7 +68,7 @@ DASH_RETRIEVAL_PERSISTENCE_DISABLE=1 \
 
 Defaults: ingestion binds `127.0.0.1:8081`, retrieval `127.0.0.1:8080`. Both default to a redb file under `./data` when a WAL is configured; the retrieval command above disables it for simplicity. The full variable list is in [Configuration](../docs-site/docs/reference/configuration.md).
 
-Without a replication source, the retrieval service does not see what ingestion receives. In v0.3.0 a service refuses to start with no credentials unless `DASH_INSECURE_DEV_MODE=1` is set; the examples here always set keys.
+Without a replication source, the retrieval service does not see what ingestion receives. A service refuses to start with no credentials unless `DASH_INSECURE_DEV_MODE=1` is set (throwaway local use only; it also forces a loopback bind); the examples here always set keys. If you build from source, `--serve` is the default and can be omitted.
 
 ## Ingest your first claim
 
@@ -96,7 +96,7 @@ curl -fsS -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
-The response is `200 OK` with `{"ingested_claim_id":"c1","claims_total":1,...}`. Validation is server-side: `confidence` and `source_quality` in `[0, 1]`, `valid_from <= valid_to` if both are given, non-empty IDs. Do not blindly retry ingest calls on v0.2.x: re-sent evidence is duplicated (fixed by idempotent upserts in v0.3.0).
+The response is `200 OK` with `{"ingested_claim_id":"c1","claims_total":1,...}`. Validation is server-side: `confidence` and `source_quality` in `[0, 1]`, `valid_from <= valid_to` if both are given, non-empty IDs. Retries are safe since 0.3.0: evidence is upserted by `evidence_id` and the whole bundle is written atomically, so re-sending leaves one copy.
 
 For bulk loads use `POST /v1/ingest/batch` (an `items` array and an optional `commit_id`), or `POST /v1/ingest/document` to extract sentence claims from text. See the [API reference](../docs-site/docs/reference/api.md).
 
@@ -145,7 +145,7 @@ The response is an object whose `results` array holds flat result records (abrid
 
 ## Use the OpenAI-compatible API
 
-The retrieval service exposes `POST /v1/embeddings` with the OpenAI v1 embeddings request and response shape. It requires authentication as of v0.3.0 (it is unauthenticated in v0.2.x; do not expose it publicly). The default provider is a deterministic hash embedder, which is for development and not semantic; set `DASH_EMBEDDING_PROVIDER=ollama` for real vectors.
+The retrieval service exposes `POST /v1/embeddings` with the OpenAI v1 embeddings request and response shape. It requires a credential with the `retrieve` role (it was open before 0.3.0). The default provider is a deterministic hash embedder, which is for development and not semantic; set `DASH_EMBEDDING_PROVIDER=ollama` for real vectors.
 
 ```bash
 curl -fsS -X POST http://localhost:8080/v1/embeddings \

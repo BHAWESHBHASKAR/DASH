@@ -68,7 +68,7 @@ Required role per route:
 |------------------------------------------------------------------|-------------|
 | retrieval `/v1/retrieve`, `/v1/embeddings`                       | `retrieve`  |
 | retrieval `/debug/*`, `/metrics`; ingestion `/debug/*`, `/metrics` | `read_only` |
-| ingestion `/v1/ingest`, `/v1/ingest/raw`, `/v1/ingest/batch`     | `ingest`    |
+| ingestion `/v1/ingest`, `/v1/ingest/raw`, `/v1/ingest/document`, `/v1/ingest/batch` | `ingest` |
 
 ## Where roles come from
 
@@ -92,7 +92,8 @@ settings.
 | `DASH_*_API_KEY_SCOPES` | unset | `key:tenant1,tenant2[:role1,role2];...` |
 | `DASH_*_API_KEY_DEFAULT_ROLES` | service primary role | roles for legacy keys and scoped keys without roles |
 | `DASH_*_REVOKED_API_KEYS`, `DASH_*_REVOKED_KEYS_PATH` | unset | revoked keys (list / file, file reloaded when mtime or size changes, checked at most once per second) |
-| `DASH_*_JWT_HS256_SECRET`, `_SECRETS`, `_SECRETS_BY_KID` | unset | HS256 signing secrets; with strict secrets each must be at least 32 characters and not a placeholder |
+| `DASH_*_JWT_HS256_SECRET`, `_SECRETS`, `_SECRETS_BY_KID` | unset | HS256 signing secrets; with strict secrets (the default) each must be at least 32 characters and not a placeholder |
+| `DASH_STRICT_SECRETS` | on | strict validation; API keys, scoped keys and the replication token need at least 16 characters and no placeholder text. Only `DASH_STRICT_SECRETS=0` together with `DASH_INSECURE_DEV_MODE=1` turns it off |
 | `DASH_*_JWT_ISSUER`, `DASH_*_JWT_AUDIENCE` | unset (HS256), **required** (OIDC) | expected `iss` / `aud` |
 | `DASH_*_JWT_ROLES_CLAIM` (alias `DASH_*_JWT_ROLE_CLAIM`) | `dash_roles` | name of the role claim |
 | `DASH_*_JWT_DEFAULT_ROLES` | none | comma/space list of roles for tokens without the role claim |

@@ -1,11 +1,12 @@
-# Audit chain (SEC-17 hotfix)
+# Audit chain
 
 Both services append JSON lines to `DASH_INGEST_AUDIT_LOG_PATH` /
 `DASH_RETRIEVAL_AUDIT_LOG_PATH`. The writer, the canonical encoding and the
 verifier live in one place: `services/common/src/audit.rs`. The verifier is
 the `audit-verify` binary (`tools/audit-verify`); `scripts/verify_audit_chain.sh`
-is a thin wrapper around it. The HMAC/KMS/signed-checkpoint redesign (ADR-09)
-is a later phase.
+is a thin wrapper around it. The HMAC/KMS/signed-checkpoint redesign (ADR-09
+in the master plan) is a later phase (P4); the chain described here is
+**unkeyed**.
 
 ## Canonical encoding (record version 2)
 

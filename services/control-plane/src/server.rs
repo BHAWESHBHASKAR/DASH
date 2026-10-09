@@ -132,7 +132,17 @@ pub(crate) fn parse_head(head: &str) -> Result<HttpRequest, String> {
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "malformed header line".to_string())?;
-        headers.push((name.trim().to_string(), value.trim().to_string()));
+        let name = name.trim().to_string();
+        // A repeated credential header is ambiguous between proxy and
+        // server; refuse it instead of picking one.
+        if name.eq_ignore_ascii_case("authorization")
+            && headers
+                .iter()
+                .any(|(existing, _): &(String, String)| existing.eq_ignore_ascii_case(&name))
+        {
+            return Err("duplicate credential header is not allowed".to_string());
+        }
+        headers.push((name, value.trim().to_string()));
     }
     Ok(HttpRequest {
         method: method.to_string(),

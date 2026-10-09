@@ -190,3 +190,53 @@ fn records_from_older_versions_without_an_instance_id_still_parse() {
     let lease = LeaderLease::new("node-a", &path, 1_000, 100);
     assert!(!lease.holds(&record));
 }
+
+#[cfg(unix)]
+#[test]
+fn epoch_floor_sidecar_is_owner_only_and_never_follows_symlinks() {
+    let dir = temp_dir("lease-floor-modes");
+    let lease_path = dir.join("lease.txt");
+    let lease = LeaderLease::new("node-a", &lease_path, 1_000, 100);
+    assert!(lease.try_acquire(0).unwrap());
+    assert_eq!(mode_of(&lease.epoch_floor_path()), 0o600);
+
+    // A planted symlink as the floor sidecar is refused, not followed.
+    let dir = temp_dir("lease-floor-symlink");
+    let victim = dir.join("victim.txt");
+    fs::write(&victim, "precious").unwrap();
+    let lease_path = dir.join("lease.txt");
+    let lease = LeaderLease::new("node-a", &lease_path, 1_000, 100);
+    std::os::unix::fs::symlink(&victim, lease.epoch_floor_path()).unwrap();
+    assert!(lease.try_acquire(0).is_err());
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+}
+
+#[test]
+fn forged_lease_epoch_never_poisons_the_floor_sidecar() {
+    let dir = temp_dir("lease-floor-forged-lease");
+    let path = dir.join("lease.txt");
+    forge(&path, "attacker", u64::MAX, u64::MAX, "x");
+    let refused = LeaderLease::new("node-a", &path, 1_000, 100);
+    assert!(refused.try_acquire(0).is_err());
+    // Nothing was written to the floor while refusing.
+    assert!(!refused.epoch_floor_path().exists());
+
+    let lease = LeaderLease::new("node-a", &path, 1_000, 100).with_lease_reset(true);
+    assert!(lease.try_acquire(0).unwrap());
+    assert_eq!(lease.fencing_token().unwrap(), Some(1));
+    assert_eq!(read_epoch_floor(&lease.epoch_floor_path()).unwrap(), 1);
+}
+
+#[test]
+fn forged_floor_sidecar_is_refused_until_reset() {
+    let dir = temp_dir("lease-floor-forged-floor");
+    let path = dir.join("lease.txt");
+    let probe = LeaderLease::new("node-a", &path, 1_000, 100);
+    fs::write(probe.epoch_floor_path(), format!("{}\n", u64::MAX)).unwrap();
+    let err = probe.try_acquire(0).expect_err("forged floor");
+    assert!(err.contains("DASH_CONTROL_PLANE_LEASE_RESET=1"), "{err}");
+
+    let lease = LeaderLease::new("node-a", &path, 1_000, 100).with_lease_reset(true);
+    assert!(lease.try_acquire(0).unwrap());
+    assert_eq!(lease.fencing_token().unwrap(), Some(1));
+}

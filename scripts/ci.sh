@@ -14,7 +14,7 @@ echo "[ci] cargo test"
 # Run tests single-threaded: the retrieval integration tests use
 # process-global environment variables and locks that are not safe
 # under cargo's default multi-threaded test runner.
-cargo test --workspace -- --test-threads=1
+cargo test --workspace --exclude dash-e2e -- --test-threads=1
 
 BENCH_GUARD_MAX_REGRESSION_PCT="${DASH_BENCH_GUARD_MAX_REGRESSION_PCT:-${EME_BENCH_GUARD_MAX_REGRESSION_PCT:-50}}"
 INCLUDE_LARGE_GUARD="${DASH_CI_INCLUDE_LARGE_GUARD:-${EME_CI_INCLUDE_LARGE_GUARD:-false}}"

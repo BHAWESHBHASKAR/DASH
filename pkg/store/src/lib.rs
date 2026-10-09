@@ -42,7 +42,7 @@ pub use wal::{
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
-    complete_group_prefix_len, is_group_marker_commit_id,
+    batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -227,6 +227,9 @@ pub struct InMemoryStore {
     /// `Some` only on detached clones: disk writes recorded for
     /// `commit_staged`.
     staged_disk_ops: Option<Vec<StagedDiskOp>>,
+    /// Claim ids of legacy claim records a replication follower skipped, so
+    /// records depending on them are skipped too.
+    replica_skipped_claims: HashSet<String>,
 }
 
 impl Clone for InMemoryStore {
@@ -339,6 +342,7 @@ impl InMemoryStore {
             disk: None,
             disk_status: self.disk_status.clone(),
             staged_disk_ops: Some(Vec::new()),
+            replica_skipped_claims: self.replica_skipped_claims.clone(),
         }
     }
 
@@ -904,6 +908,90 @@ impl InMemoryStore {
 
     pub fn apply_persisted_record_line(&mut self, line: &str) -> Result<(), StoreError> {
         self.apply_persisted_record(line_to_record(line)?)
+    }
+
+    /// Applies one replicated line the way lenient WAL replay would: a legacy
+    /// record that cannot be parsed or validated, a poisoned vector, and a
+    /// record depending on a skipped legacy claim are skipped (`Ok(false)`)
+    /// instead of failing, so a follower converges to the leader's lenient
+    /// replay state rather than wedging. Everything else behaves like
+    /// [`InMemoryStore::apply_persisted_record_line`]; `Ok(true)` means the
+    /// line was applied.
+    pub fn apply_persisted_record_line_lenient(&mut self, line: &str) -> Result<bool, StoreError> {
+        let kind = line.split('\t').next().unwrap_or_default();
+        let legacy = matches!(kind, "C" | "E" | "G" | "V" | "B");
+        let record = match line_to_record(line) {
+            Ok(record) => record,
+            Err(err) => {
+                if !legacy {
+                    return Err(err);
+                }
+                eprintln!("warning: replication skipping unreadable legacy record: {err:?}");
+                if kind == "C"
+                    && let Some(id) = line.split('\t').nth(1)
+                    && let Ok(id) = wal::unescape_field(id)
+                {
+                    self.replica_skipped_claims.insert(id);
+                }
+                return Ok(false);
+            }
+        };
+        let depends = match &record {
+            PersistedRecord::Evidence(e) => self.replica_skipped_claims.contains(&e.claim_id),
+            PersistedRecord::Edge(e) => {
+                self.replica_skipped_claims.contains(&e.from_claim_id)
+                    || self.replica_skipped_claims.contains(&e.to_claim_id)
+            }
+            PersistedRecord::ClaimVector(v) => self.replica_skipped_claims.contains(&v.claim_id),
+            PersistedRecord::Claim(_) | PersistedRecord::BatchCommit(_) => false,
+        };
+        if depends {
+            return Ok(false);
+        }
+        if let PersistedRecord::ClaimVector(v) = &record
+            && let Err(
+                StoreError::InvalidVector(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::Validation(_),
+            ) = self.validate_claim_vector(&v.claim_id, &v.values)
+        {
+            eprintln!(
+                "warning: replication skipping poisoned vector for '{}'",
+                v.claim_id
+            );
+            return Ok(false);
+        }
+        let claim_id = match &record {
+            PersistedRecord::Claim(c) => Some(c.claim_id.clone()),
+            _ => None,
+        };
+        let known_claim = claim_id
+            .as_ref()
+            .is_some_and(|id| self.claims.contains_key(id));
+        match self.apply_persisted_record(record) {
+            Ok(()) => {
+                if let Some(id) = claim_id {
+                    self.replica_skipped_claims.remove(&id);
+                }
+                Ok(true)
+            }
+            Err(
+                err @ (StoreError::Validation(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::InvalidVector(_)),
+            ) if legacy => {
+                eprintln!(
+                    "warning: replication skipping legacy record that fails validation: {err:?}"
+                );
+                if let Some(id) = claim_id
+                    && !known_claim
+                {
+                    self.replica_skipped_claims.insert(id);
+                }
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {

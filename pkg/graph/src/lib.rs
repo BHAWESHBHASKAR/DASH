@@ -82,7 +82,8 @@ pub fn traverse_edges_multi_hop(
     }
 
     let mut visited_nodes: HashSet<String> = HashSet::new();
-    let mut seen_edges: HashSet<String> = HashSet::new();
+    // Edges are keyed by (from, to, relation) like the store, not by edge id.
+    let mut seen_edges: HashSet<(&str, &str, &Relation)> = HashSet::new();
     let mut queue: VecDeque<(String, usize)> = VecDeque::new();
 
     for claim_id in start_claim_ids {
@@ -97,7 +98,11 @@ pub fn traverse_edges_multi_hop(
             continue;
         }
         for edge in outgoing.get(claim_id.as_str()).into_iter().flatten() {
-            if seen_edges.insert(edge.edge_id.clone()) {
+            if seen_edges.insert((
+                edge.from_claim_id.as_str(),
+                edge.to_claim_id.as_str(),
+                &edge.relation,
+            )) {
                 out.push((*edge).clone());
             }
             if visited_nodes.insert(edge.to_claim_id.clone()) {
@@ -647,6 +652,18 @@ mod tests {
             reason_codes: vec![],
             created_at: None,
         }
+    }
+
+    #[test]
+    fn multi_hop_keeps_edges_that_share_an_edge_id_but_differ_in_target() {
+        // The store keys edges by (from, to, relation); edge ids may repeat.
+        let edges = [
+            edge("dup", "a", "b", Relation::Supports),
+            edge("dup", "a", "c", Relation::Supports),
+            edge("dup", "a", "b", Relation::Contradicts),
+        ];
+        let out = traverse_edges_multi_hop(&["a".to_string()], &edges, 1);
+        assert_eq!(out.len(), 3, "{out:?}");
     }
 
     #[test]

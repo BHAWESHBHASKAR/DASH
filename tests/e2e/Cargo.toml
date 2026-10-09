@@ -1,0 +1,16 @@
+[package]
+name = "dash-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Black-box end-to-end tests: they launch the real compiled `ingestion`,
+# `retrieval` and `control-plane` binaries as child processes and talk to
+# them over loopback sockets. Nothing from the services is linked in.
+
+[dependencies]
+serde_json = { workspace = true }
+rand = { workspace = true }
+tempfile = "3"
+sha2 = { workspace = true }
+base64 = { workspace = true }

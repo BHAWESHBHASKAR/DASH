@@ -87,6 +87,7 @@ pub(super) fn handle_get_request(
                     rt.flush_wal_if_due();
                     let mut text = rt.metrics_text();
                     text.push_str(&rt.replication_follower_metrics_text());
+                    text.push_str(&rt.replication_leader_metrics_text());
                     text
                 }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
