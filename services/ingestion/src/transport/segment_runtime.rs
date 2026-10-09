@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use indexer::{
     CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentPublishOptions, SegmentStoreError,
-    maintain_segment_root_report, publish_claims_to_dir, resolve_tenant_dir,
+    maintain_segment_root_report, publish_claims_to_dir, resolve_tenant_dir, write_tenant_marker,
 };
 use store::InMemoryStore;
 
@@ -88,6 +88,8 @@ impl SegmentRuntime {
     ) -> Result<SegmentPublishStats, SegmentStoreError> {
         let claims = store.claims_for_tenant(tenant_id);
         let tenant_dir = self.tenant_segment_dir(tenant_id);
+        // Record the owner so a directory is never ambiguous again.
+        write_tenant_marker(&tenant_dir, tenant_id)?;
         let result = publish_claims_to_dir(
             &tenant_dir,
             &claims,
@@ -152,6 +154,16 @@ mod tests {
         rt.publish_for_tenant(&store, "a.b").expect("publish a.b");
         rt.publish_for_tenant(&store, "a_b").expect("publish a_b");
         assert_eq!(std::fs::read_dir(&root).expect("root exists").count(), 2);
+        // Each directory records its owner.
+        for tenant in ["a.b", "a_b"] {
+            let dir = rt.tenant_segment_dir(tenant);
+            assert_eq!(
+                indexer::read_tenant_marker(&dir)
+                    .expect("marker")
+                    .as_deref(),
+                Some(tenant)
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

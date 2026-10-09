@@ -109,6 +109,9 @@ impl From<std::io::Error> for SegmentStoreError {
 
 const MANIFEST_FILE_NAME: &str = "segments.manifest";
 const MANIFEST_HEADER: &str = "DASHSEG-MANIFEST\t1";
+/// Names the tenant that owns a segment directory (see [`write_tenant_marker`]).
+const TENANT_MARKER_FILE_NAME: &str = "segments.tenant";
+const TENANT_MARKER_HEADER: &str = "DASHSEG-TENANT\t1";
 const SEGMENT_FILE_SUFFIX: &str = ".seg";
 const SEGMENT_HEADER: &str = "DASHSEG\t1";
 const FINGERPRINT_FILE_NAME: &str = "segments.fingerprint";
@@ -186,9 +189,12 @@ pub fn legacy_tenant_dir_name(tenant_id: &str) -> String {
 /// Safe to call concurrently from several threads or processes: `rename` is
 /// atomic and losers of the race simply observe the migrated directory.
 ///
-/// Note: legacy names were ambiguous, so a legacy directory that was shared by
-/// colliding tenants is adopted by whichever tenant touches it first. Segment
-/// data is derived and is rewritten wholesale on the next publish.
+/// Legacy names were ambiguous (`acme.corp` and `acme_corp` shared one
+/// directory), so a legacy directory is only migrated when it carries a tenant
+/// marker (`segments.tenant`) naming exactly this tenant. Directories written
+/// by older versions have no marker: they are left untouched with a warning
+/// and the tenant starts with a fresh directory. Segment data is derived and is
+/// rewritten wholesale on the next publish, so nothing is lost.
 pub fn resolve_tenant_dir(root_dir: &Path, tenant_id: &str) -> PathBuf {
     let new_dir = root_dir.join(tenant_dir_name(tenant_id));
     let legacy_name = legacy_tenant_dir_name(tenant_id);
@@ -197,6 +203,22 @@ pub fn resolve_tenant_dir(root_dir: &Path, tenant_id: &str) -> PathBuf {
     }
     let legacy_dir = root_dir.join(&legacy_name);
     if legacy_dir.is_dir() && !new_dir.exists() {
+        match read_tenant_marker(&legacy_dir) {
+            Ok(Some(owner)) if owner == tenant_id => {}
+            Ok(Some(_)) => return new_dir,
+            Ok(None) => {
+                warn_legacy_dir_not_migrated(&legacy_dir);
+                return new_dir;
+            }
+            Err(err) => {
+                eprintln!(
+                    "indexer: legacy segment dir '{}' has an unreadable tenant marker ({err:?}); \
+                     not migrating it",
+                    legacy_dir.display()
+                );
+                return new_dir;
+            }
+        }
         match rename(&legacy_dir, &new_dir) {
             Ok(()) => {
                 let _ = sync_dir(root_dir);
@@ -217,6 +239,76 @@ pub fn resolve_tenant_dir(root_dir: &Path, tenant_id: &str) -> PathBuf {
         }
     }
     new_dir
+}
+
+fn warn_legacy_dir_not_migrated(legacy_dir: &Path) {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut warned| warned.insert(legacy_dir.to_path_buf()))
+        .unwrap_or(true);
+    if first {
+        eprintln!(
+            "indexer: legacy segment dir '{}' has no tenant marker, so its owner is ambiguous; \
+             leaving it untouched and rebuilding the tenant's segments in a new directory",
+            legacy_dir.display()
+        );
+    }
+}
+
+/// Records which tenant owns `tenant_dir` (`segments.tenant`), creating the
+/// directory when needed. Idempotent for the same tenant; fails when the
+/// directory already belongs to a different tenant.
+pub fn write_tenant_marker(tenant_dir: &Path, tenant_id: &str) -> Result<(), SegmentStoreError> {
+    create_dir_all(tenant_dir)?;
+    if let Some(existing) = read_tenant_marker(tenant_dir)? {
+        return if existing == tenant_id {
+            Ok(())
+        } else {
+            Err(SegmentStoreError::Integrity(format!(
+                "segment directory '{}' belongs to a different tenant",
+                tenant_dir.display()
+            )))
+        };
+    }
+    let path = tenant_dir.join(TENANT_MARKER_FILE_NAME);
+    let tmp_path = temp_path(&path);
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        writeln!(file, "{TENANT_MARKER_HEADER}")?;
+        writeln!(file, "{}", escape_field(tenant_id))?;
+        file.sync_all()?;
+    }
+    rename(tmp_path, path)?;
+    sync_dir(tenant_dir)?;
+    Ok(())
+}
+
+/// The tenant recorded by [`write_tenant_marker`], or `None` for directories
+/// written before markers existed.
+pub fn read_tenant_marker(tenant_dir: &Path) -> Result<Option<String>, SegmentStoreError> {
+    let raw = match std::fs::read_to_string(tenant_dir.join(TENANT_MARKER_FILE_NAME)) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut lines = raw.lines();
+    if lines.next() != Some(TENANT_MARKER_HEADER) {
+        return Err(SegmentStoreError::Parse(
+            "tenant marker header is invalid".to_string(),
+        ));
+    }
+    let Some(tenant) = lines.next() else {
+        return Err(SegmentStoreError::Parse(
+            "tenant marker has no tenant id".to_string(),
+        ));
+    };
+    unescape_field(tenant).map(Some)
 }
 
 pub fn classify_claim_tier(claim: &Claim) -> Tier {
@@ -1452,6 +1544,7 @@ mod tests {
             }],
         )
         .unwrap();
+        write_tenant_marker(&legacy, "acme.corp").unwrap();
 
         let resolved = resolve_tenant_dir(&root, "acme.corp");
         assert_eq!(resolved, root.join(tenant_dir_name("acme.corp")));
@@ -1481,6 +1574,7 @@ mod tests {
             }],
         )
         .unwrap();
+        write_tenant_marker(&legacy, "a.b").unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
         let handles: Vec<_> = (0..16)
             .map(|_| {
@@ -1520,6 +1614,93 @@ mod tests {
         let (_, b) = load_current_segments(&dir_b).unwrap().unwrap();
         assert_eq!(a[0].claim_ids, vec!["claim-a".to_string()]);
         assert_eq!(b[0].claim_ids, vec!["claim-b".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- review finding 10: legacy directory adoption --------------------------
+
+    fn legacy_dir_with_segments(root: &Path, legacy_name: &str, claim: &str) -> PathBuf {
+        let legacy = root.join(legacy_name);
+        persist_segments_atomic(
+            &legacy,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec![claim.into()],
+            }],
+        )
+        .unwrap();
+        legacy
+    }
+
+    /// Old-format directories (no tenant marker) are ambiguous: neither
+    /// colliding tenant may adopt them, whichever touches them first.
+    #[test]
+    fn old_format_legacy_dir_is_adopted_by_no_colliding_tenant() {
+        let root = temp_dir("legacy-old-format");
+        let legacy = legacy_dir_with_segments(&root, "acme_corp", "belongs-to-someone");
+        let manifest_before = fs::read(legacy.join(MANIFEST_FILE_NAME)).unwrap();
+
+        for tenant in ["acme.corp", "acme_corp", "acme corp"] {
+            let resolved = resolve_tenant_dir(&root, tenant);
+            assert_eq!(resolved, root.join(tenant_dir_name(tenant)));
+            assert!(!resolved.exists(), "{tenant} must start with an empty dir");
+        }
+        // The legacy directory is untouched, still holding the old data.
+        assert!(legacy.is_dir());
+        assert_eq!(
+            fs::read(legacy.join(MANIFEST_FILE_NAME)).unwrap(),
+            manifest_before
+        );
+        let (_, segments) = load_current_segments(&legacy).unwrap().unwrap();
+        assert_eq!(
+            segments[0].claim_ids,
+            vec!["belongs-to-someone".to_string()]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_dir_is_migrated_only_by_the_tenant_its_marker_names() {
+        let root = temp_dir("legacy-marker");
+        let legacy = legacy_dir_with_segments(&root, "acme_corp", "c-dot");
+        write_tenant_marker(&legacy, "acme.corp").unwrap();
+        assert_eq!(
+            read_tenant_marker(&legacy).unwrap().as_deref(),
+            Some("acme.corp")
+        );
+
+        // The colliding tenant does not get it, and does not disturb it.
+        let other = resolve_tenant_dir(&root, "acme_corp");
+        assert_eq!(other, root.join(tenant_dir_name("acme_corp")));
+        assert!(legacy.is_dir() && !other.exists());
+
+        // The named tenant migrates it.
+        let owner = resolve_tenant_dir(&root, "acme.corp");
+        assert_eq!(owner, root.join(tenant_dir_name("acme.corp")));
+        assert!(!legacy.exists());
+        let (_, segments) = load_current_segments(&owner).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids, vec!["c-dot".to_string()]);
+        assert_eq!(
+            read_tenant_marker(&owner).unwrap().as_deref(),
+            Some("acme.corp")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tenant_marker_round_trips_awkward_ids_and_is_never_rewritten() {
+        let root = temp_dir("marker-roundtrip");
+        let dir = root.join("t");
+        assert_eq!(read_tenant_marker(&dir).unwrap(), None);
+        write_tenant_marker(&dir, "tab\there\nnewline\\").unwrap();
+        assert_eq!(
+            read_tenant_marker(&dir).unwrap().as_deref(),
+            Some("tab\there\nnewline\\")
+        );
+        // A second tenant cannot overwrite the first claim on the directory.
+        assert!(write_tenant_marker(&dir, "someone-else").is_err());
+        write_tenant_marker(&dir, "tab\there\nnewline\\").unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
