@@ -30,11 +30,15 @@ pub(crate) struct Bm25Context {
     avg_doc_len: f32,
 }
 
-pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
+pub(crate) use wal::{
+    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, ReplayItem, line_to_record,
+    record_to_line,
+};
 pub use wal::{
-    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
-    WalReplicationDelta, WalReplicationExport, WalReplicationFrame, WalRollbackPoint,
-    WalWritePolicy,
+    CheckpointPolicy, FileWal, ReplayPolicy, WAL_REPLAY_STRICT_ENV, WalCheckpointStats, WalEvent,
+    WalInspection, WalInvalidLine, WalRepairOptions, WalRepairReport, WalReplayBoundary,
+    WalReplayStats, WalReplicationDelta, WalReplicationExport, WalReplicationFrame,
+    WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -384,32 +388,9 @@ impl InMemoryStore {
             store: &mut InMemoryStore,
             wal: &mut FileWal,
         ) -> Result<StoreLoadStats, String> {
-            let (records, replay_stats) = wal
-                .replay_records_with_stats()
-                .map_err(|e| format!("wal replay: {e:?}"))?;
-            let mut claims_loaded = 0usize;
-            let mut evidence_loaded = 0usize;
-            let mut edges_loaded = 0usize;
-            let mut vectors_loaded = 0usize;
-            for record in records {
-                match &record {
-                    PersistedRecord::Claim(_) => claims_loaded += 1,
-                    PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                    PersistedRecord::Edge(_) => edges_loaded += 1,
-                    PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
-                    PersistedRecord::BatchCommit(_) => {}
-                }
-                store
-                    .apply_persisted_record(record)
-                    .map_err(|e| format!("apply_persisted_record: {e:?}"))?;
-            }
-            Ok(StoreLoadStats {
-                replay: replay_stats,
-                claims_loaded,
-                evidence_loaded,
-                edges_loaded,
-                vectors_loaded,
-            })
+            store
+                .replay_wal(wal, ReplayPolicy::from_env())
+                .map_err(|e| format!("wal replay: {e:?}"))
         }
 
         // 1. Open the disk. If the open fails, fall back to the
@@ -475,33 +456,138 @@ impl InMemoryStore {
         wal: &FileWal,
         ann_tuning: AnnTuningConfig,
     ) -> Result<(Self, StoreLoadStats), StoreError> {
+        Self::load_from_wal_with_policy(wal, ann_tuning, ReplayPolicy::from_env())
+    }
+
+    /// Like [`Self::load_from_wal_with_stats_and_ann_tuning`] with an explicit
+    /// [`ReplayPolicy`] instead of the `DASH_WAL_REPLAY_STRICT` environment
+    /// variable.
+    pub fn load_from_wal_with_policy(
+        wal: &FileWal,
+        ann_tuning: AnnTuningConfig,
+        policy: ReplayPolicy,
+    ) -> Result<(Self, StoreLoadStats), StoreError> {
         let mut store = Self::new_with_ann_tuning(ann_tuning);
-        let (records, replay_stats) = wal.replay_records_with_stats()?;
+        let stats = store.replay_wal(wal, policy)?;
+        Ok((store, stats))
+    }
+
+    /// Replays the snapshot and WAL into `self`.
+    ///
+    /// Lenient policy: a legacy (pre-checksum) record that cannot be parsed
+    /// or fails validation, and a vector that fails validation, is copied to
+    /// `<wal>.quarantine`, counted in `quarantined_records` and skipped;
+    /// records that depend on a quarantined claim are skipped and counted in
+    /// `dependent_skipped`. Any other record that cannot be applied, and every
+    /// such record under the strict policy, fails the load.
+    fn replay_wal(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+    ) -> Result<StoreLoadStats, StoreError> {
+        fn hard(err: StoreError, origin: &str) -> StoreError {
+            match err {
+                StoreError::Validation(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::InvalidVector(_) => StoreError::Parse(format!("{origin}: {err:?}")),
+                other => other,
+            }
+        }
+        let lenient = policy == ReplayPolicy::Lenient;
+        let replay = wal.replay_with_policy(policy)?;
+        let mut stats = replay.stats;
+        let mut sink = replay.sink;
+        let mut bad_claims = replay.quarantined_claim_ids;
         let mut claims_loaded = 0usize;
         let mut evidence_loaded = 0usize;
         let mut edges_loaded = 0usize;
         let mut vectors_loaded = 0usize;
 
-        for record in records {
-            match &record {
-                PersistedRecord::Claim(_) => claims_loaded += 1,
-                PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                PersistedRecord::Edge(_) => edges_loaded += 1,
-                PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
-                PersistedRecord::BatchCommit(_) => {}
+        for item in replay.items {
+            if lenient && !bad_claims.is_empty() && item.depends_on(&bad_claims) {
+                eprintln!(
+                    "warning: skipping {} (depends on a quarantined claim)",
+                    item.origin
+                );
+                sink.push(&item.quarantine_line());
+                stats.dependent_skipped += 1;
+                continue;
             }
-            store.apply_persisted_record(record)?;
+            let ReplayItem {
+                record,
+                legacy,
+                raw,
+                origin,
+            } = item;
+            if lenient
+                && let PersistedRecord::ClaimVector(v) = &record
+                && let Err(
+                    e @ (StoreError::InvalidVector(_)
+                    | StoreError::MissingClaim(_)
+                    | StoreError::Validation(_)),
+                ) = self.validate_claim_vector(&v.claim_id, &v.values)
+            {
+                eprintln!("warning: quarantining poisoned vector at {origin}: {e:?}");
+                sink.push(&raw.unwrap_or_else(|| record_to_line(&record)));
+                stats.quarantined_records += 1;
+                continue;
+            }
+            let claim_id = match &record {
+                PersistedRecord::Claim(c) if legacy || !bad_claims.is_empty() => {
+                    Some(c.claim_id.clone())
+                }
+                _ => None,
+            };
+            let counter = match &record {
+                PersistedRecord::Claim(_) => Some(0),
+                PersistedRecord::Evidence(_) => Some(1),
+                PersistedRecord::Edge(_) => Some(2),
+                PersistedRecord::ClaimVector(_) => Some(3),
+                PersistedRecord::BatchCommit(_) => None,
+            };
+            let known_claim = claim_id
+                .as_ref()
+                .is_some_and(|id| self.claims.contains_key(id));
+            match self.apply_persisted_record(record) {
+                Ok(()) => {
+                    match counter {
+                        Some(0) => claims_loaded += 1,
+                        Some(1) => evidence_loaded += 1,
+                        Some(2) => edges_loaded += 1,
+                        Some(3) => vectors_loaded += 1,
+                        _ => {}
+                    }
+                    if let Some(id) = &claim_id {
+                        bad_claims.remove(id);
+                    }
+                }
+                Err(
+                    e @ (StoreError::Validation(_)
+                    | StoreError::MissingClaim(_)
+                    | StoreError::InvalidVector(_)),
+                ) if lenient && legacy => {
+                    eprintln!("warning: quarantining legacy record at {origin}: {e:?}");
+                    if let Some(line) = &raw {
+                        sink.push(line);
+                    }
+                    stats.quarantined_records += 1;
+                    if let Some(id) = claim_id
+                        && !known_claim
+                    {
+                        bad_claims.insert(id);
+                    }
+                }
+                Err(e) => return Err(hard(e, &origin)),
+            }
         }
-        Ok((
-            store,
-            StoreLoadStats {
-                replay: replay_stats,
-                claims_loaded,
-                evidence_loaded,
-                edges_loaded,
-                vectors_loaded,
-            },
-        ))
+        sink.flush()?;
+        Ok(StoreLoadStats {
+            replay: stats,
+            claims_loaded,
+            evidence_loaded,
+            edges_loaded,
+            vectors_loaded,
+        })
     }
 
     pub fn ingest_bundle(
