@@ -741,7 +741,7 @@ fn transport_denies_cross_tenant_ingest_for_jwt_claim_scope() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-allowed\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-allowed\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp},\"dash_roles\":[\"ingest\"]}}"
         ),
         "jwt-secret",
     )
@@ -772,7 +772,7 @@ fn transport_denies_expired_ingest_jwt() {
     let exp = now_unix_secs().saturating_sub(10);
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp},\"dash_roles\":[\"ingest\"]}}"
         ),
         "jwt-secret",
     )
@@ -807,7 +807,7 @@ fn transport_allows_ingest_jwt_signed_with_rotation_fallback_secret() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp},\"dash_roles\":[\"ingest\"]}}"
         ),
         "previous-secret",
     )
@@ -841,7 +841,7 @@ fn transport_allows_ingest_jwt_signed_with_kid_secret() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token_with_kid(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"ingestion\",\"exp\":{exp},\"dash_roles\":[\"ingest\"]}}"
         ),
         "next-secret",
         Some("next"),
@@ -935,6 +935,12 @@ fn transport_jwt_only_config_rejects_ingest_without_a_token() {
 fn transport_metrics_and_debug_require_authentication_but_probes_stay_open() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let _api_key = EnvVarGuard::set("DASH_INGEST_API_KEY", OsStr::new(STRONG_API_KEY));
+    // Legacy keys default to the ingest role only; reading metrics and debug
+    // endpoints needs read_only as well.
+    let _roles = EnvVarGuard::set(
+        "DASH_INGEST_API_KEY_DEFAULT_ROLES",
+        OsStr::new("ingest,read_only"),
+    );
     let runtime = sample_runtime();
     let get = |path: &str, headers: &str| {
         send(

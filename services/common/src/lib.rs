@@ -17,6 +17,7 @@ pub mod policy;
 
 pub use policy::{
     AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, ServiceAuthEnv, TenantRateLimiter,
+    spawn_sighup_reload,
 };
 
 pub struct ShutdownSignal {
@@ -179,6 +180,73 @@ fn strict_secrets_from(strict_flag: Option<bool>, dev_mode: bool) -> bool {
     !(strict_flag == Some(false) && dev_mode)
 }
 
+/// Result of applying the dev-mode bind policy to a requested bind address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindDecision {
+    pub addr: String,
+    /// Set when the requested host was replaced by `127.0.0.1`.
+    pub overridden: bool,
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Pure bind policy. In dev mode (no authentication may be configured) the
+/// service only listens on loopback: any other host is replaced by
+/// `127.0.0.1`, keeping the port, unless `allow_non_loopback` is set. Outside
+/// dev mode the requested address is used unchanged.
+pub fn bind_for_mode(requested: &str, dev_mode: bool, allow_non_loopback: bool) -> BindDecision {
+    let requested = requested.trim();
+    if !dev_mode || allow_non_loopback {
+        return BindDecision {
+            addr: requested.to_string(),
+            overridden: false,
+        };
+    }
+    let (host, port) = match requested.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => (requested, "0"),
+    };
+    if host_is_loopback(host) {
+        BindDecision {
+            addr: requested.to_string(),
+            overridden: false,
+        }
+    } else {
+        BindDecision {
+            addr: format!("127.0.0.1:{port}"),
+            overridden: true,
+        }
+    }
+}
+
+/// Apply [`bind_for_mode`] using `DASH_INSECURE_DEV_MODE` and
+/// `DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK`, logging a warning when the
+/// requested address is overridden.
+pub fn resolve_bind_addr(requested: &str) -> String {
+    let dev = insecure_dev_mode_enabled();
+    let allow = env_flag("DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK").unwrap_or(false);
+    let decision = bind_for_mode(requested, dev, allow);
+    if decision.overridden {
+        tracing::warn!(
+            "DASH_INSECURE_DEV_MODE=1: refusing to bind to non-loopback address '{requested}'; \
+             binding to {} instead (set DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK=1 to override)",
+            decision.addr
+        );
+    } else if dev && allow {
+        tracing::warn!(
+            "DASH_INSECURE_DEV_MODE=1 with DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK=1: \
+             binding to {requested} with relaxed security"
+        );
+    }
+    decision.addr
+}
+
 /// Constant-time byte equality. Runs in time proportional to the longer input
 /// regardless of where (or whether) the inputs differ.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -235,6 +303,41 @@ mod tests {
         assert!(strict_secrets_from(Some(true), true));
         assert!(strict_secrets_from(Some(false), false));
         assert!(!strict_secrets_from(Some(false), true));
+    }
+
+    #[test]
+    fn dev_mode_forces_loopback_bind_unless_explicitly_allowed() {
+        let d = bind_for_mode("0.0.0.0:8080", true, false);
+        assert_eq!(d.addr, "127.0.0.1:8080");
+        assert!(d.overridden);
+        assert_eq!(
+            bind_for_mode("[::]:9000", true, false).addr,
+            "127.0.0.1:9000"
+        );
+        assert_eq!(
+            bind_for_mode("10.1.2.3:81", true, false).addr,
+            "127.0.0.1:81"
+        );
+        assert_eq!(bind_for_mode("myhost:81", true, false).addr, "127.0.0.1:81");
+        for loopback in [
+            "127.0.0.1:8080",
+            "localhost:8080",
+            "[::1]:8080",
+            "127.0.0.2:1",
+        ] {
+            let d = bind_for_mode(loopback, true, false);
+            assert_eq!(d.addr, loopback);
+            assert!(!d.overridden);
+        }
+        // allowed explicitly, or not in dev mode: unchanged
+        assert_eq!(
+            bind_for_mode("0.0.0.0:8080", true, true).addr,
+            "0.0.0.0:8080"
+        );
+        assert_eq!(
+            bind_for_mode("0.0.0.0:8080", false, false).addr,
+            "0.0.0.0:8080"
+        );
     }
 
     #[test]

@@ -28,8 +28,14 @@ fn now_secs() -> u64 {
 }
 
 fn jwt(tenant: &str, exp: u64) -> String {
+    jwt_with_claims(tenant, exp, ",\"dash_roles\":[\"retrieve\",\"read_only\"]")
+}
+
+/// `extra` is spliced into the claims object (it must start with a comma or
+/// be empty).
+fn jwt_with_claims(tenant: &str, exp: u64, extra: &str) -> String {
     encode_hs256_token(
-        &format!("{{\"tenant_id\":\"{tenant}\",\"exp\":{exp}}}"),
+        &format!("{{\"tenant_id\":\"{tenant}\",\"exp\":{exp}{extra}}}"),
         JWT_SECRET,
     )
     .expect("token should encode")
@@ -336,5 +342,209 @@ fn rate_limit_returns_429_with_retry_after_for_api_keys_and_jwts() {
     assert_eq!(
         status(&policy, &request("GET", jwt_target, None, &jwt_headers)),
         429
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Role dimension: route x credential x role
+// ---------------------------------------------------------------------------
+
+fn retrieve_request(auth: &[(&str, String)]) -> HttpRequest {
+    request(
+        "GET",
+        "/v1/retrieve?tenant_id=tenant-a&query=company+x&top_k=1",
+        None,
+        auth,
+    )
+}
+
+fn planner_request(auth: &[(&str, String)]) -> HttpRequest {
+    request(
+        "GET",
+        "/debug/planner?tenant_id=tenant-a&query=company+x&top_k=1",
+        None,
+        auth,
+    )
+}
+
+/// Status of the primary route and the debug-read route for one credential.
+fn role_statuses(policy: &AuthPolicy, auth: &[(&str, String)]) -> (u16, u16) {
+    (
+        status(policy, &retrieve_request(auth)),
+        status(policy, &planner_request(auth)),
+    )
+}
+
+/// roles granted -> (primary route, debug route).
+/// Hierarchy: admin implies everything; read_only implies retrieve but never
+/// ingest; ingest and retrieve are independent and neither implies read_only.
+const ROLE_TABLE: [(&str, u16, u16); 8] = [
+    ("", 403, 403),
+    ("retrieve", 200, 403),
+    ("ingest", 403, 403),
+    ("read_only", 200, 200),
+    ("admin", 200, 200),
+    ("retrieve,read_only", 200, 200),
+    ("ingest,retrieve", 200, 403),
+    ("ingest,read_only", 200, 200),
+];
+
+fn roles_claim_json(roles: &str) -> String {
+    let items: Vec<String> = roles
+        .split(',')
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("\"{r}\""))
+        .collect();
+    format!(",\"dash_roles\":[{}]", items.join(","))
+}
+
+#[test]
+fn role_matrix_for_jwts_and_scoped_keys() {
+    let _env = env_lock().lock().expect("env lock");
+    let mut failures = Vec::new();
+    for (roles, want_main, want_debug) in ROLE_TABLE {
+        let want = (want_main, want_debug);
+        // Scoped API key carrying exactly these roles.
+        let key = format!(
+            "role-matrix-key-{}-0123456789abcdef",
+            roles.replace(',', "-")
+        );
+        let policy = policy_from_raw(RawAuthConfig {
+            api_key_scopes: Some(format!("{key}:tenant-a:{roles}")),
+            jwt_hs256_secret: Some(JWT_SECRET.to_string()),
+            strict_secrets: true,
+            ..Default::default()
+        })
+        .expect("policy");
+        let got = role_statuses(&policy, &[("x-api-key", key.clone())]);
+        if got != want {
+            failures.push(format!(
+                "scoped key [{roles}]: expected {want:?}, got {got:?}"
+            ));
+        }
+        // JWT carrying exactly these roles.
+        let token = jwt_with_claims("tenant-a", now_secs() + 300, &roles_claim_json(roles));
+        let got = role_statuses(&policy, &[("authorization", format!("Bearer {token}"))]);
+        if got != want {
+            failures.push(format!("JWT [{roles}]: expected {want:?}, got {got:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "role matrix mismatches:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn jwt_without_role_claim_gets_no_roles_unless_a_default_is_configured() {
+    let _env = env_lock().lock().expect("env lock");
+    let token = jwt_with_claims("tenant-a", now_secs() + 300, "");
+    let auth = [("authorization", format!("Bearer {token}"))];
+
+    let strict = policy_from_raw(RawAuthConfig {
+        jwt_hs256_secret: Some(JWT_SECRET.to_string()),
+        strict_secrets: true,
+        ..Default::default()
+    })
+    .expect("policy");
+    assert_eq!(
+        role_statuses(&strict, &auth),
+        (403, 403),
+        "no claim => no roles"
+    );
+
+    let with_default = policy_from_raw(RawAuthConfig {
+        jwt_hs256_secret: Some(JWT_SECRET.to_string()),
+        jwt_default_roles: Some("retrieve".to_string()),
+        strict_secrets: true,
+        ..Default::default()
+    })
+    .expect("policy");
+    assert_eq!(role_statuses(&with_default, &auth), (200, 403));
+
+    // A present-but-unusable claim never falls back to the default.
+    let bad = jwt_with_claims("tenant-a", now_secs() + 300, ",\"dash_roles\":7");
+    assert_eq!(
+        role_statuses(&with_default, &[("authorization", format!("Bearer {bad}"))]),
+        (403, 403)
+    );
+    let unknown = jwt_with_claims(
+        "tenant-a",
+        now_secs() + 300,
+        ",\"dash_roles\":[\"superuser\"]",
+    );
+    assert_eq!(
+        role_statuses(
+            &with_default,
+            &[("authorization", format!("Bearer {unknown}"))]
+        ),
+        (403, 403)
+    );
+}
+
+#[test]
+fn jwt_role_claim_accepts_arrays_strings_and_a_custom_claim_name() {
+    let _env = env_lock().lock().expect("env lock");
+    let policy = policy_from_raw(RawAuthConfig {
+        jwt_hs256_secret: Some(JWT_SECRET.to_string()),
+        jwt_role_claim: Some("roles".to_string()),
+        strict_secrets: true,
+        ..Default::default()
+    })
+    .expect("policy");
+    for (label, extra, want) in [
+        (
+            "space delimited",
+            ",\"roles\":\"retrieve read_only\"",
+            (200, 200),
+        ),
+        (
+            "comma delimited",
+            ",\"roles\":\"retrieve,read_only\"",
+            (200, 200),
+        ),
+        ("array", ",\"roles\":[\"retrieve\"]", (200, 403)),
+        (
+            "default claim name is ignored",
+            ",\"dash_roles\":[\"admin\"]",
+            (403, 403),
+        ),
+    ] {
+        let token = jwt_with_claims("tenant-a", now_secs() + 300, extra);
+        let got = role_statuses(&policy, &[("authorization", format!("Bearer {token}"))]);
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn legacy_unscoped_keys_get_an_explicit_default_role_set() {
+    let _env = env_lock().lock().expect("env lock");
+    let legacy = |defaults: Option<&str>| {
+        policy_from_raw(RawAuthConfig {
+            api_key: Some(KEY_TENANT_A.to_string()),
+            api_key_default_roles: defaults.map(str::to_string),
+            strict_secrets: true,
+            ..Default::default()
+        })
+    };
+    let auth = [("x-api-key", KEY_TENANT_A.to_string())];
+    // Default: the service's primary role only.
+    assert_eq!(role_statuses(&legacy(None).unwrap(), &auth), (200, 403));
+    assert_eq!(
+        role_statuses(&legacy(Some("retrieve,read_only")).unwrap(), &auth),
+        (200, 200)
+    );
+    assert_eq!(
+        role_statuses(&legacy(Some("admin")).unwrap(), &auth),
+        (200, 200)
+    );
+    assert_eq!(
+        role_statuses(&legacy(Some("ingest")).unwrap(), &auth),
+        (403, 403)
+    );
+    assert!(
+        legacy(Some("not-a-role")).is_err(),
+        "unknown role is a startup error"
     );
 }

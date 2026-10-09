@@ -25,7 +25,10 @@ static POLICY: PolicyCell = PolicyCell::new();
 /// start; an error means the service must not start.
 pub fn initialize_auth_policy() -> Result<(), String> {
     POLICY.pin(&SERVICE_AUTH)?;
-    validate_replication_config()
+    validate_replication_config()?;
+    // On unix the policy is rebuilt on SIGHUP (see `PolicyCell::reload`).
+    dash_common::spawn_sighup_reload(&POLICY, SERVICE_AUTH);
+    Ok(())
 }
 
 /// Replication needs a strong shared token. A follower (source URL set)
