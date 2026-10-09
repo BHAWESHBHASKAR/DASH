@@ -626,8 +626,7 @@ def test_retrieve_sends_optional_server_fields(
     spy = mocker.patch.object(
         requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
     )
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         client.retrieve(
             "tenant-a",
             "q",
@@ -639,8 +638,6 @@ def test_retrieve_sends_optional_server_fields(
             return_graph=True,
         )
         client.retrieve("tenant-a", "q", time_range={"from_unix": 5})
-    finally:
-        client.close()
 
     body = spy.call_args_list[0].kwargs["json"]
     assert body["query_embedding"] == [0.5, 0.25]
@@ -660,11 +657,8 @@ def test_retrieve_omits_unset_optional_fields(
     spy = mocker.patch.object(
         requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
     )
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         client.retrieve("tenant-a", "q")
-    finally:
-        client.close()
     body = spy.call_args.kwargs["json"]
     for key in (
         "query_embedding",
@@ -719,11 +713,8 @@ def test_retrieve_decodes_extra_response_fields(
         "serving_replica": None,
     }
     mocker.patch.object(requests.Session, "request", return_value=MockResponse(200, server_body))
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         response = client.retrieve("tenant-a", "q")
-    finally:
-        client.close()
 
     hit = response.results[0]
     assert hit.claim_confidence == 0.8
@@ -747,10 +738,7 @@ def test_retrieve_minimal_response_has_none_extras(
     mocker.patch.object(
         requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
     )
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         response = client.retrieve("tenant-a", "q")
-    finally:
-        client.close()
     assert response.graph is None
     assert response.results[0].claim_confidence is None

@@ -67,11 +67,8 @@ def test_create_with_base64_returns_float_lists(
         "request",
         return_value=MockResponse(200, _response(SERVER_BASE64)),
     )
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         response = client.embeddings.create("hi", encoding_format="base64")
-    finally:
-        client.close()
     assert isinstance(response, EmbeddingResponse)
     assert response.data[0].embedding == FLOATS
     assert spy.call_args.kwargs["json"]["encoding_format"] == "base64"
@@ -85,13 +82,10 @@ def test_dimensions_is_sent_only_when_provided(
         "request",
         return_value=MockResponse(200, _response([0.5, 0.25])),
     )
-    client = Client(base_url=base_url)
-    try:
+    with Client(base_url=base_url) as client:
         client.embeddings.create("hi", dimensions=2)
         assert spy.call_args.kwargs["json"]["dimensions"] == 2
         client.embeddings.create("hi")
         assert "dimensions" not in spy.call_args.kwargs["json"]
-    finally:
-        client.close()
     assert EmbeddingRequest(input="x", dimensions=8).to_dict()["dimensions"] == 8
     assert EmbeddingRequest.from_dict({"input": "x", "dimensions": 8}).dimensions == 8
