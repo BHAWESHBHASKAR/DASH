@@ -109,15 +109,13 @@ impl HttpResponse {
     }
 
     pub(crate) fn error_with_status(status: u16, message: &str) -> Self {
-        match status {
-            400 => Self::bad_request(message),
-            401 => Self::unauthorized(message),
-            403 => Self::forbidden(message),
-            409 => Self::conflict(message),
-            404 => Self::not_found(message),
-            405 => Self::method_not_allowed(message),
-            503 => Self::service_unavailable(message),
-            _ => Self::internal_server_error(message),
+        if status == 409 {
+            return Self::conflict(message);
+        }
+        Self {
+            status,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
         }
     }
 }
@@ -158,6 +156,13 @@ pub(crate) fn render_response_text(response: &HttpResponse) -> String {
         409 => "409 Conflict",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        408 => "408 Request Timeout",
+        411 => "411 Length Required",
+        413 => "413 Payload Too Large",
+        429 => "429 Too Many Requests",
+        431 => "431 Request Header Fields Too Large",
+        501 => "501 Not Implemented",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
