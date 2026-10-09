@@ -40,4 +40,4 @@ export function openAIBaseURL(dashBaseUrl: string): string {
  * Re-export the version string for the package so callers can
  * pin against a known SDK release.
  */
-export const DASH_TS_VERSION = '0.1.0';
+export const DASH_TS_VERSION = '0.2.0';

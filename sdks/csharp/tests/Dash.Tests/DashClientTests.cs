@@ -212,62 +212,172 @@ public class DashClientTests
     // Ingest / Retrieve / Delete / Health
     // -----------------------------------------------------------------
 
+    private static IngestRequest SampleIngestRequest() => new()
+    {
+        Claim = new IngestClaim
+        {
+            ClaimId = "c-1",
+            TenantId = "tenant-a",
+            CanonicalText = "Acme Co. was acquired in 2024.",
+            Confidence = 0.9,
+            Entities = new[] { "Acme Co." },
+        },
+        Evidence = new[]
+        {
+            new IngestEvidence
+            {
+                EvidenceId = "ev-1",
+                ClaimId = "c-1",
+                SourceId = "source://reuters",
+                Stance = "supports",
+                SourceQuality = 0.8,
+                ChunkId = "chunk-7",
+                SpanStart = 120,
+                SpanEnd = 168,
+            },
+        },
+        Edges = new[]
+        {
+            new IngestEdge
+            {
+                EdgeId = "ed-1",
+                FromClaimId = "c-1",
+                ToClaimId = "c-0",
+                Relation = "supports",
+                Strength = 0.5,
+            },
+        },
+    };
+
     [Fact]
-    public async Task IngestAsync_Bundles_AreSerializedWithSnakeCase()
+    public async Task IngestAsync_SendsServerShapedBodyToIngestionHost()
     {
         var handler = new FakeHttpMessageHandler()
             .Enqueue(HttpStatusCode.OK, TestData.SampleIngestResponseJson);
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, ingestionBaseUrl: "http://localhost:8081");
 
-        var response = await client.IngestAsync(new IngestRequest
-        {
-            TenantId = "tenant-a",
-            Bundles = new[]
-            {
-                new IngestBundle
-                {
-                    SourceId = "src-1",
-                    Title = "Acme 10-K",
-                    Claims = new[]
-                    {
-                        new IngestClaim
-                        {
-                            ClaimId = "c-1",
-                            Text = "Acme Co. was acquired in 2024.",
-                            Evidence = new[]
-                            {
-                                new IngestEvidence
-                                {
-                                    EvidenceId = "ev-1",
-                                    Stance = "supports",
-                                    SourceId = "source://reuters",
-                                    ChunkId = "chunk-7",
-                                    SpanStart = 120,
-                                    SpanEnd = 168,
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-        });
+        var response = await client.IngestAsync(SampleIngestRequest());
 
-        response.BundlesIngested.Should().Be(1);
-        response.ClaimsIngested.Should().Be(2);
-        response.EvidenceIngested.Should().Be(3);
+        response.IngestedClaimId.Should().Be("c-1");
+        response.ClaimsTotal.Should().Be(7);
+        response.CommitEpoch.Should().Be(12);
+        response.AckCount.Should().Be(1);
+        response.RequiredAcks.Should().Be(1);
+        response.CommitStatus.Should().Be("committed");
+        response.CheckpointTriggered.Should().BeFalse();
+        response.CheckpointSnapshotRecords.Should().BeNull();
 
-        var body = handler.RequestBodies.Single()!;
-        using var doc = JsonDocument.Parse(body);
-        doc.RootElement.GetProperty("tenant_id").GetString().Should().Be("tenant-a");
-        doc.RootElement.GetProperty("bundles")[0].GetProperty("source_id").GetString().Should().Be("src-1");
-        doc.RootElement.GetProperty("bundles")[0].GetProperty("claims")[0].GetProperty("claim_id").GetString().Should().Be("c-1");
+        var request = handler.Requests.Single();
+        request.RequestUri!.ToString().Should().Be("http://localhost:8081/v1/ingest");
+        request.Method.Should().Be(HttpMethod.Post);
+
+        using var doc = JsonDocument.Parse(handler.RequestBodies.Single()!);
+        var root = doc.RootElement;
+        root.TryGetProperty("tenant_id", out _).Should().BeFalse();
+        root.TryGetProperty("bundles", out _).Should().BeFalse();
+        var claim = root.GetProperty("claim");
+        claim.GetProperty("claim_id").GetString().Should().Be("c-1");
+        claim.GetProperty("tenant_id").GetString().Should().Be("tenant-a");
+        claim.GetProperty("canonical_text").GetString().Should().Be("Acme Co. was acquired in 2024.");
+        claim.GetProperty("confidence").GetDouble().Should().Be(0.9);
+        claim.TryGetProperty("claim_type", out _).Should().BeFalse();
+        var evidence = root.GetProperty("evidence")[0];
+        evidence.GetProperty("claim_id").GetString().Should().Be("c-1");
+        evidence.GetProperty("source_quality").GetDouble().Should().Be(0.8);
+        evidence.GetProperty("span_start").GetInt32().Should().Be(120);
+        root.GetProperty("edges")[0].GetProperty("from_claim_id").GetString().Should().Be("c-1");
     }
 
     [Fact]
-    public async Task RetrieveAsync_DefaultsTopKAndStanceMode_AreApplied()
+    public async Task IngestAsync_WithoutIngestionBaseUrl_Throws()
+    {
+        var handler = new FakeHttpMessageHandler();
+        using var client = new DashClient("https://dash.example.com", null, new DashClientOptions
+        {
+            HttpClient = new HttpClient(handler),
+        });
+
+        client.IngestionBaseUrl.Should().BeNull();
+        var act = async () => await client.IngestAsync(SampleIngestRequest());
+        (await act.Should().ThrowAsync<InvalidOperationException>())
+            .Which.Message.Should().Contain("IngestionBaseUrl");
+        handler.Requests.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void IngestionBaseUrl_IsDerivedFromLocalDefaultPort()
+    {
+        using var client = new DashClient("http://localhost:8080", null, new DashClientOptions
+        {
+            HttpClient = new HttpClient(new FakeHttpMessageHandler()),
+        });
+        client.IngestionBaseUrl.Should().Be("http://localhost:8081");
+    }
+
+    [Fact]
+    public void IngestionBaseUrl_IsValidated()
+    {
+        Action act = () => _ = new DashClient(TestData.BaseUrl, null, new DashClientOptions
+        {
+            IngestionBaseUrl = "not a url",
+        });
+        act.Should().Throw<ArgumentException>().WithMessage("*IngestionBaseUrl*");
+
+        Action bad = () => _ = new DashClient("ftp://localhost");
+        bad.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task IngestAsync_5xx_IsNotRetriedByDefault()
     {
         var handler = new FakeHttpMessageHandler()
-            .Enqueue(HttpStatusCode.OK, TestData.SampleRetrieveResponseJson);
+            .Enqueue(HttpStatusCode.ServiceUnavailable, TestData.ServerErrorBody)
+            .Enqueue(HttpStatusCode.OK, TestData.SampleIngestResponseJson);
+        using var client = NewClient(handler: handler, ingestionBaseUrl: "http://localhost:8081",
+            retryDelay: TimeSpan.FromMilliseconds(1));
+
+        var act = async () => await client.IngestAsync(SampleIngestRequest());
+        await act.Should().ThrowAsync<DashException>();
+        handler.Requests.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task IngestAsync_Timeout_IsNotRetried()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .EnqueueThrowingTaskCanceled()
+            .Enqueue(HttpStatusCode.OK, TestData.SampleIngestResponseJson);
+        using var client = NewClient(handler: handler, ingestionBaseUrl: "http://localhost:8081",
+            retryDelay: TimeSpan.FromMilliseconds(1));
+
+        var act = async () => await client.IngestAsync(SampleIngestRequest());
+        await act.Should().ThrowAsync<DashConnectionException>();
+        handler.Requests.Should().HaveCount(1);
+    }
+
+    [Fact]
+    public async Task IngestAsync_WithIdempotencyKey_SendsHeaderAndRetries()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .Enqueue(HttpStatusCode.ServiceUnavailable, TestData.ServerErrorBody)
+            .Enqueue(HttpStatusCode.OK, TestData.SampleIngestResponseJson);
+        using var client = NewClient(handler: handler, ingestionBaseUrl: "http://localhost:8081",
+            retryDelay: TimeSpan.FromMilliseconds(1));
+
+        var response = await client.IngestAsync(
+            SampleIngestRequest(), new RequestOptions { IdempotencyKey = "key-1" });
+
+        response.IngestedClaimId.Should().Be("c-1");
+        handler.Requests.Should().HaveCount(2);
+        handler.Requests.Should().OnlyContain(r =>
+            r.Headers.GetValues("Idempotency-Key").Single() == "key-1");
+    }
+
+    [Fact]
+    public async Task RetrieveAsync_DecodesServerShapedResponse()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .Enqueue(HttpStatusCode.OK, rawText: TestData.SampleRetrieveResponseJson);
         using var client = NewClient(handler: handler);
 
         var response = await client.RetrieveAsync(new RetrievalRequest
@@ -276,30 +386,71 @@ public class DashClientTests
             Query = "company x",
         });
 
-        response.Hits.Should().HaveCount(1);
-        var hit = response.Hits[0];
+        response.Results.Should().HaveCount(1);
+        var hit = response.Results[0];
         hit.ClaimId.Should().Be("claim-1");
         hit.CanonicalText.Should().Be("Acme Co. was acquired in 2024.");
-        hit.Score.Overall.Should().BeApproximately(0.93, 0.0001);
+        hit.Score.Should().BeApproximately(0.93, 0.0001);
+        hit.ClaimConfidence.Should().BeApproximately(0.87, 0.0001);
+        hit.ConfidenceBand.Should().Be("high");
+        hit.DominantStance.Should().Be("supports");
+        hit.ContradictionRisk.Should().BeNull();
+        hit.SupportPathCount.Should().Be(2);
+        hit.ContradictionChainDepth.Should().BeNull();
+        hit.EventTimeUnix.Should().Be(1735689600);
+        hit.ClaimType.Should().Be("factual");
         hit.Supports.Should().Be(4);
         hit.Contradicts.Should().Be(1);
         hit.Citations.Should().HaveCount(1);
         hit.Citations[0].Stance.Should().Be("supports");
         hit.Citations[0].SourceQuality.Should().BeApproximately(0.88, 0.0001);
         hit.Citations[0].SpanStart.Should().Be(120);
-
-        var body = handler.RequestBodies.Single()!;
-        using var doc = JsonDocument.Parse(body);
-        doc.RootElement.GetProperty("top_k").GetInt32().Should().Be(10);
-        doc.RootElement.GetProperty("stance_mode").GetString().Should().Be("balanced");
-        doc.RootElement.TryGetProperty("return_graph", out _).Should().BeFalse();
+        hit.Citations[0].IngestedAt.Should().Be(1735689700000);
+        response.Graph!.Edges.Should().ContainSingle().Which.Relation.Should().Be("supports");
+        response.ReadPolicy.Should().Be("one");
+        response.ReadQuorumMet.Should().BeTrue();
+        response.ServingReplica.Should().BeNull();
     }
 
     [Fact]
-    public async Task RetrieveAsync_StanceModeSupportOnly_IsSent()
+    public async Task RetrieveAsync_MinimalResponse_DefaultsMissingOptionalFields()
     {
         var handler = new FakeHttpMessageHandler()
-            .Enqueue(HttpStatusCode.OK, TestData.SampleRetrieveResponseJson);
+            .Enqueue(HttpStatusCode.OK, rawText: TestData.MinimalRetrieveResponseJson);
+        using var client = NewClient(handler: handler);
+
+        var response = await client.RetrieveAsync(new RetrievalRequest { TenantId = "t", Query = "q" });
+
+        var hit = response.Results.Single();
+        hit.Score.Should().Be(1.0);
+        hit.Citations.Should().BeEmpty();
+        hit.Supports.Should().Be(0);
+        hit.ClaimConfidence.Should().BeNull();
+        response.Graph.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task RetrieveAsync_DefaultRequest_OmitsTopKSoServerDefaultApplies()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .Enqueue(HttpStatusCode.OK, rawText: TestData.MinimalRetrieveResponseJson);
+        using var client = NewClient(handler: handler);
+
+        await client.RetrieveAsync(new RetrievalRequest { TenantId = "tenant-a", Query = "company x" });
+
+        using var doc = JsonDocument.Parse(handler.RequestBodies.Single()!);
+        doc.RootElement.GetProperty("tenant_id").GetString().Should().Be("tenant-a");
+        doc.RootElement.TryGetProperty("top_k", out _).Should().BeFalse();
+        doc.RootElement.TryGetProperty("stance_mode", out _).Should().BeFalse();
+        doc.RootElement.TryGetProperty("return_graph", out _).Should().BeFalse();
+        handler.Requests.Single().RequestUri!.AbsolutePath.Should().Be("/v1/retrieve");
+    }
+
+    [Fact]
+    public async Task RetrieveAsync_OptionalServerFields_AreSent()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .Enqueue(HttpStatusCode.OK, rawText: TestData.MinimalRetrieveResponseJson);
         using var client = NewClient(handler: handler);
 
         await client.RetrieveAsync(new RetrievalRequest
@@ -308,30 +459,57 @@ public class DashClientTests
             Query = "q",
             TopK = 3,
             StanceMode = "support_only",
+            ReturnGraph = true,
+            QueryEmbedding = new[] { 0.5f },
+            EntityFilters = new[] { "acme" },
+            EmbeddingIdFilters = new[] { "emb-1" },
+            TimeRange = new TimeRange { FromUnix = 10, ToUnix = 20 },
+            ReadConsistency = "quorum",
         });
 
-        var body = handler.RequestBodies.Single()!;
-        body.Should().Contain("\"stance_mode\":\"support_only\"");
-        body.Should().Contain("\"top_k\":3");
+        using var doc = JsonDocument.Parse(handler.RequestBodies.Single()!);
+        var root = doc.RootElement;
+        root.GetProperty("top_k").GetInt32().Should().Be(3);
+        root.GetProperty("stance_mode").GetString().Should().Be("support_only");
+        root.GetProperty("return_graph").GetBoolean().Should().BeTrue();
+        root.GetProperty("query_embedding").GetArrayLength().Should().Be(1);
+        root.GetProperty("entity_filters")[0].GetString().Should().Be("acme");
+        root.GetProperty("embedding_id_filters")[0].GetString().Should().Be("emb-1");
+        root.GetProperty("time_range").GetProperty("from_unix").GetInt64().Should().Be(10);
+        root.GetProperty("time_range").GetProperty("to_unix").GetInt64().Should().Be(20);
+        root.GetProperty("read_consistency").GetString().Should().Be("quorum");
     }
 
     [Fact]
-    public async Task DeleteAsync_ByClaimIds_CallsDeleteEndpoint()
+    public async Task EmbedAsync_429_HonorsRetryAfter()
     {
         var handler = new FakeHttpMessageHandler()
-            .Enqueue(HttpStatusCode.OK, TestData.SampleDeleteResponseJson);
-        using var client = NewClient(handler: handler);
+            .Enqueue(HttpStatusCode.TooManyRequests, new { error = "slow" },
+                headers: new Dictionary<string, string> { ["Retry-After"] = "1" })
+            .Enqueue(HttpStatusCode.OK, TestData.SampleEmbeddingResponseJson);
+        using var client = NewClient(handler: handler, retryDelay: TimeSpan.FromMilliseconds(1));
 
-        var response = await client.DeleteAsync(new DeleteRequest
-        {
-            TenantId = "tenant-a",
-            ClaimIds = new[] { "c-1", "c-2" },
-        });
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await client.EmbedAsync(TestData.SampleEmbeddingRequest());
+        sw.Stop();
 
-        response.ClaimsDeleted.Should().Be(5);
-        response.EvidenceDeleted.Should().Be(9);
+        sw.ElapsedMilliseconds.Should().BeGreaterOrEqualTo(900);
+        handler.Requests.Should().HaveCount(2);
+    }
 
-        handler.Requests.Single().RequestUri!.AbsolutePath.Should().Be("/v1/delete");
+    [Fact]
+    public async Task HealthAsync_NetworkError_IsRetried()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .EnqueueException(_ => new HttpRequestException("reset"))
+            .Enqueue(HttpStatusCode.OK, rawText: "{\"status\":\"ok\"}");
+        using var client = NewClient(handler: handler, retryDelay: TimeSpan.FromMilliseconds(1));
+
+        var response = await client.HealthAsync();
+
+        response.Status.Should().Be("ok");
+        response.Version.Should().BeNull();
+        handler.Requests.Should().HaveCount(2);
     }
 
     [Fact]
@@ -404,7 +582,7 @@ public class DashClientTests
     {
         var handler = new FakeHttpMessageHandler()
             .Enqueue(HttpStatusCode.TooManyRequests, new { error = "rate limit exceeded" });
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, maxRetries: 0);
 
         var act = async () => await client.EmbedAsync(TestData.SampleEmbeddingRequest());
         var ex = await act.Should().ThrowAsync<DashException>();
@@ -417,7 +595,7 @@ public class DashClientTests
     {
         var handler = new FakeHttpMessageHandler()
             .Enqueue(HttpStatusCode.InternalServerError, TestData.ServerErrorBody);
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, maxRetries: 0);
 
         var act = async () => await client.EmbedAsync(TestData.SampleEmbeddingRequest());
         var ex = await act.Should().ThrowAsync<DashException>();
@@ -431,7 +609,7 @@ public class DashClientTests
     {
         var handler = new FakeHttpMessageHandler()
             .EnqueueException(_ => new HttpRequestException("ECONNREFUSED"));
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, maxRetries: 0);
 
         var act = async () => await client.EmbedAsync(TestData.SampleEmbeddingRequest());
         var ex = await act.Should().ThrowAsync<DashConnectionException>();
@@ -443,7 +621,7 @@ public class DashClientTests
     {
         var handler = new FakeHttpMessageHandler()
             .Enqueue(HttpStatusCode.BadGateway, rawText: "Bad Gateway");
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, maxRetries: 0);
 
         var act = async () => await client.EmbedAsync(TestData.SampleEmbeddingRequest());
         var ex = await act.Should().ThrowAsync<DashException>();
@@ -579,18 +757,11 @@ public class DashClientTests
     {
         var handler = new FakeHttpMessageHandler()
             .Enqueue(HttpStatusCode.OK, TestData.SampleIngestResponseJson);
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, ingestionBaseUrl: "http://localhost:8081");
 
-        var response = client.Ingest(new IngestRequest
-        {
-            TenantId = "t",
-            Bundles = new[]
-            {
-                new IngestBundle { SourceId = "s", Claims = Array.Empty<IngestClaim>() },
-            },
-        });
+        var response = client.Ingest(SampleIngestRequest());
 
-        response.ClaimsIngested.Should().Be(2);
+        response.ClaimsTotal.Should().Be(7);
     }
 
     // -----------------------------------------------------------------
@@ -669,7 +840,7 @@ public class DashClientTests
                 HttpStatusCode.InternalServerError,
                 TestData.ServerErrorBody,
                 headers: new Dictionary<string, string> { ["X-Request-Id"] = "req-abc-123" });
-        using var client = NewClient(handler: handler);
+        using var client = NewClient(handler: handler, maxRetries: 0);
 
         var act = async () => await client.EmbedAsync(TestData.SampleEmbeddingRequest());
         var ex = await act.Should().ThrowAsync<DashException>();
@@ -720,16 +891,25 @@ public class DashClientTests
     private static DashClient NewClient(
         string? apiKey = null,
         FakeHttpMessageHandler? handler = null,
-        DashClientOptions? options = null)
+        DashClientOptions? options = null,
+        string? ingestionBaseUrl = null,
+        TimeSpan? retryDelay = null,
+        int? maxRetries = null)
     {
         handler ??= new FakeHttpMessageHandler();
-        var opts = options ?? new DashClientOptions
+        var opts = options ?? new DashClientOptions();
+        opts.HttpClient ??= new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
+        if (ingestionBaseUrl is not null)
         {
-            HttpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) },
-        };
-        if (opts.HttpClient is null)
+            opts.IngestionBaseUrl = ingestionBaseUrl;
+        }
+        if (maxRetries is not null)
         {
-            opts.HttpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
+            opts.MaxRetries = maxRetries.Value;
+        }
+        if (retryDelay is not null)
+        {
+            opts.RetryBaseDelay = retryDelay.Value;
         }
         return new DashClient(TestData.BaseUrl, apiKey, opts);
     }

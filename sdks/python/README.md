@@ -1,6 +1,6 @@
 # dash-py
 
-A thin, idiomatic Python client for the [DASH](https://github.com/dash-retrieval/dash)
+A thin, idiomatic Python client for the [DASH](https://github.com/BHAWESHBHASKAR/DASH)
 retrieval engine. DASH serves an OpenAI-compatible `/v1/embeddings`
 endpoint and a native `/v1/retrieve` endpoint that returns structured
 **Claim + Evidence + Contradiction** results — the differentiator
@@ -146,6 +146,15 @@ typed, first-class client:
   by hand.
 - A coroutine-first async client without the `openai` SDK's
   beta-header gymnastics.
+
+## Retrieve options (0.2.0)
+
+`retrieve` now sends and decodes the full server contract
+(`services/retrieval/src/transport/payload.rs`): `query_embedding`, `entity_filters`, `embedding_id_filters`, `time_range` (`TimeRange` or `{"from_unix": ..., "to_unix": ...}`), `read_consistency`, `return_graph` and `stance_mode`.
+Responses expose the optional `claim_confidence`, `contradiction_risk`,
+`graph`, `read_policy`, `read_quorum_met` and `serving_replica` fields
+(absent or `null` values decode as `None`). The default `top_k` is now
+5 (the server default) instead of 10.
 
 ## License
 

@@ -1,19 +1,26 @@
 # sdks.yml
-# CI for the DASH language SDKs: Go, Python, and TypeScript.
-# Runs on every push/PR to main; three parallel jobs, one per language.
-# Expected runtime: ~3-6 minutes per job.
+# CI for the DASH language SDKs: Go, Python, TypeScript, Java, Kotlin and C#.
+# Runs on push/PR to main when anything under sdks/** (or this workflow) changes;
+# one parallel job per language. Expected runtime: ~3-8 minutes per job.
 name: SDKs CI
 
 on:
   push:
     branches: [main]
+    paths:
+      - "sdks/**"
+      - ".github/workflows/sdks.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "sdks/**"
+      - ".github/workflows/sdks.yml"
 
 concurrency:
   group: sdks-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: jobs only read the repository.
 permissions:
   contents: read
 
@@ -26,10 +33,12 @@ jobs:
         working-directory: sdks/go
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Go 1.22
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v5.5.0
         with:
           go-version: "1.22"
           cache-dependency-path: sdks/go/go.sum
@@ -48,10 +57,12 @@ jobs:
         working-directory: sdks/python
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
           cache: pip
@@ -73,10 +84,12 @@ jobs:
         working-directory: sdks/typescript
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.4.0
         with:
           node-version: "20"
           cache: npm
@@ -90,3 +103,81 @@ jobs:
 
       - name: npm test
         run: npm test
+
+  java:
+    name: Java SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/java
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: sdks/java/pom.xml
+
+      - name: mvn test
+        run: mvn --batch-mode --no-transfer-progress test
+
+  kotlin:
+    name: Kotlin SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: sdks/java/pom.xml
+
+      # dash-kotlin wraps dash-java, which is not published yet: install it
+      # into the local Maven repository so Gradle resolves it via mavenLocal().
+      - name: Install dash-java locally
+        working-directory: sdks/java
+        run: mvn --batch-mode --no-transfer-progress install -DskipTests
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4.4.1
+        with:
+          gradle-version: "8.14.3"
+
+      - name: gradle test
+        working-directory: sdks/kotlin
+        run: gradle test --no-daemon --console=plain
+
+  csharp:
+    name: C# SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/csharp
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: dotnet build (all target frameworks)
+        run: dotnet build Dash.sln --configuration Release
+
+      - name: dotnet test
+        run: dotnet test tests/Dash.Tests --configuration Release --no-build

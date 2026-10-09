@@ -1,6 +1,6 @@
 {
   "name": "dash-ts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Idiomatic TypeScript client for the DASH retrieval engine",
   "type": "module",
   "main": "./dist/index.js",
@@ -31,6 +31,15 @@
   ],
   "author": "DASH Contributors",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/BHAWESHBHASKAR/DASH",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BHAWESHBHASKAR/DASH.git",
+    "directory": "sdks/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/BHAWESHBHASKAR/DASH/issues"
+  },
   "engines": {
     "node": ">=18"
   },

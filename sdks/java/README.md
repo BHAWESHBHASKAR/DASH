@@ -1,6 +1,6 @@
 # dash-java
 
-A thin, idiomatic Java client for the [DASH](https://github.com/dash-retrieval/dash)
+A thin, idiomatic Java client for the [DASH](https://github.com/BHAWESHBHASKAR/DASH)
 retrieval engine. DASH serves an OpenAI-compatible `/v1/embeddings`
 endpoint and a native `/v1/retrieve` endpoint that returns structured
 **Claim + Evidence + Contradiction** results — the differentiator
@@ -92,27 +92,43 @@ Use `stanceMode = "support_only"` to filter out claims whose
 contradiction tally exceeds their support tally before they reach
 your prompt.
 
-### 4. Ingest and delete
+### 4. Ingest (experimental)
 
-`dash-java` also exposes the bundle-style ingest and tenant-scoped
-delete endpoints, modelled after the DASH store API:
+DASH runs retrieval (embeddings, retrieve, health) and ingestion as
+two services, by default on ports 8080 and 8081. Pass the ingestion
+URL as the second constructor argument:
+
+```java
+DashClient client = new DashClient(
+        "http://localhost:8080", "http://localhost:8081", "sk-live-...");
+```
+
+If `ingestionBaseUrl` is omitted it is derived only for the local
+layout (`:8080` becomes `:8081`); otherwise `ingest(...)` throws
+`IllegalStateException`. Both URLs are validated at construction.
+
+The ingest models mirror the server's `POST /v1/ingest` body
+(`claim`, `evidence`, `edges`) and response (`ingested_claim_id`,
+`claims_total`, `commit_status`, ...):
 
 ```java
 import dev.dash.model.*;
 
-var bundle = new IngestBundle(
-        new IngestClaim("c-1", "acme", "Q3 revenue was $1B", 0.9, null),
-        List.of(new IngestEvidence("e-1", "src-1", "supports", 0.8,
-                null, null, null, null, null, "raw chunk text")),
-        null);
+var claim = new IngestClaim("c-1", "acme", "Q3 revenue was $1B", 0.9);
+var evidence = List.of(
+        new IngestEvidence("e-1", "c-1", "src-1", "supports", 0.8));
 
-IngestResponse ingest = client.ingest(new IngestRequest("acme", bundle));
-System.out.println("accepted=" + ingest.accepted() + " rejected=" + ingest.rejected());
-
-DeleteResponse deleted = client.delete(
-        new DeleteRequest("acme", List.of("c-1"), Boolean.TRUE));
-System.out.println("deleted=" + deleted.deleted() + " missing=" + deleted.missing());
+IngestResponse ingest = client.ingest(new IngestRequest(claim, evidence));
+System.out.println(ingest.ingestedClaimId() + " " + ingest.commitStatus());
 ```
+
+The ingest API is **experimental** and will change when the server
+API is versioned. Ingest is sent exactly once and is never retried
+automatically; to allow retries pass an idempotency key:
+`client.ingest(req, RequestOptions.withIdempotencyKey("..."))`.
+
+> `client.delete(...)` was removed in 0.2.0: the server has no
+> `/v1/delete` endpoint.
 
 ### 5. Authentication & error handling
 
@@ -152,20 +168,20 @@ failure mode.
 
 | Symbol | Purpose |
 | --- | --- |
-| `DashClient(baseUrl, apiKey)` | Construct a client. |
+| `DashClient(baseUrl, apiKey)` | Construct a client (ingestion URL derived for `:8080`). |
+| `DashClient(baseUrl, ingestionBaseUrl, apiKey)` | Construct a client with an explicit ingestion service URL. |
 | `withTimeout(Duration)` | Set connect/read/write timeouts. |
 | `withMaxRetries(int)` | Set max attempts (1 initial + N-1 retries). |
 | `client.embed(EmbedRequest)` | `POST /v1/embeddings`. |
-| `client.ingest(IngestRequest)` | `POST /v1/ingest`. |
+| `client.ingest(IngestRequest[, RequestOptions])` | `POST /v1/ingest` on the ingestion service (experimental, never retried by default). |
 | `client.retrieve(RetrievalRequest)` | `POST /v1/retrieve`. |
-| `client.delete(DeleteRequest)` | `POST /v1/delete`. |
 | `client.health()` | `GET /health`. |
 | `DashException` / `DashConnectionException` | Exception hierarchy. |
 
 ## Configuration reference
 
 ```java
-new DashClient(baseUrl, apiKey)            // defaults: 10s connect, 30s read, 30s write, 3 attempts
+new DashClient(baseUrl, ingestionBaseUrl, apiKey)  // defaults: 10s connect, 30s read, 30s write, 3 attempts
         .withTimeout(Duration.ofSeconds(5))
         .withMaxRetries(5);
 ```
@@ -173,6 +189,11 @@ new DashClient(baseUrl, apiKey)            // defaults: 10s connect, 30s read, 3
 `withTimeout` and `withMaxRetries` return a *new* client; the
 original is untouched, so the builder is safe to share across
 threads.
+
+Retries apply only to idempotent requests (embeddings, retrieve,
+health) or requests sent with an `Idempotency-Key`. They use
+jittered exponential backoff (capped at 5 s), honour `Retry-After`
+(up to 30 s) and are capped at 10 attempts.
 
 ## Why a Java SDK for DASH?
 

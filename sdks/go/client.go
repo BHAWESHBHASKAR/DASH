@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anomalyco/dash-go/internal/transport"
+	"github.com/BHAWESHBHASKAR/DASH/sdks/go/internal/transport"
 )
 
 // Version is the SDK version. It is included in the default
 // User-Agent header on every request.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DefaultTimeout is applied to the underlying http.Client when the
 // caller does not supply one of their own. 30s matches the Python

@@ -31,7 +31,7 @@ type Config struct {
 
 // DefaultUserAgent is the value sent in the User-Agent header when
 // the caller has not supplied one of their own.
-const DefaultUserAgent = "dash-go/0.1.0"
+const DefaultUserAgent = "dash-go/0.2.0"
 
 // Transport executes a single HTTP request and returns the raw
 // response body. It is safe for concurrent use; the underlying

@@ -438,7 +438,7 @@ def test_retrieve_default_stance_mode_is_balanced(
     assert body == {
         "tenant_id": "tenant-a",
         "query": "company x",
-        "top_k": 10,
+        "top_k": 5,
         "stance_mode": "balanced",
     }
     assert spy.call_args.args[1] == "http://localhost:8080/v1/retrieve"
@@ -609,3 +609,148 @@ def test_retrieve_raises_connection_error_on_timeout(
             client.retrieve("tenant-a", "q")
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Retrieve: server-contract fields (payload.rs)
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_sends_optional_server_fields(
+    base_url: str,
+    mocker: pytest.MockFixture,
+    sample_retrieve_response: Dict[str, Any],
+) -> None:
+    from dash import TimeRange
+
+    spy = mocker.patch.object(
+        requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
+    )
+    client = Client(base_url=base_url)
+    try:
+        client.retrieve(
+            "tenant-a",
+            "q",
+            query_embedding=[0.5, 0.25],
+            entity_filters=["acme"],
+            embedding_id_filters=["emb-1"],
+            time_range=TimeRange(from_unix=10, to_unix=20),
+            read_consistency="quorum",
+            return_graph=True,
+        )
+        client.retrieve("tenant-a", "q", time_range={"from_unix": 5})
+    finally:
+        client.close()
+
+    body = spy.call_args_list[0].kwargs["json"]
+    assert body["query_embedding"] == [0.5, 0.25]
+    assert body["entity_filters"] == ["acme"]
+    assert body["embedding_id_filters"] == ["emb-1"]
+    assert body["time_range"] == {"from_unix": 10, "to_unix": 20}
+    assert body["read_consistency"] == "quorum"
+    assert body["return_graph"] is True
+    assert spy.call_args_list[1].kwargs["json"]["time_range"] == {"from_unix": 5}
+
+
+def test_retrieve_omits_unset_optional_fields(
+    base_url: str,
+    mocker: pytest.MockFixture,
+    sample_retrieve_response: Dict[str, Any],
+) -> None:
+    spy = mocker.patch.object(
+        requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
+    )
+    client = Client(base_url=base_url)
+    try:
+        client.retrieve("tenant-a", "q")
+    finally:
+        client.close()
+    body = spy.call_args.kwargs["json"]
+    for key in (
+        "query_embedding",
+        "entity_filters",
+        "embedding_id_filters",
+        "time_range",
+        "read_consistency",
+        "return_graph",
+    ):
+        assert key not in body
+
+
+def test_retrieve_decodes_extra_response_fields(
+    base_url: str,
+    mocker: pytest.MockFixture,
+) -> None:
+    server_body = {
+        "results": [
+            {
+                "claim_id": "c-1",
+                "canonical_text": "x",
+                "score": 0.5,
+                "claim_confidence": 0.8,
+                "confidence_band": "high",
+                "dominant_stance": "supports",
+                "contradiction_risk": None,
+                "graph_score": 0.25,
+                "support_path_count": 2,
+                "contradiction_chain_depth": None,
+                "supports": 1,
+                "contradicts": 0,
+                "citations": [],
+                "event_time_unix": 1700000000,
+                "temporal_match_mode": None,
+                "temporal_in_range": True,
+                "claim_type": "factual",
+                "valid_from": None,
+                "valid_to": None,
+                "created_at": 1,
+                "updated_at": None,
+                "future_field": {"ignored": True},
+            }
+        ],
+        "graph": {
+            "nodes": [],
+            "edges": [
+                {"from_claim_id": "c-1", "to_claim_id": "c-2", "relation": "supports", "strength": 0.5}
+            ],
+        },
+        "read_policy": "one",
+        "read_quorum_met": True,
+        "serving_replica": None,
+    }
+    mocker.patch.object(requests.Session, "request", return_value=MockResponse(200, server_body))
+    client = Client(base_url=base_url)
+    try:
+        response = client.retrieve("tenant-a", "q")
+    finally:
+        client.close()
+
+    hit = response.results[0]
+    assert hit.claim_confidence == 0.8
+    assert hit.confidence_band == "high"
+    assert hit.contradiction_risk is None
+    assert hit.support_path_count == 2
+    assert hit.temporal_in_range is True
+    assert hit.event_time_unix == 1700000000
+    assert response.graph is not None
+    assert response.graph.edges[0].relation == "supports"
+    assert response.read_policy == "one"
+    assert response.read_quorum_met is True
+    assert response.serving_replica is None
+
+
+def test_retrieve_minimal_response_has_none_extras(
+    base_url: str,
+    mocker: pytest.MockFixture,
+    sample_retrieve_response: Dict[str, Any],
+) -> None:
+    mocker.patch.object(
+        requests.Session, "request", return_value=MockResponse(200, sample_retrieve_response)
+    )
+    client = Client(base_url=base_url)
+    try:
+        response = client.retrieve("tenant-a", "q")
+    finally:
+        client.close()
+    assert response.graph is None
+    assert response.results[0].claim_confidence is None
