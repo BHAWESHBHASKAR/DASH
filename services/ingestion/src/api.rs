@@ -43,24 +43,27 @@ pub struct IngestApiRequest {
 pub struct EmbedFailure {
     pub status: u16,
     pub code: &'static str,
+    /// `Retry-After` seconds to send with a 503.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl EmbedFailure {
     fn from_error(error: &embeddings::EmbeddingError) -> Self {
-        use embeddings::EmbeddingError as E;
-        match error {
-            E::Io(_) | E::Timeout(_) | E::CircuitOpen { .. } | E::InvalidConfig(_) => Self {
+        match error.classify() {
+            embeddings::FailureClass::Unavailable { retry_after_secs } => Self {
                 status: 503,
                 code: "embedding_unavailable",
+                retry_after_secs: Some(retry_after_secs),
             },
-            E::Http { status, .. } if *status == 429 || *status >= 500 => Self {
-                status: 503,
-                code: "embedding_unavailable",
-            },
-            _ => Self {
-                status: 502,
-                code: "embedding_upstream_error",
-            },
+            embeddings::FailureClass::BadGateway => Self::bad_upstream_payload(),
+        }
+    }
+
+    fn bad_upstream_payload() -> Self {
+        Self {
+            status: 502,
+            code: "embedding_upstream_error",
+            retry_after_secs: None,
         }
     }
 }
@@ -70,22 +73,9 @@ type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider 
 /// Embedding provider shared by requests. It is rebuilt only when the
 /// provider-related environment changes, instead of on every request.
 fn shared_embedding_provider() -> SharedEmbeddingProvider {
-    use std::hash::{Hash, Hasher};
     static CACHE: std::sync::Mutex<Option<(u64, SharedEmbeddingProvider)>> =
         std::sync::Mutex::new(None);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for name in [
-        "DASH_EMBEDDING_PROVIDER",
-        "DASH_OLLAMA_ENDPOINT",
-        "DASH_OLLAMA_BASE_URL",
-        "DASH_OLLAMA_MODEL",
-        "DASH_OPENAI_API_KEY",
-        "DASH_OPENAI_MODEL",
-        "DASH_EMBEDDING_ALLOW_INSECURE_HTTP",
-    ] {
-        std::env::var(name).ok().hash(&mut hasher);
-    }
-    let signature = hasher.finish();
+    let signature = embeddings::provider_env_signature();
     let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cached, provider)) = cache.as_ref()
         && *cached == signature
@@ -114,6 +104,10 @@ impl IngestApiRequest {
                 eprintln!("ingestion embedding provider failed: {error}");
                 EmbedFailure::from_error(&error)
             })?;
+        if let Err(error) = embeddings::validate_finite(&vectors) {
+            eprintln!("ingestion embedding provider failed: {error}");
+            return Err(EmbedFailure::bad_upstream_payload());
+        }
         if let Some(vector) = vectors.into_iter().next() {
             self.claim_embedding = Some(vector);
         }

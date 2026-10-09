@@ -33,7 +33,12 @@ pub enum EmbeddingError {
     #[error("io error: {0}")]
     Io(String),
     #[error("http error: {status} {body}")]
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+        /// Upstream `Retry-After` (whole seconds), when the response carried one.
+        retry_after_secs: Option<u64>,
+    },
     #[error("response parse error: {0}")]
     Parse(String),
     #[error("dimension mismatch: expected {expected}, got {actual}")]
@@ -44,6 +49,56 @@ pub enum EmbeddingError {
     ResponseTooLarge { limit: usize },
     #[error("circuit breaker is open: {reason}")]
     CircuitOpen { reason: String },
+    #[error("embedding provider is at its concurrency limit")]
+    Overloaded,
+}
+
+/// How a failed embedding call should be reported to a client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// The provider is unavailable or overloaded (breaker open, timeout,
+    /// connect error, 429, 5xx, misconfiguration). Report 503 with
+    /// `Retry-After: retry_after_secs`.
+    Unavailable { retry_after_secs: u64 },
+    /// The provider answered with something unusable (non-finite values,
+    /// wrong dimensions, malformed payload, 4xx). Report 502.
+    BadGateway,
+}
+
+impl EmbeddingError {
+    /// Whether this failure says the upstream itself is unhealthy and should
+    /// count toward opening the circuit breaker: transport errors, timeouts
+    /// and 5xx. Client-attributable outcomes (4xx, 429, validation, dimension
+    /// or payload errors) never count, so one caller sending input the
+    /// upstream rejects cannot take the provider away from everyone else.
+    /// 429 is deliberately not counted: it means the upstream is alive and
+    /// shedding load, and retries are already paced by its `Retry-After`.
+    pub fn counts_toward_breaker(&self) -> bool {
+        match self {
+            EmbeddingError::Io(_) | EmbeddingError::Timeout(_) => true,
+            EmbeddingError::Http { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
+
+    pub fn classify(&self) -> FailureClass {
+        let unavailable = |retry_after: Option<u64>| FailureClass::Unavailable {
+            retry_after_secs: retry_after.unwrap_or(1).clamp(1, 3600),
+        };
+        match self {
+            EmbeddingError::Io(_)
+            | EmbeddingError::Timeout(_)
+            | EmbeddingError::CircuitOpen { .. }
+            | EmbeddingError::Overloaded
+            | EmbeddingError::InvalidConfig(_) => unavailable(None),
+            EmbeddingError::Http {
+                status,
+                retry_after_secs,
+                ..
+            } if *status == 429 || *status >= 500 => unavailable(*retry_after_secs),
+            _ => FailureClass::BadGateway,
+        }
+    }
 }
 
 pub trait EmbeddingProvider: Send + Sync {
@@ -150,6 +205,17 @@ pub fn validate_dimensions(expected: usize, vectors: &[Vec<f32>]) -> Result<(), 
     Ok(())
 }
 
+/// Reject NaN and infinite components. JSON cannot represent them (they
+/// would serialize as `null`) and they poison similarity scoring.
+pub fn validate_finite(vectors: &[Vec<f32>]) -> Result<(), EmbeddingError> {
+    if vectors.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(EmbeddingError::Parse(
+            "provider returned a non-finite embedding value".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate `vectors` against `provider.dimensions()`.
 pub fn validate_provider_output(
     provider: &dyn EmbeddingProvider,
@@ -174,6 +240,7 @@ impl DimensionCache {
 
     /// Check the batch against the known dimension, learning it if unknown.
     fn check_and_learn(&self, vectors: &[Vec<f32>]) -> Result<(), EmbeddingError> {
+        validate_finite(vectors)?;
         validate_dimensions(self.get(), vectors)?;
         if let Some(first) = vectors.first() {
             // First writer wins; a concurrent different value is caught on
@@ -558,8 +625,9 @@ struct OpenAIEmbeddingItem {
 // `EmbeddingError::CircuitOpen`. If a probe never reports back (for example
 // its thread died), another probe is admitted after another `reset_timeout`.
 //
-// This is opt-in: callers compose `CircuitBreakerProvider` around the inner
-// provider explicitly.
+// `select_embedding_provider_from_env` wraps every network provider in this
+// breaker (see `with_resilience`). Only transport errors, timeouts and 5xx
+// responses count as failures (`EmbeddingError::counts_toward_breaker`).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
@@ -766,10 +834,212 @@ impl<P: EmbeddingProvider> EmbeddingProvider for CircuitBreakerProvider<P> {
         guard.done = true;
         match &result {
             Ok(_) => self.breaker.record_success(),
-            Err(_) => self.breaker.record_failure(),
+            // Only upstream-health failures count. Anything else (4xx, 429,
+            // validation, payload errors) proves the upstream answered, so
+            // it resolves a half-open probe as healthy instead of tripping.
+            Err(e) if e.counts_toward_breaker() => self.breaker.record_failure(),
+            Err(_) => self.breaker.record_success(),
         }
         result
     }
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency limit
+// ---------------------------------------------------------------------------
+
+/// Counting semaphore used to cap in-flight provider calls.
+#[derive(Debug)]
+pub struct CallLimiter {
+    available: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// A held slot; released on drop.
+pub struct CallPermit<'a>(&'a CallLimiter);
+
+impl Drop for CallPermit<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.0.available.lock().unwrap_or_else(|p| p.into_inner());
+        *guard += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+impl CallLimiter {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            available: std::sync::Mutex::new(max_concurrent.max(1)),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait up to `wait` for a slot; `None` when none freed in time.
+    pub fn acquire(&self, wait: Duration) -> Option<CallPermit<'_>> {
+        let deadline = Instant::now() + wait;
+        let mut guard = self.available.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if *guard > 0 {
+                *guard -= 1;
+                return Some(CallPermit(self));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            guard = self
+                .freed
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+}
+
+/// Caps concurrent calls into the wrapped provider. When no slot frees within
+/// `queue_wait` the call fails fast with [`EmbeddingError::Overloaded`], so
+/// slow upstream calls cannot pin every server worker.
+pub struct ConcurrencyLimitedProvider<P: EmbeddingProvider> {
+    inner: P,
+    limiter: CallLimiter,
+    queue_wait: Duration,
+}
+
+impl<P: EmbeddingProvider> ConcurrencyLimitedProvider<P> {
+    pub fn new(inner: P, max_concurrent: usize, queue_wait: Duration) -> Self {
+        Self {
+            inner,
+            limiter: CallLimiter::new(max_concurrent),
+            queue_wait,
+        }
+    }
+}
+
+impl<P: EmbeddingProvider> EmbeddingProvider for ConcurrencyLimitedProvider<P> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let Some(_permit) = self.limiter.acquire(self.queue_wait) else {
+            return Err(EmbeddingError::Overloaded);
+        };
+        self.inner.embed(texts)
+    }
+}
+
+/// Resilience settings applied around network providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResilienceConfig {
+    /// Max concurrent provider calls; 0 disables the limit.
+    pub max_concurrency: usize,
+    pub queue_wait: Duration,
+    /// Consecutive upstream failures that open the breaker; 0 disables it.
+    pub breaker_threshold: u32,
+    pub breaker_reset: Duration,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: 8,
+            queue_wait: Duration::from_millis(250),
+            breaker_threshold: 5,
+            breaker_reset: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ResilienceConfig {
+    /// `DASH_EMBEDDING_MAX_CONCURRENCY` (8; 0 = unlimited),
+    /// `DASH_EMBEDDING_QUEUE_WAIT_MS` (250),
+    /// `DASH_EMBEDDING_BREAKER_THRESHOLD` (5; 0 = off),
+    /// `DASH_EMBEDDING_BREAKER_RESET_MS` (10000).
+    pub fn from_env() -> Self {
+        fn num(key: &str) -> Option<u64> {
+            std::env::var(key).ok()?.trim().parse().ok()
+        }
+        let d = Self::default();
+        Self {
+            max_concurrency: num("DASH_EMBEDDING_MAX_CONCURRENCY")
+                .map_or(d.max_concurrency, |v| v as usize),
+            queue_wait: num("DASH_EMBEDDING_QUEUE_WAIT_MS")
+                .map_or(d.queue_wait, |v| Duration::from_millis(v)),
+            breaker_threshold: num("DASH_EMBEDDING_BREAKER_THRESHOLD")
+                .map_or(d.breaker_threshold, |v| v.min(u32::MAX as u64) as u32),
+            breaker_reset: num("DASH_EMBEDDING_BREAKER_RESET_MS")
+                .filter(|v| *v > 0)
+                .map_or(d.breaker_reset, Duration::from_millis),
+        }
+    }
+}
+
+/// Wrap `provider` with the circuit breaker and the concurrency limit
+/// (outermost), per `config`.
+pub fn with_resilience<P: EmbeddingProvider + 'static>(
+    provider: P,
+    config: ResilienceConfig,
+) -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
+    let guarded: Box<dyn EmbeddingProvider + Send + Sync> = if config.breaker_threshold > 0 {
+        Box::new(CircuitBreakerProvider::new(
+            provider,
+            Arc::new(CircuitBreaker::new(
+                config.breaker_threshold,
+                config.breaker_reset,
+            )),
+        ))
+    } else {
+        Box::new(provider)
+    };
+    if config.max_concurrency > 0 {
+        Box::new(ConcurrencyLimitedProvider::new(
+            guarded,
+            config.max_concurrency,
+            config.queue_wait,
+        ))
+    } else {
+        guarded
+    }
+}
+
+impl EmbeddingProvider for Box<dyn EmbeddingProvider + Send + Sync> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn dimensions(&self) -> usize {
+        (**self).dimensions()
+    }
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        (**self).embed(texts)
+    }
+}
+
+/// Stable hash of every environment variable that influences provider
+/// selection or resilience. Services key their cached provider on this so
+/// both rebuild under exactly the same conditions.
+pub fn provider_env_signature() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "DASH_EMBEDDING_PROVIDER",
+        "DASH_OLLAMA_ENDPOINT",
+        "DASH_OLLAMA_BASE_URL",
+        "DASH_OLLAMA_MODEL",
+        "DASH_OPENAI_API_KEY",
+        "DASH_OPENAI_MODEL",
+        "DASH_EMBEDDING_ALLOW_INSECURE_HTTP",
+        "DASH_EMBEDDING_MAX_CONCURRENCY",
+        "DASH_EMBEDDING_QUEUE_WAIT_MS",
+        "DASH_EMBEDDING_BREAKER_THRESHOLD",
+        "DASH_EMBEDDING_BREAKER_RESET_MS",
+    ] {
+        std::env::var(name).ok().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Build an [`EmbeddingProvider`] from the process environment. This is the
@@ -810,14 +1080,17 @@ pub fn select_embedding_provider_from_env() -> Box<dyn EmbeddingProvider + Send 
             };
             let model = std::env::var("DASH_OLLAMA_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string());
-            Box::new(OllamaEmbeddingProvider::new(model, Some(endpoint)))
+            with_resilience(
+                OllamaEmbeddingProvider::new(model, Some(endpoint)),
+                ResilienceConfig::from_env(),
+            )
         }
         "openai" => {
             let key = std::env::var("DASH_OPENAI_API_KEY").unwrap_or_default();
             let model = std::env::var("DASH_OPENAI_MODEL")
                 .unwrap_or_else(|_| "text-embedding-3-small".to_string());
             match OpenAIEmbeddingProvider::new(model, key) {
-                Ok(p) => Box::new(p),
+                Ok(p) => with_resilience(p, ResilienceConfig::from_env()),
                 Err(e) => {
                     eprintln!(
                         "dash: failed to build OpenAI embedding provider ({e}); falling back to hash"
@@ -1343,7 +1616,9 @@ mod tests {
         let server = MockServer::start(vec![json_response("400 Bad Request", "", &noisy)]);
         let provider = openai_for(&server);
         match provider.embed(&["x".to_string()]) {
-            Err(EmbeddingError::Http { status: 400, body }) => {
+            Err(EmbeddingError::Http {
+                status: 400, body, ..
+            }) => {
                 assert!(!body.contains("sk-secret-key"), "key leaked: {body}");
                 assert!(!body.contains('\n'));
                 assert!(body.len() < 400, "not truncated: {}", body.len());
@@ -1916,5 +2191,319 @@ mod tests {
         assert_eq!(ok, 1);
         assert_eq!(wrapped.inner().calls.load(Ordering::SeqCst), 1);
         assert_eq!(wrapped.breaker().state(), CircuitState::Closed);
+    }
+
+    /// Persistent fake upstream: counts every accepted connection and answers
+    /// with whatever `respond` returns for the (1-based) hit number.
+    struct CountingServer {
+        port: u16,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl CountingServer {
+        fn start(respond: impl Fn(usize) -> Vec<u8> + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind counting server");
+            let port = listener.local_addr().unwrap().port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = read_request(&mut stream);
+                    let _ = stream.write_all(&respond(n));
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            });
+            Self { port, hits }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn ollama(&self) -> OllamaEmbeddingProvider {
+            let mut opts = fast_opts();
+            opts.max_retries = 0;
+            OllamaEmbeddingProvider::new(
+                "m".into(),
+                Some(format!("http://127.0.0.1:{}/api/embed", self.port)),
+            )
+            .with_http_options(opts)
+        }
+    }
+
+    fn texts() -> Vec<String> {
+        vec!["hello".to_string()]
+    }
+
+    #[test]
+    fn breaker_opens_on_5xx_fails_fast_probes_and_recovers() {
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&healthy);
+        let server = CountingServer::start(move |_| {
+            if flag.load(Ordering::SeqCst) {
+                json_response("200 OK", "", r#"{"embeddings":[[0.5,0.25]]}"#)
+            } else {
+                json_response("500 Internal Server Error", "", "boom")
+            }
+        });
+        let provider = with_resilience(
+            server.ollama(),
+            ResilienceConfig {
+                max_concurrency: 0,
+                queue_wait: Duration::from_millis(10),
+                breaker_threshold: 3,
+                breaker_reset: Duration::from_millis(300),
+            },
+        );
+        for _ in 0..3 {
+            let err = provider.embed(&texts()).unwrap_err();
+            assert!(
+                matches!(err, EmbeddingError::Http { status: 500, .. }),
+                "{err}"
+            );
+        }
+        assert_eq!(server.hits(), 3);
+        // Open: later calls fail fast without touching the upstream.
+        for _ in 0..6 {
+            let err = provider.embed(&texts()).unwrap_err();
+            assert!(matches!(err, EmbeddingError::CircuitOpen { .. }), "{err}");
+        }
+        assert_eq!(server.hits(), 3);
+        // Half-open admits exactly one probe, which fails and re-opens.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(matches!(
+            provider.embed(&texts()).unwrap_err(),
+            EmbeddingError::Http { status: 500, .. }
+        ));
+        assert_eq!(server.hits(), 4);
+        assert!(matches!(
+            provider.embed(&texts()).unwrap_err(),
+            EmbeddingError::CircuitOpen { .. }
+        ));
+        assert_eq!(server.hits(), 4);
+        // Upstream recovers; the next probe closes the breaker.
+        healthy.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(provider.embed(&texts()).unwrap().len(), 1);
+        for _ in 0..3 {
+            assert!(provider.embed(&texts()).is_ok());
+        }
+        assert_eq!(server.hits(), 8);
+    }
+
+    #[test]
+    fn breaker_never_opens_on_client_errors() {
+        for status in ["400 Bad Request", "404 Not Found", "429 Too Many Requests"] {
+            let server =
+                CountingServer::start(move |_| json_response(status, "", "{\"error\":\"no\"}"));
+            let provider = with_resilience(
+                server.ollama(),
+                ResilienceConfig {
+                    max_concurrency: 0,
+                    queue_wait: Duration::from_millis(10),
+                    breaker_threshold: 2,
+                    breaker_reset: Duration::from_secs(60),
+                },
+            );
+            for _ in 0..10 {
+                let err = provider.embed(&texts()).unwrap_err();
+                assert!(
+                    matches!(err, EmbeddingError::Http { .. }),
+                    "{status}: {err}"
+                );
+            }
+            assert_eq!(
+                server.hits(),
+                10,
+                "{status} must reach the upstream every time"
+            );
+        }
+    }
+
+    #[test]
+    fn dead_endpoint_trips_the_breaker() {
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let mut opts = fast_opts();
+        opts.max_retries = 0;
+        let provider = with_resilience(
+            OllamaEmbeddingProvider::new(
+                "m".into(),
+                Some(format!("http://127.0.0.1:{dead}/api/embed")),
+            )
+            .with_http_options(opts),
+            ResilienceConfig {
+                breaker_threshold: 2,
+                ..ResilienceConfig::default()
+            },
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                provider.embed(&texts()).unwrap_err(),
+                EmbeddingError::Io(_)
+            ));
+        }
+        assert!(matches!(
+            provider.embed(&texts()).unwrap_err(),
+            EmbeddingError::CircuitOpen { .. }
+        ));
+    }
+
+    /// Env-driven selection must hand back a breaker-wrapped provider
+    /// (regression: it returned the bare provider and hammered the upstream).
+    #[test]
+    fn select_from_env_returns_breaker_wrapped_network_provider() {
+        let _guard = EnvScope::set(&[
+            ("DASH_EMBEDDING_PROVIDER", "ollama"),
+            ("DASH_OLLAMA_ENDPOINT", "http://127.0.0.1:9/api/embed"),
+            ("DASH_EMBEDDING_BREAKER_THRESHOLD", "1"),
+            ("DASH_EMBEDDING_MAX_CONCURRENCY", "0"),
+        ]);
+        let provider = select_embedding_provider_from_env();
+        assert!(provider.embed(&texts()).is_err());
+        assert!(matches!(
+            provider.embed(&texts()).unwrap_err(),
+            EmbeddingError::CircuitOpen { .. }
+        ));
+    }
+
+    /// Scoped, process-serialized environment overrides restored on drop.
+    struct EnvScope {
+        saved: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvScope {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let mut saved = Vec::new();
+            for (k, v) in vars {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                // SAFETY: serialized by LOCK; no other test thread mutates env.
+                unsafe { std::env::set_var(k, v) };
+            }
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                // SAFETY: still holding LOCK.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(&k, v),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrency_limit_fails_fast_with_overloaded() {
+        struct Gate(Arc<std::sync::Barrier>);
+        impl EmbeddingProvider for Gate {
+            fn name(&self) -> &str {
+                "gate"
+            }
+            fn dimensions(&self) -> usize {
+                1
+            }
+            fn embed(&self, t: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+                self.0.wait();
+                self.0.wait();
+                Ok(vec![vec![1.0]; t.len()])
+            }
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let provider = Arc::new(ConcurrencyLimitedProvider::new(
+            Gate(Arc::clone(&barrier)),
+            1,
+            Duration::from_millis(20),
+        ));
+        let p = Arc::clone(&provider);
+        let first = std::thread::spawn(move || p.embed(&texts()));
+        barrier.wait(); // first call is now inside the provider
+        let started = Instant::now();
+        assert!(matches!(
+            provider.embed(&texts()).unwrap_err(),
+            EmbeddingError::Overloaded
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        barrier.wait();
+        assert!(first.join().unwrap().is_ok());
+        // Slot released: the next call is admitted again.
+        let p = Arc::clone(&provider);
+        let second = std::thread::spawn(move || p.embed(&texts()));
+        barrier.wait();
+        barrier.wait();
+        assert!(second.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn non_finite_provider_output_is_rejected() {
+        for body in [
+            r#"{"embeddings":[[1e39,0.5]]}"#,
+            r#"{"embeddings":[[NaN,0.5]]}"#,
+        ] {
+            let server = CountingServer::start(move |_| json_response("200 OK", "", body));
+            let err = server.ollama().embed(&texts()).unwrap_err();
+            assert!(matches!(err, EmbeddingError::Parse(_)), "{body}: {err}");
+        }
+        assert!(validate_finite(&[vec![1.0, f32::INFINITY]]).is_err());
+        assert!(validate_finite(&[vec![f32::NAN]]).is_err());
+        assert!(validate_finite(&[vec![1.0, -2.0]]).is_ok());
+    }
+
+    #[test]
+    fn failure_classes_follow_the_status_contract() {
+        let http = |status, retry_after_secs| EmbeddingError::Http {
+            status,
+            body: String::new(),
+            retry_after_secs,
+        };
+        let unavailable = |secs| FailureClass::Unavailable {
+            retry_after_secs: secs,
+        };
+        assert_eq!(http(503, Some(7)).classify(), unavailable(7));
+        assert_eq!(http(429, None).classify(), unavailable(1));
+        assert_eq!(http(500, Some(0)).classify(), unavailable(1));
+        assert_eq!(EmbeddingError::Io("x".into()).classify(), unavailable(1));
+        assert_eq!(EmbeddingError::Timeout(1).classify(), unavailable(1));
+        assert_eq!(EmbeddingError::Overloaded.classify(), unavailable(1));
+        assert_eq!(http(400, None).classify(), FailureClass::BadGateway);
+        assert_eq!(
+            EmbeddingError::Parse("x".into()).classify(),
+            FailureClass::BadGateway
+        );
+        assert_eq!(
+            EmbeddingError::DimensionMismatch {
+                expected: 1,
+                actual: 2
+            }
+            .classify(),
+            FailureClass::BadGateway
+        );
+    }
+
+    #[test]
+    fn upstream_retry_after_is_carried_on_the_error() {
+        let server = CountingServer::start(|_| {
+            json_response("503 Service Unavailable", "Retry-After: 9\r\n", "busy")
+        });
+        let err = server.ollama().embed(&texts()).unwrap_err();
+        assert_eq!(
+            err.classify(),
+            FailureClass::Unavailable {
+                retry_after_secs: 9
+            }
+        );
     }
 }

@@ -318,6 +318,7 @@ fn status_failure(status: u16, resp: ureq::Response, secrets: &[&str]) -> Failur
     let error = EmbeddingError::Http {
         status,
         body: sanitize_snippet(&raw, secrets),
+        retry_after_secs: retry_after.map(|d| d.as_secs()),
     };
     if is_retryable_status(status) {
         Failure::Retryable { error, retry_after }

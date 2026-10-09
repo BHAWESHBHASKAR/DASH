@@ -333,7 +333,7 @@ fn utf8_query_decodes_the_same_over_get_and_post() {
 }
 
 #[test]
-fn embedding_provider_failure_maps_to_502_without_leaking_detail() {
+fn embedding_provider_outage_maps_to_503_without_leaking_detail() {
     let _env = env_lock();
     // Nothing listens on this port, so the provider fails with an I/O error.
     let dead_port = free_port();
@@ -350,9 +350,10 @@ fn embedding_provider_failure_maps_to_502_without_leaking_detail() {
     );
     let response = send_raw(&addr, post.as_bytes());
     assert!(
-        status_line(&response).contains("502 Bad Gateway"),
+        status_line(&response).contains("503 Service Unavailable"),
         "got: {response:?}"
     );
+    assert!(response.contains("Retry-After: 1"), "got: {response:?}");
     assert!(
         !response.contains("127.0.0.1"),
         "provider detail must not leak: {response:?}"
@@ -365,7 +366,7 @@ fn embedding_provider_failure_maps_to_502_without_leaking_detail() {
     );
     let response = send_raw(&addr, emb.as_bytes());
     assert!(
-        status_line(&response).contains("502 Bad Gateway"),
+        status_line(&response).contains("503 Service Unavailable"),
         "got: {response:?}"
     );
     assert!(!response.contains("127.0.0.1"));
@@ -416,5 +417,6 @@ fn store_write_lock_is_not_blocked_by_slow_embedding_provider() {
         .expect("writer must not wait for the remote embedding call");
     assert!(waited < Duration::from_millis(1500));
     let response = client.join().expect("client thread");
-    assert!(status_line(&response).contains("502"), "got: {response:?}");
+    // The stalled upstream finally answers 500: an outage, not a bad gateway.
+    assert!(status_line(&response).contains("503"), "got: {response:?}");
 }

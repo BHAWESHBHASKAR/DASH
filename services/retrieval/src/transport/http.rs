@@ -94,11 +94,12 @@ fn find_header_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
-pub(super) fn read_http_request(
+/// Read one request, giving up at `deadline` (measured from accept, so time
+/// spent queued counts).
+pub(super) fn read_http_request_until(
     stream: &mut TcpStream,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<Option<HttpRequest>, HttpReadError> {
-    let deadline = Instant::now() + timeout;
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut chunk = [0u8; READ_CHUNK_BYTES];
     let mut scan_from = 0usize;

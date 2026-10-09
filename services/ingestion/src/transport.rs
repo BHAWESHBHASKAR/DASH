@@ -62,7 +62,8 @@ use replication::{
     render_replication_export_frame, run_replication_pull_tick,
 };
 use request::{
-    parse_query_usize, parse_request_line, read_http_request, resolve_request_timeout, split_target,
+    parse_query_usize, parse_request_line, read_http_request_until, resolve_request_timeout,
+    split_target,
 };
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
@@ -1247,6 +1248,9 @@ dash_ingest_uptime_seconds {:.4}\n",
 pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;
 const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const SOCKET_TIMEOUT_SECS: u64 = 5;
+/// Workers reserved for health-class requests (`/health`, `/live`, ...).
+const HEALTH_WORKERS: usize = 2;
+const HEALTH_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;

@@ -14,6 +14,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
 pub mod audit;
+pub mod conn;
 pub mod policy;
 
 pub use policy::{
