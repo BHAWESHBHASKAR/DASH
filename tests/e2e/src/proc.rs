@@ -20,9 +20,27 @@ pub fn random_secret() -> String {
 }
 
 /// Reserve an ephemeral loopback port (bind to :0, read it, release it).
+///
+/// The kernel may hand the same just-released port to the next bind, so two
+/// calls in a row (for example one per process of a two-node test) could
+/// return the same port and the second server would fail with "address in
+/// use". Ports already handed out by this process are never returned again.
 pub fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().unwrap().port()
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut handed_out = HANDED_OUT.lock().unwrap_or_else(|p| p.into_inner());
+    // Hold every candidate until a fresh one is found, so the kernel cannot
+    // keep offering a port that was already handed out.
+    let mut held = Vec::new();
+    loop {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = l.local_addr().unwrap().port();
+        if handed_out.insert(port) {
+            return port;
+        }
+        held.push(l);
+        assert!(held.len() < 1000, "could not find an unused ephemeral port");
+    }
 }
 
 fn workspace_root() -> PathBuf {
