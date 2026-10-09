@@ -793,7 +793,8 @@ mod tests {
         let mut last = wall0;
         let mut adopted_at = None;
         for secs in 1..=120u64 {
-            let value = lease.now_ms_from(wall0 + step + secs * 1_000, t0 + Duration::from_secs(secs));
+            let value =
+                lease.now_ms_from(wall0 + step + secs * 1_000, t0 + Duration::from_secs(secs));
             assert!(value >= last, "went backwards at {secs}s");
             last = value;
             if value >= wall0 + step && adopted_at.is_none() {

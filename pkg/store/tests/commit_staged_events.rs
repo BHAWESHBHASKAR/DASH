@@ -8,8 +8,12 @@ use store::InMemoryStore;
 fn commit_staged_appends_only_new_events() {
     let mut live = InMemoryStore::new();
     for i in 0..3 {
-        live.ingest_bundle(claim_builder(&format!("c{i}"), "t", "text", 0.5), vec![], vec![])
-            .unwrap();
+        live.ingest_bundle(
+            claim_builder(&format!("c{i}"), "t", "text", 0.5),
+            vec![],
+            vec![],
+        )
+        .unwrap();
     }
     let before_len = live.wal_len();
     let before_total = live.wal_events_total();

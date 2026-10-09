@@ -258,9 +258,9 @@ fn extend_to_group_end(
             return Ok(next + offset + 1);
         }
     }
-    let closes_beyond_cap = lines[bound..]
-        .iter()
-        .any(|line| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end)));
+    let closes_beyond_cap = lines[bound..].iter().any(
+        |line| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end)),
+    );
     if !closes_beyond_cap {
         return Ok(next);
     }
@@ -1397,7 +1397,9 @@ impl ReplayParser {
                     return Err(with_context(err, &origin));
                 }
                 if !self.quiet {
-                    eprintln!("warning: quarantining unreadable legacy record at {origin}: {err:?}");
+                    eprintln!(
+                        "warning: quarantining unreadable legacy record at {origin}: {err:?}"
+                    );
                 }
                 if kind == "C"
                     && let Some(id) = line.split('\t').nth(1).and_then(|f| unescape_field(f).ok())
@@ -1571,7 +1573,9 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         {
             return Err(with_context(
                 err,
-                &format!("wal line {line_no} (inside the open commit group starting at line {begin_line})"),
+                &format!(
+                    "wal line {line_no} (inside the open commit group starting at line {begin_line})"
+                ),
             ));
         }
     }

@@ -950,10 +950,15 @@ impl InMemoryStore {
         }
         if let PersistedRecord::ClaimVector(v) = &record
             && let Err(
-                StoreError::InvalidVector(_) | StoreError::MissingClaim(_) | StoreError::Validation(_),
+                StoreError::InvalidVector(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::Validation(_),
             ) = self.validate_claim_vector(&v.claim_id, &v.values)
         {
-            eprintln!("warning: replication skipping poisoned vector for '{}'", v.claim_id);
+            eprintln!(
+                "warning: replication skipping poisoned vector for '{}'",
+                v.claim_id
+            );
             return Ok(false);
         }
         let claim_id = match &record {
@@ -975,7 +980,9 @@ impl InMemoryStore {
                 | StoreError::MissingClaim(_)
                 | StoreError::InvalidVector(_)),
             ) if legacy => {
-                eprintln!("warning: replication skipping legacy record that fails validation: {err:?}");
+                eprintln!(
+                    "warning: replication skipping legacy record that fails validation: {err:?}"
+                );
                 if let Some(id) = claim_id
                     && !known_claim
                 {

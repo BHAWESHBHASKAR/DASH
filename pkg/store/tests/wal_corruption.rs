@@ -287,7 +287,10 @@ fn mutated_record_lines_never_panic_apply() {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = st.apply_persisted_record_line(&line);
             }));
-            assert!(r.is_ok(), "apply_persisted_record_line panicked on {line:?}");
+            assert!(
+                r.is_ok(),
+                "apply_persisted_record_line panicked on {line:?}"
+            );
         }
     }
 }

@@ -574,7 +574,10 @@ impl IngestionRuntime {
             if let Some(path) = path.as_deref() {
                 match read_state(path) {
                     Some(saved)
-                        if self.wal.as_ref().and_then(|wal| wal.wal_record_count().ok())
+                        if self
+                            .wal
+                            .as_ref()
+                            .and_then(|wal| wal.wal_record_count().ok())
                             != Some(saved.offset) =>
                     {
                         // The local WAL does not hold what the cursor claims
@@ -895,7 +898,9 @@ pub(super) fn run_replication_pull_tick(
             // The follower rebuilds its state from a full export, so the
             // possibly half-updated state is replaced wholesale: it is safe
             // to recover a mutex poisoned by this panic.
-            let mut guard = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.replication_follower.force_resync = true;
             drop(guard);
             runtime.clear_poison();
@@ -905,7 +910,9 @@ pub(super) fn run_replication_pull_tick(
             ))
         }
     };
-    let mut guard = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match outcome {
         Ok(()) => {
             guard.replication_follower.blocked_reason = None;
@@ -1036,8 +1043,10 @@ fn resync_from_export(
     combined_lines.extend(export_frame.snapshot_lines.iter().cloned());
     combined_lines.extend(export_frame.wal_lines.iter().cloned());
     let commit_ids = extract_batch_commit_ids_from_wal_lines(&combined_lines)?;
-    apply_guarded(runtime, |rt| rt.apply_replication_export_frame(export_frame))
-        .map_err(|err| format!("replication resync apply failed: {err:?}"))?;
+    apply_guarded(runtime, |rt| {
+        rt.apply_replication_export_frame(export_frame)
+    })
+    .map_err(|err| format!("replication resync apply failed: {err:?}"))?;
     acknowledge_replication_commits(config, &commit_ids)
         .map_err(|err| format!("replication resync commit ack failed: {err}"))
 }
@@ -1546,7 +1555,8 @@ mod tests {
         wal.begin_group("grp-1", 1).expect("begin group");
         wal.append_batch_commit("batch-v2", 1, 2, &["c1".to_string()])
             .expect("batch commit");
-        wal.append_batch_commit("grp-1", 0, 3, &[]).expect("end group");
+        wal.append_batch_commit("grp-1", 0, 3, &[])
+            .expect("end group");
         wal.begin_group("c9", 5).expect("begin single group");
         wal.append_batch_commit("~tx:c9", 1, 6, &["c9".to_string()])
             .expect("single-ingest end marker");

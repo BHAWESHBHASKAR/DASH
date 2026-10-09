@@ -81,8 +81,7 @@ fn leader_frames_and_exports_skip_lines_that_lenient_replay_quarantines() {
         // Every served line is readable by the strict parser.
         let mut probe = InMemoryStore::new();
         for line in lines.iter() {
-            if line.starts_with("V\tc-ok2") || line.contains("c\\tbad") || line.contains("ghost")
-            {
+            if line.starts_with("V\tc-ok2") || line.contains("c\\tbad") || line.contains("ghost") {
                 continue; // validation-level poison is the follower's job
             }
             probe
@@ -100,9 +99,12 @@ fn follower_converges_to_the_leader_lenient_state_over_raw_poisoned_lines() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("leader.wal");
     let wal = write_leader_wal(&path);
-    let (leader, _) =
-        InMemoryStore::load_from_wal_with_policy(&wal, AnnTuningConfig::default(), ReplayPolicy::Lenient)
-            .unwrap();
+    let (leader, _) = InMemoryStore::load_from_wal_with_policy(
+        &wal,
+        AnnTuningConfig::default(),
+        ReplayPolicy::Lenient,
+    )
+    .unwrap();
     let expected = state_of(&leader);
     assert_eq!(expected.0.len(), 2);
 
@@ -131,9 +133,12 @@ fn follower_applies_leader_filtered_lines_and_matches_the_leader() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("leader.wal");
     let mut wal = write_leader_wal(&path);
-    let (leader, _) =
-        InMemoryStore::load_from_wal_with_policy(&wal, AnnTuningConfig::default(), ReplayPolicy::Lenient)
-            .unwrap();
+    let (leader, _) = InMemoryStore::load_from_wal_with_policy(
+        &wal,
+        AnnTuningConfig::default(),
+        ReplayPolicy::Lenient,
+    )
+    .unwrap();
     let frame = wal.replication_frame_from(None, 0, 1000).unwrap();
     let mut follower = InMemoryStore::new();
     for line in &frame.wal_lines {
@@ -151,5 +156,8 @@ fn follower_wal_mirrors_poisoned_lines_without_wedging() {
         wal.append_raw_record_line(&line)
             .unwrap_or_else(|e| panic!("{line:?}: {e:?}"));
     }
-    assert_eq!(wal.wal_record_count().unwrap(), poisoned_legacy_lines().len());
+    assert_eq!(
+        wal.wal_record_count().unwrap(),
+        poisoned_legacy_lines().len()
+    );
 }

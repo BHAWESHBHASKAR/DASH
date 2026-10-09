@@ -777,7 +777,9 @@ impl Follower {
         if let Err(err) = guard.commit_staged(staged) {
             eprintln!("retrieval replication: disk mirror degraded after commit: {err:?}");
         }
-        self.status.skipped_total.fetch_add(skipped, Ordering::Relaxed);
+        self.status
+            .skipped_total
+            .fetch_add(skipped, Ordering::Relaxed);
         Ok(())
     }
 
@@ -815,7 +817,9 @@ impl Follower {
                 skipped += 1;
             }
         }
-        self.status.skipped_total.fetch_add(skipped, Ordering::Relaxed);
+        self.status
+            .skipped_total
+            .fetch_add(skipped, Ordering::Relaxed);
         fresh.clear_wal_events();
         if let Some(wal) = self.wal.as_mut() {
             wal.replace_with_replication_export(&export.export)
