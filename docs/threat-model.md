@@ -1,151 +1,170 @@
 # DASH Threat Model
 
-This document describes DASH's threat model using the STRIDE framework. It is
-a living artifact: it is updated whenever the system architecture changes
-materially (new trust boundary, new persistent store, new network egress), and
-it is reviewed as part of the security sign-off gate before each release.
+Status: rewritten 2026-10-09 (register item DOC-06). The earlier version described a gRPC service backed by one shared `redb` file, with HMAC-signed WAL entries, a `tests/tenant_isolation.rs` suite, ADR-006, JWT `jti` and request/response hashes in the audit log, retention compaction, `--max-vector-bytes`, per-IP connection caps, signed container images and a deployment audit. None of those exist in this repository. This version describes the system as the code implements it, and states for every control whether it is implemented, partial, planned, or **NOT IMPLEMENTED**.
 
-## 1. System Overview
+Status legend used below:
 
-DASH is a multi-tenant vector search service. At the version this model was
-authored against, the runtime consists of two user-facing services and one
-embedded data store:
+- **Implemented**: present in code, with a test or code path cited.
+- **Partial**: present but with a known defect (register ID given).
+- **v0.3.0**: scheduled for the P0 hardening release; not in v0.2.x.
+- **Planned (Pn)**: scheduled in a later phase of the [master plan](plans/2026-10-09-production-readiness-master-plan.md).
+- **NOT IMPLEMENTED**: does not exist; do not rely on it.
 
-| Component        | Role                                                              | Persistence                          |
-|------------------|-------------------------------------------------------------------|--------------------------------------|
-| `ingestion-svc`  | gRPC + HTTP/JSON API. Accepts upsert/delete, persists vectors.    | `redb` (vectors), `redb` (audit log) |
-| `retrieval-svc`  | gRPC + HTTP/JSON API. Serves k-NN and metadata queries.           | read-only views into `redb`          |
-| `redb` (embedded)| Embedded key-value store backing both services, on local disk.    | local file (`dash.redb`)             |
+Issue IDs refer to [`plans/2026-10-09-issue-register.md`](plans/2026-10-09-issue-register.md).
 
-A single binary may run both services in-process for local development, but in
-production the deployment topology is:
+## 1. System overview
+
+| Component | Role | Persistence | Default bind |
+|---|---|---|---|
+| `ingestion` (`services/ingestion`) | HTTP/1.1 JSON write API; owns the WAL; serves WAL and full export to followers on `/internal/replication/*` | line-oriented WAL file plus `.snapshot`; redb mirror | `127.0.0.1:8081` |
+| `retrieval` (`services/retrieval`) | HTTP read API (`/v1/retrieve`), OpenAI-compatible `/v1/embeddings` proxy to the configured embedding provider; polls ingestion for replication | in-memory store; redb mirror; replication offset file | `127.0.0.1:8080` |
+| `control-plane` (`services/control-plane`) | Placement CSV state, file-lease leader election, failover promotion | CSV state file plus SHA-256 checksum; lease file | `127.0.0.1:8090` |
+| `segment-maintenance-daemon` (`services/indexer`) | Builds and garbage-collects index segment files | segment directory | no listener |
+| Embedding provider (external) | Hash (in-process), Ollama (HTTP), OpenAI (HTTPS, v0.3.0) | n/a | n/a |
+| Identity provider (external) | OIDC JWKS endpoint, optional | n/a | n/a |
+
+There is no gRPC. There is no single shared redb file: each service has its own. Containers and Compose bind `0.0.0.0` and publish ports `8080`, `8081` and `8090` on the host.
 
 ```
-                ┌────────────────────┐
-   client ───▶  │   ingestion-svc    │  ──▶  redb (writers)
-                └────────────────────┘
-                ┌────────────────────┐
-   client ───▶  │   retrieval-svc    │  ──▶  redb (readers)
-                └────────────────────┘
-                          │
-                          ▼
-                     local disk
+client ─HTTP─► retrieval :8080 ──poll /internal/replication/*──► ingestion :8081
+client ─HTTP─► ingestion :8081                                        │
+operator/automation ─HTTP─► control-plane :8090                       ▼
+retrieval ──HTTP(S)──► embedding provider (Ollama / OpenAI)      WAL, redb, segments, audit log (local disk)
+services ──HTTPS──► OIDC JWKS endpoint (optional)
 ```
 
-A single multi-tenant `redb` file is shared by both services; tenant isolation
-is enforced by the application layer (tenant-keyed tables, request-scoped
-tenant_id checks), not by separate files.
+## 2. Trust boundaries
 
-## 2. Trust Boundaries
+| # | Boundary | Untrusted side | Trusted side |
+|---|---|---|---|
+| 1 | Network to ingestion / retrieval public routes | any HTTP client | service process |
+| 2 | Network to **`/internal/replication/*`** on ingestion | any host that can reach port 8081 | WAL contents of all tenants |
+| 3 | Network to **control-plane** | any host that can reach port 8090 | placement and leader state |
+| 4 | Retrieval to **embedding provider** | provider response and network path | retrieval process, provider API key |
+| 5 | Service to OIDC JWKS URL | JWKS response | token validation |
+| 6 | Process to local disk (WAL, redb, segments, audit, revocation file, offset file) | other local users, volume snapshots | service process |
+| 7 | Operator environment (env vars, secrets, compose `.env`) | operator workstation, CI | service configuration |
+| 8 | Ingestion to adapter commands (`sh -c` from `DASH_INGEST_*_ADAPTER_CMD`) | document and text bytes sent on stdin; adapter stdout | ingestion process |
+| 9 | CI/CD to registry and release artifacts | CI runner, third-party actions | release artifact |
 
-The following boundaries exist. Each is annotated with the trust level on each
-side.
+TLS is not implemented by any DASH service. It is assumed to be terminated by a proxy for boundaries 1 to 3. Boundary 2 and 3 traffic between services is plain HTTP.
 
-| # | Boundary                                                    | Untrusted side        | Trusted side          |
-|---|-------------------------------------------------------------|-----------------------|-----------------------|
-| 1 | Internet → ingestion-svc / retrieval-svc                   | external client       | service process       |
-| 2 | Service process → `redb`                                   | service code          | embedded DB           |
-| 3 | Service process → local disk                               | file system driver    | service process       |
-| 4 | Service A → Service B (in-process share)                   | service A's request    | service B's data      |
-| 5 | Operator → service process (admin API, SSH, redeploy)      | operator workstation  | service process       |
-| 6 | CI/CD pipeline → registry (container images)               | CI runner             | release artifact      |
+## 3. Attack surface
 
-Crossing a trust boundary is the only place we explicitly validate input,
-authenticate the caller, or assert authorization. All other code is treated as
-trusted-but-defensive.
+| Surface | Routes / interface | Auth today (v0.2.x) | Auth in v0.3.0 | Notes |
+|---|---|---|---|---|
+| Ingestion write API | `POST /v1/ingest`, `/v1/ingest/batch`, `/v1/ingest/raw`, `/v1/ingest/document` | API key, scoped key, HS256 JWT or OIDC; **open if none configured** (SEC-01); JWT-only config lets a headerless request through (SEC-02) | credentials required to start; dev-mode opt-out | Embeddings are computed before auth (SEC-09) |
+| Retrieval read API | `GET/POST /v1/retrieve` | same as above | same | Embedding computed before auth (SEC-09); recursive JSON parser with no depth limit runs pre-auth (ROB-01) |
+| **Embeddings proxy** | `POST /v1/embeddings` | **none** (SEC-09) | required | Spends the configured provider's quota; with `openai` the key is sent without TLS (SEC-23, TLS in v0.3.0) |
+| **Replication endpoints** | `GET /internal/replication/wal`, `/export`, `/commit-status`; `POST /internal/replication/ack` | `x-replication-token`, only if `DASH_INGEST_REPLICATION_TOKEN` is set; no deploy sets it (SEC-08); token compared with `==`, sent in plaintext | token required | `/export` dumps all tenants' claims, evidence, edges, vectors; ack can forge commit status |
+| **Control plane** | `PUT /v1/control-plane/placement`, `POST .../failover/promote`, `POST .../leader/acquire`, `GET .../placement`, `GET .../leader` | **none** (SEC-07) | `DASH_CONTROL_PLANE_TOKEN` | Can re-route writes and reads to attacker-controlled nodes |
+| Observability and debug | `GET /metrics`, `GET /debug/placement`, `/debug/planner`, `/debug/storage-visibility`, `/debug/document-parser` | **none** (SEC-10) | required | Leaks tenant ids, topology, planner internals |
+| Health | `/health`, `/live`, `/ready` (+ `/v1/` forms) | none (intended) | none | |
+| OIDC JWKS fetch | outbound HTTPS (`http://` also accepted) | n/a | n/a | Blocking 15 s fetch can stall workers if the IdP is slow (SEC-14) |
+| Adapter commands | `sh -c` of operator-supplied command lines | env-var controlled | same | Input bytes come from authenticated users; the command line is operator-controlled |
+| Local files | WAL, snapshot, redb, segment dirs, audit log, revocation file, offset file | filesystem permissions | same | Revocation file re-read on every request |
+| Deployment manifests | compose, Helm, k8s, systemd | n/a | being corrected | Wrong secret variable names, default secrets (SEC-03, SEC-04) |
+| Supply chain | GitHub Actions, `cargo`, release workflow | n/a | n/a | No signing or provenance (SEC-21) |
 
-## 3. STRIDE Analysis
+## 4. STRIDE analysis
 
-For each STRIDE category we list the threats we have considered, our
-mitigations, and the residual risk we accept. "Mitigations" references the
-specific code or process; the references are deliberately short so the model
-stays readable.
+### 4.1 Spoofing
 
-### 3.1 Spoofing
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| Unauthenticated access to write/read API when no credentials are configured | **Partial.** Auth is fail-open today (SEC-01). **v0.3.0:** startup refuses without credentials unless `DASH_INSECURE_DEV_MODE=1` (localhost only). | `services/*/src/transport/authz.rs` | High until v0.3.0 |
+| JWT-only configuration lets a request with no `Authorization` header through | **Partial** (SEC-02). v0.3.0 P0. | `authz.rs` | High until fixed |
+| Forged JWT with guessed or leaked HS256 secret | **Implemented** (signature, `exp`, optional `iss`/`aud`, `kid` rotation). Secret strength: opt-in validation, minimum 16 characters today; v0.3.0 default-on, minimum 32 and placeholder rejection. No `jti` revocation or max-lifetime check (SEC-13). | `pkg/auth/src/lib.rs` tests (`verify_hs256_token_*`) | Secret leak enables forgery until rotation |
+| Tenant impersonation | **Partial.** The tenant comes from the **request** (`claim.tenant_id`, `tenant_id`) and is checked against the credential's tenant scope and the service allowlist; it is not taken only from the token. Wildcard `*` grants all tenants (SEC-12). | `transport_denies_cross_tenant_ingest_for_scoped_key`, `transport_denies_cross_tenant_retrieval_for_scoped_key` | Wildcard and unconfigured-service cases |
+| Spoofed replica or control-plane client | **NOT IMPLEMENTED today** (SEC-07, SEC-08). v0.3.0: replication token and `DASH_CONTROL_PLANE_TOKEN`. Tokens are plain shared secrets over HTTP; mutual TLS is **Planned (P1/P3)**. | `replication.rs`, `control-plane/src/lib.rs` | Network position equals trust until then |
+| Role escalation | **Partial.** Roles (`admin`, `ingest`, `retrieve`, `read_only`) are checked, but they have no hierarchy, a JWT without a roles claim gets all roles, and unscoped keys skip role checks (SEC-11, P1). | `pkg/auth/src/lib.rs:parse_role_claim` | Medium |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **JWT forgery.** Attacker forges a JWT signed with a guessed or stolen key and reads another tenant's vectors. | HS256 signing with a server-side secret loaded from the operator's secret store. Secret is rotated on a documented cadence; rotation is exercised by the security sign-off gate. Per-tenant signing keys are supported behind a feature flag and used for any tenant that requests them. | If the secret leaks (operator compromise, debug log), forgery becomes possible until rotation. We accept this and rely on rotation + alerting. |
-| **Tenant impersonation.** Authenticated client for `tenant=A` presents a request body referencing `tenant=B`. | `tenant_id` is taken **only** from the verified JWT claim, never from the request body or query string. A request-body `tenant_id` is ignored and a warning is emitted. | If a future regression removes the assertion, impersonation is silent. We mitigate via integration tests (see §3.5). |
+### 4.2 Tampering
 
-### 3.2 Tampering
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| Audit log modification | **Partial.** Each line carries `seq`, `prev_hash` and `hash = SHA-256(canonical record)`. The chain is **unkeyed**: anyone who can write the file can recompute it. **NOT IMPLEMENTED:** HMAC signing, WAL signatures, external anchoring (Planned, P4). Ingestion-written chains do not verify with the bundled verifier (SEC-17); truncation of the tail is undetected; audit is off unless a path is configured and no shipped deployment enables it. | `services/ingestion/src/transport/audit.rs`, `scripts/verify_audit_chain.sh`, tests `append_audit_record_writes_chained_hash_and_seq` | An attacker with file access can rewrite history |
+| WAL or snapshot tampering on disk | **NOT IMPLEMENTED.** The WAL is a text file with no record checksum or signature; replay parses whatever is there. Torn-tail truncation is **v0.3.0**. | `pkg/store/src/wal.rs` | Disk access equals full control |
+| Data at rest modification | **NOT IMPLEMENTED.** DASH does not encrypt or sign WAL, redb, segments or audit files. `pkg/encryption` is a library no service calls (SEC-16, **Planned P4**). Require an encrypted, access-controlled volume. | no crate depends on `pkg/encryption` | Operator configuration |
+| Placement or failover tampering | **NOT IMPLEMENTED today** (SEC-07). The control plane does enforce epoch monotonicity and a leader-only write rule. | tests `replace_placements_monotonic_rejects_epoch_regression`, `put_placement_rejects_stale_expected_epoch` | Open API until v0.3.0 |
+| Replication poisoning (stale or forged WAL delta applied by a follower) | **Partial.** Offsets are tracked; no generation id, so a compacted source can desync followers silently. **v0.3.0:** WAL generation ids force resync. No signature on frames. | `services/retrieval/src/replication.rs` | Medium |
+| Segment file corruption | **Implemented:** segments carry checksums and are rejected on mismatch. | test `rejects_segment_file_with_checksum_mismatch` | Low |
+| Duplicate evidence inflating rankings | **Partial** (DATA-01): evidence is duplicated on retry, restart and replication re-apply. **v0.3.0:** idempotent upserts. | register DATA-01 | Integrity of citations |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **Audit log modification.** Attacker with disk access rewrites audit entries to hide their actions. | The audit log is a **hash-chained append-only** structure: each entry contains `prev_hash` and `entry_hash = SHA-256(canonical(entry) ‖ prev_hash)`. Any modification breaks the chain, detected by `scripts/verify_audit_chain.sh` and the security sign-off gate. The chain is also embedded in the `redb` WAL; WAL entries are HMAC-signed with a separate `audit-hmac` key, so an attacker must forge both the chain and the WAL signature. | An attacker with root on the host can rewrite both. We accept this and rely on host hardening + off-host log shipping for forensic recovery. |
-| **Vector payload tampering on disk.** | `redb` is opened with its built-in crash-safety, but not encrypted at rest (see ADR-006 — a deliberate trade-off, see Residual Risks §4). The deployment guide requires the underlying volume to be on an encrypted block device (LUKS / cloud-provider managed encryption). | Operator configuration drift. Detected by the security checklist and the deployment audit. |
-| **WAL entry forgery on restart.** | WAL entries are HMAC-signed; replay is rejected on startup if the signature does not match. | If the HMAC key is lost, the WAL cannot be replayed. This is intentional and is documented in the runbook. |
+### 4.3 Repudiation
 
-### 3.3 Repudiation
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| User denies an action | **Partial.** Audited requests record `ts_unix_ms`, `service`, `action`, `tenant_id`, `claim_id`, `status`, `outcome`, `reason`. **NOT IMPLEMENTED:** principal or key identity, JWT `jti`, request hash, response hash. There is no actor field, so a record cannot say who acted. Only the audited write and retrieve actions are recorded; audit is off by default. | `audit.rs` (`AuditEvent` fields) | An audit entry cannot attribute an action to a credential |
+| Per-tenant audit retention | **NOT IMPLEMENTED.** One chain per service log file; no retention setting, compaction job or per-tenant chain. (`DASH_AUDIT_RETENTION_DAYS` does not exist.) | `docs-site/docs/reference/configuration.md` | Retention is an operator concern (logrotate, off-host shipping) |
+| Audit write failure | **Partial.** Failures increment a metric and are logged to stderr; the request still succeeds (SEC-17). | `emit_audit_event` | Silent audit gaps |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **User denies performing an action.** Operator cannot prove which tenant issued a write. | Every state-changing request produces an audit entry containing the verified `tenant_id`, the principal's JWT `jti`, the request hash, the response hash, and the server-side timestamp. The entry is hash-chained (see §3.2), so any retroactive edit is detectable. | A user can still deny a request that is not in scope of the audit log (e.g. health checks). We log only meaningful events and document the scope. |
-| **Per-tenant audit retention.** A tenant disputes an action taken 18 months ago. | Per-tenant retention is configurable; the default is 365 days. The retention is enforced by a periodic compaction job and recorded as an audit event of its own. | If a tenant's retention is reduced without operator awareness, evidence is lost. The compaction job requires an explicit operator approval and emits its own audit event. |
+### 4.4 Information disclosure
 
-### 3.4 Information Disclosure
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| Cross-tenant leak through retrieval | **Partial.** Candidate generation and final filtering compare tenant ids; ANN graphs are per tenant; claim ids reused across tenants are rejected on write. Known leaks: conflict errors name the owning tenant; `claim_id` namespace is global (existence oracle); edge `to_claim_id` is not tenant-checked; graph output can emit another tenant's ids (SEC-18). Segment directory names collide (`a.b` and `a_b`) (SEC-19, P0). **NOT IMPLEMENTED:** a dedicated isolation test suite (`tests/tenant_isolation.rs` does not exist) and `assert_tenant(request, record)` calls. | `retrieve_semantic_with_tenant_isolation_filters_other_tenants` (`pkg/store/tests/integration_retrieval.rs`); `ingest_bundle_persistent_rejects_cross_tenant_claim_id_before_wal_append` (`pkg/store`) | Do not host mutually untrusted tenants until SEC-18/19 are closed |
+| Full data export through replication endpoints | **NOT IMPLEMENTED today** (SEC-08); v0.3.0 token required | `GET /internal/replication/export` | Critical until v0.3.0 |
+| Tenant ids and topology via `/metrics`, `/debug/*` | **NOT IMPLEMENTED today** (SEC-10); v0.3.0 requires auth | `retrieval/src/transport.rs` | Medium |
+| Provider key or query text leakage to a third party | **Partial.** With `DASH_EMBEDDING_PROVIDER=openai` query and claim text go to OpenAI and the key is sent without TLS in v0.2.x (SEC-23); v0.3.0 adds TLS. Ollama is plain HTTP by design (local network). | `pkg/embeddings/src/lib.rs` | Treat as sensitive-data egress |
+| Anonymous use of embedding provider quota | **NOT IMPLEMENTED today** (SEC-09); v0.3.0 requires auth on `/v1/embeddings` and authenticates before embedding | `retrieval/src/transport.rs` | Cost and DoS |
+| Verbose errors leaking internals | **Partial.** Errors are `{"error":"message"}` with store messages such as validation details and tenant names in conflicts. There is no regression test that errors never contain paths or keys. A placeholder-secret error logs the secret value (SEC-13). | `HttpResponse::*` | Low to medium |
+| Data at rest readable by anyone with disk or snapshot access | **NOT IMPLEMENTED** (no application-level encryption; SEC-16). Use an encrypted volume. An earlier claim that ADR-006 records this decision was wrong: there is no ADR-006. | n/a | Operator controls |
+| Secrets in deployment files and `.env` | **Partial.** `scripts/generate-secrets.sh` creates random keys but writes `.env` without restrictive permissions (SEC-24); Helm/k8s defaults are well-known strings (SEC-03, SEC-04). | `scripts/generate-secrets.sh`, `deploy/` | Operator controls until P0 deploy fixes land |
+| Timing side channels | **NOT IMPLEMENTED / not assessed.** API keys are compared as plain strings (SEC-15). No side-channel review has been done. | `authz.rs` | Unknown |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **Cross-tenant data leak via shared `redb`.** A bug allows a request for `tenant=A` to read `tenant=B`'s vectors. | All tables are **tenant-keyed**: the primary key is a composite of `(tenant_id, vector_id)`. Every read path is required to call `assert_tenant(request, record)` and returns 404 (not 403) on mismatch to avoid tenant existence enumeration. Tenant-keyed tables are exercised by a dedicated integration test suite (`tests/tenant_isolation.rs`) that runs on every PR. | A new code path that bypasses the assertion is the dominant residual risk. The test suite is the primary defense; we plan to add a property-based test in Future Work §5. |
-| **Verbose error messages leaking internals.** A panic in a query path returns a stack trace to the client. | Errors are mapped to a stable, opaque set of public error codes; the raw cause is logged server-side with the request id. A regression test asserts that no error response contains the substring `"redb"`, the on-disk path, or a hex-encoded key. | None accepted; this is enforced in CI. |
-| **Side channel via timing.** Different tenant responses take different amounts of time, allowing existence probes. | Query path is constant-time with respect to tenant identity for the cases we have measured. We have not done a full side-channel audit; see Future Work §5. | Accepted pending a side-channel audit. |
+### 4.5 Denial of service
 
-### 3.5 Denial of Service
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| Oversized request body | **Implemented:** 16 MiB cap on `Content-Length` (returns 400). **NOT IMPLEMENTED:** `--max-vector-bytes`, `--max-batch-vectors` flags (do not exist). Batch item count is capped by `DASH_INGEST_BATCH_MAX_ITEMS` (default 128). Header size and count are unbounded (ROB-03). | `services/ingestion/src/transport/request.rs`, `config.rs` | Memory exhaustion via headers |
+| Deeply nested JSON | **NOT IMPLEMENTED** (ROB-01): retrieval's recursive parser can abort the process pre-auth. P0. | `retrieval/src/transport/payload.rs` | High until fixed |
+| Slow-loris / connection starvation | **Partial.** 5 s socket timeout is per read, not per request, and a fixed worker pool with a bounded queue (503 when full) bounds memory but not stalls (ROB-04). **NOT IMPLEMENTED:** per-IP connection caps (do not exist). | `transport.rs` | Worker pool exhaustion |
+| Accept-loop exit | **Partial** (ROB-06): some accept errors end the server with status 0. P0. | `transport.rs` | Availability |
+| Request-rate abuse | **NOT IMPLEMENTED today:** the per-tenant limiter is rebuilt per request, skips JWT paths and returns 401 (SEC-06). **v0.3.0:** enforced, HTTP 429. Not per-IP. | `authz.rs` | High until v0.3.0 |
+| Expensive queries | **Partial.** `top_k` has no enforced maximum; ANN insert path is quadratic in total vectors (IDX-01). Bounded worker pool. | `payload.rs` | Medium |
+| JWKS outage stalls auth | **Partial** (SEC-14). | `pkg/auth/src/oidc.rs` | Medium |
+| Embedding provider failure | **Implemented:** circuit breaker wraps providers. | tests `circuit_breaker_*` in `pkg/embeddings` | Low |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **Memory exhaustion via huge vectors or huge batches.** A client uploads a 1 GB vector or a 100k batch. | Per-request payload limits (`--max-vector-bytes`, `--max-batch-vectors`) are enforced at the gRPC and HTTP layers. The limits default to conservative values and are documented. Limits are validated as part of the security sign-off gate. | A malicious operator can raise the limits. This is accepted; limits are an operator decision, not a security control. |
-| **Slow-loris / connection starvation.** A client opens many idle connections. | All ingress listeners enforce a `request_timeout` and a `keep-alive` budget. Idle connections past the budget are closed. Per-IP connection caps are configurable and default on. | Network-layer DoS is **out of scope** (see `SECURITY.md`). |
-| **Expensive query that blocks the worker pool.** A client issues a brute-force k-NN scan. | k-NN is index-bound; the request rate is rate-limited per tenant (`--rate-limit-rps`); the worker pool is bounded and queues have explicit depth limits. | A tenant with a legitimate high-RPS workload can be rate-limited. The default is generous and operators can tune. |
+### 4.6 Elevation of privilege
 
-### 3.6 Elevation of Privilege
+| Threat | Control and status | Evidence | Residual risk |
+|---|---|---|---|
+| Cross-tenant access via a scoped or role-limited credential | **Partial**, see 4.4. | tests in 4.1 | see 4.4 |
+| Control-plane takeover to redirect traffic | **NOT IMPLEMENTED today** (SEC-07); v0.3.0 token | `control-plane/src/lib.rs` | Critical until v0.3.0 |
+| Command execution through adapter variables | **By design**: `DASH_INGEST_RAW_ADAPTER_CMD`, `..._DOCUMENT_ADAPTER_CMD`, `..._EMBEDDING_ADAPTER_CMD` are run with `sh -c`. They are operator-controlled environment variables; callers supply only stdin. No sandboxing. | `services/ingestion/src/extraction.rs` | Anyone who can set the service environment owns the host |
+| Container breakout | **Partial.** Non-root user, `no-new-privileges`, capabilities dropped except `CHOWN, SETUID, SETGID, DAC_OVERRIDE`, ports on `0.0.0.0` (SEC-20). | `deploy/container/docker-compose.yml` | Reduce caps in P0/P7 |
+| Tampered build or image | **NOT IMPLEMENTED:** signed images, provenance, digest pinning. The release workflow generates an SBOM with `anchore/sbom-action` only; CI uses `trivy-action@master` and tag-pinned actions (SEC-21, **Planned P7**). | `.github/workflows/release.yml`, `docs/supply-chain.md` (aspirational) | Supply-chain risk |
 
-| Threat                                                 | Mitigation                                                                                          | Residual |
-|--------------------------------------------------------|-----------------------------------------------------------------------------------------------------|----------|
-| **Tenant A reads Tenant B's vectors.** (A specific instance of §3.4, called out here because it is a privilege boundary, not a confidentiality boundary.) | The composite primary key makes a foreign-tenant read impossible at the data layer. **In addition**, every code path that returns a record is required to call `assert_tenant(request, record)` and the call is the subject of an integration test (`tests/tenant_isolation.rs::cross_tenant_read_is_rejected`). The test fails the build on regression. | See §3.4 — we treat this as a single threat with two independent mitigations. |
-| **Local privilege escalation to bypass tenant check.** An attacker who can write to the service binary modifies it to skip the tenant check. | Service binary is deployed from a signed container image (see `docs/supply-chain.md`); the host's package manager verifies the signature on update. Modifications between deploys are detected by the host's file-integrity monitoring (operator responsibility, documented in the runbook). | The host itself must be hardened; this is out of scope for the service code. |
+## 5. Controls this document previously claimed that do not exist
 
-## 4. Residual Risks
+For clarity, the following were described as controls in earlier versions and are **NOT IMPLEMENTED**:
 
-The following risks remain after the mitigations above. Each is accepted
-**with** a justification and an owner; the security sign-off gate refuses to
-pass if a residual-risk row is missing an owner.
+- HMAC-signed WAL entries and an `audit-hmac` key.
+- `tests/tenant_isolation.rs` and `assert_tenant(request, record)`.
+- ADR-006 (redb encryption decision).
+- JWT `jti`, request hash and response hash in audit entries.
+- Per-tenant audit retention configuration and a compaction job.
+- `--max-vector-bytes`, `--max-batch-vectors`, `--rate-limit-rps` flags (limits are environment variables; see the configuration reference).
+- Per-IP connection caps; `request_timeout` and keep-alive budgets as configurable settings.
+- Signed container images and host package-manager signature verification.
+- Per-tenant JWT signing keys behind a feature flag.
+- Key review metadata and a periodic access review process.
+- Encryption of redb at rest by DASH.
+- gRPC services.
 
-1. **No encryption at rest inside `redb`.** Decided in ADR-006. The mitigation
-   is "encrypt the volume underneath the file", not "encrypt the file
-   itself". Owner: platform team. Tracked in the security checklist.
-2. **HS256 JWTs.** Switching to RS256/EdDSA is planned but not yet shipped
-   (tracked in the roadmap). HS256 with a rotated secret is acceptable for
-   the current threat model because the verifier and signer are the same
-   process; there is no federated identity yet.
-3. **No full side-channel audit.** Timing differences across tenant
-   boundaries have not been measured by a third party. Owner: security
-   working group.
-4. **In-process trust between ingestion and retrieval.** When run in the
-   same process, the two services share memory. A memory-corruption bug
-   in one can read the other's data. Owner: runtime team — process
-   separation is the long-term plan.
-5. **Operator compromise.** We assume the operator's secret store is
-   competent. A compromised operator is the dominant residual risk for
-   any self-hosted service; we mitigate with audit, alerting, and
-   documented runbooks, not with code.
+## 6. Accepted residual risks
 
-## 5. Future Work
+1. HS256 shared-secret JWTs; asymmetric validation exists only through the OIDC/JWKS path, which is covered by unit tests with symmetric JWKs only.
+2. No TLS in DASH; plaintext HTTP between services and to Ollama.
+3. No application-level encryption at rest.
+4. Single-writer ingestion with polling followers; no consensus, no automatic failover.
+5. Operator compromise (environment, adapter commands, volumes) equals full compromise.
+6. No external security review, penetration test or side-channel assessment has been performed.
 
-- **Property-based tenant isolation tests.** `quickcheck`/`proptest`
-  harness that asserts no path in the read or write API can return a
-  record whose `tenant_id` differs from the caller's.
-- **Side-channel audit.** Engage an external reviewer to measure
-  per-tenant response-time distributions.
-- **Process separation by default.** Run ingestion and retrieval as
-  separate processes with separate `redb` files (one writer, one reader)
-  and IPC for control-plane events.
-- **Migrate JWTs to RS256/EdDSA.** Tracked in the roadmap. Eliminates the
-  shared-secret class of attack once we federate identity.
-- **Audit log external anchoring.** Periodically publish the head of the
-  hash chain to a transparency log (Sigstore Rekor or similar) so that
-  off-host tampering of the WAL becomes detectable.
-- **Threat model for the control plane.** Once we have a control plane
-  (admin API, RBAC, multi-region replication), this document is split and
-  a separate model is authored for the control plane.
+## 7. Work tracked elsewhere
+
+- P0 (v0.3.0): SEC-01 to SEC-10, SEC-23, ROB-01 to ROB-04, ROB-06, DATA-01, SEC-18 leak fixes, SEC-19.
+- P1: SEC-11 to SEC-15, SEC-22, fuzzing of parsers and authz.
+- P4: encryption at rest and key management, audit integrity (keyed chain, anchoring), tenant lifecycle.
+- P7: supply chain signing and provenance, container hardening, external review.

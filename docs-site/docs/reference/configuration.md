@@ -11,7 +11,7 @@ The list was derived from the source by searching for `DASH_` string literals in
 - **Unparseable numbers** are silently ignored and the default applies, except where a row says the service exits.
 - **Bind addresses** are full `host:port` strings, not a bare port. There is no `DASH_INGEST_PORT` or `DASH_RETRIEVAL_PORT`.
 - There is no config-file path, no relative-path rejection and no "empty value means unset" rule; do not rely on them.
-- Services are restarted to pick up changes, with two exceptions: the API-key revocation file and the API key / JWT / tenant-allowlist variables are re-read on every request.
+- Environment variables are read at process start, with one exception: the contents of the revoked-keys file (`DASH_*_REVOKED_KEYS_PATH`) are re-read on every request, so a key can be revoked without a restart. Everything else needs a restart.
 
 ## Defaults at a glance
 

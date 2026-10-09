@@ -1,5 +1,7 @@
 # Incident Response Policy
 
+> **Implementation status (2026-10-09):** this is a process template, not an implemented control. Prometheus alert rules exist in `deploy/container/monitoring/prometheus-alert-rules.yml` (disk unavailable, ingest-to-visible lag, storage divergence, server error rate, readiness failing) but are not validated by tests. Rotating `DASH_*_API_KEY` values requires a restart of the affected service; there is no JWT revocation (`jti`) mechanism, so "revoke affected JWTs" means rotating the signing secret. SEV definitions, notification windows and postmortem deadlines have no tooling behind them. See [soc2-readiness.md](../soc2-readiness.md).
+
 ## Purpose
 
 Establish a consistent process for identifying, containing, and remediating security and availability incidents.

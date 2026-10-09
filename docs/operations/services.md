@@ -80,8 +80,9 @@ readinessProbe:
 | ingestion | `/v1/ingest/batch` | POST | `{ commit_id?, items: [...] }` |
 | ingestion | `/v1/ingest/raw` | POST | raw document extraction path |
 | ingestion | `/v1/ingest/document` | POST | document-level path |
-| ingestion | `/v1/delete` | POST | `{ tenant_id, claim_ids }` |
 | ingestion | `/internal/replication/ack` | POST | inter-replica WAL ack |
+
+There is no delete route: `POST /v1/delete` was documented here in error and does not exist (see [Planned API](../../docs-site/docs/reference/planned-api.md)). Routes, auth requirements and status codes are in the [HTTP API reference](../../docs-site/docs/reference/api.md).
 
 ## Graceful shutdown
 
