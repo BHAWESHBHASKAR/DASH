@@ -219,6 +219,32 @@ impl ConnFrontend {
     }
 }
 
+/// Upper bounds for [`linger_close`].
+const LINGER_MAX_BYTES: usize = 1024 * 1024;
+const LINGER_MAX_TIME: Duration = Duration::from_millis(300);
+
+/// Close a connection after an early error response (for example 413 or 417)
+/// while the client may still be sending its body: half-close, then read and
+/// discard briefly. Closing with unread data pending makes the kernel send a
+/// reset that can destroy the response before the client has read it.
+pub fn linger_close(stream: &mut TcpStream) {
+    use std::io::Read;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + LINGER_MAX_TIME;
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0usize;
+    while total < LINGER_MAX_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n,
+        }
+    }
+}
+
 /// Paths served by the reserved health lane.
 pub fn is_health_class_path(path: &str) -> bool {
     matches!(

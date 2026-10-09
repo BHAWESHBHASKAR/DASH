@@ -114,7 +114,12 @@ pub(super) fn serve_http_with_workers(
                         continue;
                     }
                     let deadline = conn.deadline(request_timeout);
-                    if let Err(err) = handle_connection(&runtime, &mut conn.stream, deadline) {
+                    if let Err(err) = handle_connection(
+                        &runtime,
+                        &mut conn.stream,
+                        deadline,
+                        &backpressure_metrics,
+                    ) {
                         eprintln!("ingestion transport error: {err}");
                     }
                 }
@@ -213,6 +218,7 @@ fn handle_connection(
     runtime: &SharedRuntime,
     stream: &mut TcpStream,
     deadline: Instant,
+    backpressure: &TransportBackpressureMetrics,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
@@ -224,10 +230,13 @@ fn handle_connection(
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(err) => {
-            return write_response(
+            backpressure.observe_read_error(err.status);
+            let result = write_response(
                 stream,
                 HttpResponse::error_with_status(err.status, &err.message),
             );
+            dash_common::conn::linger_close(stream);
+            return result;
         }
     };
 

@@ -404,9 +404,84 @@ pub(super) fn parse_json(input: &str) -> Result<JsonValue, String> {
         return Err("empty JSON payload".to_string());
     }
     check_json_nesting_depth(input)?;
-    let value: serde_json::Value =
+    let StrictValue(value) =
         serde_json::from_str(input).map_err(|err| format!("invalid JSON: {err}"))?;
     Ok(JsonValue::from_serde(value))
+}
+
+/// A `serde_json::Value` that fails to deserialize when an object repeats a
+/// key, instead of silently keeping the last value. Parsing is still done by
+/// serde_json; this only supplies the object visitor.
+struct StrictValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any valid JSON value")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Bool(v)))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<StrictValue, E> {
+                Ok(StrictValue(v.into()))
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<StrictValue, E> {
+                Ok(StrictValue(v.into()))
+            }
+
+            fn visit_f64<E>(self, v: f64) -> Result<StrictValue, E> {
+                Ok(StrictValue(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v.to_string())))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v)))
+            }
+
+            fn visit_unit<E>(self) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<StrictValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(StrictValue(item)) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(StrictValue(serde_json::Value::Array(items)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<StrictValue, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let StrictValue(value) = map.next_value()?;
+                    if object.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
+                    }
+                    object.insert(key, value);
+                }
+                Ok(StrictValue(serde_json::Value::Object(object)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 fn check_json_nesting_depth(input: &str) -> Result<(), String> {
@@ -672,6 +747,19 @@ pub(super) fn json_escape(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_json_rejects_duplicate_keys_at_any_depth() {
+        for bad in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":{"b":1,"b":2}}"#,
+            r#"{"a":[{"b":1,"b":1}]}"#,
+        ] {
+            let err = parse_json(bad).err().unwrap_or_default();
+            assert!(err.contains("duplicate key"), "{bad}: {err}");
+        }
+        assert!(parse_json(r#"{"a":1,"b":[1,2.5,"x",null,true],"c":{"a":1}}"#).is_ok());
+    }
 
     #[test]
     fn json_strings_decode_utf8_and_surrogate_pairs() {

@@ -2506,4 +2506,29 @@ mod tests {
             }
         );
     }
+
+    /// Both services key their cached provider on this signature; every
+    /// variable that changes provider construction must change it.
+    #[test]
+    fn env_signature_covers_alias_and_insecure_http_and_resilience_vars() {
+        let base = {
+            let _g = EnvScope::set(&[]);
+            provider_env_signature()
+        };
+        for (key, value) in [
+            ("DASH_OLLAMA_BASE_URL", "http://127.0.0.1:1"),
+            ("DASH_EMBEDDING_ALLOW_INSECURE_HTTP", "1"),
+            ("DASH_EMBEDDING_MAX_CONCURRENCY", "3"),
+            ("DASH_EMBEDDING_QUEUE_WAIT_MS", "5"),
+            ("DASH_EMBEDDING_BREAKER_THRESHOLD", "9"),
+            ("DASH_EMBEDDING_BREAKER_RESET_MS", "7"),
+            ("DASH_OLLAMA_MODEL", "other"),
+        ] {
+            let changed = {
+                let _g = EnvScope::set(&[(key, value)]);
+                provider_env_signature()
+            };
+            assert_ne!(base, changed, "{key} must be part of the signature");
+        }
+    }
 }

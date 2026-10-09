@@ -1090,3 +1090,24 @@ fn transport_ingest_authorizes_before_calling_the_embedding_provider() {
     assert!(detail.contains("embedding_unavailable"), "{detail}");
     assert!(!detail.contains("127.0.0.1"), "{detail}");
 }
+
+#[test]
+fn transport_rejects_invalid_percent_encoding_in_query_with_400() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let runtime = sample_runtime();
+    for bad in ["tenant_id=%FF", "entity_key=%zz", "tenant_id=t&x=%4"] {
+        let request = format!(
+            "GET /debug/placement?{bad} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let raw = handle_http_request_bytes(&runtime, request.as_bytes()).expect("parses");
+        let text = String::from_utf8(raw).expect("utf8");
+        assert!(text.contains(" 400 "), "{bad}: {text}");
+        assert!(
+            text.contains("invalid percent-encoding in query"),
+            "{bad}: {text}"
+        );
+    }
+    let ok = "GET /debug/placement?tenant_id=tenant-http&entity_key=company%2Dx+y HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let raw = handle_http_request_bytes(&runtime, ok.as_bytes()).expect("parses");
+    assert!(!String::from_utf8(raw).expect("utf8").contains(" 400 "));
+}

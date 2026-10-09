@@ -68,6 +68,58 @@ impl EmbedFailure {
     }
 }
 
+/// Ingest-side checks that need the current store state, run before anything
+/// is written (and before the WAL append) so a rejected request leaves no
+/// trace:
+///
+/// * a claim embedding must be finite and have a non-zero norm, matching the
+///   query-vector validation (a zero vector has no direction and can never
+///   match);
+/// * an edge may not point at a claim that exists under a different tenant,
+///   in the store or earlier in the same batch. A target that does not exist
+///   yet is allowed, since edges may arrive before their targets.
+///
+/// The error never names the other tenant.
+pub fn validate_ingest_bundles(
+    store: &store::InMemoryStore,
+    bundles: &[(&Claim, Option<&[f32]>, &[ClaimEdge])],
+) -> Result<(), store::StoreError> {
+    for (claim, embedding, edges) in bundles {
+        if let Some(vector) = embedding {
+            if vector.iter().any(|v| !v.is_finite()) {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding values must be finite".to_string(),
+                ));
+            }
+            let norm_sq: f64 = vector.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            if !vector.is_empty() && norm_sq <= 0.0 {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding must have a non-zero norm".to_string(),
+                ));
+            }
+        }
+        for edge in *edges {
+            let target_tenant = bundles
+                .iter()
+                .find(|(other, _, _)| other.claim_id == edge.to_claim_id)
+                .map(|(other, _, _)| other.tenant_id.as_str())
+                .or_else(|| {
+                    store
+                        .claim_by_id(&edge.to_claim_id)
+                        .map(|existing| existing.tenant_id.as_str())
+                });
+            if let Some(tenant) = target_tenant
+                && tenant != claim.tenant_id
+            {
+                return Err(store::StoreError::Conflict(
+                    "edge target is not in this tenant".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
 
 /// Embedding provider shared by requests. It is rebuilt only when the

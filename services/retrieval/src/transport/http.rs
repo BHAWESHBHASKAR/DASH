@@ -15,6 +15,9 @@ pub(super) const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
 pub(super) const MAX_HEADER_COUNT: usize = 100;
 /// Default whole-request read deadline.
 pub(super) const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
+/// Parse error for a well-formed HTTP version other than 1.0/1.1 (answered
+/// with 505).
+const UNSUPPORTED_VERSION: &str = "unsupported HTTP version";
 /// Upper bound on bytes allocated ahead of bytes actually received.
 const READ_CHUNK_BYTES: usize = 4096;
 
@@ -134,8 +137,10 @@ pub(super) fn read_http_request_until(
     if request_line.len() > MAX_HEADER_LINE_BYTES {
         return Err(HttpReadError::new(431, "request line too large"));
     }
-    let (method, target) =
-        parse_request_line(request_line).map_err(|e| HttpReadError::bad_request(&e))?;
+    let (method, target) = parse_request_line(request_line).map_err(|e| {
+        let status = if e == UNSUPPORTED_VERSION { 505 } else { 400 };
+        HttpReadError::new(status, &e)
+    })?;
 
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut header_count = 0usize;
@@ -150,9 +155,17 @@ pub(super) fn read_http_request_until(
         if header_count > MAX_HEADER_COUNT {
             return Err(HttpReadError::new(431, "too many request headers"));
         }
+        if line.starts_with([' ', '\t']) {
+            return Err(HttpReadError::bad_request(
+                "obsolete header line folding is not supported",
+            ));
+        }
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| HttpReadError::bad_request("invalid HTTP header"))?;
+        if name.is_empty() || name.contains([' ', '\t']) {
+            return Err(HttpReadError::bad_request("invalid HTTP header name"));
+        }
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim().to_string();
         if name == "content-length"
@@ -164,6 +177,15 @@ pub(super) fn read_http_request_until(
             ));
         }
         headers.insert(name, value);
+    }
+
+    if headers.contains_key("expect") {
+        // Answer immediately instead of waiting for a body the client will
+        // not send until it sees `100 Continue`.
+        return Err(HttpReadError::new(
+            417,
+            "the Expect header is not supported; send the body directly",
+        ));
     }
 
     if headers.contains_key("transfer-encoding") {
@@ -233,8 +255,20 @@ pub(super) fn parse_request_line(line: &str) -> Result<(String, String), String>
     let version = parts
         .next()
         .ok_or_else(|| "missing HTTP version".to_string())?;
-    if !version.starts_with("HTTP/1.") {
-        return Err("unsupported HTTP version".to_string());
+    if parts.next().is_some() {
+        return Err("malformed request line".to_string());
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let well_formed = version
+            .strip_prefix("HTTP/")
+            .and_then(|v| v.split_once('.'))
+            .is_some_and(|(major, minor)| digits(major) && digits(minor));
+        return Err(if well_formed {
+            UNSUPPORTED_VERSION.to_string()
+        } else {
+            "malformed HTTP version".to_string()
+        });
     }
     Ok((method.to_string(), target.to_string()))
 }
@@ -266,6 +300,19 @@ pub(super) fn split_target(target: &str) -> (String, HashMap<String, String>) {
     (path.to_string(), query)
 }
 
+/// True when the query string contains an invalid percent-encoding (bad hex
+/// digits, truncated escape, or non-UTF-8 bytes). `split_target` silently
+/// skips such parameters, so callers must reject the request first.
+pub(super) fn query_encoding_is_invalid(target: &str) -> bool {
+    let Some((_, query)) = target.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        url_decode(key).is_err() || url_decode(value).is_err()
+    })
+}
+
 pub(super) fn write_response(
     stream: &mut TcpStream,
     response: HttpResponse,
@@ -285,11 +332,13 @@ pub(super) fn render_response_text(response: &HttpResponse) -> String {
         408 => "408 Request Timeout",
         411 => "411 Length Required",
         413 => "413 Payload Too Large",
+        417 => "417 Expectation Failed",
         429 => "429 Too Many Requests",
         431 => "431 Request Header Fields Too Large",
         501 => "501 Not Implemented",
         502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
+        505 => "505 HTTP Version Not Supported",
         _ => "500 Internal Server Error",
     };
     let body_len = response.body.len();

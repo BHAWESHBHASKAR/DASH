@@ -62,8 +62,8 @@ use replication::{
     render_replication_export_frame, run_replication_pull_tick,
 };
 use request::{
-    parse_query_usize, parse_request_line, read_http_request_until, resolve_request_timeout,
-    split_target,
+    parse_query_usize, parse_request_line, query_encoding_is_invalid, read_http_request_until,
+    resolve_request_timeout, split_target,
 };
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
@@ -151,6 +151,9 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
+    /// Requests that failed while being read (408/413/431/400/...), by status class.
+    pub(crate) read_error_4xx_total: AtomicU64,
+    pub(crate) read_error_5xx_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +180,8 @@ impl TransportBackpressureMetrics {
             queue_depth: AtomicUsize::new(0),
             queue_capacity,
             queue_full_reject_total: AtomicU64::new(0),
+            read_error_4xx_total: AtomicU64::new(0),
+            read_error_5xx_total: AtomicU64::new(0),
         }
     }
 
@@ -194,6 +199,15 @@ impl TransportBackpressureMetrics {
 
     pub(crate) fn observe_rejected(&self) {
         self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_read_error(&self, status: u16) {
+        let counter = if status >= 500 {
+            &self.read_error_5xx_total
+        } else {
+            &self.read_error_4xx_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -443,6 +457,14 @@ impl IngestionRuntime {
             evidence: request.evidence,
             edges: request.edges,
         };
+        crate::api::validate_ingest_bundles(
+            &self.store,
+            &[(
+                &input.claim,
+                input.claim_embedding.as_deref(),
+                input.edges.as_slice(),
+            )],
+        )?;
         let (checkpoint_stats, checkpoint_deferred, applied) = self.ingest_input_internal(input)?;
 
         self.successful_ingests += 1;
@@ -488,6 +510,18 @@ impl IngestionRuntime {
             touched_tenants.insert(tenant_id);
             ingested_claim_ids.push(claim_id);
         }
+
+        let bundles: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    &input.claim,
+                    input.claim_embedding.as_deref(),
+                    input.edges.as_slice(),
+                )
+            })
+            .collect();
+        crate::api::validate_ingest_bundles(&self.store, &bundles)?;
 
         // Idempotency is decided on CONTENT, not on claim ids (DATA-12): a
         // known commit id whose every bundle is already stored verbatim is a
@@ -1042,6 +1076,16 @@ impl IngestionRuntime {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (read_error_4xx, read_error_5xx) = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| {
+                (
+                    metrics.read_error_4xx_total.load(Ordering::Relaxed),
+                    metrics.read_error_5xx_total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         format!(
             "# TYPE dash_ingest_success_total counter\n\
 dash_ingest_success_total {}\n\
@@ -1159,6 +1203,9 @@ dash_ingest_transport_queue_capacity {}\n\
 dash_ingest_transport_queue_depth {}\n\
 # TYPE dash_ingest_transport_queue_full_reject_total counter\n\
 dash_ingest_transport_queue_full_reject_total {}\n\
+# TYPE dash_ingest_transport_read_error_total counter\n\
+dash_ingest_transport_read_error_total{{status_class=\"4xx\"}} {}\n\
+dash_ingest_transport_read_error_total{{status_class=\"5xx\"}} {}\n\
 # TYPE dash_ingest_replication_pull_success_total counter\n\
 dash_ingest_replication_pull_success_total {}\n\
 # TYPE dash_ingest_replication_pull_failure_total counter\n\
@@ -1233,6 +1280,8 @@ dash_ingest_uptime_seconds {:.4}\n",
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            read_error_4xx,
+            read_error_5xx,
             self.replication_pull_success_total,
             self.replication_pull_failure_total,
             self.replication_applied_records_total,

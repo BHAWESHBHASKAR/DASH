@@ -55,8 +55,8 @@ use debug_render::{
     resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
 };
 use http::{
-    parse_request_line, read_http_request_until, render_response_text, resolve_request_timeout,
-    split_target, write_response,
+    parse_request_line, query_encoding_is_invalid, read_http_request_until, render_response_text,
+    resolve_request_timeout, split_target, write_response,
 };
 #[cfg(test)]
 use payload::build_retrieve_request_from_json;
@@ -84,6 +84,9 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
+    /// Requests that failed while being read (408/413/431/400/...), by status class.
+    pub(crate) read_error_4xx_total: AtomicU64,
+    pub(crate) read_error_5xx_total: AtomicU64,
 }
 
 impl TransportBackpressureMetrics {
@@ -92,6 +95,8 @@ impl TransportBackpressureMetrics {
             queue_depth: AtomicUsize::new(0),
             queue_capacity,
             queue_full_reject_total: AtomicU64::new(0),
+            read_error_4xx_total: AtomicU64::new(0),
+            read_error_5xx_total: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +114,15 @@ impl TransportBackpressureMetrics {
 
     pub(crate) fn observe_rejected(&self) {
         self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_read_error(&self, status: u16) {
+        let counter = if status >= 500 {
+            &self.read_error_5xx_total
+        } else {
+            &self.read_error_4xx_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -660,6 +674,16 @@ impl TransportMetrics {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (read_error_4xx, read_error_5xx) = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| {
+                (
+                    metrics.read_error_4xx_total.load(Ordering::Relaxed),
+                    metrics.read_error_5xx_total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         let (disk_unavailable, disk_recovering) = match disk_status {
             store::DiskStatus::Unavailable { .. } => (1, 0),
             store::DiskStatus::Recovering => (0, 1),
@@ -697,6 +721,9 @@ dash_retrieve_transport_queue_capacity {}\n\
 dash_retrieve_transport_queue_depth {}\n\
 # TYPE dash_retrieve_transport_queue_full_reject_total counter\n\
 dash_retrieve_transport_queue_full_reject_total {}\n\
+# TYPE dash_retrieve_transport_read_error_total counter\n\
+dash_retrieve_transport_read_error_total{{status_class=\"4xx\"}} {}\n\
+dash_retrieve_transport_read_error_total{{status_class=\"5xx\"}} {}\n\
 # TYPE dash_retrieve_placement_enabled gauge\n\
 dash_retrieve_placement_enabled {}\n\
 # TYPE dash_retrieve_placement_route_reject_total counter\n\
@@ -828,6 +855,8 @@ dash_transport_uptime_seconds {:.4}\n",
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            read_error_4xx,
+            read_error_5xx,
             placement_enabled,
             self.placement_route_reject_total,
             placement_last_shard_id,
@@ -1007,6 +1036,7 @@ pub fn serve_http_with_workers(
                         deadline,
                         &metrics,
                         &placement_routing,
+                        &backpressure_metrics,
                     ) {
                         eprintln!("retrieval transport error: {err}");
                     }
@@ -1115,7 +1145,14 @@ pub fn serve_http_once_with_listener(
     )?));
     let (mut stream, _) = listener.accept()?;
     let deadline = Instant::now() + resolve_request_timeout();
-    handle_connection(&store, &mut stream, deadline, &metrics, &placement_routing)
+    handle_connection(
+        &store,
+        &mut stream,
+        deadline,
+        &metrics,
+        &placement_routing,
+        &TransportBackpressureMetrics::default(),
+    )
 }
 
 pub fn handle_http_request_bytes(
@@ -1193,6 +1230,7 @@ fn handle_connection(
     deadline: Instant,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
+    backpressure: &TransportBackpressureMetrics,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
@@ -1204,10 +1242,13 @@ fn handle_connection(
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(err) => {
-            return write_response(
+            backpressure.observe_read_error(err.status);
+            let result = write_response(
                 stream,
                 HttpResponse::error_with_status(err.status, &err.message),
             );
+            dash_common::conn::linger_close(stream);
+            return result;
         }
     };
 
@@ -1370,6 +1411,9 @@ fn route_request<S: StoreAccess + ?Sized>(
     auth_policy: &AuthPolicy,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
+    if query_encoding_is_invalid(&request.target) {
+        return HttpResponse::bad_request("invalid percent-encoding in query");
+    }
     let audit_log_path = env_with_fallback(
         "DASH_RETRIEVAL_AUDIT_LOG_PATH",
         "EME_RETRIEVAL_AUDIT_LOG_PATH",
@@ -2801,6 +2845,50 @@ mod tests {
     }
 
     #[test]
+    fn invalid_percent_encoding_in_query_is_a_400_not_a_dropped_parameter() {
+        let store = sample_store();
+        for bad in [
+            "stance_mode=%FF",
+            "entity_filters=%FF",
+            "top_k=%zz",
+            "query=%4",
+            "%zz=1",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&query=company+x&{bad}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_eq!(response.status, 400, "{bad}: {}", response.body);
+            assert!(
+                response.body.contains("invalid percent-encoding in query"),
+                "{bad}: {}",
+                response.body
+            );
+        }
+        // Valid encodings, `+` and bare flags are unchanged.
+        for good in [
+            "stance_mode=balanced",
+            "query=company%20x",
+            "query=company+x&flag",
+            "entity_filters=a%2Cb",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&top_k=1&{good}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_ne!(response.status, 400, "{good}: {}", response.body);
+        }
+        assert!(!query_encoding_is_invalid("/x?a=b+c&d=%41&e"));
+        assert!(query_encoding_is_invalid("/x?a=%"));
+    }
+
+    #[test]
     fn handle_request_get_returns_json_payload() {
         let store = sample_store();
         let request = HttpRequest {
@@ -3712,6 +3800,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             queue_depth: AtomicUsize::new(3),
             queue_capacity: 8,
             queue_full_reject_total: AtomicU64::new(11),
+            ..TransportBackpressureMetrics::default()
         });
         {
             let mut guard = metrics.lock().expect("metrics lock should be available");

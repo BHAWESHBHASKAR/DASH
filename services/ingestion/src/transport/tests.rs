@@ -1276,6 +1276,7 @@ fn metrics_endpoint_reports_backpressure_queue_values() {
         queue_depth: AtomicUsize::new(3),
         queue_capacity: 8,
         queue_full_reject_total: AtomicU64::new(11),
+        ..TransportBackpressureMetrics::default()
     });
     {
         let mut guard = runtime.lock().expect("runtime lock should be available");
@@ -2118,4 +2119,50 @@ fn append_audit_record_writes_chained_hash_and_seq() {
     assert_eq!(second_prev, first_hash);
 
     let _ = std::fs::remove_file(audit_path);
+}
+
+fn ingest_json(runtime: &mut IngestionRuntime, body: &str) -> Result<(), StoreError> {
+    let request = build_ingest_request_from_json(body).expect("request should parse");
+    runtime.ingest(request).map(|_| ())
+}
+
+#[test]
+fn ingest_rejects_edges_into_another_tenants_claim() {
+    let mut runtime = IngestionRuntime::in_memory(InMemoryStore::new());
+    ingest_json(
+        &mut runtime,
+        r#"{"claim":{"claim_id":"victim-claim","tenant_id":"tenant-b","canonical_text":"b claim","confidence":0.9}}"#,
+    )
+    .expect("tenant-b claim ingests");
+
+    let cross = r#"{"claim":{"claim_id":"a1","tenant_id":"tenant-a","canonical_text":"a claim","confidence":0.9},
+        "edges":[{"edge_id":"e1","from_claim_id":"a1","to_claim_id":"victim-claim","relation":"supports","strength":0.5}]}"#;
+    let err = ingest_json(&mut runtime, cross).expect_err("cross-tenant edge must be rejected");
+    assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    assert!(
+        runtime.store.claim_by_id("a1").is_none(),
+        "a rejected bundle must not be applied"
+    );
+    // The other tenant's claim never gains an inbound edge.
+    assert!(runtime.store.edges_for_claim("victim-claim").is_empty());
+
+    // Edges whose target does not exist yet stay allowed (edges may arrive
+    // before their targets), as do edges within the tenant.
+    let dangling = r#"{"claim":{"claim_id":"a2","tenant_id":"tenant-a","canonical_text":"a2 claim","confidence":0.9},
+        "edges":[{"edge_id":"e2","from_claim_id":"a2","to_claim_id":"not-yet","relation":"supports","strength":0.5}]}"#;
+    ingest_json(&mut runtime, dangling).expect("dangling target is allowed");
+    let same_tenant = r#"{"claim":{"claim_id":"a3","tenant_id":"tenant-a","canonical_text":"a3 claim","confidence":0.9},
+        "edges":[{"edge_id":"e3","from_claim_id":"a3","to_claim_id":"a2","relation":"supports","strength":0.5}]}"#;
+    ingest_json(&mut runtime, same_tenant).expect("same-tenant edge is allowed");
+}
+
+#[test]
+fn ingest_rejects_all_zero_claim_embedding() {
+    let mut runtime = IngestionRuntime::in_memory(InMemoryStore::new());
+    let zero = r#"{"claim":{"claim_id":"z1","tenant_id":"tenant-a","canonical_text":"zero","confidence":0.9,"embedding_vector":[0.0,0.0,0.0]}}"#;
+    let err = ingest_json(&mut runtime, zero).expect_err("zero vector must be rejected");
+    assert!(matches!(err, StoreError::InvalidVector(_)), "{err:?}");
+    assert!(runtime.store.claim_by_id("z1").is_none());
+    let ok = r#"{"claim":{"claim_id":"z2","tenant_id":"tenant-a","canonical_text":"nonzero","confidence":0.9,"embedding_vector":[0.0,0.5,0.0]}}"#;
+    ingest_json(&mut runtime, ok).expect("non-zero vector is accepted");
 }
