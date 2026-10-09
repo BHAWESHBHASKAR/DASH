@@ -965,10 +965,14 @@ impl FileWal {
         for line in lines {
             write_line(&mut file, line)?;
         }
-        file.sync_all()?;
+        failpoint!("snapshot.tmp_written");
+        sync_file(&file)?;
+        failpoint!("snapshot.fsynced");
         drop(file);
-        rename(&tmp_path, &snapshot_path)?;
+        rename_file(&tmp_path, &snapshot_path)?;
+        failpoint!("snapshot.renamed");
         sync_parent_dir(&snapshot_path)?;
+        failpoint!("snapshot.dir_synced");
         Ok(())
     }
 
@@ -991,14 +995,16 @@ impl FileWal {
         // New lineage first: a crash between the bump and the truncation
         // only causes a spurious resync, never a silent skip.
         self.bump_generation()?;
+        failpoint!("wal.generation_bumped");
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        file.sync_all()?;
+        sync_file(&file)?;
         drop(file);
         sync_parent_dir(&self.path)?;
+        failpoint!("wal.truncated");
         self.wal_records = 0;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
@@ -1062,6 +1068,7 @@ fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    trace_op!("fsync_dir");
     #[cfg(unix)]
     {
         File::open(dir)?.sync_all()?;
@@ -1071,6 +1078,18 @@ fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
         let _ = dir;
     }
     Ok(())
+}
+
+/// `File::sync_all` with a test-only trace of the operation order.
+fn sync_file(file: &File) -> std::io::Result<()> {
+    trace_op!("fsync_file");
+    file.sync_all()
+}
+
+/// `fs::rename` with a test-only trace of the operation order.
+fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    trace_op!("rename");
+    rename(from, to)
 }
 
 fn generation_path_for(wal_path: &Path) -> PathBuf {
@@ -1098,9 +1117,9 @@ fn write_generation(path: &Path, generation: u64) -> Result<(), StoreError> {
         .truncate(true)
         .open(&tmp)?;
     write_line(&mut file, &format!("{generation:016x}"))?;
-    file.sync_all()?;
+    sync_file(&file)?;
     drop(file);
-    rename(&tmp, path)?;
+    rename_file(&tmp, path)?;
     sync_parent_dir(path)?;
     Ok(())
 }

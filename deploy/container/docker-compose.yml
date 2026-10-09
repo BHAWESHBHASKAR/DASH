@@ -109,6 +109,9 @@ services:
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
       DASH_RETRIEVAL_AUDIT_LOG_PATH: /var/lib/dash/audit/retrieval.audit.jsonl
       DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081
+      # Plain http on the compose network: acknowledges that the token and WAL
+      # stream are unencrypted there (docs/operations/replication-security.md).
+      DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
       DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
       DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: /var/lib/dash/state/retrieval-replication.offset
       DASH_RETRIEVAL_REPLICATION_TOKEN: ${DASH_RETRIEVAL_REPLICATION_TOKEN:?DASH_RETRIEVAL_REPLICATION_TOKEN must be set (run scripts/generate-secrets.sh)}

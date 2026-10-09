@@ -16,6 +16,7 @@ use signal_hook::flag;
 pub mod audit;
 pub mod conn;
 pub mod policy;
+pub mod replication_client;
 
 pub use policy::{
     AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, RouteClass, ServiceAuthEnv,

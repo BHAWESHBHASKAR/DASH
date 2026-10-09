@@ -54,6 +54,10 @@ data:
 
   # ----- replication: every retrieval pod follows the single ingestion pod -----
   DASH_RETRIEVAL_REPLICATION_SOURCE_URL: {{ printf "http://%s.%s.svc.cluster.local:%v" (include "dash.componentName" (list . "ingestion")) $ns .Values.service.ports.http | quote }}
+  # Replication is plain http inside the cluster; this acknowledges that the
+  # token and WAL stream cross the pod network unencrypted
+  # (docs/operations/replication-security.md).
+  DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
   DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | quote }}
   DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: {{ printf "%s/state/retrieval-replication.offset" $p | quote }}
 

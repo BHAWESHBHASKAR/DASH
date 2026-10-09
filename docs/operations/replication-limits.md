@@ -74,3 +74,17 @@ A follower persists `(generation, offset)` next to its WAL
 number of records in its local WAL; if they differ (a restored or truncated
 WAL, or a stale state file) it discards the cursor and performs a full
 resync, instead of resuming and silently missing records.
+
+## What `/ready` reports about a failure
+
+`/ready` embeds the follower state as one JSON object under `replication`.
+`replication.last_error` is a short code, never the raw error text, because
+the raw text can contain hostnames, filesystem paths and part of the leader's
+response body. The codes are `source_unreachable`, `source_timeout`,
+`source_rejected_credentials`, `source_error_status`, `response_too_large`,
+`group_too_large`, `token_transport_refused`, `ack_failed`, `apply_failed`,
+`invalid_response` and `replication_error`. The full message is written to the
+service log and, on the retrieval follower, kept in the in-process status.
+`replication.skipped_records_total` is the number of replicated lines skipped
+because lenient replay quarantines them. A disk failure is reported as
+`"reason":"disk_unavailable"` without the underlying error.

@@ -1187,3 +1187,69 @@ fn leader_checkpoint_between_groups_forces_resync_and_converges() {
     });
     assert_eq!(supports_for(&node.store, "k2"), 1, "no duplicate evidence");
 }
+
+/// ROB-12: `/ready` is one JSON document and carries error codes, never the
+/// raw error text (hosts, ports, upstream bodies).
+fn assert_ready_is_clean(body: &str, forbidden: &[&str]) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .unwrap_or_else(|err| panic!("/ready must be valid JSON ({err}): {body}"));
+    assert!(
+        value["replication"].is_object(),
+        "replication must be an embedded object, not an encoded string: {body}"
+    );
+    for leaked in forbidden
+        .iter()
+        .chain(["http://", "refused", "os error", "byte limit", "\\\""].iter())
+    {
+        assert!(!body.contains(leaked), "/ready leaked '{leaked}': {body}");
+    }
+    value
+}
+
+#[test]
+fn ready_reports_an_unreachable_leader_by_code_only() {
+    let dead_addr = free_addr();
+    let node = start_volatile(test_config(&dead_addr), InMemoryStore::new());
+    let server = RetrievalServer::start(Arc::clone(&node.store));
+    wait_until("a failure is recorded", Duration::from_secs(10), || {
+        node.status().last_error.is_some()
+    });
+    assert!(
+        node.status()
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&dead_addr),
+        "the raw error stays available in-process for logs"
+    );
+    let (code, body) = server.get("/ready");
+    assert_eq!(code, 503, "{body}");
+    let port = dead_addr.rsplit(':').next().unwrap();
+    let value = assert_ready_is_clean(&body, &[&dead_addr, port]);
+    assert_eq!(value["replication"]["last_error"], "source_unreachable");
+    assert_eq!(value["reason"], "replication_initial_sync_pending");
+}
+
+#[test]
+fn ready_reports_an_oversized_leader_response_by_code_only() {
+    let mock = MockLeader::start(&"x".repeat(200_000));
+    let mut capped = test_config(&mock.addr);
+    capped.max_response_bytes = 1024;
+    let node = start_volatile(capped, InMemoryStore::new());
+    let server = RetrievalServer::start(Arc::clone(&node.store));
+    wait_until("oversized failure", Duration::from_secs(10), || {
+        node.status()
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("exceeds"))
+    });
+    let (code, body) = server.get("/ready");
+    assert_eq!(code, 503, "{body}");
+    let value = assert_ready_is_clean(&body, &["1024", &mock.addr]);
+    assert_eq!(value["reason"], "replication_response_too_large");
+    assert_eq!(
+        value["replication"]["blocked_reason"],
+        "replication_response_too_large"
+    );
+    assert_eq!(value["replication"]["last_error"], "response_too_large");
+}

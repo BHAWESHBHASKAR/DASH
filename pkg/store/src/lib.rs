@@ -10,6 +10,8 @@ use schema::{
     StanceMode, ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
 };
 
+#[macro_use]
+mod failpoint;
 mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
