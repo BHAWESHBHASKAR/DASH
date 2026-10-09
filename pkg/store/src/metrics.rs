@@ -71,5 +71,11 @@ pub struct StoreIndexStats {
     pub inverted_terms: usize,
     pub entity_terms: usize,
     pub temporal_buckets: usize,
+    /// Vectors held by the per-tenant vector indexes (flat or HNSW).
     pub ann_vector_buckets: usize,
+    /// Estimated heap held by the vector indexes themselves (quantised
+    /// HNSW graph and flat copies); the full-precision vectors in
+    /// `claim_vectors` are not included.
+    #[serde(default)]
+    pub vector_index_bytes: usize,
 }

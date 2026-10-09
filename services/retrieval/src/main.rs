@@ -151,12 +151,12 @@ fn main() {
             tracing::info!("retrieval transport listening on http://{bind_addr}");
             tracing::info!("retrieval transport workers: {http_workers}");
             tracing::info!(
-                "retrieval ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-                store_guard.ann_tuning().max_neighbors_base,
-                store_guard.ann_tuning().max_neighbors_upper,
-                store_guard.ann_tuning().search_expansion_factor,
-                store_guard.ann_tuning().search_expansion_min,
-                store_guard.ann_tuning().search_expansion_max
+                "retrieval vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+                store_guard.ann_tuning().connectivity,
+                store_guard.ann_tuning().expansion_add,
+                store_guard.ann_tuning().expansion_search,
+                store_guard.ann_tuning().flat_threshold,
+                store_guard.ann_tuning().rerank
             );
             tracing::info!(
                 "retrieval vector backend: {}",
@@ -234,46 +234,39 @@ where
 fn parse_ann_tuning_config() -> AnnTuningConfig {
     let defaults = AnnTuningConfig::default();
     AnnTuningConfig {
-        max_neighbors_base: parse_env_first::<usize>(&[
+        connectivity: parse_env_first::<usize>(&[
             "DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE",
             "DASH_ANN_MAX_NEIGHBORS_BASE",
             "EME_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE",
             "EME_ANN_MAX_NEIGHBORS_BASE",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_base),
-        max_neighbors_upper: parse_env_first::<usize>(&[
-            "DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER",
-            "DASH_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_ANN_MAX_NEIGHBORS_UPPER",
+        .unwrap_or(defaults.connectivity),
+        expansion_add: parse_env_first::<usize>(&[
+            "DASH_RETRIEVAL_ANN_EXPANSION_ADD",
+            "DASH_ANN_EXPANSION_ADD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_upper),
-        search_expansion_factor: parse_env_first::<usize>(&[
-            "DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_FACTOR",
-            "DASH_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_RETRIEVAL_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_ANN_SEARCH_EXPANSION_FACTOR",
-        ])
-        .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_factor),
-        search_expansion_min: parse_env_first::<usize>(&[
+        .unwrap_or(defaults.expansion_add),
+        expansion_search: parse_env_first::<usize>(&[
             "DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN",
             "DASH_ANN_SEARCH_EXPANSION_MIN",
             "EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN",
             "EME_ANN_SEARCH_EXPANSION_MIN",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_min),
-        search_expansion_max: parse_env_first::<usize>(&[
-            "DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX",
-            "DASH_ANN_SEARCH_EXPANSION_MAX",
-            "EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX",
-            "EME_ANN_SEARCH_EXPANSION_MAX",
+        .unwrap_or(defaults.expansion_search),
+        flat_threshold: parse_env_first::<usize>(&[
+            "DASH_RETRIEVAL_VECTOR_FLAT_THRESHOLD",
+            "DASH_VECTOR_FLAT_THRESHOLD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_max),
+        .unwrap_or(defaults.flat_threshold),
+        rerank: parse_env_first::<usize>(&[
+            "DASH_RETRIEVAL_VECTOR_RERANK",
+            "DASH_VECTOR_RERANK",
+        ])
+        .unwrap_or(defaults.rerank),
     }
 }
 

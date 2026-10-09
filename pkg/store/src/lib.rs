@@ -15,16 +15,15 @@ mod failpoint;
 mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
-mod ann;
-pub mod vector_index;
 #[cfg(feature = "gpu-backend")]
 mod gpu;
 mod metrics;
+pub mod vector_index;
 mod wal;
-pub use ann::AnnTuningConfig;
-pub(crate) use ann::{ANN_GRAPH_LEVELS, ScoredNode, TenantAnnGraph};
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
+pub use vector_index::AnnTuningConfig;
+use vector_index::{TenantVectorIndex, exact_top_k};
 
 #[derive(Default)]
 pub(crate) struct Bm25Context {
@@ -213,7 +212,12 @@ pub struct InMemoryStore {
     /// Reverse index: target claim id -> edges pointing at it.
     edges_in: HashMap<String, Vec<IncomingEdge>>,
     claim_vectors: HashMap<String, Vec<f32>>,
-    ann_vector_graphs: HashMap<String, TenantAnnGraph>,
+    /// Per-tenant vector index (flat below the threshold, HNSW above).
+    /// Holds no full-precision copy: rerank reads `claim_vectors`.
+    vector_indexes: HashMap<String, TenantVectorIndex>,
+    /// `true` while a bulk load is replaying vectors: they are collected in
+    /// `claim_vectors` only and the indexes are built once afterwards.
+    defer_vector_index: bool,
     tenant_vector_dims: HashMap<String, usize>,
     tenant_claim_ids: HashMap<String, HashSet<String>>,
     inverted_index: HashMap<String, HashMap<String, HashSet<String>>>,
@@ -262,8 +266,15 @@ impl InMemoryStore {
         &self.ann_tuning
     }
 
+    /// Change the vector index tuning. Existing indexes are rebuilt from the
+    /// stored vectors so the new connectivity, beam widths, flat threshold
+    /// and rerank width apply to them too (a cold-start-sized cost).
     pub fn set_ann_tuning(&mut self, ann_tuning: AnnTuningConfig) {
+        if self.ann_tuning == ann_tuning {
+            return;
+        }
         self.ann_tuning = ann_tuning;
+        self.rebuild_vector_indexes();
     }
 
     pub fn vector_backend_runtime(&self) -> VectorBackendRuntime {
@@ -330,7 +341,8 @@ impl InMemoryStore {
             edges_by_claim: self.edges_by_claim.clone(),
             edges_in: self.edges_in.clone(),
             claim_vectors: self.claim_vectors.clone(),
-            ann_vector_graphs: self.ann_vector_graphs.clone(),
+            vector_indexes: self.vector_indexes.clone(),
+            defer_vector_index: false,
             tenant_vector_dims: self.tenant_vector_dims.clone(),
             tenant_claim_ids: self.tenant_claim_ids.clone(),
             inverted_index: self.inverted_index.clone(),
@@ -471,6 +483,9 @@ impl InMemoryStore {
         let mut store = Self {
             disk,
             disk_status: disk::DiskStatus::Recovering,
+            // The bulk load only fills `claim_vectors`; the WAL replay that
+            // follows builds the vector indexes once at its end.
+            defer_vector_index: true,
             ..Self::new_with_ann_tuning(ann_tuning)
         };
         // Arc::clone the disk handle so we can hold a borrow on the
@@ -542,6 +557,20 @@ impl InMemoryStore {
     /// `dependent_skipped`. Any other record that cannot be applied, and every
     /// such record under the strict policy, fails the load.
     fn replay_wal(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+    ) -> Result<StoreLoadStats, StoreError> {
+        // Vectors are collected first and indexed once at the end, building
+        // each tenant's index in bulk (multi-threaded) instead of one
+        // insert per record.
+        self.defer_vector_index = true;
+        let result = self.replay_wal_records(wal, policy);
+        self.rebuild_vector_indexes();
+        result
+    }
+
+    fn replay_wal_records(
         &mut self,
         wal: &FileWal,
         policy: ReplayPolicy,
@@ -1398,10 +1427,11 @@ impl InMemoryStore {
             .values()
             .map(|timeline| timeline.len())
             .sum();
-        let ann_vector_buckets = self
-            .ann_vector_graphs
+        let ann_vector_buckets = self.vector_indexes.values().map(|index| index.len()).sum();
+        let vector_index_bytes = self
+            .vector_indexes
             .values()
-            .map(|graph| graph.levels.first().map(|level| level.len()).unwrap_or(0))
+            .map(|index| index.heap_bytes())
             .sum();
         StoreIndexStats {
             tenant_count: self.tenant_claim_ids.len(),
@@ -1411,6 +1441,7 @@ impl InMemoryStore {
             entity_terms,
             temporal_buckets,
             ann_vector_buckets,
+            vector_index_bytes,
         }
     }
 
@@ -1473,7 +1504,7 @@ impl InMemoryStore {
             return 0;
         }
         let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-        self.vector_candidates(tenant_id, query_vector, vector_top_n)
+        self.vector_candidates(tenant_id, query_vector, vector_top_n, (None, None), None)
             .len()
     }
 
@@ -1486,7 +1517,32 @@ impl InMemoryStore {
         if query_vector.is_empty() || top_n == 0 {
             return Vec::new();
         }
-        self.vector_candidates(tenant_id, query_vector, top_n)
+        self.vector_candidates(tenant_id, query_vector, top_n, (None, None), None)
+    }
+
+    /// Like [`Self::ann_vector_top_candidates`] but only claims matching
+    /// `time_range` and (when given) `allowed_claim_ids` are candidates, so
+    /// the result is the `top_n` best of the ALLOWED set rather than the
+    /// allowed part of the global top `top_n`. Small allowed sets are scanned
+    /// exactly (see the strategy note on `vector_candidates`).
+    pub fn ann_vector_top_candidates_filtered(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+        top_n: usize,
+        time_range: (Option<i64>, Option<i64>),
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> Vec<String> {
+        if query_vector.is_empty() || top_n == 0 {
+            return Vec::new();
+        }
+        self.vector_candidates(
+            tenant_id,
+            query_vector,
+            top_n,
+            time_range,
+            allowed_claim_ids,
+        )
     }
 
     pub fn exact_vector_top_candidates(
@@ -1643,7 +1699,13 @@ impl InMemoryStore {
 
         if let Some(vector) = query_vector {
             let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-            for claim_id in self.vector_candidates(tenant_id, vector, vector_top_n) {
+            for claim_id in self.vector_candidates(
+                tenant_id,
+                vector,
+                vector_top_n,
+                time_range,
+                allowed_claim_ids,
+            ) {
                 candidates.insert(claim_id);
             }
         }
@@ -1671,49 +1733,103 @@ impl InMemoryStore {
         out
     }
 
+    /// Vector candidates for `tenant_id`: the `top_n` claim ids most similar
+    /// to `query_vector`, best first, restricted to claims that match
+    /// `time_range` and (when given) `allowed_claim_ids`.
+    ///
+    /// Invalid (empty, non-finite, zero-norm, wrong-dimension) query vectors
+    /// yield no candidates: never a fallback scan (IDX-03). The search only
+    /// ever touches the tenant's own index.
+    ///
+    /// Strategy (ADR 0003): a tenant at or below the flat threshold is
+    /// scanned exactly. Above it, a filter whose allowed set is no larger
+    /// than the threshold is also scanned exactly (filtered HNSW is slower
+    /// and less exact on small allowed sets); otherwise the HNSW runs with
+    /// the filter as a predicate.
     fn vector_candidates(
         &self,
         tenant_id: &str,
         query_vector: &[f32],
         top_n: usize,
+        time_range: (Option<i64>, Option<i64>),
+        allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Vec<String> {
-        // Invalid (empty, non-finite, zero-norm, wrong-dimension) query
-        // vectors yield no candidates: never a fallback scan (IDX-03).
-        if self.validate_query_vector(tenant_id, query_vector).is_err() {
+        if top_n == 0 || self.validate_query_vector(tenant_id, query_vector).is_err() {
             return Vec::new();
         }
+        let Some(index) = self.vector_indexes.get(tenant_id) else {
+            return Vec::new();
+        };
+        let (from_unix, to_unix) = time_range;
+        let has_time = from_unix.is_some() || to_unix.is_some();
+        let in_range = |claim_id: &str| {
+            !has_time
+                || self
+                    .claims
+                    .get(claim_id)
+                    .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix))
+        };
+        let passes = |claim_id: &str| {
+            allowed_claim_ids.is_none_or(|allowed| allowed.contains(claim_id)) && in_range(claim_id)
+        };
 
-        let mut scoped_ids = self.approximate_vector_candidate_ids(tenant_id, query_vector, top_n);
-        if scoped_ids.is_empty() {
-            // Exact fallback, scoped to this tenant's own claim ids.
-            scoped_ids = self
-                .tenant_claim_ids
-                .get(tenant_id)
+        if (!has_time && allowed_claim_ids.is_none()) || !index.is_hnsw() {
+            let filter: Option<&dyn Fn(&str) -> bool> = if has_time || allowed_claim_ids.is_some() {
+                Some(&passes)
+            } else {
+                None
+            };
+            return index
+                .search(query_vector, top_n, filter, &self.claim_vectors)
                 .into_iter()
-                .flatten()
-                .filter(|claim_id| self.claim_vectors.contains_key(*claim_id))
-                .cloned()
+                .map(|(claim_id, _)| claim_id)
                 .collect();
         }
 
-        let candidate_vectors: Vec<(String, &[f32])> = scoped_ids
-            .into_iter()
-            .filter_map(|claim_id| {
-                let vector = self.claim_vectors.get(&claim_id)?;
-                let claim = self.claims.get(&claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
+        // Large tenant with a filter: size the allowed set first.
+        let limit = self.ann_tuning.flat_threshold;
+        let exact_ids: Option<Vec<&str>> = match allowed_claim_ids {
+            Some(allowed) if allowed.len() <= limit => Some(
+                allowed
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| index.contains(id) && in_range(id))
+                    .collect(),
+            ),
+            Some(_) => None,
+            None => {
+                // Time filter only: count matches, stopping once the set is
+                // too large to scan.
+                let mut matching: Vec<&str> = Vec::new();
+                let mut small = true;
+                for id in self.tenant_claim_ids.get(tenant_id).into_iter().flatten() {
+                    if index.contains(id) && in_range(id) {
+                        if matching.len() == limit {
+                            small = false;
+                            break;
+                        }
+                        matching.push(id.as_str());
+                    }
                 }
-                Some((claim_id, vector.as_slice()))
-            })
-            .collect();
-        let mut scored = self.score_query_candidate_vectors(query_vector, candidate_vectors);
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
+                small.then_some(matching)
+            }
+        };
+        match exact_ids {
+            Some(ids) => exact_top_k(
+                query_vector,
+                ids.into_iter()
+                    .filter_map(|id| self.claim_vectors.get(id).map(|v| (id, v.as_slice()))),
+                top_n,
+            )
             .into_iter()
-            .take(top_n)
-            .map(|(claim_id, _)| claim_id)
-            .collect()
+            .map(|(claim_id, _)| claim_id.to_string())
+            .collect(),
+            None => index
+                .search(query_vector, top_n, Some(&passes), &self.claim_vectors)
+                .into_iter()
+                .map(|(claim_id, _)| claim_id)
+                .collect(),
+        }
     }
 
     fn score_query_candidate_vectors(
@@ -1735,117 +1851,6 @@ impl InMemoryStore {
         }
 
         score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
-    }
-
-    fn approximate_vector_candidate_ids(
-        &self,
-        tenant_id: &str,
-        query_vector: &[f32],
-        top_n: usize,
-    ) -> HashSet<String> {
-        let mut out = HashSet::new();
-        let Some(graph) = self.ann_vector_graphs.get(tenant_id) else {
-            return out;
-        };
-        let Some(entry_point) = graph.entry_point.as_ref() else {
-            return out;
-        };
-        let Some(mut current_score) = self
-            .claim_vectors
-            .get(entry_point)
-            .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
-        else {
-            return out;
-        };
-        let mut current = entry_point.clone();
-
-        let max_level = graph.entry_level.min(ANN_GRAPH_LEVELS.saturating_sub(1));
-        for level in (1..=max_level).rev() {
-            loop {
-                let mut improved = false;
-                let Some(neighbors) = graph.levels[level].get(&current) else {
-                    break;
-                };
-                for neighbor_id in neighbors {
-                    let Some(score) =
-                        self.claim_vectors
-                            .get(neighbor_id)
-                            .and_then(|neighbor_vector| {
-                                cosine_similarity(query_vector, neighbor_vector)
-                            })
-                    else {
-                        continue;
-                    };
-                    if score > current_score {
-                        current = neighbor_id.clone();
-                        current_score = score;
-                        improved = true;
-                    }
-                }
-                if !improved {
-                    break;
-                }
-            }
-        }
-
-        let mut frontier = std::collections::BinaryHeap::new();
-        let mut visited = HashSet::new();
-        if visited.insert(current.clone()) {
-            frontier.push(ScoredNode {
-                claim_id: current,
-                score: current_score,
-            });
-        }
-        if visited.insert(entry_point.clone())
-            && let Some(score) = self
-                .claim_vectors
-                .get(entry_point)
-                .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
-        {
-            frontier.push(ScoredNode {
-                claim_id: entry_point.clone(),
-                score,
-            });
-        }
-
-        let expansion_budget = top_n
-            .saturating_mul(self.ann_tuning.search_expansion_factor.max(1))
-            .clamp(
-                self.ann_tuning.search_expansion_min.max(1),
-                self.ann_tuning
-                    .search_expansion_max
-                    .max(self.ann_tuning.search_expansion_min.max(1)),
-            );
-        let mut expanded = 0usize;
-
-        while let Some(node) = frontier.pop() {
-            out.insert(node.claim_id.clone());
-            expanded += 1;
-            if expanded >= expansion_budget {
-                break;
-            }
-
-            let Some(neighbors) = graph.levels[0].get(&node.claim_id) else {
-                continue;
-            };
-            for neighbor_id in neighbors {
-                if !visited.insert(neighbor_id.clone()) {
-                    continue;
-                }
-                let Some(neighbor_vector) = self.claim_vectors.get(neighbor_id) else {
-                    continue;
-                };
-                let Some(score) = cosine_similarity(query_vector, neighbor_vector) else {
-                    continue;
-                };
-                frontier.push(ScoredNode {
-                    claim_id: neighbor_id.clone(),
-                    score,
-                });
-            }
-        }
-
-        out
     }
 
     fn bm25_context_for_tenant(&self, tenant_id: &str, query: &str) -> Bm25Context {
@@ -2363,217 +2368,62 @@ impl InMemoryStore {
     }
 
     fn add_vector_index_entry(&mut self, tenant_id: &str, claim_id: &str, vector: &[f32]) {
-        let node_level = self.assign_ann_level(claim_id);
-        {
-            let graph = self
-                .ann_vector_graphs
-                .entry(tenant_id.to_string())
-                .or_default();
-            graph.node_levels.insert(claim_id.to_string(), node_level);
-            for level in 0..=node_level {
-                graph.levels[level].entry(claim_id.to_string()).or_default();
-            }
-            if graph.entry_point.is_none() {
-                graph.entry_point = Some(claim_id.to_string());
-                graph.entry_level = node_level;
-            }
+        if self.defer_vector_index {
+            return;
         }
-
-        for level in (0..=node_level).rev() {
-            let max_neighbors = self.ann_level_max_neighbors(level);
-            let neighbor_ids =
-                self.select_ann_neighbors(tenant_id, claim_id, vector, level, max_neighbors);
-            for neighbor_id in neighbor_ids {
-                self.connect_ann_nodes(tenant_id, level, claim_id, &neighbor_id, max_neighbors);
-            }
-        }
-
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id)
-            && node_level > graph.entry_level
-        {
-            graph.entry_point = Some(claim_id.to_string());
-            graph.entry_level = node_level;
-        }
+        let tuning = &self.ann_tuning;
+        let index = self
+            .vector_indexes
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| TenantVectorIndex::new(vector.len(), tuning.clone()));
+        // A vector that cannot be indexed (zero norm) stays stored but is
+        // unreachable by similarity search, as it never had a cosine score.
+        let _ = index.upsert(claim_id, vector);
     }
 
     fn remove_vector_index_entry(&mut self, tenant_id: &str, claim_id: &str) {
-        let mut remove_graph = false;
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id) {
-            graph.node_levels.remove(claim_id);
-            for level in &mut graph.levels {
-                level.remove(claim_id);
-                for neighbor_ids in level.values_mut() {
-                    neighbor_ids.retain(|id| id != claim_id);
-                }
-            }
-            if graph.entry_point.as_deref() == Some(claim_id) {
-                if let Some((next_id, next_level)) = graph
-                    .node_levels
-                    .iter()
-                    .max_by_key(|(_, level)| **level)
-                    .map(|(id, level)| (id.clone(), *level))
-                {
-                    graph.entry_point = Some(next_id);
-                    graph.entry_level = next_level;
-                } else {
-                    graph.entry_point = None;
-                    graph.entry_level = 0;
-                }
-            }
-            remove_graph = graph.node_levels.is_empty();
+        if self.defer_vector_index {
+            return;
         }
-        if remove_graph {
-            self.ann_vector_graphs.remove(tenant_id);
+        if let Some(index) = self.vector_indexes.get_mut(tenant_id) {
+            index.remove(claim_id);
+            if index.is_empty() {
+                self.vector_indexes.remove(tenant_id);
+            }
         }
     }
 
-    fn select_ann_neighbors(
-        &self,
-        tenant_id: &str,
-        claim_id: &str,
-        vector: &[f32],
-        level: usize,
-        max_neighbors: usize,
-    ) -> Vec<String> {
-        let mut scored: Vec<(String, f32)> = self
-            .claim_vectors
-            .iter()
-            .filter_map(|(other_claim_id, other_vector)| {
-                if other_claim_id == claim_id {
-                    return None;
-                }
-                let claim = self.claims.get(other_claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
-                }
-                if !self.ann_node_is_visible_at_level(tenant_id, other_claim_id, level) {
-                    return None;
-                }
-                let sim = cosine_similarity(vector, other_vector)?;
-                Some((other_claim_id.clone(), sim))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
-            .into_iter()
-            .take(max_neighbors)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
-    fn connect_ann_nodes(
-        &mut self,
-        tenant_id: &str,
-        level: usize,
-        claim_id: &str,
-        neighbor_id: &str,
-        max_neighbors: usize,
-    ) {
-        if claim_id == neighbor_id {
-            return;
+    /// Rebuild every tenant's vector index from `claim_vectors`, building
+    /// large tenants multi-threaded. Used when the tuning changes and at the
+    /// end of a bulk load; replaces the incremental per-vector inserts.
+    pub(crate) fn rebuild_vector_indexes(&mut self) {
+        self.defer_vector_index = false;
+        let mut by_tenant: HashMap<&str, Vec<(&str, &[f32])>> = HashMap::new();
+        for (claim_id, vector) in &self.claim_vectors {
+            if let Some(claim) = self.claims.get(claim_id) {
+                by_tenant
+                    .entry(claim.tenant_id.as_str())
+                    .or_default()
+                    .push((claim_id.as_str(), vector.as_slice()));
+            }
         }
-        if level >= ANN_GRAPH_LEVELS {
-            return;
-        }
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id) {
-            if graph
-                .node_levels
-                .get(claim_id)
-                .is_none_or(|node_level| *node_level < level)
-                || graph
-                    .node_levels
-                    .get(neighbor_id)
-                    .is_none_or(|node_level| *node_level < level)
+        let mut indexes = HashMap::with_capacity(by_tenant.len());
+        for (tenant_id, mut items) in by_tenant {
+            // Deterministic insertion order regardless of hash iteration.
+            items.sort_unstable_by_key(|(claim_id, _)| *claim_id);
+            let dim = self
+                .tenant_vector_dims
+                .get(tenant_id)
+                .copied()
+                .unwrap_or_else(|| items[0].1.len());
+            let built = TenantVectorIndex::build(dim, self.ann_tuning.clone(), items.into_iter());
+            if let Ok(index) = built
+                && !index.is_empty()
             {
-                return;
-            }
-            let claim_neighbors = graph.levels[level].entry(claim_id.to_string()).or_default();
-            if !claim_neighbors.iter().any(|id| id == neighbor_id) {
-                claim_neighbors.push(neighbor_id.to_string());
-            }
-
-            let neighbor_neighbors = graph.levels[level]
-                .entry(neighbor_id.to_string())
-                .or_default();
-            if !neighbor_neighbors.iter().any(|id| id == claim_id) {
-                neighbor_neighbors.push(claim_id.to_string());
+                indexes.insert(tenant_id.to_string(), index);
             }
         }
-        self.prune_ann_neighbors(tenant_id, level, claim_id, max_neighbors);
-        self.prune_ann_neighbors(tenant_id, level, neighbor_id, max_neighbors);
-    }
-
-    fn prune_ann_neighbors(
-        &mut self,
-        tenant_id: &str,
-        level: usize,
-        claim_id: &str,
-        max_neighbors: usize,
-    ) {
-        if level >= ANN_GRAPH_LEVELS {
-            return;
-        }
-        let Some(node_vector) = self.claim_vectors.get(claim_id).cloned() else {
-            return;
-        };
-        let Some(candidate_neighbors) = self
-            .ann_vector_graphs
-            .get(tenant_id)
-            .and_then(|graph| graph.levels[level].get(claim_id))
-            .cloned()
-        else {
-            return;
-        };
-        if candidate_neighbors.len() <= max_neighbors {
-            return;
-        }
-
-        let mut scored: Vec<(String, f32)> = candidate_neighbors
-            .into_iter()
-            .filter_map(|neighbor_id| {
-                let neighbor_vector = self.claim_vectors.get(&neighbor_id)?;
-                let similarity = cosine_similarity(&node_vector, neighbor_vector)?;
-                Some((neighbor_id, similarity))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let keep: Vec<String> = scored
-            .into_iter()
-            .take(max_neighbors)
-            .map(|(neighbor_id, _)| neighbor_id)
-            .collect();
-
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id)
-            && let Some(neighbors) = graph.levels[level].get_mut(claim_id)
-        {
-            neighbors.clear();
-            neighbors.extend(keep);
-        }
-    }
-
-    fn ann_node_is_visible_at_level(&self, tenant_id: &str, claim_id: &str, level: usize) -> bool {
-        self.ann_vector_graphs
-            .get(tenant_id)
-            .and_then(|graph| graph.node_levels.get(claim_id))
-            .is_some_and(|node_level| *node_level >= level)
-    }
-
-    fn ann_level_max_neighbors(&self, level: usize) -> usize {
-        if level == 0 {
-            self.ann_tuning.max_neighbors_base.max(1)
-        } else {
-            self.ann_tuning.max_neighbors_upper.max(1)
-        }
-    }
-
-    fn assign_ann_level(&self, claim_id: &str) -> usize {
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        claim_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let level = (hash.trailing_zeros() as usize) / 4;
-        level.min(ANN_GRAPH_LEVELS.saturating_sub(1))
+        self.vector_indexes = indexes;
     }
 
     fn add_claim_indexes(&mut self, claim: &Claim) {
@@ -4625,57 +4475,66 @@ mod tests {
     }
 
     #[test]
-    fn ann_graph_populates_multiple_levels_for_tenant() {
-        let mut store = InMemoryStore::new();
-        let mut high_level_claim_id = None;
+    fn tenant_vector_index_tracks_every_vector_and_converts_to_hnsw() {
+        let tuning = AnnTuningConfig {
+            flat_threshold: 64,
+            ..AnnTuningConfig::default()
+        };
+        let mut store = InMemoryStore::new_with_ann_tuning(tuning);
 
         for i in 0..256 {
             let claim_id = format!("c-level-{i}");
-            let level = store.assign_ann_level(&claim_id);
-            if level > 0 {
-                high_level_claim_id = Some(claim_id.clone());
-            }
-
             store
-                .ingest_bundle(
-                    claim(&claim_id, "ANN graph level population"),
-                    vec![],
-                    vec![],
-                )
+                .ingest_bundle(claim(&claim_id, "vector index population"), vec![], vec![])
                 .unwrap();
-            let vector = vec![
-                0.1 + (i as f32 * 0.001),
-                0.2,
-                0.3,
-                if level > 0 { 0.99 } else { 0.4 },
-            ];
+            let vector = vec![0.1 + (i as f32 * 0.001), 0.2, 0.3, 0.4 + (i % 7) as f32];
             store.upsert_claim_vector(&claim_id, vector).unwrap();
+            let index = store
+                .vector_indexes
+                .get("tenant-a")
+                .expect("tenant vector index should exist");
+            assert_eq!(index.len(), i + 1);
+            assert_eq!(index.is_hnsw(), i + 1 > 64, "after {} vectors", i + 1);
         }
-
-        let high_level_claim_id =
-            high_level_claim_id.expect("expected at least one claim to land in an upper ANN level");
-        let graph = store
-            .ann_vector_graphs
-            .get("tenant-a")
-            .expect("tenant ANN graph should exist");
-
-        assert_eq!(graph.levels[0].len(), 256);
-        assert!(!graph.levels[1].is_empty());
-        assert!(graph.entry_level >= 1);
-        assert!(graph.levels[graph.entry_level].contains_key(&high_level_claim_id));
+        let stats = store.index_stats();
+        assert_eq!(stats.ann_vector_buckets, 256);
+        assert!(stats.vector_index_bytes > 0);
     }
 
     #[test]
     fn store_ann_tuning_can_be_overridden() {
         let tuning = AnnTuningConfig {
-            max_neighbors_base: 8,
-            max_neighbors_upper: 4,
-            search_expansion_factor: 9,
-            search_expansion_min: 32,
-            search_expansion_max: 2048,
+            connectivity: 8,
+            expansion_add: 64,
+            expansion_search: 32,
+            flat_threshold: 1000,
+            rerank: 20,
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);
+    }
+
+    #[test]
+    fn set_ann_tuning_rebuilds_existing_indexes() {
+        let mut store = InMemoryStore::new();
+        for i in 0..100 {
+            let claim_id = format!("c-{i}");
+            store
+                .ingest_bundle(claim(&claim_id, "rebuild me"), vec![], vec![])
+                .unwrap();
+            store
+                .upsert_claim_vector(&claim_id, vec![1.0, i as f32 * 0.01, 0.5, 0.25])
+                .unwrap();
+        }
+        assert!(!store.vector_indexes["tenant-a"].is_hnsw());
+        store.set_ann_tuning(AnnTuningConfig {
+            flat_threshold: 10,
+            ..AnnTuningConfig::default()
+        });
+        assert!(store.vector_indexes["tenant-a"].is_hnsw());
+        assert_eq!(store.vector_indexes["tenant-a"].len(), 100);
+        let top = store.ann_vector_top_candidates("tenant-a", &[1.0, 0.0, 0.5, 0.25], 1);
+        assert_eq!(top, vec!["c-0".to_string()]);
     }
 
     #[test]

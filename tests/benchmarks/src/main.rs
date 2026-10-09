@@ -751,26 +751,20 @@ where
     let mut scorecard_out = None;
     let defaults = AnnTuningConfig::default();
     let mut ann_tuning = AnnTuningConfig {
-        max_neighbors_base: env_or_default_usize(
-            "DASH_BENCH_ANN_MAX_NEIGHBORS_BASE",
-            defaults.max_neighbors_base,
-        ),
-        max_neighbors_upper: env_or_default_usize(
-            "DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER",
-            defaults.max_neighbors_upper,
-        ),
-        search_expansion_factor: env_or_default_usize(
-            "DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR",
-            defaults.search_expansion_factor,
-        ),
-        search_expansion_min: env_or_default_usize(
+        connectivity: env_or_default_usize("DASH_BENCH_ANN_MAX_NEIGHBORS_BASE", defaults.connectivity),
+        expansion_add: env_or_default_usize("DASH_BENCH_ANN_EXPANSION_ADD", defaults.expansion_add),
+        expansion_search: env_or_default_usize(
             "DASH_BENCH_ANN_SEARCH_EXPANSION_MIN",
-            defaults.search_expansion_min,
+            defaults.expansion_search,
         ),
-        search_expansion_max: env_or_default_usize(
-            "DASH_BENCH_ANN_SEARCH_EXPANSION_MAX",
-            defaults.search_expansion_max,
+        flat_threshold: env_or_default_usize(
+            "DASH_BENCH_VECTOR_FLAT_THRESHOLD",
+            defaults.flat_threshold,
         ),
+        rerank: std::env::var("DASH_BENCH_VECTOR_RERANK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(defaults.rerank),
     };
     let mut large_min_candidate_reduction_pct =
         env_or_default_f64("DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT", 95.0);
@@ -891,24 +885,27 @@ where
                 scorecard_out = Some(value);
             }
             "--ann-max-neighbors-base" => {
-                ann_tuning.max_neighbors_base =
+                ann_tuning.connectivity =
                     parse_positive_usize_arg(args.next(), "--ann-max-neighbors-base")?;
             }
-            "--ann-max-neighbors-upper" => {
-                ann_tuning.max_neighbors_upper =
-                    parse_positive_usize_arg(args.next(), "--ann-max-neighbors-upper")?;
-            }
-            "--ann-search-expansion-factor" => {
-                ann_tuning.search_expansion_factor =
-                    parse_positive_usize_arg(args.next(), "--ann-search-expansion-factor")?;
+            "--ann-expansion-add" => {
+                ann_tuning.expansion_add =
+                    parse_positive_usize_arg(args.next(), "--ann-expansion-add")?;
             }
             "--ann-search-expansion-min" => {
-                ann_tuning.search_expansion_min =
+                ann_tuning.expansion_search =
                     parse_positive_usize_arg(args.next(), "--ann-search-expansion-min")?;
             }
-            "--ann-search-expansion-max" => {
-                ann_tuning.search_expansion_max =
-                    parse_positive_usize_arg(args.next(), "--ann-search-expansion-max")?;
+            "--vector-flat-threshold" => {
+                ann_tuning.flat_threshold =
+                    parse_positive_usize_arg(args.next(), "--vector-flat-threshold")?;
+            }
+            "--vector-rerank" => {
+                ann_tuning.rerank = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --vector-rerank".to_string())?
+                    .parse::<usize>()
+                    .map_err(|_| "--vector-rerank must be a non-negative integer".to_string())?;
             }
             "--large-min-candidate-reduction-pct" => {
                 large_min_candidate_reduction_pct =
@@ -994,9 +991,6 @@ where
         }
     }
 
-    if ann_tuning.search_expansion_max < ann_tuning.search_expansion_min {
-        return Err("--ann-search-expansion-max must be >= --ann-search-expansion-min".to_string());
-    }
     if large_min_ann_recall_at_100 > 1.0 {
         return Err("--large-min-ann-recall-at-100 must be <= 1".to_string());
     }
@@ -1093,7 +1087,7 @@ fn parse_non_negative_usize_arg(value: Option<String>, flag: &str) -> Result<usi
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|xxlarge|hybrid] [--fixture-size N] [--iterations N] [--min-iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--guard-min-iterations N] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-max-neighbors-upper N] [--ann-search-expansion-factor N] [--ann-search-expansion-min N] [--ann-search-expansion-max N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--large-min-ann-recall-at-100 N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--xlarge-min-ann-recall-at-100 N] [--xxlarge-min-candidate-reduction-pct N] [--xxlarge-max-dash-latency-ms N] [--xxlarge-min-ann-recall-at-100 N] [--large-plus-min-graph-score-coverage N] [--large-plus-min-graph-support-path-count N] [--large-plus-min-graph-contradiction-chain-depth N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [--require-vector-backend cpu|gpu] [quality probes enforce contradiction_detection_f1 >= 0.80, citation_coverage >= 0.95, extraction_span_coverage >= 0.95; large+ profiles enforce graph coverage/path/depth gates]"
+    "Usage: cargo run -p benchmark-smoke --bin benchmark-smoke -- [--smoke] [--profile smoke|standard|large|xlarge|xxlarge|hybrid] [--fixture-size N] [--iterations N] [--min-iterations N] [--history-out PATH] [--history-csv-out PATH] [--guard-history PATH] [--guard-min-iterations N] [--max-dash-latency-regression-pct N] [--scorecard-out PATH] [--ann-max-neighbors-base N] [--ann-expansion-add N] [--ann-search-expansion-min N] [--vector-flat-threshold N] [--vector-rerank N] [--large-min-candidate-reduction-pct N] [--large-max-dash-latency-ms N] [--large-min-ann-recall-at-100 N] [--xlarge-min-candidate-reduction-pct N] [--xlarge-max-dash-latency-ms N] [--xlarge-min-ann-recall-at-100 N] [--xxlarge-min-candidate-reduction-pct N] [--xxlarge-max-dash-latency-ms N] [--xxlarge-min-ann-recall-at-100 N] [--large-plus-min-graph-score-coverage N] [--large-plus-min-graph-support-path-count N] [--large-plus-min-graph-contradiction-chain-depth N] [--min-segment-refresh-successes N] [--min-segment-cache-hits N] [--require-vector-backend cpu|gpu] [quality probes enforce contradiction_detection_f1 >= 0.80, citation_coverage >= 0.95, extraction_span_coverage >= 0.95; large+ profiles enforce graph coverage/path/depth gates]"
 }
 
 #[allow(unused_unsafe)]
@@ -1579,12 +1573,12 @@ fn print_quality_summary(summary: &QualityProbeSummary) {
 
 fn print_ann_tuning(ann_tuning: &AnnTuningConfig) {
     println!(
-        "ANN tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-        ann_tuning.max_neighbors_base,
-        ann_tuning.max_neighbors_upper,
-        ann_tuning.search_expansion_factor,
-        ann_tuning.search_expansion_min,
-        ann_tuning.search_expansion_max
+        "Vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+        ann_tuning.connectivity,
+        ann_tuning.expansion_add,
+        ann_tuning.expansion_search,
+        ann_tuning.flat_threshold,
+        ann_tuning.rerank
     );
 }
 
@@ -1974,29 +1968,25 @@ fn write_scorecard(
     )?;
     writeln!(
         file,
-        "- ann_max_neighbors_base: {}",
-        summary.ann_tuning.max_neighbors_base
+        "- ann_connectivity: {}",
+        summary.ann_tuning.connectivity
     )?;
     writeln!(
         file,
-        "- ann_max_neighbors_upper: {}",
-        summary.ann_tuning.max_neighbors_upper
+        "- ann_expansion_add: {}",
+        summary.ann_tuning.expansion_add
     )?;
     writeln!(
         file,
-        "- ann_search_expansion_factor: {}",
-        summary.ann_tuning.search_expansion_factor
+        "- ann_expansion_search: {}",
+        summary.ann_tuning.expansion_search
     )?;
     writeln!(
         file,
-        "- ann_search_expansion_min: {}",
-        summary.ann_tuning.search_expansion_min
+        "- vector_flat_threshold: {}",
+        summary.ann_tuning.flat_threshold
     )?;
-    writeln!(
-        file,
-        "- ann_search_expansion_max: {}",
-        summary.ann_tuning.search_expansion_max
-    )?;
+    writeln!(file, "- vector_rerank: {}", summary.ann_tuning.rerank)?;
     let segment_refresh_avg_ms = if summary.segment_cache_probe.refresh_attempts == 0 {
         0.0
     } else {

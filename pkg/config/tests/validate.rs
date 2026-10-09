@@ -538,7 +538,7 @@ fn shared_ann_names_are_valid_spellings_and_are_validated() {
     assert!(
         !check(
             Service::Ingestion,
-            &[("DASH_INGEST_ANN_MAX_NEIGHBORS_UPPER", "0")]
+            &[("DASH_INGEST_VECTOR_FLAT_THRESHOLD", "0")]
         )
         .is_ok()
     );

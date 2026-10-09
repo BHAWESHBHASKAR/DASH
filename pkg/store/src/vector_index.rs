@@ -858,12 +858,17 @@ impl TenantVectorIndex {
             raw,
         };
         let filter: Option<&dyn Fn(u64) -> bool> = allowed.map(|_| &by_key as &dyn Fn(u64) -> bool);
-        self.backend
+        let mut out: Vec<(String, f32)> = self
+            .backend
             .as_index()
             .search(query, k, filter, Some(&source))
             .into_iter()
             .filter_map(|(key, score)| Some((self.ids.id_of(key)?.to_string(), score)))
-            .collect()
+            .collect();
+        // Keys depend on insertion order (and are recycled); equal scores
+        // (duplicate vectors) must still order the same way after a rebuild.
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
     }
 
     pub fn heap_bytes(&self) -> usize {

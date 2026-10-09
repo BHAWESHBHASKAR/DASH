@@ -559,8 +559,8 @@ impl DiskBackedStore {
 
     /// Read every record from the redb file into `dest`, rebuilding
     /// the in-memory inverted/entity/embedding/temporal indices, the
-    /// tenant→claim sets, the per-tenant ANN index, and the
-    /// `claim_vectors` map. Returns the number of claims loaded.
+    /// tenant→claim sets and the `claim_vectors` map (the
+    /// per-tenant vector indexes are built after the WAL tail replay). Returns the number of claims loaded.
     ///
     /// `dest` must be empty; this function does not clear it. The
     /// caller is expected to construct `dest` via

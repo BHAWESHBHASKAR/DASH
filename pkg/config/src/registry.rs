@@ -45,10 +45,22 @@ const ROLE_CLAIM_ALIAS: &[Alias] = &[Alias {
     eme: true,
 }];
 const ANN_BASE: &[Alias] = &[Alias::shared("DASH_ANN_MAX_NEIGHBORS_BASE")];
-const ANN_UPPER: &[Alias] = &[Alias::shared("DASH_ANN_MAX_NEIGHBORS_UPPER")];
-const ANN_FACTOR: &[Alias] = &[Alias::shared("DASH_ANN_SEARCH_EXPANSION_FACTOR")];
 const ANN_MIN: &[Alias] = &[Alias::shared("DASH_ANN_SEARCH_EXPANSION_MIN")];
-const ANN_MAX: &[Alias] = &[Alias::shared("DASH_ANN_SEARCH_EXPANSION_MAX")];
+const ANN_ADD: &[Alias] = &[Alias {
+    name: "DASH_ANN_EXPANSION_ADD",
+    deprecated: false,
+    eme: false,
+}];
+const VEC_FLAT: &[Alias] = &[Alias {
+    name: "DASH_VECTOR_FLAT_THRESHOLD",
+    deprecated: false,
+    eme: false,
+}];
+const VEC_RERANK: &[Alias] = &[Alias {
+    name: "DASH_VECTOR_RERANK",
+    deprecated: false,
+    eme: false,
+}];
 const SEG_SIZE: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENT_SIZE")];
 const SEG_TIER: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENTS_PER_TIER")];
 const SEG_COMPACT: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS")];
@@ -552,57 +564,54 @@ pub static REGISTRY: &[Entry] = &[
         "off",
         "When on, WAL replay fails on the first record that lenient mode would quarantine, instead of quarantining it and continuing. See `docs/operations/wal-recovery.md`.",
     ),
-    // ---- ANN (patterns, shared alias)
+    // ---- Vector index (patterns, shared alias)
     Entry::new(
         "DASH_{SVC}_ANN_MAX_NEIGHBORS_BASE",
         Common,
         T_ANN,
         Kind::POSITIVE,
-        "12",
-        "Max neighbors on the base layer.",
+        "16",
+        "HNSW connectivity `M` (usearch `connectivity`): neighbours per node. Higher is more accurate and uses more memory. The previous in-repo graph used 12.",
     )
     .aliases(ANN_BASE)
     .eme(),
     Entry::new(
-        "DASH_{SVC}_ANN_MAX_NEIGHBORS_UPPER",
+        "DASH_{SVC}_ANN_EXPANSION_ADD",
         Common,
         T_ANN,
         Kind::POSITIVE,
-        "6",
-        "Max neighbors on upper layers.",
+        "128",
+        "HNSW `ef_construction` (usearch `expansion_add`): beam width while inserting a vector. Higher builds a better graph more slowly.",
     )
-    .aliases(ANN_UPPER)
-    .eme(),
-    Entry::new(
-        "DASH_{SVC}_ANN_SEARCH_EXPANSION_FACTOR",
-        Common,
-        T_ANN,
-        Kind::POSITIVE,
-        "16",
-        "Candidate expansion multiplier.",
-    )
-    .aliases(ANN_FACTOR)
-    .eme(),
+    .aliases(ANN_ADD),
     Entry::new(
         "DASH_{SVC}_ANN_SEARCH_EXPANSION_MIN",
         Common,
         T_ANN,
         Kind::POSITIVE,
-        "64",
-        "Minimum candidates examined.",
+        "128",
+        "HNSW `ef_search` floor (usearch `expansion_search`): beam width while searching; it is widened to the number of requested candidates when that is larger.",
     )
     .aliases(ANN_MIN)
     .eme(),
     Entry::new(
-        "DASH_{SVC}_ANN_SEARCH_EXPANSION_MAX",
+        "DASH_{SVC}_VECTOR_FLAT_THRESHOLD",
         Common,
         T_ANN,
         Kind::POSITIVE,
-        "4096",
-        "Maximum candidates examined.",
+        "8192",
+        "A tenant with at most this many vectors is searched exactly (flat scan); above it an HNSW index is built. The same number bounds filtered searches that are scanned exactly instead of through the HNSW.",
     )
-    .aliases(ANN_MAX)
-    .eme(),
+    .aliases(VEC_FLAT),
+    Entry::new(
+        "DASH_{SVC}_VECTOR_RERANK",
+        Common,
+        T_ANN,
+        Kind::UINT,
+        "50",
+        "HNSW candidates re-scored with exact `f32` cosine after the quantised (`i8`) search. `0` returns the quantised scores unchanged.",
+    )
+    .aliases(VEC_RERANK),
     Entry::new(
         "DASH_VECTOR_BACKEND",
         Common,
@@ -1747,40 +1756,40 @@ pub static REGISTRY: &[Entry] = &[
         Tools,
         T_BENCH,
         Kind::POSITIVE,
-        "12",
-        "ANN tuning used by the benchmark store (base layer neighbors).",
-    ),
-    Entry::new(
-        "DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER",
-        Tools,
-        T_BENCH,
-        Kind::POSITIVE,
-        "6",
-        "ANN tuning used by the benchmark store (upper layer neighbors).",
-    ),
-    Entry::new(
-        "DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR",
-        Tools,
-        T_BENCH,
-        Kind::POSITIVE,
         "16",
-        "ANN tuning used by the benchmark store (expansion factor).",
+        "Vector index tuning used by the benchmark store (HNSW connectivity).",
+    ),
+    Entry::new(
+        "DASH_BENCH_ANN_EXPANSION_ADD",
+        Tools,
+        T_BENCH,
+        Kind::POSITIVE,
+        "128",
+        "Vector index tuning used by the benchmark store (HNSW construction beam).",
     ),
     Entry::new(
         "DASH_BENCH_ANN_SEARCH_EXPANSION_MIN",
         Tools,
         T_BENCH,
         Kind::POSITIVE,
-        "64",
-        "ANN tuning used by the benchmark store (minimum expansion).",
+        "128",
+        "Vector index tuning used by the benchmark store (HNSW search beam floor).",
     ),
     Entry::new(
-        "DASH_BENCH_ANN_SEARCH_EXPANSION_MAX",
+        "DASH_BENCH_VECTOR_FLAT_THRESHOLD",
         Tools,
         T_BENCH,
         Kind::POSITIVE,
-        "4096",
-        "ANN tuning used by the benchmark store (maximum expansion).",
+        "8192",
+        "Vector index tuning used by the benchmark store (flat-to-HNSW threshold).",
+    ),
+    Entry::new(
+        "DASH_BENCH_VECTOR_RERANK",
+        Tools,
+        T_BENCH,
+        Kind::UINT,
+        "50",
+        "Vector index tuning used by the benchmark store (exact rerank width; 0 disables).",
     ),
     Entry::new(
         "DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT",
