@@ -828,8 +828,10 @@ mod tests {
                 let bytes = base64_decode(b).expect("decode base64");
                 assert_eq!(bytes.len() % 4, 0, "byte length should be a multiple of 4");
                 let floats: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes(*chunk))
                     .collect();
                 assert_eq!(floats.len(), 384);
                 // Hash provider's first dim for "hello world" should match
@@ -856,8 +858,10 @@ mod tests {
                     let bytes = base64_decode(b).expect("decode base64");
                     assert_eq!(bytes.len() % 4, 0);
                     let floats: Vec<f32> = bytes
-                        .chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|chunk| f32::from_le_bytes(*chunk))
                         .collect();
                     assert_eq!(floats.len(), 384);
                 }
@@ -904,8 +908,10 @@ mod tests {
         let bytes = base64_decode(&b).unwrap();
         assert_eq!(bytes.len(), 16);
         let floats: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(floats[0], 1.0);
         assert_eq!(floats[1], -2.0);

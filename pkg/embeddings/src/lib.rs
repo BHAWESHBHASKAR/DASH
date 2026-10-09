@@ -768,7 +768,7 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let failures = self
             .consecutive_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 Some(v.saturating_add(1))
             })
             .unwrap_or(u32::MAX)

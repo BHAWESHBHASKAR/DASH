@@ -161,15 +161,15 @@ pub trait VectorIndex: Send + Sync {
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0.0f32; 8];
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (x, y) in (&mut ca).zip(&mut cb) {
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
         for lane in 0..8 {
             acc[lane] += x[lane] * y[lane];
         }
     }
     let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         sum += x * y;
     }
     sum
