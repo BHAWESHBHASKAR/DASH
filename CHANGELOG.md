@@ -36,7 +36,8 @@ to [Semantic Versioning](https://semver.org/).
 - Measured on a shared 4 vCPU VM (WAL only, 32 clients): 106 requests/s before,
   968 with the single-fsync commit group, 2063 with group commit (6.5 requests
   per fsync). With the default redb mirror the per-write redb transactions
-  now dominate (287 before, 575 off, 624 on at 32 clients). Method, full table
+  now dominate (32 clients: 287 before, 575 off, 624 on in one round; 110,
+  217 and 393 in a second, busier round). Method, full table
   and caveats: [`docs/operations/wal-durability.md`](docs/operations/wal-durability.md);
   reproduce with `scripts/benchmark_ingest_group_commit.sh`.
 

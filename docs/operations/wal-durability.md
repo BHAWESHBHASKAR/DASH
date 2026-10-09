@@ -161,8 +161,21 @@ Default configuration (WAL and redb mirror):
 | 8 | 269.2 | 266.1 | 492.2 (1.75) |
 | 32 | 287.4 | 574.7 | 623.5 (1.40) |
 
-(The 64-client runs with redb crashed in every mode, including "before",
-because the shared disk ran out of space; they are not reported.)
+The 64-client runs of that round crashed in every mode, including "before",
+because the shared disk ran out of space. A second round with redb, run
+later while the disk was busier (absolute numbers are lower, the order is
+the same):
+
+| Clients | before | off | on |
+| ---: | ---: | ---: | ---: |
+| 32 | 110.4 | 217.1 | 393.0 (1.61) |
+| 64 | 148.8 | 274.0 | 417.2 (1.28) |
+
+p99 latency at 64 clients in that round: before 1776 ms, off 936 ms, on
+210 ms. Two of 9600 requests failed in each of the 64-client "off" and "on"
+runs (none in "before"); a repeat of the "on" run completed all 9600 with no
+server-side failure, transport rejection or failed batch, so the cause was
+not identified.
 
 How to read this:
 
@@ -172,7 +185,8 @@ How to read this:
 * "off" to "on" is group commit. Without redb it roughly doubles throughput
   at 32 clients (6.5 requests per fsync). At 64 clients on 4 vCPUs the CPU
   and the runtime lock become the limit, so batches get smaller.
-* With the redb mirror the gain from group commit is small at 32 clients:
+* With the redb mirror the gain from group commit varies between 10% and
+  80% in these runs:
   each redb mirror write is its own durable redb transaction (several fsyncs
   per ingest) made while holding the runtime lock, and that now dominates.
   Batching or relaxing the redb mirror writes is a separate change.
