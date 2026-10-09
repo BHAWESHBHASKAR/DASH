@@ -32,7 +32,7 @@ if [ ! -x "$BIN" ]; then
     exit 127
 fi
 
-# Default CMD is "--serve"; both ingestion and retrieval honor this flag.
+# Default CMD is "--serve"; ingestion, retrieval and control-plane honor this flag.
 # The segment-maintenance-daemon runs its loop when invoked with no flag.
 if [ "$#" -eq 0 ] && [ "$DASH_BIN" != "segment-maintenance-daemon" ]; then
     set -- --serve
