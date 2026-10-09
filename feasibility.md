@@ -4,6 +4,8 @@
 **Project Model:** Open-source, community-built  
 **Purpose:** Assess the technical feasibility, market positioning, and community viability of Dash as an open-source next-generation vector database with evidence-first retrieval.
 
+> **Correction note (2026-10-09, register item DOC-05).** This study is a dated snapshot written on 2026-02-17. The counts in section 2 describe the codebase at that time and have been superseded; the table in section 2.1 now shows the original figures next to measured current figures. Measurement method: `wc -l` over `*.rs` files in the listed directories, and `grep -rE '#\[(tokio::)?test\]'` for static test counts, run on 2026-10-09 at the head of the hardening branch. Statements in this document about what is "functional" are the 2026-02 assessment, not a current verification; see the README Status section and `docs/claims-ledger.md` for the current state.
+
 ---
 
 ## 1. Project Vision
@@ -23,16 +25,18 @@ The project is designed to be **built in the open**, starting with a solid Rust 
 
 ### 2.1 Quantitative Overview
 
-| Metric | Value |
-|---|---|
-| Language | Rust |
-| Total LOC | **4,192** |
-| Workspace crates | 9 (4 libs + 4 services + 1 benchmark) |
-| Unit tests | 36 passing |
-| External dependencies | 0 (pure `std` — see §2.3) |
-| CI pipeline | ✅ `scripts/ci.sh` (clippy + tests + benchmarks) |
+| Metric | 2026-02-17 (original) | 2026-10-09 (measured) |
+|---|---|---|
+| Language | Rust | Rust (edition 2024) |
+| Total LOC | 4,192 | 42,933 across `pkg/`, `services/`, `tests/benchmarks`, `fuzz/` (including in-file unit tests) |
+| Workspace crates | 9 (4 libs + 4 services + 1 benchmark) | 14 (7 `pkg/*` libraries, 6 `services/*` crates including the shared `common` crate, 1 benchmark crate); `fuzz/` is a separate workspace |
+| Tests | 36 passing | 420 `#[test]` / `#[tokio::test]` declarations in the repository (417 in the crates above), plus SDK suites (Python 64, Go 89, TypeScript 69, Java 21, Kotlin 12, C# 41). These are static counts, not pass results. |
+| External dependencies | 0 (pure `std` — see §2.3) | 25 direct workspace dependencies declared in `Cargo.toml` (303 packages in `Cargo.lock`) |
+| CI pipeline | `scripts/ci.sh` (clippy + tests + benchmarks) | GitHub Actions: fmt, clippy `-D warnings`, tests, release build, backup/restore drill (`rust.yml`); security scans (`security.yml`); fuzz nightly; SDK builds |
 
-### 2.2 Crate Architecture
+### 2.2 Crate Architecture (original, 2026-02-17)
+
+*The LOC figures below are the original snapshot. Current measured LOC (including in-file tests): schema 561, ranking 158, graph 602, store 7,205, auth 998, embeddings 998, encryption 198, services/common 149, ingestion 11,661, retrieval 10,900, indexer 1,222, metadata-router 752, control-plane 1,355, benchmarks 6,052, fuzz 122.*
 
 ```
 pkg/
@@ -51,9 +55,9 @@ tests/
   benchmarks/ — Benchmark harness with profiles, history guards, quality probes
 ```
 
-### 2.3 Why Zero External Dependencies (For Now)
+### 2.3 Why Zero External Dependencies (For Now) (historical)
 
-The `progress.md` notes an **offline/no-network constraint** during initial development. The pure-`std` approach was a pragmatic choice, not a philosophical one. Moving forward, adopting crates like `serde`, `tokio`, and ANN libraries is essential and planned.
+The `progress.md` notes an **offline/no-network constraint** during initial development. The pure-`std` approach was a pragmatic choice, not a philosophical one. Moving forward, adopting crates like `serde`, `tokio`, and ANN libraries is essential and planned. *(2026-10-09: `serde`, `redb`, `jsonwebtoken` and others have since been adopted. The `usearch` ANN crate is declared but unused; the ANN index is an in-repo HNSW-style graph.)*
 
 ### 2.4 What's Functional Today
 
@@ -146,7 +150,7 @@ The closest analogy: **Dash is to evidence-based retrieval what Qdrant was to ve
 | **Modular crate architecture** | ✅ Clean workspace with isolated crates means contributors can work on `pkg/ranking` without understanding `pkg/store`. |
 | **Novel problem domain** | ✅ Evidence-first retrieval is genuinely new. Contributors are more motivated by unsolved problems than by reimplementing existing solutions. |
 | **CI + benchmark discipline** | ✅ CI pipeline and regression guards from day one signal a serious project. |
-| **Well-articulated architecture** | ✅ `EME_ARCHITECTURE.md` gives contributors a clear map of where the project is going. |
+| **Well-articulated architecture** | ✅ `docs/architecture/eme-architecture.md` (formerly `EME_ARCHITECTURE.md`) gives contributors a clear map of where the project is going. |
 | **Clear "good first issues"** | ✅ Replacing hand-rolled JSON with `serde`, adding async HTTP, writing client SDKs — all well-scoped entry points. |
 
 ### 4.2 Risks for Community Building

@@ -1,5 +1,10 @@
 # M11 Completion Plan — RBAC, OIDC, CMEK, SOC 2 Readiness
 
+> **Delivery note (2026-10-09).** This is a plan, not a status report. What shipped is recorded in the M11 entry of
+> `CHANGELOG.md`: OIDC/JWKS validation and role checks (with gaps SEC-11, SEC-12, SEC-14), the `pkg/encryption`
+> library (not wired into storage, SEC-16), and the SOC 2 documents (corrected 2026-10-09). Control-plane `admin`
+> role enforcement and `DASH_*_REQUIRE_ROLES` described below were not implemented (SEC-07).
+
 ## Goal
 
 Close the remaining production-adoption blockers that mature vector databases ship as table-stakes: enterprise identity (OIDC), coarse-grained authorization (RBAC), customer-managed encryption keys (CMEK / BYOK), and the evidence package needed for SOC 2 Type II readiness.

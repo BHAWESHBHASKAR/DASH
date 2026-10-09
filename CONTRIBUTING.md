@@ -266,7 +266,7 @@ pub fn ingest_bundle(
 
 ### Architecture Docs
 
-- For architectural decisions, update `EME_ARCHITECTURE.md`
+- For architectural decisions, update `docs/architecture/eme-architecture.md`
 - For execution details, add to `docs/execution/`
 
 ---
@@ -317,7 +317,7 @@ Contributors are recognized in:
 
 ## Questions?
 
-- Check [`EME_ARCHITECTURE.md`](EME_ARCHITECTURE.md) for system design
+- Check [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) for system design
 - Check [`feasibility.md`](feasibility.md) for roadmap and priorities
 - Open a [GitHub Discussion](https://github.com/your-org/dash/discussions) for questions
 - Tag maintainers in issues if blocked

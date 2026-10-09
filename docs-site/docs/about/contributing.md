@@ -320,7 +320,7 @@ Contributors are recognized in:
 ## Questions?
 
 - Check the [Concepts](../concepts/index.md) section of the docs for system design.
-- Check [`EME_ARCHITECTURE.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/EME_ARCHITECTURE.md) for the original EME architecture doc.
+- Check [`docs/architecture/eme-architecture.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/architecture/eme-architecture.md) for the original EME architecture doc.
 - Open a [GitHub Discussion](https://github.com/BHAWESHBHASKAR/DASH/discussions) for questions.
 - Tag maintainers in issues if blocked.
 
