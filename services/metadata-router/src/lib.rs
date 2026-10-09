@@ -820,13 +820,14 @@ fn build_ring(config: &RouterConfig) -> BTreeMap<u64, u32> {
 }
 
 type RingKey = (Vec<u32>, u32);
+type RingCache = Mutex<HashMap<RingKey, Arc<BTreeMap<u64, u32>>>>;
 
 const RING_CACHE_MAX_ENTRIES: usize = 32;
 
 /// Return the hash ring for `config`, building it once per distinct shard set
 /// and virtual-node count instead of once per routed claim.
 fn cached_ring(config: &RouterConfig) -> Arc<BTreeMap<u64, u32>> {
-    static CACHE: OnceLock<Mutex<HashMap<RingKey, Arc<BTreeMap<u64, u32>>>>> = OnceLock::new();
+    static CACHE: OnceLock<RingCache> = OnceLock::new();
     let mut shard_ids = config.shard_ids.clone();
     shard_ids.sort_unstable();
     shard_ids.dedup();
