@@ -117,6 +117,12 @@ fn fake_upstream(delay: Duration, reply: &'static str) -> u16 {
                 let mut buf = [0u8; 8192];
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let _ = stream.read(&mut buf);
+                // Take in the rest of the request (the body can arrive in a
+                // later segment) before replying. Closing a socket that still
+                // has unread data resets the connection on macOS, which can
+                // discard the reply and make the client retry.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
                 std::thread::sleep(delay);
                 let _ = stream.write_all(reply.as_bytes());
             });
