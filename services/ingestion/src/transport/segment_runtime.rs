@@ -1,17 +1,14 @@
 use std::{path::PathBuf, time::Duration};
 
 use indexer::{
-    CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentStoreError, apply_compaction_plan,
-    build_segments, load_manifest, maintain_segment_root, persist_segments_atomic,
-    plan_compaction_round, prune_unreferenced_segment_files,
+    CompactionSchedulerConfig, SegmentMaintenanceStats, SegmentPublishOptions, SegmentStoreError,
+    maintain_segment_root_report, publish_claims_to_dir, resolve_tenant_dir,
 };
 use store::InMemoryStore;
 
 use super::{
     DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS, DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS,
-    config::{
-        env_with_fallback, parse_env_first_u64, parse_env_first_usize, sanitize_path_component,
-    },
+    config::{env_with_fallback, parse_env_first_u64, parse_env_first_usize},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,32 +87,71 @@ impl SegmentRuntime {
         tenant_id: &str,
     ) -> Result<SegmentPublishStats, SegmentStoreError> {
         let claims = store.claims_for_tenant(tenant_id);
-        let claim_count = claims.len();
-        let mut segments = build_segments(&claims, self.max_segment_size);
-        let plans = plan_compaction_round(&segments, &self.scheduler);
-        for plan in &plans {
-            segments = apply_compaction_plan(&segments, plan);
-        }
         let tenant_dir = self.tenant_segment_dir(tenant_id);
-        let previous_manifest = load_manifest(&tenant_dir)?;
-        let manifest = persist_segments_atomic(&tenant_dir, &segments)?;
-        let stale_file_pruned_count =
-            prune_unreferenced_segment_files(&tenant_dir, &manifest, previous_manifest.as_ref())?;
+        let result = publish_claims_to_dir(
+            &tenant_dir,
+            &claims,
+            &SegmentPublishOptions {
+                max_segment_size: self.max_segment_size,
+                scheduler: self.scheduler.clone(),
+                prune_grace: self.maintenance_min_stale_age,
+            },
+        )?;
         Ok(SegmentPublishStats {
-            claim_count,
-            segment_count: manifest.entries.len(),
-            compaction_plan_count: plans.len(),
-            stale_file_pruned_count,
+            claim_count: result.claim_count,
+            segment_count: result.segment_count,
+            compaction_plan_count: result.compaction_plan_count,
+            stale_file_pruned_count: result.stale_file_pruned_count,
         })
     }
 
     fn tenant_segment_dir(&self, tenant_id: &str) -> PathBuf {
-        self.root_dir.join(sanitize_path_component(tenant_id))
+        resolve_tenant_dir(&self.root_dir, tenant_id)
     }
 
     pub(super) fn maintain_all_tenants(
         &self,
     ) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
-        maintain_segment_root(&self.root_dir, self.maintenance_min_stale_age)
+        let report = maintain_segment_root_report(&self.root_dir, self.maintenance_min_stale_age)?;
+        for (tenant_dir, err) in &report.tenant_errors {
+            eprintln!(
+                "ingestion segment maintenance failed for tenant dir '{tenant_dir}': {err:?}"
+            );
+        }
+        Ok(report.stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(root: PathBuf) -> SegmentRuntime {
+        SegmentRuntime {
+            root_dir: root,
+            max_segment_size: 10,
+            scheduler: CompactionSchedulerConfig::default(),
+            maintenance_interval: None,
+            maintenance_min_stale_age: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn colliding_tenant_ids_use_distinct_segment_directories() {
+        let rt = runtime(PathBuf::from("/nonexistent-segments-root"));
+        assert_ne!(rt.tenant_segment_dir("a.b"), rt.tenant_segment_dir("a_b"));
+        let traversal = rt.tenant_segment_dir("../x");
+        assert_eq!(traversal.parent(), Some(rt.root_dir.as_path()));
+    }
+
+    #[test]
+    fn publish_for_colliding_tenants_writes_separate_directories() {
+        let root = std::env::temp_dir().join(format!("dash-ingest-seg-{}", std::process::id()));
+        let rt = runtime(root.clone());
+        let store = InMemoryStore::new();
+        rt.publish_for_tenant(&store, "a.b").expect("publish a.b");
+        rt.publish_for_tenant(&store, "a_b").expect("publish a_b");
+        assert_eq!(std::fs::read_dir(&root).expect("root exists").count(), 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
