@@ -1141,6 +1141,7 @@ dependencies = [
  "schema",
  "serde",
  "serde_json",
+ "sha2",
  "store",
  "thiserror 1.0.69",
 ]

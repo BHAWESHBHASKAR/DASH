@@ -76,20 +76,6 @@ pub(super) fn resolve_wal_async_flush_interval(
     )
 }
 
-pub(super) fn sanitize_path_component(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect();
-    if out.is_empty() {
-        out.push('_');
-    }
-    out
-}
-
 pub(super) fn unix_timestamp_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

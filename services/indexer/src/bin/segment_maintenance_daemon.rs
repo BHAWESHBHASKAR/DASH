@@ -1,4 +1,4 @@
-use indexer::{SegmentMaintenanceStats, maintain_segment_root};
+use indexer::{SegmentMaintenanceReport, maintain_segment_root_report};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -15,6 +15,7 @@ struct Config {
     interval: Duration,
     min_stale_age: Duration,
     once: bool,
+    strict: bool,
 }
 
 fn main() {
@@ -34,23 +35,26 @@ fn run() -> Result<(), String> {
 
     if config.once {
         let started_at = unix_timestamp_seconds();
-        let stats = run_tick(&config.root_dir, config.min_stale_age)?;
-        print_tick_snapshot(started_at, &config.root_dir, &stats, None);
-        return Ok(());
+        let report = run_tick(&config.root_dir, config.min_stale_age)?;
+        print_tick_snapshot(started_at, &config.root_dir, &report, None);
+        return strict_outcome(&config, &report);
     }
 
     loop {
         let tick_started_at = unix_timestamp_seconds();
         let tick_timer = Instant::now();
         match run_tick(&config.root_dir, config.min_stale_age) {
-            Ok(stats) => {
-                print_tick_snapshot(tick_started_at, &config.root_dir, &stats, None);
+            Ok(report) => {
+                print_tick_snapshot(tick_started_at, &config.root_dir, &report, None);
+                if let Err(err) = strict_outcome(&config, &report) {
+                    eprintln!("segment-maintenance-daemon: {err}");
+                }
             }
             Err(err) => {
                 print_tick_snapshot(
                     tick_started_at,
                     &config.root_dir,
-                    &SegmentMaintenanceStats::default(),
+                    &SegmentMaintenanceReport::default(),
                     Some(&err),
                 );
             }
@@ -63,34 +67,63 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn run_tick(root_dir: &Path, min_stale_age: Duration) -> Result<SegmentMaintenanceStats, String> {
-    maintain_segment_root(root_dir, min_stale_age).map_err(|err| format!("{err:?}"))
+fn run_tick(root_dir: &Path, min_stale_age: Duration) -> Result<SegmentMaintenanceReport, String> {
+    maintain_segment_root_report(root_dir, min_stale_age).map_err(|err| format!("{err:?}"))
+}
+
+/// Per-tenant failures never abort a pass; with `--strict` they make a
+/// one-shot run exit non-zero once every tenant has been processed.
+fn strict_outcome(config: &Config, report: &SegmentMaintenanceReport) -> Result<(), String> {
+    if config.strict && !report.tenant_errors.is_empty() {
+        return Err(format!(
+            "{} tenant(s) failed segment maintenance",
+            report.tenant_errors.len()
+        ));
+    }
+    Ok(())
 }
 
 fn usage_text() -> &'static str {
-    "Usage: segment_maintenance_daemon [--once] [--root PATH] [--interval-ms N] [--min-stale-age-ms N]\n\
+    "Usage: segment_maintenance_daemon [--once] [--strict] [--root PATH] [--interval-ms N] [--min-stale-age-ms N]\n\
 Defaults:\n\
   --root from DASH_INGEST_SEGMENT_DIR (fallback EME_INGEST_SEGMENT_DIR)\n\
   --interval-ms from DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS (fallback EME_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS), default 30000\n\
-  --min-stale-age-ms from DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS (fallback EME_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS), default 60000"
+  --min-stale-age-ms from DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS (fallback EME_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS), default 60000\n\
+  --strict from DASH_INGEST_SEGMENT_MAINTENANCE_STRICT (1/true): exit non-zero in --once mode if any tenant failed (the pass itself always visits every tenant)"
 }
 
 fn print_tick_snapshot(
     started_at_unix: u64,
     root_dir: &Path,
-    stats: &SegmentMaintenanceStats,
+    report: &SegmentMaintenanceReport,
     error: Option<&str>,
 ) {
+    let stats = &report.stats;
+    let tenant_errors_json = report
+        .tenant_errors
+        .iter()
+        .map(|(tenant, err)| {
+            format!(
+                "{{\"tenant_dir\":\"{}\",\"error\":\"{}\"}}",
+                json_escape(tenant),
+                json_escape(&format!("{err:?}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let error_json = error
         .map(|value| format!("\"{}\"", json_escape(value)))
         .unwrap_or_else(|| "null".to_string());
     println!(
-        "{{\"ts_unix\":{},\"root_dir\":\"{}\",\"tenant_dirs_scanned\":{},\"tenant_manifests_found\":{},\"pruned_file_count\":{},\"error\":{}}}",
+        "{{\"ts_unix\":{},\"root_dir\":\"{}\",\"tenant_dirs_scanned\":{},\"tenant_manifests_found\":{},\"pruned_file_count\":{},\"tmp_files_removed\":{},\"tenant_error_count\":{},\"tenant_errors\":[{}],\"error\":{}}}",
         started_at_unix,
         json_escape(root_dir.to_string_lossy().as_ref()),
         stats.tenant_dirs_scanned,
         stats.tenant_manifests_found,
         stats.pruned_file_count,
+        stats.tmp_files_removed,
+        stats.tenant_error_count,
+        tenant_errors_json,
         error_json
     );
 }
@@ -101,6 +134,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mut once = false;
+    let mut strict = false;
     let mut root_dir_override: Option<String> = None;
     let mut interval_ms_override: Option<u64> = None;
     let mut min_stale_age_ms_override: Option<u64> = None;
@@ -109,6 +143,7 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--once" => once = true,
+            "--strict" => strict = true,
             "--root" => {
                 root_dir_override = Some(
                     args.next()
@@ -183,11 +218,21 @@ where
         })
         .unwrap_or(DEFAULT_MIN_STALE_AGE_MS);
 
+    let strict = strict
+        || [
+            "DASH_INGEST_SEGMENT_MAINTENANCE_STRICT",
+            "EME_INGEST_SEGMENT_MAINTENANCE_STRICT",
+        ]
+        .iter()
+        .filter_map(|key| env_lookup(key))
+        .any(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes"));
+
     Ok(Config {
         root_dir: PathBuf::from(root_dir),
         interval: Duration::from_millis(interval_ms.max(1)),
         min_stale_age: Duration::from_millis(min_stale_age_ms),
         once,
+        strict,
     })
 }
 
@@ -255,6 +300,38 @@ mod tests {
         assert_eq!(config.interval, Duration::from_millis(30_000));
         assert_eq!(config.min_stale_age, Duration::from_millis(60_000));
         assert!(!config.once);
+        assert!(!config.strict);
+    }
+
+    #[test]
+    fn config_strict_flag_and_env() {
+        let env = env_lookup(&[
+            ("DASH_INGEST_SEGMENT_DIR", "/tmp/segments"),
+            ("DASH_INGEST_SEGMENT_MAINTENANCE_STRICT", "true"),
+        ]);
+        let config = config_from_inputs(Vec::<String>::new(), env).expect("config");
+        assert!(config.strict);
+        let env = env_lookup(&[("DASH_INGEST_SEGMENT_DIR", "/tmp/segments")]);
+        let config = config_from_inputs(vec!["--strict".to_string()], env).expect("config");
+        assert!(config.strict);
+    }
+
+    #[test]
+    fn strict_outcome_fails_only_when_strict_and_tenant_failed() {
+        let mut config = config_from_inputs(
+            Vec::<String>::new(),
+            env_lookup(&[("DASH_INGEST_SEGMENT_DIR", "/tmp/segments")]),
+        )
+        .expect("config");
+        let mut report = SegmentMaintenanceReport::default();
+        report.tenant_errors.push((
+            "t".to_string(),
+            indexer::SegmentStoreError::Integrity("bad".to_string()),
+        ));
+        assert!(strict_outcome(&config, &report).is_ok());
+        config.strict = true;
+        assert!(strict_outcome(&config, &report).is_err());
+        assert!(strict_outcome(&config, &SegmentMaintenanceReport::default()).is_ok());
     }
 
     #[test]
