@@ -40,6 +40,19 @@ impl ShutdownSignal {
     pub fn is_triggered(&self) -> bool {
         self.flag.load(Ordering::Relaxed)
     }
+
+    /// A signal that is only ever set by [`ShutdownSignal::trigger`] (no OS
+    /// signal handlers). Lets in-process tests stop a server they started.
+    pub fn manual() -> Arc<Self> {
+        Arc::new(Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Request shutdown, as if SIGTERM had been received.
+    pub fn trigger(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Poll the shutdown signal with a bounded sleep between checks.

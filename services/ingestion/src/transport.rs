@@ -67,7 +67,7 @@ use request::{
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationFrame,
     WalReplicationExport, batch_commit_payload_fingerprint,
 };
 
@@ -139,6 +139,7 @@ pub struct IngestionRuntime {
     replication_resync_total: u64,
     replication_last_offset: usize,
     replication_last_error: Option<String>,
+    replication_follower: replication::ReplicationFollowerState,
     replication_commit_status: HashMap<String, ReplicationCommitStatus>,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
@@ -246,6 +247,7 @@ impl IngestionRuntime {
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
+            replication_follower: replication::ReplicationFollowerState::default(),
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
             started_at: Instant::now(),
@@ -308,6 +310,7 @@ impl IngestionRuntime {
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
+            replication_follower: replication::ReplicationFollowerState::default(),
             replication_commit_status: HashMap::new(),
             transport_backpressure: None,
             started_at: Instant::now(),
@@ -862,95 +865,26 @@ impl IngestionRuntime {
 
     fn replication_delta_for_followers(
         &mut self,
+        from_generation: Option<u64>,
         from_offset: usize,
         max_records: usize,
-    ) -> Result<WalReplicationDelta, StoreError> {
+    ) -> Result<WalReplicationFrame, StoreError> {
         let wal = self.wal.as_mut().ok_or_else(|| {
             StoreError::Io("replication source requires persistent WAL mode".to_string())
         })?;
-        wal.replication_delta_from(from_offset, max_records)
+        wal.replication_frame_from(from_generation, from_offset, max_records)
     }
 
-    fn replication_export_for_followers(&mut self) -> Result<WalReplicationExport, StoreError> {
-        let wal = self.wal.as_mut().ok_or_else(|| {
-            StoreError::Io("replication source requires persistent WAL mode".to_string())
-        })?;
-        wal.replication_export()
-    }
-
-    fn apply_replication_delta_lines(
+    /// Full export plus the WAL generation it was taken at (read under the
+    /// same runtime lock, so the pair is consistent).
+    fn replication_export_for_followers(
         &mut self,
-        wal_lines: &[String],
-        next_offset: usize,
-    ) -> Result<(), StoreError> {
-        if wal_lines.is_empty() {
-            self.replication_pull_success_total =
-                self.replication_pull_success_total.saturating_add(1);
-            self.replication_last_offset = next_offset;
-            self.replication_last_error = None;
-            return Ok(());
-        }
-
-        let mut staged_store = self.store.clone();
-        for line in wal_lines {
-            staged_store.apply_persisted_record_line(line)?;
-        }
-
-        if let Some(wal) = self.wal.as_mut() {
-            let rollback_point = wal.begin_rollback_point()?;
-            let append_result = (|| {
-                for line in wal_lines {
-                    wal.append_raw_record_line(line)?;
-                }
-                Ok::<(), StoreError>(())
-            })();
-            if let Err(err) = append_result {
-                if let Err(rollback_err) = wal.rollback_to(rollback_point) {
-                    eprintln!(
-                        "replication rollback failed after WAL append error: {rollback_err:?}"
-                    );
-                }
-                return Err(err);
-            }
-        }
-
-        self.store = staged_store;
-        for tenant_id in self.store.tenant_ids() {
-            self.publish_segments_for_tenant(&tenant_id);
-        }
-        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
-        self.replication_applied_records_total = self
-            .replication_applied_records_total
-            .saturating_add(wal_lines.len() as u64);
-        self.replication_last_offset = next_offset;
-        self.replication_last_error = None;
-        Ok(())
-    }
-
-    fn apply_replication_export(&mut self, export: WalReplicationExport) -> Result<(), StoreError> {
-        let ann_tuning = self.store.ann_tuning().clone();
-        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning);
-        for line in &export.snapshot_lines {
-            rebuilt_store.apply_persisted_record_line(line)?;
-        }
-        for line in &export.wal_lines {
-            rebuilt_store.apply_persisted_record_line(line)?;
-        }
-        if let Some(wal) = self.wal.as_mut() {
-            wal.replace_with_replication_export(&export)?;
-        }
-        self.store = rebuilt_store;
-        for tenant_id in self.store.tenant_ids() {
-            self.publish_segments_for_tenant(&tenant_id);
-        }
-        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
-        self.replication_applied_records_total = self
-            .replication_applied_records_total
-            .saturating_add(export.wal_lines.len() as u64);
-        self.replication_resync_total = self.replication_resync_total.saturating_add(1);
-        self.replication_last_offset = export.wal_lines.len();
-        self.replication_last_error = None;
-        Ok(())
+    ) -> Result<(WalReplicationExport, u64), StoreError> {
+        let wal = self.wal.as_mut().ok_or_else(|| {
+            StoreError::Io("replication source requires persistent WAL mode".to_string())
+        })?;
+        let export = wal.replication_export()?;
+        Ok((export, wal.generation()))
     }
 
     fn observe_replication_pull_failure(&mut self, error: String) {
@@ -1254,6 +1188,7 @@ const DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
 const DEFAULT_INGEST_BATCH_MAX_ITEMS: usize = 128;
 const DEFAULT_REPLICATION_PULL_MAX_RECORDS: usize = 512;
+const MAX_REPLICATION_PULL_MAX_RECORDS: usize = 10_000;
 
 pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     let default_capacity = worker_count

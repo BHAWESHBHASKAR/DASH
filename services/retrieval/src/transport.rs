@@ -1201,11 +1201,35 @@ fn handle_request_with_policy<S: StoreAccess + ?Sized>(
                 eprintln!("retrieval /ready: metrics mutex poisoned: {poisoned}");
                 return HttpResponse::internal_server_error("metrics_unavailable");
             }
+            // Replication follower health: a dead, stale or lagging follower
+            // means this node serves outdated data, so it must leave the
+            // load balancer. Only applies when a follower is attached.
+            let replication_status = store.replication_status();
+            if let Some(follower) = replication_status.as_ref()
+                && let Err(reason) = follower.readiness()
+            {
+                return HttpResponse {
+                    status: 503,
+                    content_type: "application/json",
+                    body: format!(
+                        "{{\"status\":\"not_ready\",\"reason\":\"{reason}\",\"replication\":{}}}",
+                        follower.to_json()
+                    ),
+                    retry_after_secs: None,
+                };
+            }
+            let ready_body = match replication_status.as_ref() {
+                Some(follower) => format!(
+                    "{{\"status\":\"ready\",\"replication\":{}}}",
+                    follower.to_json()
+                ),
+                None => "{\"status\":\"ready\"}".to_string(),
+            };
             let store_view = store.read_store();
             let disk_status = store_view.disk_status();
             match disk_status {
                 store::DiskStatus::Available | store::DiskStatus::Recovering => {
-                    HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                    HttpResponse::ok_json(ready_body)
                 }
                 store::DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
@@ -1218,7 +1242,7 @@ fn handle_request_with_policy<S: StoreAccess + ?Sized>(
                             retry_after_secs: None,
                         }
                     } else {
-                        HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                        HttpResponse::ok_json(ready_body)
                     }
                 }
             }
@@ -1236,11 +1260,14 @@ fn handle_request_with_policy<S: StoreAccess + ?Sized>(
             {
                 return denied;
             }
-            let body = if let Ok(guard) = metrics.lock() {
+            let mut body = if let Ok(guard) = metrics.lock() {
                 guard.render_prometheus(placement_routing, store.read_store().disk_status())
             } else {
                 "dash_transport_metrics_unavailable 1\n".to_string()
             };
+            if let Some(follower) = store.replication_status() {
+                body.push_str(&follower.render_prometheus());
+            }
             HttpResponse::ok_text(body)
         }
         ("GET", "/debug/placement") => {
@@ -2279,6 +2306,11 @@ impl HttpResponse {
 /// for the sections that need it, instead of for the whole request.
 trait StoreAccess {
     fn read_store(&self) -> StoreView<'_>;
+
+    /// Replication follower attached to this store, if any.
+    fn replication_status(&self) -> Option<Arc<crate::replication::FollowerStatus>> {
+        None
+    }
 }
 
 enum StoreView<'a> {
@@ -2305,6 +2337,10 @@ impl StoreAccess for InMemoryStore {
 impl StoreAccess for RwLock<InMemoryStore> {
     fn read_store(&self) -> StoreView<'_> {
         StoreView::Guard(self.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn replication_status(&self) -> Option<Arc<crate::replication::FollowerStatus>> {
+        crate::replication::status_for_store_ptr(self as *const Self as usize)
     }
 }
 

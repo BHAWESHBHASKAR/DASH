@@ -42,6 +42,7 @@ fn main() {
     )
     .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
 
+    let mut follower_wal: Option<FileWal> = None;
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
@@ -75,6 +76,7 @@ fn main() {
             store = attach_disk(store, &disk_path);
         }
         tracing::info!("retrieval ready: claims={}", store.claims_len());
+        follower_wal = Some(wal);
         store
     } else {
         let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
@@ -128,7 +130,9 @@ fn main() {
     };
 
     let shared_store = Arc::new(RwLock::new(store));
-    spawn_replication_follower(Arc::clone(&shared_store));
+    // The retrieval WAL (when configured) is handed to the follower so
+    // replicated records are mirrored into it and survive a restart.
+    let _replication_follower = spawn_replication_follower(Arc::clone(&shared_store), follower_wal);
 
     if serve_mode {
         {

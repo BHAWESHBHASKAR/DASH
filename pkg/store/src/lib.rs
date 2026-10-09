@@ -367,6 +367,40 @@ impl InMemoryStore {
         Ok(())
     }
 
+    /// Replace ALL in-memory state with `fresh` (built from a replication
+    /// export) instead of merging onto it, keeping this store's redb handle.
+    /// The redb file is cleared and rewritten from the new state so it never
+    /// retains rows the leader no longer has. If the redb rewrite fails the
+    /// handle is dropped, `disk_status` becomes `Unavailable`, and the error
+    /// is returned; the in-memory replacement still stands.
+    pub fn replace_state_from(&mut self, fresh: InMemoryStore) -> Result<(), StoreError> {
+        let mut fresh = fresh;
+        let disk = self.disk.take();
+        let disk_status = self.disk_status.clone();
+        let own_staging = self.staged_disk_ops.take();
+        let mut ring = std::mem::take(&mut self.wal);
+        ring.total = ring.total.max(fresh.wal.total);
+        ring.events.append(&mut fresh.wal.events);
+        ring.trim();
+
+        *self = fresh;
+        self.wal = ring;
+        self.disk = disk;
+        self.disk_status = disk_status;
+        self.staged_disk_ops = own_staging;
+
+        if let Some(disk) = self.disk.clone()
+            && let Err(reason) = disk.clear_all().and_then(|()| disk.checkpoint_from(self))
+        {
+            self.disk = None;
+            self.disk_status = disk::DiskStatus::Unavailable {
+                reason: reason.clone(),
+            };
+            return Err(StoreError::Io(reason));
+        }
+        Ok(())
+    }
+
     /// Construct an `InMemoryStore` by bulk-loading from a disk
     /// snapshot, then replaying any WAL delta. Returns the new store
     /// + load stats. This is the cold-start path when both the WAL
