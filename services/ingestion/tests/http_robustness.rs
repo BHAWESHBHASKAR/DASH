@@ -222,3 +222,40 @@ fn replication_ack_query_values_are_percent_decoded() {
         "commit id must be percent-decoded: {response:?}"
     );
 }
+
+/// Review finding 8: a repeated credential header used to be last-wins, which
+/// lets a proxy and the service disagree about which credential was sent.
+#[test]
+fn duplicate_credential_headers_are_rejected_with_400() {
+    let _env = env_lock();
+    let addr = start_server();
+    for (label, headers) in [
+        (
+            "authorization",
+            "Authorization: Bearer one\r\nauthorization: Bearer two\r\n",
+        ),
+        ("x-api-key", "X-API-Key: one\r\nx-api-key: two\r\n"),
+        (
+            "x-replication-token",
+            "X-Replication-Token: one\r\nx-replication-token: two\r\n",
+        ),
+        (
+            "identical authorization",
+            "Authorization: Bearer same\r\nAuthorization: Bearer same\r\n",
+        ),
+    ] {
+        let request = format!("GET /health HTTP/1.1\r\nHost: t\r\n{headers}\r\n");
+        let response = send_raw(&addr, request.as_bytes());
+        assert!(
+            status_line(&response).contains("400"),
+            "{label}: {response:?}"
+        );
+    }
+    // A single credential header is still fine.
+    let response = send_raw(
+        &addr,
+        b"GET /health HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer one\r\n\r\n",
+    );
+    assert!(status_line(&response).contains("200 OK"), "{response:?}");
+    assert_server_alive(&addr);
+}

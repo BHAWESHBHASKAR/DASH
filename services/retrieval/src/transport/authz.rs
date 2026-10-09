@@ -28,6 +28,7 @@ static POLICY: PolicyCell = PolicyCell::new();
 /// On unix the policy is rebuilt on SIGHUP (see `dash_common::PolicyCell::reload`).
 pub fn initialize_auth_policy() -> Result<(), String> {
     POLICY.pin(&SERVICE_AUTH)?;
+    dash_common::audit::warn_if_fail_open("RETRIEVAL");
     dash_common::spawn_sighup_reload(&POLICY, SERVICE_AUTH);
     Ok(())
 }
@@ -48,14 +49,24 @@ pub(crate) fn authorize_request_for_tenant(
     policy.authorize_for_tenant(&request.headers, tenant_id, required_role)
 }
 
-/// Authorize a request that is not scoped to a tenant (`/metrics`,
-/// `/debug/placement`, `/v1/embeddings`).
+/// Authorize a tenant-less data-plane request (`/v1/embeddings`).
 pub(crate) fn authorize_request_any_tenant(
     request: &HttpRequest,
     policy: &AuthPolicy,
     required_role: Role,
 ) -> AuthDecision {
     policy.authorize_any_tenant(&request.headers, required_role)
+}
+
+/// Authorize a tenant-less operations request (`/metrics`,
+/// `/debug/placement`). Requires the admin role or an unscoped credential,
+/// see `AuthPolicy::authorize_ops`.
+pub(crate) fn authorize_request_ops(
+    request: &HttpRequest,
+    policy: &AuthPolicy,
+    required_role: Role,
+) -> AuthDecision {
+    policy.authorize_ops(&request.headers, required_role)
 }
 
 /// Build a policy from explicit values (no environment, no strict secret

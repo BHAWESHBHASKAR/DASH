@@ -66,7 +66,7 @@ pub(super) fn handle_request_with_policy(
             audit_log_path.as_deref(),
         ),
         ("POST", "/internal/replication/ack") => {
-            read_routes::handle_replication_ack_post(runtime, request, &query)
+            read_routes::handle_replication_ack_post(runtime, request, &query, auth_policy)
         }
         (_, "/v1/ingest") => HttpResponse::method_not_allowed("only POST is supported"),
         (_, "/v1/ingest/raw") => HttpResponse::method_not_allowed("only POST is supported"),

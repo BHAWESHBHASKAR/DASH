@@ -2,14 +2,14 @@ use std::{
     collections::HashMap,
     fs,
     io::Write,
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use auth::sha256_hex;
@@ -109,8 +109,39 @@ pub fn resolve_security(
     insecure_dev: bool,
     bind_addr: &str,
 ) -> Result<SecurityConfig, String> {
+    // Strict secret validation is on by default and can only be relaxed in
+    // explicit dev mode (`DASH_STRICT_SECRETS=0` together with
+    // `DASH_INSECURE_DEV_MODE=1`), exactly like the data-plane services.
+    let relaxed = insecure_dev
+        && matches!(
+            std::env::var("DASH_STRICT_SECRETS")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "no" | "off")
+        );
+    resolve_security_with(token, insecure_dev, !relaxed, bind_addr)
+}
+
+/// Minimum length of the control-plane bearer token under strict secrets.
+pub const TOKEN_MIN_LENGTH: usize = 32;
+
+/// [`resolve_security`] with the strict-secrets decision made by the caller.
+pub fn resolve_security_with(
+    token: Option<&str>,
+    insecure_dev: bool,
+    strict_secrets: bool,
+    bind_addr: &str,
+) -> Result<SecurityConfig, String> {
     let token = token.map(str::trim).filter(|value| !value.is_empty());
     if let Some(token) = token {
+        if strict_secrets {
+            dash_common::validate_secret_min_len(
+                token,
+                "DASH_CONTROL_PLANE_TOKEN",
+                TOKEN_MIN_LENGTH,
+            )?;
+        }
         return Ok(SecurityConfig {
             auth: AuthMode::Token(token.to_string()),
             bind_addr: bind_addr.to_string(),
@@ -148,6 +179,73 @@ pub fn resolve_security(
         bind_addr: bind,
         warnings,
     })
+}
+
+/// Resolve the leader-election node id. Outside dev mode an explicit
+/// `DASH_CONTROL_PLANE_NODE_ID` is required: the old `control-plane-<pid>`
+/// default collides between containers (every container is pid 1) and would
+/// let two nodes act as the same lease holder.
+pub fn resolve_node_id(configured: Option<&str>, insecure_dev: bool) -> Result<String, String> {
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(node_id) => Ok(node_id.to_string()),
+        None if insecure_dev => Ok(format!("control-plane-{}", std::process::id())),
+        None => Err(
+            "DASH_CONTROL_PLANE_NODE_ID is required (a unique, stable id per control-plane node); \
+             set it, or set DASH_INSECURE_DEV_MODE=1 for local development only"
+                .to_string(),
+        ),
+    }
+}
+
+/// Failed bearer-token attempts allowed per peer address and window.
+const AUTH_FAILURE_LIMIT: u32 = 10;
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_FAILURE_MAX_PEERS: usize = 10_000;
+
+/// Throttles credential guessing: after [`AUTH_FAILURE_LIMIT`] failed
+/// attempts within a minute a peer address gets 429 with `Retry-After` until
+/// its window ends.
+#[derive(Default)]
+pub struct AuthFailureThrottle {
+    peers: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+}
+
+impl AuthFailureThrottle {
+    /// Seconds the peer must wait, or `None` when it may attempt.
+    pub fn blocked_for(&self, peer: IpAddr, now: Instant) -> Option<u64> {
+        let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        let (started, failures) = peers.get(&peer)?;
+        let elapsed = now.saturating_duration_since(*started);
+        if *failures >= AUTH_FAILURE_LIMIT && elapsed < AUTH_FAILURE_WINDOW {
+            Some((AUTH_FAILURE_WINDOW - elapsed).as_secs().max(1))
+        } else {
+            None
+        }
+    }
+
+    pub fn record_failure(&self, peer: IpAddr, now: Instant) {
+        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        if peers.len() >= AUTH_FAILURE_MAX_PEERS && !peers.contains_key(&peer) {
+            peers.retain(|_, (started, _)| {
+                now.saturating_duration_since(*started) < AUTH_FAILURE_WINDOW
+            });
+            if peers.len() >= AUTH_FAILURE_MAX_PEERS {
+                // Still full of live windows: drop the oldest entry.
+                if let Some(oldest) = peers
+                    .iter()
+                    .min_by_key(|(_, (started, _))| *started)
+                    .map(|(ip, _)| *ip)
+                {
+                    peers.remove(&oldest);
+                }
+            }
+        }
+        let entry = peers.entry(peer).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= AUTH_FAILURE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +310,8 @@ pub struct ControlPlanePlacementState {
     /// disk. A mismatch with the live lease epoch forces a reload before the
     /// node serves or persists anything.
     synced_lease_epoch: Option<u64>,
+    /// Failed-token throttle shared by every request served from this state.
+    auth_throttle: Arc<AuthFailureThrottle>,
 }
 
 impl std::fmt::Debug for ControlPlanePlacementState {
@@ -348,6 +448,7 @@ impl ControlPlanePlacementState {
                 node_id: self.local_node_id_or_unknown(),
                 epoch: self.highest_epoch(),
                 expires_at_ms: u64::MAX,
+                instance_id: String::new(),
             })),
         }
     }
@@ -814,7 +915,28 @@ pub fn handle_http_request_bytes(
         return Err("content-length does not match body size".to_string());
     }
     request.body = body.to_vec();
-    let response = handle_request(state, request);
+    let response = handle_request(state, request, None);
+    Ok(render_response_text(&response).into_bytes())
+}
+
+/// Like [`handle_http_request_bytes`] for a request received from `peer`
+/// (used by the authentication-failure throttle).
+pub fn handle_http_request_bytes_from_peer(
+    state: &Arc<Mutex<ControlPlanePlacementState>>,
+    raw_request: &[u8],
+    peer: IpAddr,
+) -> Result<Vec<u8>, String> {
+    let header_end =
+        find_header_end(raw_request).ok_or_else(|| "missing HTTP header terminator".to_string())?;
+    let head = std::str::from_utf8(&raw_request[..header_end])
+        .map_err(|_| "request must be valid UTF-8".to_string())?;
+    let mut request = parse_head(head)?;
+    let body = &raw_request[header_end + 4..];
+    if content_length(&request)? != body.len() {
+        return Err("content-length does not match body size".to_string());
+    }
+    request.body = body.to_vec();
+    let response = handle_request(state, request, Some(peer));
     Ok(render_response_text(&response).into_bytes())
 }
 
@@ -824,8 +946,9 @@ fn handle_connection(
     config: &ServerConfig,
 ) -> std::io::Result<()> {
     stream.set_write_timeout(Some(config.write_timeout))?;
+    let peer = stream.peer_addr().ok().map(|addr| addr.ip());
     let response = match read_request(&mut stream, config) {
-        Ok(request) => handle_request(state, request),
+        Ok(request) => handle_request(state, request, peer),
         Err(ReadError::Closed) => return Ok(()),
         Err(ReadError::Io(err)) => return Err(err),
         Err(ReadError::Timeout) => HttpResponse::error(408, "request timed out"),
@@ -950,15 +1073,30 @@ fn requires_auth(path: &str) -> bool {
 fn handle_request(
     state: &Arc<Mutex<ControlPlanePlacementState>>,
     request: HttpRequest,
+    peer: Option<IpAddr>,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
 
     if requires_auth(&path) {
-        let auth = match lock_state(state) {
-            Ok(guard) => guard.auth_mode().clone(),
+        let (auth, throttle) = match lock_state(state) {
+            Ok(guard) => (guard.auth_mode().clone(), Arc::clone(&guard.auth_throttle)),
             Err(response) => return response,
         };
+        // Requests without a known peer share one bucket.
+        let peer = peer.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let now = Instant::now();
+        if matches!(auth, AuthMode::Token(_))
+            && let Some(retry_after) = throttle.blocked_for(peer, now)
+        {
+            return HttpResponse::error(429, "too many failed authentication attempts")
+                .with_header("Retry-After", retry_after.to_string());
+        }
         if let Err(response) = auth.authorize(request.header("authorization")) {
+            // Only a presented-but-wrong credential is a guess; a request with no
+            // credential at all is not counted.
+            if response.status == 401 && request.header("authorization").is_some() {
+                throttle.record_failure(peer, now);
+            }
             return response;
         }
     }
@@ -1311,6 +1449,7 @@ fn render_response_text(response: &HttpResponse) -> String {
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Internal Server Error",

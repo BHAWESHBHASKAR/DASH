@@ -290,8 +290,8 @@ fn startup_refuses_without_token_unless_insecure_dev() {
 
 #[test]
 fn startup_with_token_keeps_requested_bind() {
-    let config = resolve_security(Some("abc"), false, "0.0.0.0:8090").unwrap();
-    assert_eq!(config.auth, AuthMode::Token("abc".to_string()));
+    let config = resolve_security(Some(STRONG_TOKEN), false, "0.0.0.0:8090").unwrap();
+    assert_eq!(config.auth, AuthMode::Token(STRONG_TOKEN.to_string()));
     assert_eq!(config.bind_addr, "0.0.0.0:8090");
     assert!(config.warnings.is_empty());
 }
@@ -932,4 +932,148 @@ fn router_client_refuses_follower_control_plane() {
     )
     .expect_err("follower placement must not be served");
     assert!(err.contains("503"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// Review findings: token strength, node id, authentication-failure throttle
+// ---------------------------------------------------------------------------
+
+const STRONG_TOKEN: &str = "9f2b7c41d8e0a3566b1c4d7e8f90a2b3c4d5e6f7";
+
+#[test]
+fn strict_secrets_reject_short_and_placeholder_tokens() {
+    for weak in [
+        "abc",
+        "short-token",
+        "0123456789abcdef0123456789abcde", // 31 chars
+        "change-me-change-me-change-me-change-me",
+        "<generate-a-long-random-token-here-please>",
+        "secret-secret-secret-secret-secret-secret",
+    ] {
+        let err = resolve_security(Some(weak), false, "0.0.0.0:8090").expect_err(weak);
+        assert!(err.contains("DASH_CONTROL_PLANE_TOKEN"), "{err}");
+        assert!(!err.contains(weak), "error leaked the token: {err}");
+    }
+    let ok = resolve_security(Some(STRONG_TOKEN), false, "0.0.0.0:8090").unwrap();
+    assert_eq!(ok.auth, AuthMode::Token(STRONG_TOKEN.to_string()));
+}
+
+#[test]
+fn weak_token_is_only_allowed_when_strict_secrets_are_relaxed() {
+    // Dev mode alone does not relax the check; the explicit opt-out does.
+    assert!(resolve_security_with(Some("abc"), true, true, "127.0.0.1:1").is_err());
+    let relaxed = resolve_security_with(Some("abc"), true, false, "127.0.0.1:1").unwrap();
+    assert_eq!(relaxed.auth, AuthMode::Token("abc".to_string()));
+}
+
+#[test]
+fn node_id_is_required_outside_dev_mode() {
+    let err = resolve_node_id(None, false).expect_err("no node id");
+    assert!(err.contains("DASH_CONTROL_PLANE_NODE_ID"), "{err}");
+    assert!(resolve_node_id(Some("   "), false).is_err());
+    assert_eq!(resolve_node_id(Some(" cp-1 "), false).unwrap(), "cp-1");
+    assert_eq!(resolve_node_id(Some("cp-1"), true).unwrap(), "cp-1");
+    let dev = resolve_node_id(None, true).unwrap();
+    assert_eq!(dev, format!("control-plane-{}", std::process::id()));
+}
+
+fn throttled_call(
+    state: &Arc<Mutex<ControlPlanePlacementState>>,
+    token: Option<&str>,
+    peer: std::net::IpAddr,
+) -> String {
+    let raw = raw_request("GET", "/v1/control-plane/placement", token, "");
+    String::from_utf8(handle_http_request_bytes_from_peer(state, &raw, peer).unwrap()).unwrap()
+}
+
+#[test]
+fn repeated_bad_tokens_from_one_peer_get_429_with_retry_after() {
+    let state = Arc::new(Mutex::new(
+        ControlPlanePlacementState::new(sample_placements(1)).with_auth_token(STRONG_TOKEN),
+    ));
+    let attacker: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+    let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+    for attempt in 0..10 {
+        let response = throttled_call(&state, Some("wrong-token"), attacker);
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "{attempt}: {response}"
+        );
+    }
+    let blocked = throttled_call(&state, Some("wrong-token"), attacker);
+    assert!(blocked.starts_with("HTTP/1.1 429"), "{blocked}");
+    assert!(blocked.contains("Retry-After: "), "{blocked}");
+    // Even the right token is refused while the peer is throttled...
+    let blocked = throttled_call(&state, Some(STRONG_TOKEN), attacker);
+    assert!(blocked.starts_with("HTTP/1.1 429"), "{blocked}");
+    // ...but other peers are unaffected.
+    let fine = throttled_call(&state, Some(STRONG_TOKEN), other);
+    assert!(fine.starts_with("HTTP/1.1 200"), "{fine}");
+}
+
+#[test]
+fn successful_requests_and_open_routes_do_not_count_as_failures() {
+    let state = Arc::new(Mutex::new(
+        ControlPlanePlacementState::new(sample_placements(1)).with_auth_token(STRONG_TOKEN),
+    ));
+    let peer: std::net::IpAddr = "198.51.100.1".parse().unwrap();
+    for _ in 0..30 {
+        let ok = throttled_call(&state, Some(STRONG_TOKEN), peer);
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    }
+}
+
+#[test]
+fn failure_window_expires_and_peer_table_is_bounded() {
+    let throttle = AuthFailureThrottle::default();
+    let peer: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let t0 = Instant::now();
+    assert!(throttle.blocked_for(peer, t0).is_none());
+    for _ in 0..10 {
+        throttle.record_failure(peer, t0);
+    }
+    let wait = throttle.blocked_for(peer, t0).expect("blocked");
+    assert!((1..=60).contains(&wait));
+    assert!(
+        throttle
+            .blocked_for(peer, t0 + Duration::from_secs(61))
+            .is_none()
+    );
+    // A new failure after the window starts a fresh count.
+    throttle.record_failure(peer, t0 + Duration::from_secs(61));
+    assert!(
+        throttle
+            .blocked_for(peer, t0 + Duration::from_secs(62))
+            .is_none()
+    );
+    // Many distinct peers cannot grow the table without bound.
+    for i in 0..12_000u32 {
+        let ip = std::net::IpAddr::from(i.to_be_bytes());
+        throttle.record_failure(ip, t0);
+    }
+    assert!(throttle.peers.lock().unwrap().len() <= 10_000);
+}
+
+#[test]
+fn duplicate_authorization_headers_are_rejected_with_400() {
+    let state = Arc::new(Mutex::new(
+        ControlPlanePlacementState::new(sample_placements(1)).with_auth_token(STRONG_TOKEN),
+    ));
+    let raw = format!(
+        "GET /v1/control-plane/placement HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {STRONG_TOKEN}\r\nauthorization: Bearer other\r\nContent-Length: 0\r\n\r\n"
+    );
+    // The library entry point refuses to parse it ...
+    assert!(handle_http_request_bytes(&state, raw.as_bytes()).is_err());
+    // ... and the real socket server answers 400.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_state = Arc::clone(&state);
+    std::thread::spawn(move || {
+        let _ = serve_listener(listener, server_state, ServerConfig::default());
+    });
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(raw.as_bytes()).unwrap();
+    let mut out = String::new();
+    stream.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
 }

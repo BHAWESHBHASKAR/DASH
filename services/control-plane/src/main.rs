@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use control_plane::{
     ControlPlanePersistence, ControlPlanePlacementState, LeaderStatus, LeaseMaintainer,
-    leader::LeaderLease, resolve_security, serve_http,
+    leader::LeaderLease, resolve_node_id, resolve_security, serve_http,
 };
 use metadata_router::load_shard_placements_csv;
 
@@ -28,8 +28,14 @@ fn main() {
         eprintln!("WARNING: {warning}");
     }
     let bind_addr = security.bind_addr.clone();
-    let node_id = env_with_fallback("DASH_CONTROL_PLANE_NODE_ID", "EME_CONTROL_PLANE_NODE_ID")
-        .unwrap_or_else(|| format!("control-plane-{}", std::process::id()));
+    let node_id = resolve_node_id(
+        env_with_fallback("DASH_CONTROL_PLANE_NODE_ID", "EME_CONTROL_PLANE_NODE_ID").as_deref(),
+        insecure_dev,
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("control-plane refusing to start: {err}");
+        std::process::exit(2);
+    });
     let state_path = env_with_fallback(
         "DASH_CONTROL_PLANE_STATE_PATH",
         "EME_CONTROL_PLANE_STATE_PATH",
@@ -115,7 +121,17 @@ fn main() {
                 lease_duration_ms,
                 lease_renewal_ms,
             )
-            .with_safety_margin_ms(lease_safety_margin_ms),
+            .with_safety_margin_ms(lease_safety_margin_ms)
+            // Admin recovery from a forged or corrupt lease record.
+            .with_lease_reset(matches!(
+                env_with_fallback(
+                    "DASH_CONTROL_PLANE_LEASE_RESET",
+                    "EME_CONTROL_PLANE_LEASE_RESET"
+                )
+                .as_deref()
+                .map(str::trim),
+                Some("1")
+            )),
         );
         let mut state = state.with_lease(lease);
         // Acquire (and, if leader, reload persisted placements) before

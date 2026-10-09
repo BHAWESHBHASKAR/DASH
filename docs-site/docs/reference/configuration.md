@@ -74,11 +74,11 @@ The service refuses to start (exit 2) when no authentication method is configure
 | `DASH_INGEST_API_KEYS` / `DASH_RETRIEVAL_API_KEYS` | unset | Comma-separated accepted API keys (legacy unscoped keys). |
 | `DASH_INGEST_API_KEY_DEFAULT_ROLES` / `DASH_RETRIEVAL_API_KEY_DEFAULT_ROLES` | the service's primary role: `ingest` for ingestion, `retrieve` for retrieval | Roles granted to legacy unscoped keys and to scoped keys that list no roles. Comma or space separated list of `admin`, `ingest`, `retrieve`, `read_only`; an unknown name stops startup. |
 | `DASH_INGEST_API_KEY_SCOPES` / `DASH_RETRIEVAL_API_KEY_SCOPES` | unset | Scoped keys, entries separated by `;`, each `key:tenantA,tenantB[:role1,role2]`. A tenant of `*` means all tenants. A scoped key need not also appear in `..._API_KEYS`. |
-| `DASH_INGEST_ALLOWED_TENANTS` / `DASH_RETRIEVAL_ALLOWED_TENANTS` | any tenant | Comma-separated tenant allowlist applied to every authenticated request (403 otherwise); `*` or empty means any. |
+| `DASH_INGEST_ALLOWED_TENANTS` / `DASH_RETRIEVAL_ALLOWED_TENANTS` | any tenant | Comma-separated tenant allowlist applied to every authenticated request (403 otherwise); `*` means any. Leave it unset for any tenant: a value that is set but empty or only separators is a startup error. |
 | `DASH_INGEST_REVOKED_API_KEYS` / `DASH_RETRIEVAL_REVOKED_API_KEYS` | unset | Comma-separated keys rejected with 401 `API key revoked`. |
 | `DASH_INGEST_REVOKED_KEYS_PATH` / `DASH_RETRIEVAL_REVOKED_KEYS_PATH` | unset | File with one revoked key per line. Re-read when its mtime or size changes (checked at most once per second). |
-| `DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS` / `DASH_RETRIEVAL_RATE_LIMIT_PER_TENANT_RPS` | `100` (ingestion), `500` (retrieval) | Per-tenant token-bucket refill rate. `0` disables limiting. Applies to API keys, JWTs and OIDC alike. Excess requests get HTTP 429 with a `Retry-After` header. Non-tenant requests (`/metrics`, `/debug/placement`, `/v1/embeddings`) share one bucket. |
-| `DASH_INGEST_RATE_LIMIT_BURST` / `DASH_RETRIEVAL_RATE_LIMIT_BURST` | `200` (ingestion), `1000` (retrieval); never below the rate | Per-tenant bucket size. |
+| `DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS` / `DASH_RETRIEVAL_RATE_LIMIT_PER_TENANT_RPS` | `100` (ingestion), `500` (retrieval) | Token-bucket refill rate per credential and route class (data, embeddings, ops); the tenant joins the key only for keys bound to a fixed tenant set, so a wildcard key cannot gain buckets by rotating tenant ids. `0` disables limiting. Applies to API keys, JWTs and OIDC alike. Excess requests get HTTP 429 with a `Retry-After` header. At most 50,000 buckets are kept. |
+| `DASH_INGEST_RATE_LIMIT_BURST` / `DASH_RETRIEVAL_RATE_LIMIT_BURST` | `200` (ingestion), `1000` (retrieval); never below the rate | Bucket size. |
 
 Rate-limit state is in memory per process and starts fresh after a restart or a SIGHUP reload.
 
@@ -127,6 +127,8 @@ HS256 tokens carry tenants in `tenant_id` (string) or `tenants` / `tenant_ids` (
 | `DASH_RETRIEVAL_AUDIT_FSYNC` | `1` | retrieval | Same, for retrieval. DASH only. |
 | `DASH_INGEST_AUDIT_FAIL_CLOSED` | `0` | ingestion | When on, a write to `/v1/ingest*` is refused with 503 if the audit log cannot be opened, locked and its tail recovered. The check is made before the mutation; the append itself still happens after it (see `docs/operations/audit-chain.md`). DASH only. |
 | `DASH_RETRIEVAL_AUDIT_FAIL_CLOSED` | `0` | retrieval | Same gate for `/v1/retrieve`. DASH only. |
+| `DASH_AUDIT_FINGERPRINT_KEY` | random per process | ingestion, retrieval | Key for the HMAC-SHA256 credential fingerprints in audit records. Set the same value on every node whose fingerprints should be comparable; without it a random key is used and a warning is logged. |
+| `DASH_AUDIT_DENIAL_MAX_PER_SEC` | `50` | ingestion, retrieval | Maximum denial (401/403/429) audit records per second per audit file (burst 10x); extra denials are dropped and counted in `dash_audit_denials_dropped_total`. `0` disables the limit. |
 
 Verify a log with `tools/audit-verify` or `scripts/verify_audit_chain.sh`.
 
@@ -194,7 +196,8 @@ Placement routing is enabled when `DASH_ROUTER_PLACEMENT_FILE` or `DASH_ROUTER_C
 | `DASH_ROUTER_SHARD_IDS` | from placement | ingestion, retrieval | Comma-separated shard ids override. |
 | `DASH_ROUTER_REPLICA_COUNT` | from placement | ingestion, retrieval | Replica count override. |
 | `DASH_ROUTER_VIRTUAL_NODES_PER_SHARD` | `64` | ingestion, retrieval | Virtual nodes for shard hashing. |
-| `DASH_CONTROL_PLANE_NODE_ID` | `control-plane-<pid>` | control-plane | Node id used in leader election. |
+| `DASH_CONTROL_PLANE_NODE_ID` | none (required; dev mode falls back to `control-plane-<pid>`) | control-plane | Unique, stable node id used in leader election. Startup fails without it unless `DASH_INSECURE_DEV_MODE=1`. |
+| `DASH_CONTROL_PLANE_LEASE_RESET` | `0` | control-plane | Set to `1` for one start to discard a forged or corrupt lease record (or epoch sidecar) that the node otherwise refuses to run with. Remove it afterwards. |
 | `DASH_CONTROL_PLANE_STATE_PATH` | unset (state not persisted) | control-plane | Persisted placement CSV. |
 | `DASH_CONTROL_PLANE_STATE_SHA256_PATH` | unset | control-plane | Checksum file for the persisted state; verified at startup (mismatch exits with code 2). |
 | `DASH_CONTROL_PLANE_LEASE_PATH` | unset (standalone, always leader) | control-plane | File lease for leader election. |

@@ -41,7 +41,9 @@ docker build -f deploy/container/Dockerfile --build-arg SERVICE=ingestion -t das
   root and are not writable by the runtime user.
 - Compose drops all capabilities, sets `no-new-privileges`, uses a
   read-only root filesystem with a `tmpfs` at `/tmp`, and persists state
-  only on the `dash-state` volume at `/var/lib/dash`.
+  only on per-service named volumes at `/var/lib/dash` (`dash-ingestion-state`,
+  `dash-retrieval-state`, `dash-control-plane-state`), so one compromised
+  container cannot rewrite another service's WAL, audit log or lease.
 - `HEALTHCHECK` runs `dash-healthcheck`, which probes `/v1/ready`
   (`/v1/control-plane/ready` for the control plane) on the service's port.
 - Published ports bind to `127.0.0.1`. Set `DASH_PUBLISH_ADDR=0.0.0.0` only
@@ -87,7 +89,7 @@ docker compose -f deploy/container/docker-compose.yml --profile control-plane up
 ```
 
 Stop the stack with `docker compose -f deploy/container/docker-compose.yml down`.
-The `dash-state` volume survives `down`; use `down --volumes` to wipe it.
+The state volumes survive `down`; use `down --volumes` to wipe them.
 
 ## Data path
 
@@ -136,16 +138,48 @@ Secrets (generated into `.env`):
 ## Where data lives
 
 ```
-/var/lib/dash/                      # volume dash-state
+/var/lib/dash/                      # volume dash-ingestion-state
 ├── wal/ingestion.wal               # ingestion WAL
-├── state/
-│   ├── ingestion.redb              # redb files (file paths)
-│   ├── retrieval.redb
-│   ├── retrieval-replication.offset
-│   └── control-plane.*             # control plane state, lease
-├── segments/{ingestion,retrieval}/
-└── audit/{ingestion,retrieval}.audit.jsonl
+├── state/ingestion.redb
+├── segments/ingestion/             # also mounted by segment-maintenance
+└── audit/ingestion.audit.jsonl
+
+/var/lib/dash/                      # volume dash-retrieval-state
+├── state/retrieval.redb
+├── state/retrieval-replication.offset
+├── segments/retrieval/
+└── audit/retrieval.audit.jsonl
+
+/var/lib/dash/                      # volume dash-control-plane-state
+└── state/control-plane.*           # control plane state, lease
 ```
+
+Retrieval follows ingestion over HTTP and never reads its files; the control
+plane shares nothing with the data plane. The segment-maintenance daemon
+belongs to the ingestion trust domain and mounts the ingestion volume.
+
+### Upgrading from the single `dash-state` volume
+
+Earlier versions of this file used one shared `dash-state` volume. Compose
+now creates three empty volumes, so copy the old data once before the first
+`up` (replace the paths as needed), for example:
+
+```bash
+migrate() {  # migrate <service> <path under /var/lib/dash>...
+  local svc="$1"; shift
+  docker volume create "dash-${svc}-state" >/dev/null
+  docker run --rm -v dash-state:/old:ro -v "dash-${svc}-state:/new" alpine \
+    sh -c 'cd /old; for p in "$@"; do [ -e "$p" ] && cp -a --parents "$p" /new/; done
+           chown 10001:10001 /new; chmod 0750 /new' sh "$@"
+}
+migrate ingestion wal state/ingestion.redb segments/ingestion audit/ingestion.audit.jsonl
+migrate retrieval state/retrieval.redb state/retrieval-replication.offset \
+  segments/retrieval audit/retrieval.audit.jsonl
+migrate control-plane state/control-plane.csv state/control-plane.csv.sha256 \
+  state/control-plane.lease
+```
+
+Retrieval can also start empty and re-sync from ingestion.
 
 ## Backup and restore
 
@@ -162,7 +196,7 @@ docker compose -f deploy/container/docker-compose.yml pull        # if using rel
 docker compose -f deploy/container/docker-compose.yml up -d --build
 ```
 
-State lives on the `dash-state` volume, so it survives upgrades.
+State lives on the per-service volumes, so it survives upgrades.
 
 ## Local development
 

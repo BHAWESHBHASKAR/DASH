@@ -9,7 +9,7 @@ All deployments need credentials: every service refuses to start without them. S
 
 ## Docker Compose (recommended)
 
-The stack is `deploy/container/docker-compose.yml`. It builds the images locally, starts ingestion (`:8081`), retrieval (`:8080`) and the segment-maintenance daemon, and shares one named volume (`dash-state`). The control plane (`:8090`) is optional: it starts only with `--profile control-plane`.
+The stack is `deploy/container/docker-compose.yml`. It builds the images locally, starts ingestion (`:8081`), retrieval (`:8080`) and the segment-maintenance daemon, and gives each service its own named volume (`dash-ingestion-state`, `dash-retrieval-state`, `dash-control-plane-state`); the segment-maintenance daemon mounts the ingestion volume. The control plane (`:8090`) is optional: it starts only with `--profile control-plane`.
 
 ```bash
 git clone https://github.com/BHAWESHBHASKAR/DASH.git

@@ -30,8 +30,7 @@ mod server_runtime;
 use audit::{AuditEvent, emit_audit_event};
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
-    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
-    shared_auth_policy,
+    AuthDecision, Role, authorize_request_for_tenant, authorize_request_ops, shared_auth_policy,
 };
 use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,

@@ -441,6 +441,8 @@ dependencies = [
  "auth",
  "axum",
  "chrono",
+ "dash-common",
+ "libc",
  "metadata-router",
  "serde",
  "serde_json",
@@ -625,7 +627,9 @@ name = "dash-common"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "rand 0.8.7",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "tracing",

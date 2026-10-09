@@ -45,7 +45,7 @@ use audit::{AuditEvent, append_audit_record, audit_gate};
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
     AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
-    shared_auth_policy,
+    authorize_request_ops, shared_auth_policy,
 };
 use dash_common::AuthPolicy;
 use debug_render::{
@@ -1402,7 +1402,7 @@ fn route_request<S: StoreAccess + ?Sized>(
         ("GET", "/metrics") => {
             if !auth_policy.metrics_public()
                 && let Some(denied) = deny_unless_allowed(
-                    authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                    authorize_request_ops(request, auth_policy, Role::ReadOnly),
                     metrics,
                     audit_log_path.as_deref(),
                     "metrics",
@@ -1424,7 +1424,7 @@ fn route_request<S: StoreAccess + ?Sized>(
         }
         ("GET", "/debug/placement") => {
             if let Some(denied) = deny_unless_allowed(
-                authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                authorize_request_ops(request, auth_policy, Role::ReadOnly),
                 metrics,
                 audit_log_path.as_deref(),
                 "debug_placement",

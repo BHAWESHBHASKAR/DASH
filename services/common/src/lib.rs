@@ -17,8 +17,8 @@ pub mod audit;
 pub mod policy;
 
 pub use policy::{
-    AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, ServiceAuthEnv, TenantRateLimiter,
-    spawn_sighup_reload,
+    AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, RouteClass, ServiceAuthEnv,
+    TenantRateLimiter, spawn_sighup_reload,
 };
 
 pub struct ShutdownSignal {
@@ -259,6 +259,15 @@ pub fn resolve_bind_addr(requested: &str) -> String {
         );
     }
     decision.addr
+}
+
+/// `bytes` random bytes from the operating system CSPRNG, as lower-case hex.
+/// Used for unguessable file-name suffixes and per-process instance ids.
+pub fn random_hex(bytes: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; bytes];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    audit::hex_lower(&buf)
 }
 
 /// Constant-time byte equality. Runs in time proportional to the longer input
