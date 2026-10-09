@@ -52,8 +52,22 @@ pub(super) fn json_escape(raw: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
             _ => out.push(ch),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::json_escape;
+
+    #[test]
+    fn json_escape_produces_valid_json_for_control_characters() {
+        let raw: String = (0u8..0x20).map(char::from).collect::<String>() + "\"\\ok";
+        let wrapped = format!("\"{}\"", json_escape(&raw));
+        let decoded: String = serde_json::from_str(&wrapped).expect("valid JSON string");
+        assert_eq!(decoded, raw);
+    }
 }

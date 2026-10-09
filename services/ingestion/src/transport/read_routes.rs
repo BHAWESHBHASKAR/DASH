@@ -27,18 +27,19 @@ pub(super) fn handle_get_request(
                 }
                 DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
-                        HttpResponse::error_with_status(
-                            503,
-                            &format!(
-                                "{{\"status\":\"not_ready\",\"reason\":\"disk unavailable: {reason}\"}}"
-                            ),
-                        )
+                        eprintln!("ingestion /ready: disk unavailable: {reason}");
+                        HttpResponse {
+                            status: 503,
+                            content_type: "application/json",
+                            body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
+                                .to_string(),
+                        }
                     } else {
                         HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                     }
                 }
             },
-            Err(_) => HttpResponse::internal_server_error("runtime mutex poisoned"),
+            Err(_) => HttpResponse::internal_server_error("runtime_unavailable"),
         },
         "/metrics" => {
             let body = match runtime.lock() {
