@@ -79,7 +79,7 @@ public class DashException : Exception
         {
             (int)HttpStatusCode.Unauthorized or (int)HttpStatusCode.Forbidden
                 => new DashAuthException(message, statusCode, errorCode, requestId, body, innerException),
-            (int)HttpStatusCode.TooManyRequests
+            429
                 => new DashRateLimitException(message, statusCode, errorCode, requestId, body, innerException),
             (int)HttpStatusCode.NotFound
                 => new DashNotFoundException(message, statusCode, errorCode, requestId, body, innerException),

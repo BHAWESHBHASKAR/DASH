@@ -5,26 +5,31 @@ namespace Dash;
 
 // ---------------------------------------------------------------------------
 // /v1/retrieve
+//
+// Wire contract: services/retrieval/src/transport/payload.rs
+// (build_retrieve_transport_request_from_json and
+// render_retrieve_response_json / render_evidence_node_json /
+// render_citations_json). Response models are tolerant: unknown fields are
+// ignored and missing optional fields keep their defaults.
 // ---------------------------------------------------------------------------
 
 /// <summary>
-/// A single citation attached to a retrieval result. Mirrors
-/// <c>schema::Citation</c>.
+/// A single citation attached to a retrieval result.
 /// </summary>
 public sealed record Citation
 {
     [JsonPropertyName("evidence_id")]
-    public required string EvidenceId { get; init; }
+    public string EvidenceId { get; init; } = string.Empty;
 
     [JsonPropertyName("source_id")]
-    public required string SourceId { get; init; }
+    public string SourceId { get; init; } = string.Empty;
 
     /// <summary>One of <c>"supports"</c>, <c>"contradicts"</c>, <c>"neutral"</c>.</summary>
     [JsonPropertyName("stance")]
-    public required string Stance { get; init; }
+    public string Stance { get; init; } = string.Empty;
 
     [JsonPropertyName("source_quality")]
-    public required double SourceQuality { get; init; }
+    public double SourceQuality { get; init; }
 
     [JsonPropertyName("chunk_id")]
     public string? ChunkId { get; init; }
@@ -46,42 +51,23 @@ public sealed record Citation
 }
 
 /// <summary>
-/// A breakdown of the score components that contributed to a hit's
-/// overall ranking. <see cref="Overall"/> is the composite value
-/// the server uses to sort hits; <see cref="Semantic"/> and
-/// <see cref="Lexical"/> expose the individual signals when the
-/// server is configured to return them.
-/// </summary>
-public sealed record RetrievalScore
-{
-    [JsonPropertyName("overall")]
-    public required double Overall { get; init; }
-
-    [JsonPropertyName("semantic")]
-    public double? Semantic { get; init; }
-
-    [JsonPropertyName("lexical")]
-    public double? Lexical { get; init; }
-}
-
-/// <summary>
-/// A single claim returned by <c>/v1/retrieve</c>. Mirrors
-/// <c>schema::RetrievalResult</c>. The Claim + Evidence +
-/// Contradiction differentiator lives in
-/// <see cref="Supports"/> and <see cref="Contradicts"/>: callers
-/// can filter on them without walking the <see cref="Citations"/>
-/// list.
+/// A single claim returned by <c>/v1/retrieve</c> (an "evidence node" in
+/// server terms). <see cref="Supports"/> and <see cref="Contradicts"/> are
+/// stance tallies so callers can filter without walking
+/// <see cref="Citations"/>. Properties after <see cref="Citations"/> are
+/// optional and null when the server omits them.
 /// </summary>
 public sealed record RetrievalHit
 {
     [JsonPropertyName("claim_id")]
-    public required string ClaimId { get; init; }
+    public string ClaimId { get; init; } = string.Empty;
 
     [JsonPropertyName("canonical_text")]
-    public required string CanonicalText { get; init; }
+    public string CanonicalText { get; init; } = string.Empty;
 
+    /// <summary>Ranking score; the server emits a plain number.</summary>
     [JsonPropertyName("score")]
-    public required RetrievalScore Score { get; init; }
+    public double Score { get; init; }
 
     [JsonPropertyName("supports")]
     public int Supports { get; init; }
@@ -91,10 +77,94 @@ public sealed record RetrievalHit
 
     [JsonPropertyName("citations")]
     public IReadOnlyList<Citation> Citations { get; init; } = new List<Citation>();
+
+    [JsonPropertyName("claim_confidence")]
+    public double? ClaimConfidence { get; init; }
+
+    [JsonPropertyName("confidence_band")]
+    public string? ConfidenceBand { get; init; }
+
+    [JsonPropertyName("dominant_stance")]
+    public string? DominantStance { get; init; }
+
+    [JsonPropertyName("contradiction_risk")]
+    public double? ContradictionRisk { get; init; }
+
+    [JsonPropertyName("graph_score")]
+    public double? GraphScore { get; init; }
+
+    [JsonPropertyName("support_path_count")]
+    public int? SupportPathCount { get; init; }
+
+    [JsonPropertyName("contradiction_chain_depth")]
+    public int? ContradictionChainDepth { get; init; }
+
+    [JsonPropertyName("event_time_unix")]
+    public long? EventTimeUnix { get; init; }
+
+    [JsonPropertyName("temporal_match_mode")]
+    public string? TemporalMatchMode { get; init; }
+
+    [JsonPropertyName("temporal_in_range")]
+    public bool? TemporalInRange { get; init; }
+
+    [JsonPropertyName("claim_type")]
+    public string? ClaimType { get; init; }
+
+    [JsonPropertyName("valid_from")]
+    public long? ValidFrom { get; init; }
+
+    [JsonPropertyName("valid_to")]
+    public long? ValidTo { get; init; }
+
+    [JsonPropertyName("created_at")]
+    public long? CreatedAt { get; init; }
+
+    [JsonPropertyName("updated_at")]
+    public long? UpdatedAt { get; init; }
+}
+
+/// <summary>An edge of the evidence graph returned when <c>return_graph</c> is set.</summary>
+public sealed record GraphEdge
+{
+    [JsonPropertyName("from_claim_id")]
+    public string FromClaimId { get; init; } = string.Empty;
+
+    [JsonPropertyName("to_claim_id")]
+    public string ToClaimId { get; init; } = string.Empty;
+
+    [JsonPropertyName("relation")]
+    public string Relation { get; init; } = string.Empty;
+
+    [JsonPropertyName("strength")]
+    public double Strength { get; init; }
+}
+
+/// <summary>Evidence graph; present only when <c>return_graph</c> was true.</summary>
+public sealed record RetrievalGraph
+{
+    [JsonPropertyName("nodes")]
+    public IReadOnlyList<RetrievalHit> Nodes { get; init; } = new List<RetrievalHit>();
+
+    [JsonPropertyName("edges")]
+    public IReadOnlyList<GraphEdge> Edges { get; init; } = new List<GraphEdge>();
+}
+
+/// <summary>Inclusive unix-second window; either bound may be null.</summary>
+public sealed record TimeRange
+{
+    [JsonPropertyName("from_unix")]
+    public long? FromUnix { get; init; }
+
+    [JsonPropertyName("to_unix")]
+    public long? ToUnix { get; init; }
 }
 
 /// <summary>
-/// Request body for <c>POST /v1/retrieve</c>.
+/// Request body for <c>POST /v1/retrieve</c>. Every property except
+/// <see cref="TenantId"/> and <see cref="Query"/> is optional and omitted
+/// from the JSON when null, so server defaults apply (<c>top_k</c> 5,
+/// <c>stance_mode</c> <c>balanced</c>, <c>return_graph</c> false).
 /// </summary>
 public sealed record RetrievalRequest
 {
@@ -104,28 +174,51 @@ public sealed record RetrievalRequest
     [JsonPropertyName("query")]
     public required string Query { get; init; }
 
-    /// <summary>Maximum number of claims to return. Defaults to 10.</summary>
+    /// <summary>Maximum number of claims to return. Omitted (server default 5) when null.</summary>
     [JsonPropertyName("top_k")]
-    public int TopK { get; init; } = 10;
+    public int? TopK { get; init; }
 
-    /// <summary>One of <c>"balanced"</c> (default) or <c>"support_only"</c>.</summary>
+    /// <summary><c>"balanced"</c> or <c>"support_only"</c>. Omitted when null.</summary>
     [JsonPropertyName("stance_mode")]
-    public string StanceMode { get; init; } = "balanced";
+    public string? StanceMode { get; init; }
 
-    /// <summary>
-    /// When <c>true</c>, also returns the claim graph. Servers that
-    /// do not implement it silently ignore the flag.
-    /// </summary>
     [JsonPropertyName("return_graph")]
     public bool? ReturnGraph { get; init; }
+
+    [JsonPropertyName("query_embedding")]
+    public IReadOnlyList<float>? QueryEmbedding { get; init; }
+
+    [JsonPropertyName("entity_filters")]
+    public IReadOnlyList<string>? EntityFilters { get; init; }
+
+    [JsonPropertyName("embedding_id_filters")]
+    public IReadOnlyList<string>? EmbeddingIdFilters { get; init; }
+
+    [JsonPropertyName("time_range")]
+    public TimeRange? TimeRange { get; init; }
+
+    [JsonPropertyName("read_consistency")]
+    public string? ReadConsistency { get; init; }
 }
 
 /// <summary>
 /// Response body for <c>POST /v1/retrieve</c>. Wire format is
-/// <c>{"hits": [...]}</c>.
+/// <c>{"results": [...], "graph": ..., "read_policy": ..., ...}</c>.
 /// </summary>
 public sealed record RetrievalResponse
 {
-    [JsonPropertyName("hits")]
-    public required IReadOnlyList<RetrievalHit> Hits { get; init; }
+    [JsonPropertyName("results")]
+    public IReadOnlyList<RetrievalHit> Results { get; init; } = new List<RetrievalHit>();
+
+    [JsonPropertyName("graph")]
+    public RetrievalGraph? Graph { get; init; }
+
+    [JsonPropertyName("read_policy")]
+    public string? ReadPolicy { get; init; }
+
+    [JsonPropertyName("read_quorum_met")]
+    public bool? ReadQuorumMet { get; init; }
+
+    [JsonPropertyName("serving_replica")]
+    public string? ServingReplica { get; init; }
 }

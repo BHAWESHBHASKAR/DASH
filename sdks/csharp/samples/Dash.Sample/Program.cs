@@ -26,7 +26,12 @@ public static class Program
         }
 
         var apiKey = Environment.GetEnvironmentVariable("DASH_API_KEY");
-        using var client = new DashClient(baseUrl, apiKey);
+        // Ingestion is a separate service (default port 8081).
+        var ingestUrl = Environment.GetEnvironmentVariable("DASH_INGEST_URL");
+        using var client = new DashClient(baseUrl, apiKey, new DashClientOptions
+        {
+            IngestionBaseUrl = string.IsNullOrWhiteSpace(ingestUrl) ? null : ingestUrl,
+        });
 
         var health = await client.HealthAsync();
         Console.WriteLine($"health: {health.Status} ({health.Version ?? "unknown"})");
@@ -44,11 +49,10 @@ public static class Program
             TenantId = "acme-corp",
             Query = "Q3 2024 revenue",
             TopK = 3,
-            StanceMode = "balanced",
         });
-        foreach (var hit in retrieve.Hits)
+        foreach (var hit in retrieve.Results)
         {
-            Console.WriteLine($"[{hit.Score.Overall:F2}] supports={hit.Supports} contradicts={hit.Contradicts}");
+            Console.WriteLine($"[{hit.Score:F2}] supports={hit.Supports} contradicts={hit.Contradicts}");
             Console.WriteLine($"    {hit.CanonicalText}");
         }
     }

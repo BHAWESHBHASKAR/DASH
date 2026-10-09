@@ -5,6 +5,45 @@ All notable changes to `dash-csharp` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Retrieval models now match the server: the response field is `results`
+  (was `hits`), `score` is a number (was an object), and the extra
+  fields (`claim_confidence`, `contradiction_risk`, `graph`,
+  `read_policy`, ...) are decoded as optional. Response models tolerate
+  unknown and missing optional fields.
+- Ingest models now match `POST /v1/ingest` (`claim`, `evidence`,
+  `edges`; response `ingested_claim_id`, `claims_total`,
+  `commit_status`, ...). Ingest is **experimental**.
+- `netstandard2.0` target compiles (polyfills for `init`/`required`,
+  `ThrowIfNull`, `HttpStatusCode.TooManyRequests`); the test project no
+  longer inherits the multi-target setting.
+- `TopK` and `StanceMode` are omitted by default so server defaults
+  (`top_k` 5, `balanced`) apply.
+
+### Added
+
+- `DashClientOptions.IngestionBaseUrl` and `DashClient.IngestionBaseUrl`
+  for the separate ingestion service (default port 8081).
+- `RequestOptions` (`IdempotencyKey`, `Retry`).
+- Optional retrieve request fields: `QueryEmbedding`, `EntityFilters`,
+  `EmbeddingIdFilters`, `TimeRange`, `ReadConsistency`.
+
+### Changed
+
+- Retries only happen for idempotent requests (embeddings, retrieve,
+  health) or when an idempotency key / `Retry = true` is supplied;
+  ingest is never retried by default. Backoff is jittered and capped
+  (5 s); `Retry-After` is honoured (up to 30 s); `MaxRetries` is capped
+  at 10.
+
+### Removed
+
+- `DeleteAsync` / `Delete` and the `DeleteRequest` / `DeleteResponse`
+  models: the server has no `/v1/delete` endpoint.
+
 ## [0.2.0] - 2026-06-15
 
 ### Added
