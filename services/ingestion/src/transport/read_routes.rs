@@ -31,25 +31,45 @@ pub(super) fn handle_get_request(
         // disk persistence is healthy when a persistence path was
         // configured.
         "/ready" | "/v1/ready" => match runtime.lock() {
-            Ok(rt) => match rt.disk_status() {
-                DiskStatus::Available | DiskStatus::Recovering => {
-                    HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+            Ok(rt) => {
+                // A follower that is lagging, stale or never synced serves
+                // outdated data and must leave the load balancer.
+                if let Some(Err(reason)) = rt.replication_readiness() {
+                    return HttpResponse {
+                        status: 503,
+                        content_type: "application/json",
+                        body: format!(
+                            "{{\"status\":\"not_ready\",\"reason\":\"{reason}\",\"replication\":{}}}",
+                            rt.replication_ready_json()
+                                .unwrap_or_else(|| "null".to_string())
+                        ),
+                        retry_after_secs: None,
+                    };
                 }
-                DiskStatus::Unavailable { reason } => {
-                    if persistence_path_configured() {
-                        eprintln!("ingestion /ready: disk unavailable: {reason}");
-                        HttpResponse {
-                            status: 503,
-                            content_type: "application/json",
-                            body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
-                                .to_string(),
-                            retry_after_secs: None,
+                let ready_body = match rt.replication_ready_json() {
+                    Some(json) => format!("{{\"status\":\"ready\",\"replication\":{json}}}"),
+                    None => "{\"status\":\"ready\"}".to_string(),
+                };
+                match rt.disk_status() {
+                    DiskStatus::Available | DiskStatus::Recovering => {
+                        HttpResponse::ok_json(ready_body)
+                    }
+                    DiskStatus::Unavailable { reason } => {
+                        if persistence_path_configured() {
+                            eprintln!("ingestion /ready: disk unavailable: {reason}");
+                            HttpResponse {
+                                status: 503,
+                                content_type: "application/json",
+                                body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
+                                    .to_string(),
+                                retry_after_secs: None,
+                            }
+                        } else {
+                            HttpResponse::ok_json(ready_body)
                         }
-                    } else {
-                        HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                     }
                 }
-            },
+            }
             Err(_) => HttpResponse::internal_server_error("runtime_unavailable"),
         },
         "/metrics" => {
@@ -65,7 +85,9 @@ pub(super) fn handle_get_request(
                 Ok(mut rt) => {
                     rt.flush_wal_if_due();
                     rt.refresh_placement_if_due();
-                    rt.metrics_text()
+                    let mut text = rt.metrics_text();
+                    text.push_str(&rt.replication_follower_metrics_text());
+                    text
                 }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
             };
@@ -159,17 +181,32 @@ fn handle_replication_wal_get(
         Err(err) => return HttpResponse::bad_request(&err),
     };
     let max_records = match parse_query_usize(query, "max_records") {
-        Ok(value) => value.unwrap_or(DEFAULT_REPLICATION_PULL_MAX_RECORDS),
+        Ok(value) => value
+            .unwrap_or(DEFAULT_REPLICATION_PULL_MAX_RECORDS)
+            .min(MAX_REPLICATION_PULL_MAX_RECORDS),
         Err(err) => return HttpResponse::bad_request(&err),
     };
-    match runtime.lock() {
-        Ok(mut rt) => match rt.replication_delta_for_followers(from_offset, max_records) {
-            Ok(delta) => HttpResponse::ok_plain(render_replication_delta_frame(&delta)),
-            Err(err) => {
-                let (status, message) = map_store_error(&err);
-                HttpResponse::error_with_status(status, &message)
+    let from_generation = match query.get("from_generation") {
+        None => None,
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                return HttpResponse::bad_request(
+                    "query parameter 'from_generation' must be a valid u64",
+                );
             }
         },
+    };
+    match runtime.lock() {
+        Ok(mut rt) => {
+            match rt.replication_delta_for_followers(from_generation, from_offset, max_records) {
+                Ok(delta) => HttpResponse::ok_plain(render_replication_delta_frame(&delta)),
+                Err(err) => {
+                    let (status, message) = map_store_error(&err);
+                    HttpResponse::error_with_status(status, &message)
+                }
+            }
+        }
         Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
     }
 }
@@ -180,7 +217,9 @@ fn handle_replication_export_get(runtime: &SharedRuntime, request: &HttpRequest)
     }
     match runtime.lock() {
         Ok(mut rt) => match rt.replication_export_for_followers() {
-            Ok(export) => HttpResponse::ok_plain(render_replication_export_frame(&export)),
+            Ok((export, generation)) => {
+                HttpResponse::ok_plain(render_replication_export_frame(&export, generation))
+            }
             Err(err) => {
                 let (status, message) = map_store_error(&err);
                 HttpResponse::error_with_status(status, &message)
