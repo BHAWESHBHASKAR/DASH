@@ -6,6 +6,42 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (supply chain; register SEC-20, SEC-21)
+
+- **`bincode` removed (RUSTSEC-2025-0141, unmaintained).** The redb snapshot
+  values are now written by an in-tree codec (`pkg/store/src/value_codec.rs`)
+  that produces the same fixed-width little-endian layout `bincode` 1.x used,
+  prefixed with an 8-byte version header (`DASHv2\0\xff`). Values without the
+  header are read as legacy `bincode` values, so snapshots written by earlier
+  releases load unchanged, and rows are rewritten in the new format as they
+  are updated. Bytes captured from `bincode` 1.3.3 before its removal
+  (`pkg/store/tests/fixtures/legacy-bincode-v1.hex`) back the tests. Legacy
+  `StoreIndexStats` written before `vector_index_bytes` existed now load
+  with that field at 0 instead of failing. *Downgrade:* a release that still
+  uses `bincode` cannot read rows that carry the header; delete the redb file
+  and it is rebuilt from the WAL.
+- **`chacha20` 0.10.1 (yanked) updated to 0.10.2.** `cargo audit` now
+  reports no warnings.
+- **`cargo deny`** (`deny.toml`, new `cargo-deny` job in `security.yml`):
+  vulnerable, unsound, unmaintained and yanked crates fail; licenses must be
+  on a permissive allow-list; crates may come only from crates.io; wildcard
+  requirements are denied; duplicate versions are warnings. Workspace crates
+  now declare `license = "Apache-2.0"` (the `LICENSE` file) and
+  `publish = false`.
+- **Every GitHub Action is pinned to a full commit SHA** with the release tag
+  in a trailing comment, resolved with `git ls-remote`. `trivy-action` moves
+  from `@master` to v0.36.0. `cargo install` in CI uses `--locked` and an
+  exact version. Dependabot also covers the Java, Kotlin and C# SDKs.
+- **Container base images pinned by digest**: `rust:1.99-bookworm`,
+  `debian:bookworm-slim` and the `docker/dockerfile:1.7` frontend.
+- **Release supply chain** (`release.yml`): CycloneDX SBOM per binary and
+  target, SPDX SBOM per image attached as a cosign attestation, keyless
+  cosign signatures (Sigstore bundle per file, signature on each image
+  digest), `SHA256SUMS`, and GitHub build-provenance attestations for files
+  and images. `id-token: write` is limited to the two signing jobs.
+  Verification steps: `docs/operations/supply-chain.md`. Not yet exercised:
+  no tag has been pushed since.
+
 ### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
 
 - **Semantic retrieval now finds the true nearest neighbours.** The in-repo

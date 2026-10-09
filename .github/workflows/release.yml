@@ -10,7 +10,7 @@
 #
 # Supply chain (verification steps: docs/operations/supply-chain.md):
 #   binaries      CycloneDX SBOM per binary and target (cargo-cyclonedx),
-#                 cosign sign-blob bundle (<file>.sigstore.json) per file,
+#                 cosign sign-blob bundle (<file>.cosign.bundle) per file,
 #                 SHA256SUMS, GitHub build-provenance attestation.
 #   images        SPDX SBOM (syft) attached as a cosign attestation, cosign
 #                 signature on the pushed digest, GitHub build-provenance
@@ -265,8 +265,8 @@ jobs:
           set -euo pipefail
           cd release
           for f in *; do
-            case "$f" in *.sigstore.json) continue ;; esac
-            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+            case "$f" in *.cosign.bundle) continue ;; esac
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "$f"
           done
           ls -la
 

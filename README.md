@@ -103,7 +103,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - HTTP services on a hand-written thread-per-connection transport (ingestion, retrieval, control-plane) with bounded headers, bodies and whole-request deadlines. Since 0.3.0 the services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1`; strict secret validation (>= 16 characters for keys and tokens, >= 32 for JWT secrets, placeholders rejected) is on by default; `/v1/embeddings`, `/debug/*` and `/metrics` require auth; replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`. TLS is not terminated by DASH; put a proxy in front.
 - Evidence and edge writes are idempotent upserts (evidence by `evidence_id`, edges by endpoints and relation), so retries, restarts and replication re-apply do not duplicate citations.
 - Single-writer ingestion plus polling read replicas that follow the WAL generation-aware (resync on checkpoint, `/ready` reflects lag), a file-lease control plane with fenced leases and lag-guarded promotion, and CSV placement files. This is not consensus replication.
-- `redb` on-disk persistence is **on by default** when a WAL path is configured (default `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`; opt out with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`). If the file cannot be opened the service logs an error and continues in memory.
+- `redb` on-disk persistence is **on by default** when a WAL path is configured (default `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`; opt out with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`). If the file cannot be opened the service logs an error and continues in memory. Snapshot values are written by an in-tree versioned codec; snapshots written by earlier releases (the `bincode` 1.x layout) still load.
 - Embedding providers: `hash` (default, dev only), `ollama`, `openai` (HTTPS). `/v1/embeddings` rejects token-id array inputs unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`, and `usage.prompt_tokens` is an estimate. The Ollama endpoint variable is `DASH_OLLAMA_ENDPOINT`. Live Ollama and OpenAI calls are not exercised by CI.
 - SHA-256 hash-chained audit log (`DASH_*_AUDIT_LOG_PATH`) with one canonical record encoding, file locking, torn-tail recovery and the `tools/audit-verify` verifier (`scripts/verify_audit_chain.sh` wraps it). The chain is **unkeyed**, so it detects accidental edits but not an attacker who can rewrite the file; there is no HMAC. Details: [`docs/operations/audit-chain.md`](docs/operations/audit-chain.md).
 - OIDC/JWKS validation: asymmetric algorithms only, `iss`/`aud`/`exp` required, HTTPS JWKS, a hardened JWKS cache. Tests use RS256 keys against an in-process stub IdP; there is no test against a real identity provider, and the ES256/EdDSA/PS* algorithms are accepted but untested.
@@ -119,7 +119,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - GPU vector backend. `pkg/store/src/gpu.rs` is a placeholder that never returns a GPU engine; scoring runs on CPU.
 - Consensus replication (Raft), automatic failover, sharded cluster mode.
 - Delete, tenant management and reindex APIs (`/v1/delete`, `/v1/tenants`, `/v1/admin/reindex` do not exist; see [Planned API](docs-site/docs/reference/planned-api.md)).
-- Signed release images and published release artifacts.
+- Published release artifacts. The release workflow builds CycloneDX/SPDX SBOMs, keyless cosign signatures and build-provenance attestations for every binary and image ([`docs/operations/supply-chain.md`](docs/operations/supply-chain.md)), but no release has been tagged with it yet. CI actions are pinned by commit SHA, base images by digest, and `cargo deny` gates licenses, sources and advisories.
 
 ## Architecture
 
@@ -167,7 +167,7 @@ Counts are static (computed 2026-10-09: the Rust figure with `cargo test --works
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1178 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1189 |
 | Python SDK | 69 |
 | Go SDK | 92 |
 | TypeScript SDK | 71 |
