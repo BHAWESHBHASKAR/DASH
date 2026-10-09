@@ -328,10 +328,11 @@ mod tests {
 
     #[test]
     fn silent_connections_are_dropped_and_requests_routed() {
-        let mut front = ConnFrontend::new(
-            &test_cfg(Duration::from_millis(100), 0),
-            default_health_classifier,
-        );
+        // The timeout only has to be exceeded by the final sleep, so it is long
+        // enough that a stalled CI runner cannot expire the silent socket
+        // before the first assertions have run.
+        let first_byte = Duration::from_secs(1);
+        let mut front = ConnFrontend::new(&test_cfg(first_byte, 0), default_health_classifier);
         let (_silent_client, silent, _l1) = pair();
         let (mut health_client, health, _l2) = pair();
         front.admit(silent).unwrap();
@@ -345,7 +346,7 @@ mod tests {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].0, Lane::Health);
         assert!(front.has_pending());
-        std::thread::sleep(Duration::from_millis(120));
+        std::thread::sleep(first_byte + Duration::from_millis(100));
         front.poll(&mut ready);
         assert!(!front.has_pending(), "silent socket must be closed");
         assert_eq!(ready.len(), 1);
