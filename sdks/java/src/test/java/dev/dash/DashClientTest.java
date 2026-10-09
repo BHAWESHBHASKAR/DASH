@@ -14,14 +14,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import dev.dash.model.DeleteRequest;
-import dev.dash.model.DeleteResponse;
 import dev.dash.model.EmbedRequest;
 import dev.dash.model.EmbeddingResponse;
 import dev.dash.model.EmbeddingUsage;
 import dev.dash.model.HealthResponse;
-import dev.dash.model.IngestBundle;
 import dev.dash.model.IngestClaim;
+import dev.dash.model.IngestEdge;
 import dev.dash.model.IngestEvidence;
 import dev.dash.model.IngestRequest;
 import dev.dash.model.IngestResponse;
@@ -34,6 +32,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class DashClientTest {
 
     private MockWebServer server;
+    private MockWebServer ingestServer;
     private DashClient client;
     private final ObjectMapper json = new ObjectMapper();
 
@@ -41,12 +40,15 @@ class DashClientTest {
     void setUp() throws IOException {
         server = new MockWebServer();
         server.start();
-        client = new DashClient(server.url("/").toString(), "test-key");
+        ingestServer = new MockWebServer();
+        ingestServer.start();
+        client = new DashClient(server.url("/").toString(), ingestServer.url("/").toString(), "test-key");
     }
 
     @AfterEach
     void tearDown() throws IOException {
         server.shutdown();
+        ingestServer.shutdown();
     }
 
     // ------------------------------------------------------------------
@@ -118,42 +120,117 @@ class DashClientTest {
     // ------------------------------------------------------------------
 
     @Test
-    @DisplayName("ingest_sendsBundlesAndDecodesPerClaimStatus")
-    void ingest_sendsBundlesAndDecodesPerClaimStatus() throws Exception {
-        server.enqueue(new MockResponse()
+    @DisplayName("ingest_sendsServerShapedBodyToIngestionHostAndDecodesResponse")
+    void ingest_sendsServerShapedBodyToIngestionHostAndDecodesResponse() throws Exception {
+        ingestServer.enqueue(new MockResponse()
                 .setResponseCode(200)
                 .setHeader("Content-Type", "application/json")
                 .setBody("""
-                        {
-                          "results": [
-                            {"claim_id": "c-1", "tenant_id": "acme", "canonical_text": "hi", "status": "accepted"},
-                            {"claim_id": "c-2", "tenant_id": "acme", "canonical_text": "bye", "status": "rejected"}
-                          ],
-                          "accepted": 1,
-                          "rejected": 1
-                        }
+                        {"ingested_claim_id":"c-1","claims_total":7,"commit_epoch":12,
+                         "ack_count":1,"required_acks":1,"commit_status":"committed",
+                         "checkpoint_triggered":false,"unknown_future_field":true}
                         """));
 
-        IngestRequest req = new IngestRequest("acme", new IngestBundle(
-                new IngestClaim("c-1", "acme", "hi", 0.9, null),
-                List.of(new IngestEvidence("e-1", "src-1", "supports", 0.8,
-                        null, null, null, null, null, "raw")),
-                null));
+        IngestRequest req = new IngestRequest(
+                new IngestClaim("c-1", "acme", "hi", 0.9),
+                List.of(new IngestEvidence("e-1", "c-1", "src-1", "supports", 0.8)),
+                List.of(new IngestEdge("ed-1", "c-1", "c-0", "supports", 0.5, null, null)));
 
         IngestResponse resp = client.ingest(req);
 
-        assertThat(resp.accepted()).isEqualTo(1);
-        assertThat(resp.rejected()).isEqualTo(1);
-        assertThat(resp.results()).hasSize(2);
-        assertThat(resp.results().get(0).claimId()).isEqualTo("c-1");
-        assertThat(resp.results().get(0).status()).isEqualTo("accepted");
-        assertThat(resp.results().get(1).status()).isEqualTo("rejected");
+        assertThat(resp.ingestedClaimId()).isEqualTo("c-1");
+        assertThat(resp.claimsTotal()).isEqualTo(7);
+        assertThat(resp.commitEpoch()).isEqualTo(12L);
+        assertThat(resp.ackCount()).isEqualTo(1);
+        assertThat(resp.requiredAcks()).isEqualTo(1);
+        assertThat(resp.commitStatus()).isEqualTo("committed");
+        assertThat(resp.checkpointTriggered()).isFalse();
+        assertThat(resp.checkpointSnapshotRecords()).isNull();
 
-        RecordedRequest sent = server.takeRequest(1, TimeUnit.SECONDS);
+        assertThat(server.getRequestCount()).isZero();
+        RecordedRequest sent = ingestServer.takeRequest(1, TimeUnit.SECONDS);
+        assertThat(sent.getMethod()).isEqualTo("POST");
         assertThat(sent.getPath()).isEqualTo("/v1/ingest");
         var body = json.readTree(sent.getBody().readUtf8());
-        assertThat(body.get("tenant_id").asText()).isEqualTo("acme");
-        assertThat(body.get("bundles")).hasSize(1);
+        assertThat(body.has("tenant_id")).isFalse();
+        assertThat(body.has("bundles")).isFalse();
+        assertThat(body.get("claim").get("claim_id").asText()).isEqualTo("c-1");
+        assertThat(body.get("claim").get("tenant_id").asText()).isEqualTo("acme");
+        assertThat(body.get("claim").get("canonical_text").asText()).isEqualTo("hi");
+        assertThat(body.get("claim").get("confidence").asDouble()).isEqualTo(0.9);
+        assertThat(body.get("claim").has("claim_type")).isFalse();
+        assertThat(body.get("evidence").get(0).get("claim_id").asText()).isEqualTo("c-1");
+        assertThat(body.get("evidence").get(0).get("stance").asText()).isEqualTo("supports");
+        assertThat(body.get("edges").get(0).get("relation").asText()).isEqualTo("supports");
+    }
+
+    @Test
+    @DisplayName("ingest_withoutIngestionUrl_failsClearly")
+    void ingest_withoutIngestionUrl_failsClearly() {
+        DashClient noIngest = new DashClient("http://example.invalid:9999", "k");
+        assertThatThrownBy(() -> noIngest.ingest(new IngestRequest(
+                new IngestClaim("c", "t", "x", 0.5))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("ingestionBaseUrl");
+    }
+
+    @Test
+    @DisplayName("ingestionUrl_isDerivedFromLocalDefaultPort")
+    void ingestionUrl_isDerivedFromLocalDefaultPort() {
+        assertThat(DashClient.deriveIngestionUrl("http://localhost:8080")).isEqualTo("http://localhost:8081");
+        assertThat(DashClient.deriveIngestionUrl("https://dash.example.com")).isNull();
+    }
+
+    @Test
+    @DisplayName("ingestionUrl_isValidated")
+    void ingestionUrl_isValidated() {
+        assertThatThrownBy(() -> new DashClient("http://localhost:8080", "not a url", "k"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("ingestionBaseUrl");
+        assertThatThrownBy(() -> new DashClient("ftp://localhost", "k"))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("baseUrl");
+    }
+
+    @Test
+    @DisplayName("ingest_5xx_isNotRetriedByDefault")
+    void ingest_5xx_isNotRetriedByDefault() {
+        for (int i = 0; i < 3; i++) {
+            ingestServer.enqueue(new MockResponse().setResponseCode(503).setBody("{\"error\":\"down\"}"));
+        }
+        assertThatThrownBy(() -> client.ingest(new IngestRequest(new IngestClaim("c", "t", "x", 0.5))))
+                .isInstanceOf(DashException.class)
+                .satisfies(e -> assertThat(((DashException) e).getStatusCode()).isEqualTo(503));
+        assertThat(ingestServer.getRequestCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("ingest_timeout_isNotRetried")
+    void ingest_timeout_isNotRetried() {
+        DashClient fast = client.withTimeout(Duration.ofMillis(100));
+        ingestServer.enqueue(new MockResponse().setBodyDelay(1, TimeUnit.SECONDS).setBody("{}"));
+        ingestServer.enqueue(new MockResponse().setBody("{}"));
+        assertThatThrownBy(() -> fast.ingest(new IngestRequest(new IngestClaim("c", "t", "x", 0.5))))
+                .isInstanceOf(DashConnectionException.class);
+        assertThat(ingestServer.getRequestCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("ingest_withIdempotencyKey_sendsHeaderAndRetries")
+    void ingest_withIdempotencyKey_sendsHeaderAndRetries() throws Exception {
+        ingestServer.enqueue(new MockResponse().setResponseCode(503).setBody("{}"));
+        ingestServer.enqueue(new MockResponse().setResponseCode(200).setBody(
+                "{\"ingested_claim_id\":\"c\",\"claims_total\":1,\"ack_count\":1,"
+                        + "\"required_acks\":1,\"commit_status\":\"committed\","
+                        + "\"checkpoint_triggered\":false}"));
+
+        IngestResponse resp = client.ingest(new IngestRequest(new IngestClaim("c", "t", "x", 0.5)),
+                RequestOptions.withIdempotencyKey("key-1"));
+
+        assertThat(resp.ingestedClaimId()).isEqualTo("c");
+        assertThat(ingestServer.getRequestCount()).isEqualTo(2);
+        assertThat(ingestServer.takeRequest().getHeader("Idempotency-Key")).isEqualTo("key-1");
+        assertThat(ingestServer.takeRequest().getHeader("Idempotency-Key")).isEqualTo("key-1");
     }
 
     // ------------------------------------------------------------------
@@ -175,12 +252,22 @@ class DashClientTest {
                               "score": 0.91,
                               "supports": 3,
                               "contradicts": 0,
+                              "claim_confidence": 0.8,
+                              "contradiction_risk": null,
+                              "event_time_unix": 1700000000,
                               "citations": [
                                 {"evidence_id": "e-1", "source_id": "s-1",
-                                 "stance": "supports", "source_quality": 0.95}
+                                 "stance": "supports", "source_quality": 0.95,
+                                 "chunk_id": null, "span_start": null}
                               ]
                             }
-                          ]
+                          ],
+                          "graph": {"nodes": [], "edges": [
+                            {"from_claim_id": "c-1", "to_claim_id": "c-2",
+                             "relation": "supports", "strength": 0.5}]},
+                          "read_policy": "one",
+                          "read_quorum_met": true,
+                          "serving_replica": null
                         }
                         """));
 
@@ -196,6 +283,12 @@ class DashClientTest {
         assertThat(hit.contradicts()).isZero();
         assertThat(hit.citations()).hasSize(1);
         assertThat(hit.citations().get(0).stance()).isEqualTo("supports");
+        assertThat(hit.claimConfidence()).isEqualTo(0.8);
+        assertThat(hit.contradictionRisk()).isNull();
+        assertThat(hit.eventTimeUnix()).isEqualTo(1700000000L);
+        assertThat(resp.graph().edges()).hasSize(1);
+        assertThat(resp.readQuorumMet()).isTrue();
+        assertThat(resp.servingReplica()).isNull();
 
         RecordedRequest sent = server.takeRequest(1, TimeUnit.SECONDS);
         assertThat(sent.getPath()).isEqualTo("/v1/retrieve");
@@ -205,41 +298,39 @@ class DashClientTest {
         assertThat(body.get("top_k").asInt()).isEqualTo(5);
     }
 
-    // ------------------------------------------------------------------
-    // Delete
-    // ------------------------------------------------------------------
+    @Test
+    @DisplayName("retrieve_defaultRequestOmitsTopKSoServerDefaultApplies")
+    void retrieve_defaultRequestOmitsTopKSoServerDefaultApplies() throws Exception {
+        server.enqueue(new MockResponse().setResponseCode(200).setBody("{\"results\":[]}"));
+
+        RetrievalResponse resp = client.retrieve(new RetrievalRequest("acme", "q"));
+
+        assertThat(resp.results()).isEmpty();
+        var body = json.readTree(server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8());
+        assertThat(body.has("top_k")).isFalse();
+        assertThat(body.has("stance_mode")).isFalse();
+        assertThat(body.get("tenant_id").asText()).isEqualTo("acme");
+    }
 
     @Test
-    @DisplayName("delete_sendsClaimIdsAndDecodesResults")
-    void delete_sendsClaimIdsAndDecodesResults() throws Exception {
-        server.enqueue(new MockResponse()
-                .setResponseCode(200)
-                .setHeader("Content-Type", "application/json")
-                .setBody("""
-                        {
-                          "deleted": 1,
-                          "missing": 1,
-                          "results": [
-                            {"claim_id": "c-1", "status": "deleted"},
-                            {"claim_id": "c-2", "status": "missing"}
-                          ]
-                        }
-                        """));
+    @DisplayName("retrieve_sendsOptionalServerFields")
+    void retrieve_sendsOptionalServerFields() throws Exception {
+        server.enqueue(new MockResponse().setResponseCode(200).setBody("{\"results\":[]}"));
 
-        DeleteResponse resp = client.delete(
-                new DeleteRequest("acme", List.of("c-1", "c-2"), Boolean.TRUE));
+        client.retrieve(new RetrievalRequest("acme", "q", 3, "support_only", true,
+                List.of(0.5f), List.of("acme corp"), List.of("emb-1"),
+                new RetrievalRequest.TimeRange(10L, 20L), "quorum"));
 
-        assertThat(resp.deleted()).isEqualTo(1);
-        assertThat(resp.missing()).isEqualTo(1);
-        assertThat(resp.results()).hasSize(2);
-        assertThat(resp.results().get(0).claimId()).isEqualTo("c-1");
-        assertThat(resp.results().get(0).status()).isEqualTo("deleted");
-        assertThat(resp.results().get(1).status()).isEqualTo("missing");
-
-        RecordedRequest sent = server.takeRequest(1, TimeUnit.SECONDS);
-        assertThat(sent.getPath()).isEqualTo("/v1/delete");
-        var body = json.readTree(sent.getBody().readUtf8());
-        assertThat(body.get("claim_ids")).hasSize(2);
+        var body = json.readTree(server.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8());
+        assertThat(body.get("top_k").asInt()).isEqualTo(3);
+        assertThat(body.get("stance_mode").asText()).isEqualTo("support_only");
+        assertThat(body.get("return_graph").asBoolean()).isTrue();
+        assertThat(body.get("query_embedding")).hasSize(1);
+        assertThat(body.get("entity_filters").get(0).asText()).isEqualTo("acme corp");
+        assertThat(body.get("embedding_id_filters").get(0).asText()).isEqualTo("emb-1");
+        assertThat(body.get("time_range").get("from_unix").asLong()).isEqualTo(10L);
+        assertThat(body.get("time_range").get("to_unix").asLong()).isEqualTo(20L);
+        assertThat(body.get("read_consistency").asText()).isEqualTo("quorum");
     }
 
     // ------------------------------------------------------------------
@@ -309,7 +400,7 @@ class DashClientTest {
                 .satisfies(err -> {
                     DashException de = (DashException) err;
                     assertThat(de.getStatusCode()).isEqualTo(401);
-                    assertThat(de.getErrorCode()).isEqualTo("unauthorized");
+                    assertThat(de.getErrorCode()).isEqualTo("invalid_request_error");
                 });
     }
 
@@ -436,6 +527,58 @@ class DashClientTest {
         assertThat(server.getRequestCount()).isEqualTo(2);
     }
 
+    @Test
+    @DisplayName("transport_readsBodyOnce_successAndErrorBodies")
+    void transport_readsBodyOnce_successAndErrorBodies() {
+        server.enqueue(new MockResponse().setResponseCode(200)
+                .setBody(embeddingResponseBody("m", 0.25)));
+        assertThat(client.embed(EmbedRequest.of("a")).data().get(0).embedding()).containsExactly(0.25);
+
+        server.enqueue(new MockResponse().setResponseCode(400).setHeader("X-Request-Id", "r-9")
+                .setBody("{\"error\": {\"message\": \"bad input\", \"code\": \"invalid\"}}"));
+        assertThatThrownBy(() -> client.embed(EmbedRequest.of("b")))
+                .isInstanceOf(DashException.class)
+                .hasMessageContaining("bad input")
+                .satisfies(e -> {
+                    assertThat(((DashException) e).getRequestId()).isEqualTo("r-9");
+                    assertThat(((DashException) e).getErrorCode()).isEqualTo("invalid");
+                });
+        // 400 is not retried.
+        assertThat(server.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("retry_honorsRetryAfterHeader")
+    void retry_honorsRetryAfterHeader() {
+        server.enqueue(new MockResponse().setResponseCode(429).setHeader("Retry-After", "1").setBody("{}"));
+        server.enqueue(new MockResponse().setResponseCode(200).setBody(embeddingResponseBody("m", 0.1)));
+
+        long start = System.nanoTime();
+        client.embed(EmbedRequest.of("x"));
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+
+        assertThat(elapsedMs).isGreaterThanOrEqualTo(900);
+        assertThat(server.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("retry_networkErrorOnIdempotentGet_isRetried")
+    void retry_networkErrorOnIdempotentGet_isRetried() {
+        server.enqueue(new MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST));
+        server.enqueue(new MockResponse().setResponseCode(200).setBody("{\"status\":\"ok\"}"));
+
+        assertThat(client.health().status()).isEqualTo("ok");
+        assertThat(server.getRequestCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("retryAfter_parsesSecondsAndDates")
+    void retryAfter_parsesSecondsAndDates() {
+        assertThat(dev.dash.internal.HttpTransport.parseRetryAfterMs("3")).isEqualTo(3000L);
+        assertThat(dev.dash.internal.HttpTransport.parseRetryAfterMs("garbage")).isEqualTo(-1L);
+        assertThat(dev.dash.internal.HttpTransport.parseRetryAfterMs(null)).isEqualTo(-1L);
+    }
+
     // ------------------------------------------------------------------
     // OpenAI drop-in compatibility
     // ------------------------------------------------------------------
@@ -492,11 +635,11 @@ class DashClientTest {
                 .isInstanceOf(DashException.class)
                 .hasMessageContaining("400")
                 .hasMessageContaining("input cannot be empty")
-                .hasMessageContaining("invalid_input")
+                .hasMessageContaining("invalid_request_error")
                 .satisfies(err -> {
                     DashException de = (DashException) err;
                     assertThat(de.getStatusCode()).isEqualTo(400);
-                    assertThat(de.getErrorCode()).isEqualTo("invalid_input");
+                    assertThat(de.getErrorCode()).isEqualTo("invalid_request_error");
                 });
     }
 
@@ -544,12 +687,14 @@ class DashClientTest {
     @Test
     @DisplayName("requestId_header_isCapturedInException")
     void requestId_header_isCapturedInException() {
+        // Single attempt so only one canned response is needed.
+        DashClient once = client.withMaxRetries(1);
         server.enqueue(new MockResponse()
                 .setResponseCode(500)
                 .setHeader("X-Request-Id", "req-abc-123")
                 .setBody("{\"error\": {\"message\": \"bad\"}}"));
 
-        assertThatThrownBy(() -> client.embed(EmbedRequest.of("hi")))
+        assertThatThrownBy(() -> once.embed(EmbedRequest.of("hi")))
                 .isInstanceOf(DashException.class)
                 .satisfies(err -> {
                     DashException de = (DashException) err;
