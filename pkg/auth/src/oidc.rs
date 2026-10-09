@@ -151,6 +151,16 @@ pub fn verify_oidc_token_with_jwks(
     now_unix_secs: u64,
     jwks: &JwkSet,
 ) -> Result<Value, JwtValidationError> {
+    verify_oidc_token_with_jwks_inner(token, Some(tenant_id), config, now_unix_secs, jwks)
+}
+
+fn verify_oidc_token_with_jwks_inner(
+    token: &str,
+    tenant_id: Option<&str>,
+    config: &OidcValidationConfig,
+    now_unix_secs: u64,
+    jwks: &JwkSet,
+) -> Result<Value, JwtValidationError> {
     let header = decode_header(token).map_err(map_jwt_error)?;
     let kid = header
         .kid
@@ -184,10 +194,12 @@ pub fn verify_oidc_token_with_jwks(
         now_unix_secs,
     )?;
 
-    if config.tenant_claims.is_empty() {
-        check_tenant_allowlist(&token_data.claims, tenant_id)?;
-    } else {
-        check_tenant_claim(&token_data.claims, tenant_id, &config.tenant_claims)?;
+    if let Some(tenant_id) = tenant_id {
+        if config.tenant_claims.is_empty() {
+            check_tenant_allowlist(&token_data.claims, tenant_id)?;
+        } else {
+            check_tenant_claim(&token_data.claims, tenant_id, &config.tenant_claims)?;
+        }
     }
     Ok(token_data.claims)
 }
@@ -205,6 +217,22 @@ pub fn verify_oidc_token_for_tenant(
     }
     let jwks = load_jwks(&config.jwks_url, config.jwks_refresh_minutes)?;
     verify_oidc_token_with_jwks(token, tenant_id, config, now_unix_secs, &jwks)
+}
+
+/// Verify an OIDC token (signature, issuer, audience, time bounds) without a
+/// tenant check, for endpoints that are not tenant-scoped.
+pub fn verify_oidc_token(
+    token: &str,
+    config: &OidcValidationConfig,
+    now_unix_secs: u64,
+) -> Result<Value, JwtValidationError> {
+    if config.jwks_url.is_empty() {
+        return Err(JwtValidationError::OidcProviderError(
+            "JWKS URL is empty".to_string(),
+        ));
+    }
+    let jwks = load_jwks(&config.jwks_url, config.jwks_refresh_minutes)?;
+    verify_oidc_token_with_jwks_inner(token, None, config, now_unix_secs, &jwks)
 }
 
 #[cfg(test)]
