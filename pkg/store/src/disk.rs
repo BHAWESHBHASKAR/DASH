@@ -699,6 +699,31 @@ impl DiskBackedStore {
         Ok(claims_loaded)
     }
 
+    /// Delete every row from every data table (replication resync replaces
+    /// the whole state). Done in one transaction.
+    pub fn clear_all(&self) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
+        {
+            macro_rules! clear {
+                ($table:expr, $name:expr) => {
+                    txn.delete_table($table)
+                        .map_err(|e| err(concat!("delete ", $name), e))?;
+                    txn.open_table($table)
+                        .map_err(|e| err(concat!("recreate ", $name), e))?;
+                };
+            }
+            clear!(TABLE_CLAIMS, "claims");
+            clear!(TABLE_EVIDENCE, "evidence");
+            clear!(TABLE_EDGES, "edges");
+            clear!(TABLE_CLAIM_VECTORS, "claim_vectors");
+            clear!(TABLE_TENANT_DIMS, "tenant_dims");
+            clear!(TABLE_TENANT_CLAIMS_SET, "tenant_claims_set");
+            clear!(TABLE_BATCH_COMMITS, "batch_commits");
+        }
+        txn.commit().map_err(|e| err("commit clear", e))?;
+        Ok(())
+    }
+
     /// Take every record currently in the in-memory `store` and write
     /// it to the redb file. This is the "checkpoint" path: it is
     /// called from `InMemoryStore::checkpoint_to_disk` (added in

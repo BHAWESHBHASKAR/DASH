@@ -13,6 +13,8 @@ members = [
   "services/indexer",
   "services/metadata-router",
   "tests/benchmarks",
+  "tools/audit-verify",
+  "tools/wal-inspect",
 ]
 resolver = "2"
 

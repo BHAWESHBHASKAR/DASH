@@ -13,6 +13,11 @@ pub(super) fn serve_http_with_workers(
     let segment_maintenance_interval = runtime.segment_maintenance_interval();
     let replication_pull = ReplicationPullConfig::from_env();
     let runtime = Arc::new(Mutex::new(runtime));
+    if let Some(config) = replication_pull.as_ref()
+        && let Ok(mut guard) = runtime.lock()
+    {
+        guard.enable_replication_follower(config);
+    }
     let backpressure_metrics = Arc::new(TransportBackpressureMetrics::new(queue_capacity));
     if let Ok(mut guard) = runtime.lock() {
         guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
@@ -61,12 +66,16 @@ pub(super) fn serve_http_with_workers(
         if let Some(replication_pull) = replication_pull.clone() {
             let runtime = Arc::clone(&runtime);
             scope.spawn(move || {
+                // Back off (up to the configured cap) while pulls keep
+                // failing instead of hammering a dead or misbehaving leader.
+                let mut delay = replication_pull.poll_interval;
                 loop {
-                    match replication_shutdown_rx.recv_timeout(replication_pull.poll_interval) {
+                    match replication_shutdown_rx.recv_timeout(delay) {
                         Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    run_replication_pull_tick(&runtime, &replication_pull);
+                    let failures = run_replication_pull_tick(&runtime, &replication_pull);
+                    delay = replication_pull.backoff_delay(failures);
                 }
             });
         }

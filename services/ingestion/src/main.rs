@@ -37,8 +37,10 @@ fn main() {
     // assumed the default was to serve, and the service would
     // silently exit after printing the startup banner.
     let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
-    let bind_addr = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
+    let requested_bind = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
         .unwrap_or_else(|| "127.0.0.1:8081".to_string());
+    // Dev mode only ever listens on loopback (see dash_common::resolve_bind_addr).
+    let bind_addr = dash_common::resolve_bind_addr(&requested_bind);
     let http_workers = parse_http_workers();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_INGEST_SEGMENT_DIR", "EME_INGEST_SEGMENT_DIR");
@@ -228,6 +230,14 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        if load_stats.replay.quarantined_records > 0 || load_stats.replay.dependent_skipped > 0 {
+            tracing::warn!(
+                "ingestion startup replay quarantined {} unreadable legacy record(s) and skipped {} dependent record(s); see '{}.quarantine' and docs/operations/wal-recovery.md",
+                load_stats.replay.quarantined_records,
+                load_stats.replay.dependent_skipped,
+                wal_path
+            );
+        }
         tracing::info!(
             "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, async_flush_interval_ms={}, background_flush_only={}, unsafe_override={}",
             wal.sync_every_records(),

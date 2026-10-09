@@ -201,6 +201,8 @@ fn timed_segment_load(segment_tenant_path: &Path) -> SegmentPrefilterLoadResult 
     let refresh_start = std::time::Instant::now();
     #[cfg(test)]
     tests::on_segment_load(segment_tenant_path);
+    #[cfg(test)]
+    apply_test_load_delay(segment_tenant_path);
     let load_result = load_segment_prefilter_claim_ids(segment_tenant_path);
     let elapsed_micros = refresh_start.elapsed().as_micros();
     let elapsed_micros_u64 = u64::try_from(elapsed_micros).unwrap_or(u64::MAX);
@@ -214,6 +216,30 @@ fn timed_segment_load(segment_tenant_path: &Path) -> SegmentPrefilterLoadResult 
         observe_segment_fallback_activation(load_result.fallback_reason);
     }
     load_result
+}
+
+#[cfg(test)]
+static TEST_LOAD_DELAYS: Mutex<Vec<(PathBuf, Duration)>> = Mutex::new(Vec::new());
+
+/// Test hook: make every refresh of `tenant_dir` sleep for `delay`.
+#[cfg(test)]
+pub(super) fn set_segment_load_delay_for_tests(tenant_dir: &Path, delay: Duration) {
+    let mut delays = TEST_LOAD_DELAYS.lock().unwrap_or_else(|p| p.into_inner());
+    delays.retain(|(path, _)| path != tenant_dir);
+    delays.push((tenant_dir.to_path_buf(), delay));
+}
+
+#[cfg(test)]
+fn apply_test_load_delay(tenant_dir: &Path) {
+    let delay = TEST_LOAD_DELAYS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(path, _)| path == tenant_dir)
+        .map(|(_, delay)| *delay);
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
 }
 
 /// How often a reader re-reads the manifest when a segment file vanishes

@@ -12,9 +12,13 @@
 use std::collections::{HashMap, HashSet};
 
 pub mod oidc;
+#[cfg(test)]
+mod oidc_tests;
+#[cfg(test)]
+mod test_keys;
 pub use oidc::{
-    OidcValidationConfig, clear_jwks_cache, verify_oidc_token, verify_oidc_token_for_tenant,
-    verify_oidc_token_with_jwks,
+    OidcValidationConfig, clear_jwks_cache, validate_jwks_url, verify_oidc_token,
+    verify_oidc_token_for_tenant, verify_oidc_token_with_jwks,
 };
 
 use jsonwebtoken::{
@@ -71,8 +75,25 @@ impl RoleSet {
         }
     }
 
+    /// Role hierarchy: `admin` implies every role; `read_only` implies
+    /// `retrieve` (it can run queries and read debug endpoints) but never
+    /// `ingest`; `ingest` and `retrieve` are independent of each other and do
+    /// not imply `read_only`.
     pub fn allows(&self, role: Role) -> bool {
-        self.allow_all || self.roles.contains(&role)
+        self.allow_all
+            || self.roles.contains(&Role::Admin)
+            || self.roles.contains(&role)
+            || (role == Role::Retrieve && self.roles.contains(&Role::ReadOnly))
+    }
+
+    /// Parse a comma and/or whitespace separated role list. Unknown names are
+    /// ignored.
+    pub fn parse_list(raw: &str) -> Self {
+        Self::from_roles(
+            raw.split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|value| !value.is_empty())
+                .filter_map(Role::parse),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,23 +101,17 @@ impl RoleSet {
     }
 }
 
-pub fn parse_role_claim(claims: &Value, claim_name: &str) -> RoleSet {
-    let obj = match claims.as_object() {
-        Some(value) => value,
-        None => return RoleSet::empty(),
+/// Extract roles from a token claim. A missing claim yields `default_roles`
+/// (never "all roles"); a claim of an unsupported type yields no roles. A
+/// string is split on commas and whitespace, an array must hold strings.
+pub fn parse_role_claim(claims: &Value, claim_name: &str, default_roles: &RoleSet) -> RoleSet {
+    let Some(obj) = claims.as_object() else {
+        return RoleSet::empty();
     };
-    let value = match obj.get(claim_name) {
-        Some(value) => value,
-        None => return RoleSet::all(),
-    };
-    match value {
-        Value::String(raw) => RoleSet::from_roles(
-            raw.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .filter_map(Role::parse),
-        ),
-        Value::Array(items) => RoleSet::from_roles(
+    match obj.get(claim_name) {
+        None => default_roles.clone(),
+        Some(Value::String(raw)) => RoleSet::parse_list(raw),
+        Some(Value::Array(items)) => RoleSet::from_roles(
             items
                 .iter()
                 .filter_map(|item| item.as_str())
@@ -104,9 +119,14 @@ pub fn parse_role_claim(claims: &Value, claim_name: &str) -> RoleSet {
                 .filter(|value| !value.is_empty())
                 .filter_map(Role::parse),
         ),
-        _ => RoleSet::empty(),
+        Some(_) => RoleSet::empty(),
     }
 }
+
+/// Upper bound for clock-skew leeway, whatever the configuration says.
+pub const MAX_LEEWAY_SECS: u64 = 60;
+/// Default maximum token lifetime (`exp - iat`, or `exp - now` without `iat`).
+pub const DEFAULT_MAX_LIFETIME_SECS: u64 = 86_400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtValidationConfig {
@@ -115,8 +135,27 @@ pub struct JwtValidationConfig {
     pub hs256_secrets_by_kid: HashMap<String, String>,
     pub issuer: Option<String>,
     pub audience: Option<String>,
+    /// Clock-skew leeway; values above [`MAX_LEEWAY_SECS`] are clamped.
     pub leeway_secs: u64,
-    pub require_exp: bool,
+    /// Maximum accepted token lifetime in seconds. `exp` is always required.
+    pub max_lifetime_secs: u64,
+    /// Honor a `"*"` tenant in the token. Off by default.
+    pub allow_wildcard_tenant: bool,
+}
+
+impl Default for JwtValidationConfig {
+    fn default() -> Self {
+        Self {
+            hs256_secret: String::new(),
+            hs256_fallback_secrets: Vec::new(),
+            hs256_secrets_by_kid: HashMap::new(),
+            issuer: None,
+            audience: None,
+            leeway_secs: 0,
+            max_lifetime_secs: DEFAULT_MAX_LIFETIME_SECS,
+            allow_wildcard_tenant: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -147,6 +186,8 @@ pub enum JwtValidationError {
     Expired,
     #[error("token not yet valid")]
     NotYetValid,
+    #[error("token lifetime exceeds the configured maximum")]
+    TokenLifetimeTooLong,
     #[error("issuer mismatch")]
     IssuerMismatch,
     #[error("audience mismatch")]
@@ -199,11 +240,7 @@ fn verify_hs256_token_inner(
         validation.leeway = 0;
         validation.validate_exp = false;
         validation.validate_nbf = false;
-        validation.required_spec_claims = if config.require_exp {
-            HashSet::from(["exp".to_string()])
-        } else {
-            HashSet::new()
-        };
+        validation.required_spec_claims = HashSet::from(["exp".to_string()]);
         if let Some(iss) = config.issuer.as_deref() {
             validation.set_issuer(&[iss]);
         }
@@ -218,7 +255,7 @@ fn verify_hs256_token_inner(
             Ok(data) => {
                 check_time_bounds(&data.claims, config, now_unix_secs)?;
                 if let Some(tenant_id) = tenant_id {
-                    check_tenant_allowlist(&data.claims, tenant_id)?;
+                    check_tenant_allowlist(&data.claims, tenant_id, config.allow_wildcard_tenant)?;
                 }
                 return Ok(data.claims);
             }
@@ -269,31 +306,44 @@ fn select_hs256_secrets_for_header<'a>(
 pub(crate) fn check_time_bounds_value(
     claims: &Value,
     leeway_secs: u64,
-    require_exp: bool,
+    max_lifetime_secs: u64,
     now_unix_secs: u64,
 ) -> Result<(), JwtValidationError> {
     let obj = claims.as_object().ok_or(JwtValidationError::InvalidJson)?;
+    let leeway_secs = leeway_secs.min(MAX_LEEWAY_SECS);
 
-    if let Some(exp_value) = obj.get("exp") {
-        let exp = exp_value
-            .as_u64()
-            .ok_or(JwtValidationError::InvalidClaimType("exp"))?;
-        let expiry = exp.saturating_add(leeway_secs);
-        if now_unix_secs > expiry {
-            return Err(JwtValidationError::Expired);
-        }
-    } else if require_exp {
-        return Err(JwtValidationError::MissingClaim("exp"));
+    let exp = obj
+        .get("exp")
+        .ok_or(JwtValidationError::MissingClaim("exp"))?
+        .as_u64()
+        .ok_or(JwtValidationError::InvalidClaimType("exp"))?;
+    if now_unix_secs > exp.saturating_add(leeway_secs) {
+        return Err(JwtValidationError::Expired);
     }
 
     if let Some(nbf_value) = obj.get("nbf") {
         let nbf = nbf_value
             .as_u64()
             .ok_or(JwtValidationError::InvalidClaimType("nbf"))?;
-        let now_with_leeway = now_unix_secs.saturating_add(leeway_secs);
-        if now_with_leeway < nbf {
+        if now_unix_secs.saturating_add(leeway_secs) < nbf {
             return Err(JwtValidationError::NotYetValid);
         }
+    }
+
+    let issued_at = match obj.get("iat") {
+        Some(value) => {
+            let iat = value
+                .as_u64()
+                .ok_or(JwtValidationError::InvalidClaimType("iat"))?;
+            if iat > now_unix_secs.saturating_add(leeway_secs) {
+                return Err(JwtValidationError::NotYetValid);
+            }
+            iat
+        }
+        None => now_unix_secs,
+    };
+    if exp.saturating_sub(issued_at) > max_lifetime_secs {
+        return Err(JwtValidationError::TokenLifetimeTooLong);
     }
 
     Ok(())
@@ -307,7 +357,7 @@ fn check_time_bounds(
     check_time_bounds_value(
         claims,
         config.leeway_secs,
-        config.require_exp,
+        config.max_lifetime_secs,
         now_unix_secs,
     )
 }
@@ -315,12 +365,24 @@ fn check_time_bounds(
 pub(crate) fn check_tenant_allowlist(
     claims: &Value,
     tenant_id: &str,
+    allow_wildcard: bool,
 ) -> Result<(), JwtValidationError> {
     let tenants = extract_tenants(claims)?;
-    if !tenants.contains("*") && !tenants.contains(tenant_id) {
-        return Err(JwtValidationError::TenantNotAllowed);
+    tenant_permitted(&tenants, tenant_id, allow_wildcard)
+}
+
+/// `"*"` only matches every tenant when the wildcard is explicitly enabled;
+/// otherwise it is an ordinary (and useless) tenant name.
+pub(crate) fn tenant_permitted(
+    tenants: &HashSet<String>,
+    tenant_id: &str,
+    allow_wildcard: bool,
+) -> Result<(), JwtValidationError> {
+    if (allow_wildcard && tenants.contains("*")) || tenants.contains(tenant_id) {
+        Ok(())
+    } else {
+        Err(JwtValidationError::TenantNotAllowed)
     }
-    Ok(())
 }
 
 pub(crate) fn extract_tenants(claims: &Value) -> Result<HashSet<String>, JwtValidationError> {
@@ -453,7 +515,8 @@ mod tests {
             issuer: Some("dash".to_string()),
             audience: Some("ingestion".to_string()),
             leeway_secs: 0,
-            require_exp: true,
+            max_lifetime_secs: u64::MAX,
+            allow_wildcard_tenant: false,
         }
     }
 
@@ -613,14 +676,162 @@ mod tests {
     }
 
     #[test]
-    fn verify_hs256_token_supports_wildcard_tenant() {
+    fn wildcard_tenant_is_ignored_unless_explicitly_enabled() {
         let token = encode_hs256_token(
             r#"{"tenant_id":"*","iss":"dash","aud":"ingestion","exp":4102444800}"#,
             "secret",
         )
         .unwrap();
-        let result = verify_hs256_token_for_tenant(&token, "any-tenant", &sample_config(), 1_000);
-        assert!(result.is_ok(), "expected Ok via wildcard, got {result:?}");
+        let off = verify_hs256_token_for_tenant(&token, "any-tenant", &sample_config(), 1_000);
+        assert_eq!(off, Err(JwtValidationError::TenantNotAllowed));
+        let mut config = sample_config();
+        config.allow_wildcard_tenant = true;
+        let on = verify_hs256_token_for_tenant(&token, "any-tenant", &config, 1_000);
+        assert!(on.is_ok(), "expected Ok via wildcard, got {on:?}");
+    }
+
+    #[test]
+    fn exp_is_always_required() {
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion"}"#,
+            "secret",
+        )
+        .unwrap();
+        let result = verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000);
+        assert!(
+            matches!(result, Err(JwtValidationError::MissingClaim("exp"))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn max_lifetime_uses_iat_when_present_and_now_otherwise() {
+        let mut config = sample_config();
+        config.max_lifetime_secs = 3_600;
+        let now = 1_000_000;
+        let ok_iat = encode_hs256_token(
+            &format!(
+                r#"{{"tenant_id":"t","iss":"dash","aud":"ingestion","iat":{},"exp":{}}}"#,
+                now - 10,
+                now + 3_000
+            ),
+            "secret",
+        )
+        .unwrap();
+        assert!(verify_hs256_token_for_tenant(&ok_iat, "t", &config, now).is_ok());
+        let long_iat = encode_hs256_token(
+            &format!(
+                r#"{{"tenant_id":"t","iss":"dash","aud":"ingestion","iat":{},"exp":{}}}"#,
+                now - 10,
+                now + 3_600
+            ),
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_hs256_token_for_tenant(&long_iat, "t", &config, now),
+            Err(JwtValidationError::TokenLifetimeTooLong)
+        );
+        let no_iat_long = encode_hs256_token(
+            &format!(
+                r#"{{"tenant_id":"t","iss":"dash","aud":"ingestion","exp":{}}}"#,
+                now + 86_400
+            ),
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_hs256_token_for_tenant(&no_iat_long, "t", &config, now),
+            Err(JwtValidationError::TokenLifetimeTooLong)
+        );
+        let future_iat = encode_hs256_token(
+            &format!(
+                r#"{{"tenant_id":"t","iss":"dash","aud":"ingestion","iat":{},"exp":{}}}"#,
+                now + 1_000,
+                now + 1_100
+            ),
+            "secret",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_hs256_token_for_tenant(&future_iat, "t", &config, now),
+            Err(JwtValidationError::NotYetValid)
+        );
+    }
+
+    #[test]
+    fn leeway_is_capped_at_sixty_seconds() {
+        let mut config = sample_config();
+        config.leeway_secs = 100_000;
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"t","iss":"dash","aud":"ingestion","exp":1000}"#,
+            "secret",
+        )
+        .unwrap();
+        assert!(verify_hs256_token_for_tenant(&token, "t", &config, 1_060).is_ok());
+        assert_eq!(
+            verify_hs256_token_for_tenant(&token, "t", &config, 1_061),
+            Err(JwtValidationError::Expired)
+        );
+    }
+
+    #[test]
+    fn token_errors_do_not_echo_claim_values() {
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"SECRET-TENANT-VALUE","iss":"SECRET-ISSUER","aud":"ingestion","exp":4102444800}"#,
+            "secret",
+        )
+        .unwrap();
+        let err =
+            verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000).unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("SECRET"), "{text}");
+    }
+
+    #[test]
+    fn missing_role_claim_yields_the_default_not_all_roles() {
+        let claims = serde_json::json!({"tenant_id": "t"});
+        let none = parse_role_claim(&claims, "dash_roles", &RoleSet::empty());
+        assert!(none.is_empty());
+        assert!(!none.allows(Role::Retrieve));
+        let default = RoleSet::from_roles([Role::Retrieve].into_iter());
+        let got = parse_role_claim(&claims, "dash_roles", &default);
+        assert!(got.allows(Role::Retrieve) && !got.allows(Role::Ingest));
+    }
+
+    #[test]
+    fn role_claim_accepts_string_space_string_and_array_and_custom_names() {
+        let empty = RoleSet::empty();
+        let c = serde_json::json!({"roles": "retrieve ingest", "dash_roles": ["read_only"]});
+        let r = parse_role_claim(&c, "roles", &empty);
+        assert!(r.allows(Role::Retrieve) && r.allows(Role::Ingest));
+        let r = parse_role_claim(&c, "dash_roles", &empty);
+        assert!(r.allows(Role::Retrieve) && !r.allows(Role::Ingest));
+        let c = serde_json::json!({"dash_roles": "retrieve,ingest"});
+        assert!(parse_role_claim(&c, "dash_roles", &empty).allows(Role::Ingest));
+        // wrong type and unknown names grant nothing, even with a default
+        let default = RoleSet::from_roles([Role::Retrieve].into_iter());
+        let c = serde_json::json!({"dash_roles": 7});
+        assert!(parse_role_claim(&c, "dash_roles", &default).is_empty());
+        let c = serde_json::json!({"dash_roles": ["superuser"]});
+        assert!(parse_role_claim(&c, "dash_roles", &default).is_empty());
+    }
+
+    #[test]
+    fn role_hierarchy() {
+        let admin = RoleSet::from_roles([Role::Admin].into_iter());
+        for role in [Role::Admin, Role::Ingest, Role::Retrieve, Role::ReadOnly] {
+            assert!(admin.allows(role));
+        }
+        let ingest = RoleSet::from_roles([Role::Ingest].into_iter());
+        assert!(ingest.allows(Role::Ingest));
+        assert!(!ingest.allows(Role::Retrieve) && !ingest.allows(Role::ReadOnly));
+        let retrieve = RoleSet::from_roles([Role::Retrieve].into_iter());
+        assert!(retrieve.allows(Role::Retrieve));
+        assert!(!retrieve.allows(Role::Ingest) && !retrieve.allows(Role::ReadOnly));
+        let ro = RoleSet::from_roles([Role::ReadOnly].into_iter());
+        assert!(ro.allows(Role::Retrieve) && ro.allows(Role::ReadOnly));
+        assert!(!ro.allows(Role::Ingest) && !ro.allows(Role::Admin));
     }
 
     #[test]

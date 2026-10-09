@@ -16,8 +16,10 @@ fn main() {
     // assumed the default was to serve, and the service would
     // silently exit after printing the startup banner.
     let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
-    let bind_addr = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
+    let requested_bind = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    // Dev mode only ever listens on loopback (see dash_common::resolve_bind_addr).
+    let bind_addr = dash_common::resolve_bind_addr(&requested_bind);
     let http_workers = parse_http_workers();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");
@@ -42,6 +44,7 @@ fn main() {
     )
     .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
 
+    let mut follower_wal: Option<FileWal> = None;
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
@@ -71,10 +74,19 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        if load_stats.replay.quarantined_records > 0 || load_stats.replay.dependent_skipped > 0 {
+            tracing::warn!(
+                "retrieval startup replay quarantined {} unreadable legacy record(s) and skipped {} dependent record(s); see '{}.quarantine' and docs/operations/wal-recovery.md",
+                load_stats.replay.quarantined_records,
+                load_stats.replay.dependent_skipped,
+                wal_path
+            );
+        }
         if !disk_disabled {
             store = attach_disk(store, &disk_path);
         }
         tracing::info!("retrieval ready: claims={}", store.claims_len());
+        follower_wal = Some(wal);
         store
     } else {
         let mut store = InMemoryStore::new_with_ann_tuning(ann_tuning);
@@ -128,7 +140,9 @@ fn main() {
     };
 
     let shared_store = Arc::new(RwLock::new(store));
-    spawn_replication_follower(Arc::clone(&shared_store));
+    // The retrieval WAL (when configured) is handed to the follower so
+    // replicated records are mirrored into it and survive a restart.
+    let _replication_follower = spawn_replication_follower(Arc::clone(&shared_store), follower_wal);
 
     if serve_mode {
         {
@@ -277,25 +291,16 @@ where
 }
 
 fn attach_disk(store: InMemoryStore, disk_path: &str) -> InMemoryStore {
-    match store.with_disk(disk_path) {
-        Ok(updated) => {
-            match updated.disk_status() {
-                store::DiskStatus::Unavailable { reason } => {
-                    tracing::error!(
-                        "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                    );
-                }
-                _ => {
-                    tracing::info!("retrieval persistence: disk={disk_path}");
-                }
-            }
-            updated
-        }
-        Err(err) => {
+    let updated = store.attach_disk(disk_path);
+    match updated.disk_status() {
+        store::DiskStatus::Unavailable { reason } => {
             tracing::error!(
-                "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+                "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
             );
-            unreachable!("with_disk always returns Ok")
+        }
+        _ => {
+            tracing::info!("retrieval persistence: disk={disk_path}");
         }
     }
+    updated
 }

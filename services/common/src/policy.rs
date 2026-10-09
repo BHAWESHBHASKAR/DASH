@@ -18,21 +18,24 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use auth::{
-    JwtValidationConfig, JwtValidationError, OidcValidationConfig, Role, RoleSet, parse_role_claim,
-    verify_hs256_token, verify_hs256_token_for_tenant, verify_oidc_token,
-    verify_oidc_token_for_tenant,
+    DEFAULT_MAX_LIFETIME_SECS, JwtValidationConfig, JwtValidationError, MAX_LEEWAY_SECS,
+    OidcValidationConfig, Role, RoleSet, parse_role_claim, validate_jwks_url, verify_hs256_token,
+    verify_hs256_token_for_tenant, verify_oidc_token, verify_oidc_token_for_tenant,
 };
 
 use crate::{
-    JWT_SECRET_MIN_LENGTH, SECRET_MIN_LENGTH, constant_time_eq, env_with_fallback,
-    insecure_dev_mode_enabled, strict_secrets_enabled, validate_secret_csv_min_len,
-    validate_secret_min_len,
+    JWT_SECRET_MIN_LENGTH, SECRET_MIN_LENGTH, constant_time_eq, strict_secrets_from,
+    validate_secret_csv_min_len, validate_secret_min_len,
 };
+
+/// Source of configuration values (environment, optionally overlaid with the
+/// `DASH_CONFIG_RELOAD_FILE`).
+type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// Outcome of an authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,18 +56,17 @@ pub struct ServiceAuthEnv {
     pub service: &'static str,
     /// Environment infix: `RETRIEVAL` gives `DASH_RETRIEVAL_*` / `EME_RETRIEVAL_*`.
     pub prefix: &'static str,
-    /// Role granted to scoped keys that do not list roles explicitly.
+    /// Primary role of the service. It is the default role set of API keys
+    /// that carry no explicit roles (`DASH_*_API_KEY_DEFAULT_ROLES`).
     pub default_scoped_role: Role,
     pub default_rate_limit_rps: u64,
     pub default_rate_limit_burst: u64,
 }
 
 impl ServiceAuthEnv {
-    fn var(&self, suffix: &str) -> Option<String> {
-        env_with_fallback(
-            &format!("DASH_{}_{suffix}", self.prefix),
-            &format!("EME_{}_{suffix}", self.prefix),
-        )
+    fn var(&self, lookup: Lookup<'_>, suffix: &str) -> Option<String> {
+        lookup(&format!("DASH_{}_{suffix}", self.prefix))
+            .or_else(|| lookup(&format!("EME_{}_{suffix}", self.prefix)))
     }
 
     fn dash(&self, suffix: &str) -> String {
@@ -86,8 +88,25 @@ pub struct RawAuthConfig {
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
     pub jwt_leeway_secs: Option<String>,
+    /// Ignored: `exp` is always required. Setting it to a false value only
+    /// logs a warning at startup.
     pub jwt_require_exp: Option<String>,
+    /// `DASH_*_JWT_ROLES_CLAIM` (legacy name `DASH_*_JWT_ROLE_CLAIM`).
     pub jwt_role_claim: Option<String>,
+    /// `DASH_*_JWT_DEFAULT_ROLES`: roles for tokens without a role claim.
+    pub jwt_default_roles: Option<String>,
+    /// `DASH_*_API_KEY_DEFAULT_ROLES`: roles for keys without explicit roles.
+    pub api_key_default_roles: Option<String>,
+    /// `DASH_*_JWT_ALLOW_WILDCARD_TENANT`.
+    pub jwt_allow_wildcard_tenant: Option<String>,
+    /// `DASH_*_JWT_MAX_LIFETIME_SECS`.
+    pub jwt_max_lifetime_secs: Option<String>,
+    /// `DASH_*_JWT_REVOKED_JTIS`: comma separated `jti` denylist.
+    pub jwt_revoked_jtis: Option<String>,
+    /// `DASH_*_JWT_REVOKED_JTIS_PATH`: file with one revoked `jti` per line.
+    pub jwt_revoked_jtis_path: Option<String>,
+    /// `DASH_OIDC_ALLOW_INSECURE_JWKS=1`.
+    pub allow_insecure_jwks: bool,
     pub jwt_provider: Option<String>,
     pub jwt_jwks_url: Option<String>,
     pub jwt_jwks_refresh_minutes: Option<String>,
@@ -105,37 +124,51 @@ pub struct RawAuthConfig {
 
 impl RawAuthConfig {
     pub fn from_env(svc: &ServiceAuthEnv) -> Self {
+        Self::from_lookup(svc, &|key| std::env::var(key).ok())
+    }
+
+    pub fn from_lookup(svc: &ServiceAuthEnv, lookup: Lookup<'_>) -> Self {
+        let flag = |name: &str| {
+            lookup(name).and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            })
+        };
+        let insecure_dev = flag("DASH_INSECURE_DEV_MODE").unwrap_or(false);
         Self {
-            api_key: svc.var("API_KEY"),
-            api_keys: svc.var("API_KEYS"),
-            revoked_api_keys: svc.var("REVOKED_API_KEYS"),
-            allowed_tenants: svc.var("ALLOWED_TENANTS"),
-            api_key_scopes: svc.var("API_KEY_SCOPES"),
-            jwt_hs256_secret: svc.var("JWT_HS256_SECRET"),
-            jwt_hs256_secrets: svc.var("JWT_HS256_SECRETS"),
-            jwt_hs256_secrets_by_kid: svc.var("JWT_HS256_SECRETS_BY_KID"),
-            jwt_issuer: svc.var("JWT_ISSUER"),
-            jwt_audience: svc.var("JWT_AUDIENCE"),
-            jwt_leeway_secs: svc.var("JWT_LEEWAY_SECS"),
-            jwt_require_exp: svc.var("JWT_REQUIRE_EXP"),
-            jwt_role_claim: svc.var("JWT_ROLE_CLAIM"),
-            jwt_provider: svc.var("JWT_PROVIDER"),
-            jwt_jwks_url: svc.var("JWT_JWKS_URL"),
-            jwt_jwks_refresh_minutes: svc.var("JWT_JWKS_REFRESH_MINUTES"),
-            jwt_tenant_claims: svc.var("JWT_TENANT_CLAIMS"),
-            rate_limit_rps: svc.var("RATE_LIMIT_PER_TENANT_RPS"),
-            rate_limit_burst: svc.var("RATE_LIMIT_BURST"),
-            revoked_keys_path: svc.var("REVOKED_KEYS_PATH"),
-            insecure_dev: insecure_dev_mode_enabled(),
-            strict_secrets: strict_secrets_enabled(),
-            metrics_public: matches!(
-                std::env::var("DASH_METRICS_PUBLIC")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "1" | "true" | "yes" | "on"
-            ),
+            api_key: svc.var(lookup, "API_KEY"),
+            api_keys: svc.var(lookup, "API_KEYS"),
+            revoked_api_keys: svc.var(lookup, "REVOKED_API_KEYS"),
+            allowed_tenants: svc.var(lookup, "ALLOWED_TENANTS"),
+            api_key_scopes: svc.var(lookup, "API_KEY_SCOPES"),
+            jwt_hs256_secret: svc.var(lookup, "JWT_HS256_SECRET"),
+            jwt_hs256_secrets: svc.var(lookup, "JWT_HS256_SECRETS"),
+            jwt_hs256_secrets_by_kid: svc.var(lookup, "JWT_HS256_SECRETS_BY_KID"),
+            jwt_issuer: svc.var(lookup, "JWT_ISSUER"),
+            jwt_audience: svc.var(lookup, "JWT_AUDIENCE"),
+            jwt_leeway_secs: svc.var(lookup, "JWT_LEEWAY_SECS"),
+            jwt_require_exp: svc.var(lookup, "JWT_REQUIRE_EXP"),
+            jwt_role_claim: svc
+                .var(lookup, "JWT_ROLES_CLAIM")
+                .or_else(|| svc.var(lookup, "JWT_ROLE_CLAIM")),
+            jwt_default_roles: svc.var(lookup, "JWT_DEFAULT_ROLES"),
+            api_key_default_roles: svc.var(lookup, "API_KEY_DEFAULT_ROLES"),
+            jwt_allow_wildcard_tenant: svc.var(lookup, "JWT_ALLOW_WILDCARD_TENANT"),
+            jwt_max_lifetime_secs: svc.var(lookup, "JWT_MAX_LIFETIME_SECS"),
+            jwt_revoked_jtis: svc.var(lookup, "JWT_REVOKED_JTIS"),
+            jwt_revoked_jtis_path: svc.var(lookup, "JWT_REVOKED_JTIS_PATH"),
+            allow_insecure_jwks: flag("DASH_OIDC_ALLOW_INSECURE_JWKS").unwrap_or(false),
+            jwt_provider: svc.var(lookup, "JWT_PROVIDER"),
+            jwt_jwks_url: svc.var(lookup, "JWT_JWKS_URL"),
+            jwt_jwks_refresh_minutes: svc.var(lookup, "JWT_JWKS_REFRESH_MINUTES"),
+            jwt_tenant_claims: svc.var(lookup, "JWT_TENANT_CLAIMS"),
+            rate_limit_rps: svc.var(lookup, "RATE_LIMIT_PER_TENANT_RPS"),
+            rate_limit_burst: svc.var(lookup, "RATE_LIMIT_BURST"),
+            revoked_keys_path: svc.var(lookup, "REVOKED_KEYS_PATH"),
+            insecure_dev,
+            strict_secrets: strict_secrets_from(flag("DASH_STRICT_SECRETS"), insecure_dev),
+            metrics_public: flag("DASH_METRICS_PUBLIC").unwrap_or(false),
         }
     }
 }
@@ -176,6 +209,10 @@ pub struct AuthPolicy {
     jwt_validation: Option<JwtValidationConfig>,
     oidc_validation: Option<OidcValidationConfig>,
     jwt_role_claim: String,
+    jwt_default_roles: RoleSet,
+    api_key_default_roles: RoleSet,
+    revoked_jtis: HashSet<String>,
+    jti_revocation_list: RevocationList,
     rate_limiter: Option<TenantRateLimiter>,
     revocation_list: RevocationList,
     insecure_dev: bool,
@@ -203,7 +240,7 @@ impl AuthPolicy {
     /// Build a policy from the process environment, validating it. Intended
     /// to be called once at startup.
     pub fn from_env(svc: &ServiceAuthEnv) -> Result<Self, String> {
-        Self::build(RawAuthConfig::from_env(svc), svc)
+        Self::build(load_raw_config(svc)?, svc)
     }
 
     /// A policy that rejects every request, used when configuration is
@@ -217,6 +254,10 @@ impl AuthPolicy {
             jwt_validation: None,
             oidc_validation: None,
             jwt_role_claim: "dash_roles".to_string(),
+            jwt_default_roles: RoleSet::empty(),
+            api_key_default_roles: RoleSet::empty(),
+            revoked_jtis: HashSet::new(),
+            jti_revocation_list: RevocationList::new(None),
             rate_limiter: None,
             revocation_list: RevocationList::new(None),
             insecure_dev: false,
@@ -226,7 +267,9 @@ impl AuthPolicy {
     }
 
     /// Parse and validate `raw`. Fails when:
-    /// * OIDC is selected but `JWKS_URL` or `ISSUER` is missing,
+    /// * OIDC is selected but `JWKS_URL`, `ISSUER` or `AUDIENCE` is missing,
+    ///   or the JWKS URL is plain http to a non-loopback host,
+    /// * a configured default role list names an unknown role,
     /// * the JWT provider name is unknown,
     /// * a scoped key entry is malformed,
     /// * strict secrets are on and a key/secret is a placeholder or too short,
@@ -243,8 +286,24 @@ impl AuthPolicy {
             parse_key_list(None, raw.revoked_api_keys.as_deref())
                 .into_iter()
                 .collect();
+        let api_key_default_roles = parse_default_roles(
+            &svc.dash("API_KEY_DEFAULT_ROLES"),
+            raw.api_key_default_roles.as_deref(),
+            Some(svc.default_scoped_role),
+        )?;
+        let jwt_default_roles = parse_default_roles(
+            &svc.dash("JWT_DEFAULT_ROLES"),
+            raw.jwt_default_roles.as_deref(),
+            None,
+        )?;
         let scoped_api_keys =
-            parse_scoped_api_keys(svc, raw.api_key_scopes.as_deref(), svc.default_scoped_role)?;
+            parse_scoped_api_keys(svc, raw.api_key_scopes.as_deref(), &api_key_default_roles)?;
+        if !parse_bool(raw.jwt_require_exp.as_deref(), true) {
+            tracing::warn!(
+                "{} is ignored: JWTs must always carry an exp claim",
+                svc.dash("JWT_REQUIRE_EXP")
+            );
+        }
 
         let (jwt_validation, oidc_validation) = match provider {
             JwtMode::Hs256 => (parse_hs256_config(&raw), None),
@@ -283,6 +342,9 @@ impl AuthPolicy {
             .filter(|v| !v.is_empty())
             .unwrap_or("dash_roles")
             .to_string();
+        let revoked_jtis: HashSet<String> = parse_key_list(None, raw.jwt_revoked_jtis.as_deref())
+            .into_iter()
+            .collect();
 
         Ok(Self {
             required_api_keys,
@@ -292,6 +354,16 @@ impl AuthPolicy {
             jwt_validation,
             oidc_validation,
             jwt_role_claim,
+            jwt_default_roles,
+            api_key_default_roles,
+            revoked_jtis,
+            jti_revocation_list: RevocationList::new(
+                raw.jwt_revoked_jtis_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from),
+            ),
             rate_limiter: TenantRateLimiter::from_raw(
                 raw.rate_limit_rps.as_deref(),
                 raw.rate_limit_burst.as_deref(),
@@ -413,20 +485,20 @@ impl AuthPolicy {
             {
                 return AuthDecision::Forbidden("tenant is not allowed for this API key");
             }
-            Some(&scoped.roles)
+            &scoped.roles
         } else if self
             .required_api_keys
             .iter()
             .any(|candidate| constant_time_eq(candidate.as_bytes(), key.as_bytes()))
         {
-            None
+            // Legacy unscoped key: an explicit, configurable default role set
+            // (never "all roles").
+            &self.api_key_default_roles
         } else {
             return AuthDecision::Unauthorized("missing or invalid API key");
         };
 
-        if let Some(roles) = roles
-            && !roles.allows(required_role)
-        {
+        if !roles.allows(required_role) {
             return AuthDecision::Forbidden("role is not allowed for this API key");
         }
         self.finish(tenant_id)
@@ -441,7 +513,14 @@ impl AuthPolicy {
     ) -> AuthDecision {
         match verified {
             Ok(claims) => {
-                if !parse_role_claim(&claims, &self.jwt_role_claim).allows(required_role) {
+                if let Some(jti) = claims.get("jti").and_then(|v| v.as_str())
+                    && (self.revoked_jtis.contains(jti) || self.jti_revocation_list.is_revoked(jti))
+                {
+                    return AuthDecision::Unauthorized("JWT revoked");
+                }
+                let roles =
+                    parse_role_claim(&claims, &self.jwt_role_claim, &self.jwt_default_roles);
+                if !roles.allows(required_role) {
                     return AuthDecision::Forbidden("role is not allowed for this JWT");
                 }
                 self.finish(tenant_id)
@@ -586,7 +665,7 @@ fn scoped_entries(raw: Option<&str>) -> impl Iterator<Item = &str> {
 fn parse_scoped_api_keys(
     svc: &ServiceAuthEnv,
     raw: Option<&str>,
-    default_role: Role,
+    default_roles: &RoleSet,
 ) -> Result<Vec<ScopedKey>, String> {
     let mut scoped = Vec::new();
     for entry in scoped_entries(raw) {
@@ -615,7 +694,7 @@ fn parse_scoped_api_keys(
             }
             RoleSet::from_roles(parsed.into_iter())
         } else {
-            RoleSet::from_roles(std::iter::once(default_role))
+            default_roles.clone()
         };
         scoped.push(ScopedKey {
             key: key.to_string(),
@@ -688,13 +767,45 @@ fn parse_hs256_config(raw: &RawAuthConfig) -> Option<JwtValidationConfig> {
         hs256_secrets_by_kid: by_kid,
         issuer: non_empty(raw.jwt_issuer.as_deref()),
         audience: non_empty(raw.jwt_audience.as_deref()),
-        leeway_secs: raw
-            .jwt_leeway_secs
-            .as_deref()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0),
-        require_exp: parse_bool(raw.jwt_require_exp.as_deref(), true),
+        leeway_secs: parse_leeway(raw.jwt_leeway_secs.as_deref()),
+        max_lifetime_secs: parse_max_lifetime(raw.jwt_max_lifetime_secs.as_deref()),
+        allow_wildcard_tenant: parse_bool(raw.jwt_allow_wildcard_tenant.as_deref(), false),
     })
+}
+
+fn parse_leeway(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(MAX_LEEWAY_SECS)
+}
+
+fn parse_max_lifetime(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_LIFETIME_SECS)
+}
+
+/// Parse a role list that must only name known roles. An unset or blank
+/// value yields `fallback` (or no roles).
+fn parse_default_roles(
+    name: &str,
+    raw: Option<&str>,
+    fallback: Option<Role>,
+) -> Result<RoleSet, String> {
+    let Some(raw) = non_empty(raw) else {
+        return Ok(match fallback {
+            Some(role) => RoleSet::from_roles(std::iter::once(role)),
+            None => RoleSet::empty(),
+        });
+    };
+    let mut roles = Vec::new();
+    for item in raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|v| !v.is_empty())
+    {
+        roles.push(Role::parse(item).ok_or_else(|| format!("{name} contains an unknown role"))?);
+    }
+    Ok(RoleSet::from_roles(roles.into_iter()))
 }
 
 fn parse_oidc_config(
@@ -715,6 +826,15 @@ fn parse_oidc_config(
             svc.dash("JWT_ISSUER")
         )
     })?;
+    let audience = non_empty(raw.jwt_audience.as_deref()).ok_or_else(|| {
+        format!(
+            "{} is 'oidc' but {} is not set (an audience is required for OIDC)",
+            svc.dash("JWT_PROVIDER"),
+            svc.dash("JWT_AUDIENCE")
+        )
+    })?;
+    validate_jwks_url(&jwks_url, raw.allow_insecure_jwks)
+        .map_err(|reason| format!("{}: {reason}", svc.dash("JWT_JWKS_URL")))?;
     let tenant_claims = raw
         .jwt_tenant_claims
         .as_deref()
@@ -736,20 +856,18 @@ fn parse_oidc_config(
         });
     Ok(OidcValidationConfig {
         issuer,
-        audience: non_empty(raw.jwt_audience.as_deref()),
+        audience,
         jwks_url,
         jwks_refresh_minutes: raw
             .jwt_jwks_refresh_minutes
             .as_deref()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(15),
-        leeway_secs: raw
-            .jwt_leeway_secs
-            .as_deref()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0),
-        require_exp: parse_bool(raw.jwt_require_exp.as_deref(), true),
+        leeway_secs: parse_leeway(raw.jwt_leeway_secs.as_deref()),
+        max_lifetime_secs: parse_max_lifetime(raw.jwt_max_lifetime_secs.as_deref()),
         tenant_claims,
+        allow_wildcard_tenant: parse_bool(raw.jwt_allow_wildcard_tenant.as_deref(), false),
+        allow_insecure_jwks: raw.allow_insecure_jwks,
     })
 }
 
@@ -944,15 +1062,70 @@ impl TenantRateLimiter {
 // Process-wide policy holder
 // ---------------------------------------------------------------------------
 
-/// Holds the policy for a service. [`PolicyCell::pin`] builds it once at
-/// startup; the request path then only clones an `Arc`.
+/// Overlay file read at startup and on reload: `KEY=VALUE` lines (blank lines
+/// and `#` comments ignored, optional surrounding quotes stripped). Only
+/// `DASH_*` / `EME_*` keys are honored and they take precedence over the
+/// process environment. Set `DASH_CONFIG_RELOAD_FILE` to its path.
+pub const CONFIG_RELOAD_FILE_ENV: &str = "DASH_CONFIG_RELOAD_FILE";
+
+fn parse_overlay(content: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if !(key.starts_with("DASH_") || key.starts_with("EME_")) {
+            continue;
+        }
+        let mut value = value.trim();
+        for quote in ['"', '\''] {
+            if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+                value = &value[1..value.len() - 1];
+            }
+        }
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
+}
+
+/// Read the raw configuration: process environment overlaid with the
+/// `DASH_CONFIG_RELOAD_FILE`, when set.
+fn load_raw_config(svc: &ServiceAuthEnv) -> Result<RawAuthConfig, String> {
+    let overlay = match std::env::var(CONFIG_RELOAD_FILE_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(path) => {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {CONFIG_RELOAD_FILE_ENV}: {}", e.kind()))?;
+            parse_overlay(&content)
+        }
+        None => HashMap::new(),
+    };
+    Ok(RawAuthConfig::from_lookup(svc, &|key| {
+        overlay
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+    }))
+}
+
+/// Holds the policy for a service. [`PolicyCell::pin`] builds it at startup;
+/// the request path then only clones an `Arc`. [`PolicyCell::reload`] (wired
+/// to SIGHUP by [`spawn_sighup_reload`]) atomically replaces it.
 ///
 /// When nothing was pinned (library use, unit and integration tests driving
 /// the handler directly) [`PolicyCell::current`] builds a policy from the
 /// environment and caches it until the relevant environment changes, so the
 /// rate limiter keeps its state across calls.
 pub struct PolicyCell {
-    pinned: OnceLock<Arc<AuthPolicy>>,
+    pinned: RwLock<Option<Arc<AuthPolicy>>>,
     cached: Mutex<Option<(u64, Arc<AuthPolicy>)>>,
 }
 
@@ -965,26 +1138,47 @@ impl Default for PolicyCell {
 impl PolicyCell {
     pub const fn new() -> Self {
         Self {
-            pinned: OnceLock::new(),
+            pinned: RwLock::new(None),
             cached: Mutex::new(None),
         }
     }
 
-    /// Build the policy from the environment and pin it for the lifetime of
-    /// the process. Returns the validation error unchanged so the caller can
-    /// refuse to start.
+    fn pinned(&self) -> Option<Arc<AuthPolicy>> {
+        self.pinned
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Build the policy from the environment and pin it. Returns the
+    /// validation error unchanged so the caller can refuse to start.
     pub fn pin(&self, svc: &ServiceAuthEnv) -> Result<Arc<AuthPolicy>, String> {
-        if let Some(existing) = self.pinned.get() {
+        let mut slot = self.pinned.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = slot.as_ref() {
             return Ok(Arc::clone(existing));
         }
         let policy = Arc::new(AuthPolicy::from_env(svc)?);
-        Ok(Arc::clone(self.pinned.get_or_init(|| policy)))
+        *slot = Some(Arc::clone(&policy));
+        Ok(policy)
+    }
+
+    /// Rebuild the pinned policy from the environment and the
+    /// `DASH_CONFIG_RELOAD_FILE` overlay. On any error the running policy is
+    /// kept and the error is returned. Rate-limit buckets start fresh.
+    pub fn reload(&self, svc: &ServiceAuthEnv) -> Result<(), String> {
+        let policy = Arc::new(AuthPolicy::from_env(svc)?);
+        let mut slot = self.pinned.write().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            return Err("auth policy is not pinned".to_string());
+        }
+        *slot = Some(policy);
+        Ok(())
     }
 
     /// The policy for the current request.
     pub fn current(&self, svc: &ServiceAuthEnv) -> Arc<AuthPolicy> {
-        if let Some(pinned) = self.pinned.get() {
-            return Arc::clone(pinned);
+        if let Some(pinned) = self.pinned() {
+            return pinned;
         }
         let fingerprint = env_fingerprint(svc);
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
@@ -1002,6 +1196,39 @@ impl PolicyCell {
     }
 }
 
+/// On unix, rebuild the policy in `cell` whenever the process receives
+/// SIGHUP. Failures keep the previous policy and are logged without any key
+/// material. Call once, after [`PolicyCell::pin`].
+#[cfg(unix)]
+pub fn spawn_sighup_reload(cell: &'static PolicyCell, svc: ServiceAuthEnv) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let flag = Arc::new(AtomicBool::new(false));
+    if let Err(err) = signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&flag)) {
+        tracing::error!(
+            "{} cannot install SIGHUP reload handler: {err}",
+            svc.service
+        );
+        return;
+    }
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if flag.swap(false, Ordering::SeqCst) {
+                match cell.reload(&svc) {
+                    Ok(()) => tracing::info!("{} authentication policy reloaded", svc.service),
+                    Err(reason) => tracing::error!(
+                        "{} policy reload rejected, keeping the previous policy: {reason}",
+                        svc.service
+                    ),
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub fn spawn_sighup_reload(_cell: &'static PolicyCell, _svc: ServiceAuthEnv) {}
+
 fn env_fingerprint(svc: &ServiceAuthEnv) -> u64 {
     let dash = format!("DASH_{}_", svc.prefix);
     let eme = format!("EME_{}_", svc.prefix);
@@ -1012,6 +1239,8 @@ fn env_fingerprint(svc: &ServiceAuthEnv) -> u64 {
                 || key == "DASH_INSECURE_DEV_MODE"
                 || key == "DASH_STRICT_SECRETS"
                 || key == "DASH_METRICS_PUBLIC"
+                || key == "DASH_OIDC_ALLOW_INSECURE_JWKS"
+                || key == CONFIG_RELOAD_FILE_ENV
         })
         .collect();
     entries.sort();
@@ -1023,6 +1252,9 @@ fn env_fingerprint(svc: &ServiceAuthEnv) -> u64 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod hardening_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1120,6 +1352,7 @@ mod tests {
                 api_key: Some("k".repeat(20)),
                 jwt_provider: Some("oidc".into()),
                 jwt_jwks_url: Some("https://issuer.test/jwks".into()),
+                jwt_audience: Some("dash".into()),
                 ..raw()
             },
             &SVC,

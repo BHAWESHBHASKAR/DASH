@@ -288,7 +288,7 @@ fn transport_denies_cross_tenant_retrieval_for_jwt_claim_scope() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp},\"dash_roles\":[\"retrieve\"]}}"
         ),
         "jwt-secret",
     )
@@ -315,7 +315,7 @@ fn transport_denies_expired_retrieval_jwt() {
     let exp = now_unix_secs().saturating_sub(10);
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp},\"dash_roles\":[\"retrieve\"]}}"
         ),
         "jwt-secret",
     )
@@ -349,7 +349,7 @@ fn transport_allows_retrieval_jwt_signed_with_rotation_fallback_secret() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp},\"dash_roles\":[\"retrieve\"]}}"
         ),
         "previous-secret",
     )
@@ -382,7 +382,7 @@ fn transport_allows_retrieval_jwt_signed_with_kid_secret() {
     let exp = now_unix_secs() + 300;
     let token = encode_hs256_token_with_kid(
         &format!(
-            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp}}}"
+            "{{\"tenant_id\":\"tenant-http\",\"iss\":\"dash\",\"aud\":\"retrieval\",\"exp\":{exp},\"dash_roles\":[\"retrieve\"]}}"
         ),
         "next-secret",
         Some("next"),
@@ -453,8 +453,8 @@ fn transport_openai_embeddings_array_input_returns_indexed_results() {
     assert!(response.contains("\"index\":0"));
     assert!(response.contains("\"index\":1"));
     assert!(response.contains("\"index\":2"));
-    // Word count tokenization: "alpha"=1, "beta"=1, "gamma"=1 => total 3
-    assert!(response.contains("\"total_tokens\":3"));
+    // Estimate is ceil(chars / 4) per input: alpha=2, beta=1, gamma=2 => 5
+    assert!(response.contains("\"total_tokens\":5"));
 }
 
 #[test]
@@ -551,6 +551,12 @@ fn transport_jwt_only_config_rejects_requests_without_a_token() {
 fn transport_embeddings_metrics_and_debug_require_authentication() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let _api_key = EnvVarGuard::set("DASH_RETRIEVAL_API_KEY", OsStr::new(STRONG_API_KEY));
+    // Legacy keys default to the retrieve role only; reading metrics and debug
+    // endpoints needs read_only as well.
+    let _roles = EnvVarGuard::set(
+        "DASH_RETRIEVAL_API_KEY_DEFAULT_ROLES",
+        OsStr::new("retrieve,read_only"),
+    );
     let store = sample_store();
     let body = r#"{"input":"hello","model":"text-embedding-3-small"}"#;
     let embeddings = format!(

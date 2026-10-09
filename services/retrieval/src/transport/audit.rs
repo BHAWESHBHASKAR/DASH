@@ -1,23 +1,8 @@
-use std::{
-    collections::HashMap,
-    fs::{OpenOptions, create_dir_all},
-    io::{BufRead, BufReader, Write},
-    path::Path,
-    sync::{Mutex, OnceLock},
-};
+//! Retrieval audit events. Chaining, canonical encoding, locking and torn-tail
+//! recovery live in `dash_common::audit` (shared with ingestion and the
+//! `audit-verify` tool); this module only adapts the retrieval call sites.
 
-use auth::sha256_hex;
-
-use super::payload::{JsonValue, json_escape, parse_json};
-
-const AUDIT_CHAIN_GENESIS_HASH: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AuditChainState {
-    next_seq: u64,
-    last_hash: String,
-}
+use dash_common::audit::{AuditInput, AuditOptions, append_record};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AuditEvent<'a> {
@@ -28,157 +13,118 @@ pub(super) struct AuditEvent<'a> {
     pub(super) reason: &'a str,
 }
 
+pub(super) fn audit_options() -> AuditOptions {
+    AuditOptions::from_env("RETRIEVAL")
+}
+
 pub(super) fn append_audit_record(
     path: &str,
     timestamp_ms: u64,
     event: AuditEvent<'_>,
 ) -> Result<(), String> {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_dir_all(parent).map_err(|e| format!("creating audit directory failed: {e}"))?;
-    }
-    let mut chain_states = audit_chain_states()
-        .lock()
-        .map_err(|_| "acquiring audit chain lock failed".to_string())?;
-    let state = if let Some(existing) = chain_states.get(path).cloned() {
-        existing
-    } else {
-        let loaded = load_audit_chain_state(path)?;
-        chain_states.insert(path.to_string(), loaded.clone());
-        loaded
-    };
-    let (payload, next_state) = render_chained_audit_payload(timestamp_ms, event, &state);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("opening audit file failed: {e}"))?;
-    writeln!(file, "{payload}").map_err(|e| format!("appending audit file failed: {e}"))?;
-    chain_states.insert(path.to_string(), next_state);
-    Ok(())
-}
-
-fn render_chained_audit_payload(
-    timestamp_ms: u64,
-    event: AuditEvent<'_>,
-    state: &AuditChainState,
-) -> (String, AuditChainState) {
-    let seq = state.next_seq;
-    let prev_hash = state.last_hash.as_str();
-    let canonical = canonical_audit_payload(seq, timestamp_ms, event, prev_hash);
-    let hash = sha256_hex(canonical.as_bytes());
-    let payload = format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\",\"hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-        hash,
-    );
-    (
-        payload,
-        AuditChainState {
-            next_seq: seq.saturating_add(1),
-            last_hash: hash,
+    let result = append_record(
+        path,
+        &AuditInput {
+            service: "retrieval",
+            action: event.action,
+            tenant_id: event.tenant_id,
+            claim_id: None,
+            status: event.status,
+            outcome: event.outcome,
+            reason: event.reason,
         },
-    )
-}
-
-fn canonical_audit_payload(
-    seq: u64,
-    timestamp_ms: u64,
-    event: AuditEvent<'_>,
-    prev_hash: &str,
-) -> String {
-    format!(
-        "{{\"seq\":{seq},\"ts_unix_ms\":{timestamp_ms},\"service\":\"retrieval\",\"action\":\"{}\",\"tenant_id\":{},\"claim_id\":null,\"status\":{},\"outcome\":\"{}\",\"reason\":\"{}\",\"prev_hash\":\"{}\"}}",
-        json_escape(event.action),
-        optional_json_string(event.tenant_id),
-        event.status,
-        json_escape(event.outcome),
-        json_escape(event.reason),
-        prev_hash,
-    )
-}
-
-fn optional_json_string(value: Option<&str>) -> String {
-    value
-        .map(|raw| format!("\"{}\"", json_escape(raw)))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-pub(super) fn audit_chain_states() -> &'static Mutex<HashMap<String, AuditChainState>> {
-    static STATES: OnceLock<Mutex<HashMap<String, AuditChainState>>> = OnceLock::new();
-    STATES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn load_audit_chain_state(path: &str) -> Result<AuditChainState, String> {
-    if !Path::new(path).exists() {
-        return Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        });
+        timestamp_ms,
+        &audit_options(),
+    );
+    if result.is_err() && audit_options().fail_closed {
+        eprintln!(
+            "retrieval audit FAIL_CLOSED violation: action={} completed without an audit record",
+            event.action
+        );
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| format!("opening audit file failed: {e}"))?;
-    let reader = BufReader::new(file);
-    let mut last_line: Option<String> = None;
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("reading audit file failed: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
+    result
+}
+
+/// Pre-work gate for `DASH_RETRIEVAL_AUDIT_FAIL_CLOSED=1`: `Err` means the
+/// audit log is currently unusable and the request must fail with 503.
+pub(super) fn audit_gate(audit_log_path: Option<&str>) -> Result<(), String> {
+    match audit_log_path {
+        Some(path) if audit_options().fail_closed => dash_common::audit::preflight(path),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+pub(super) use dash_common::audit::is_sha256_hex;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dash_common::audit::{VerifyOptions, verify_file};
+
+    fn temp_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "dash-retrieve-audit-{tag}-{}-{nanos}.jsonl",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn event() -> AuditEvent<'static> {
+        AuditEvent {
+            action: "retrieve",
+            tenant_id: Some("tenant-a"),
+            status: 200,
+            outcome: "success",
+            reason: "ok\ttab \"q\"",
         }
-        last_line = Some(line);
     }
-    let Some(last_line) = last_line else {
-        return Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        });
-    };
-    match parse_audit_chain_state_from_line(&last_line)? {
-        Some(state) => Ok(state),
-        None => Ok(AuditChainState {
-            next_seq: 1,
-            last_hash: AUDIT_CHAIN_GENESIS_HASH.to_string(),
-        }),
+
+    #[test]
+    fn real_retrieval_records_verify_with_shared_verifier() {
+        let path = temp_path("verify");
+        for i in 0..3u64 {
+            append_audit_record(&path, 1_700_000_000_000 + i, event()).expect("append");
+        }
+        let report = verify_file(
+            &path,
+            &VerifyOptions {
+                service: Some("retrieval".into()),
+                ..Default::default()
+            },
+        )
+        .expect("retrieval log must verify");
+        assert_eq!(report.chained_records, 3);
+        let _ = std::fs::remove_file(path);
     }
-}
 
-fn parse_audit_chain_state_from_line(line: &str) -> Result<Option<AuditChainState>, String> {
-    let value = parse_json(line)?;
-    let object = match value {
-        JsonValue::Object(object) => object,
-        _ => return Ok(None),
-    };
-
-    let seq_value = object.get("seq");
-    let hash_value = object.get("hash");
-    if seq_value.is_none() && hash_value.is_none() {
-        return Ok(None);
+    /// Records written by the pre-v2 retrieval writer (insertion-order
+    /// `format!` payload) still verify, and the new writer continues them.
+    #[test]
+    fn legacy_retrieval_records_still_verify() {
+        let path = temp_path("legacy");
+        let mut prev = dash_common::audit::GENESIS_HASH.to_string();
+        let mut out = String::new();
+        for seq in 1..=2u64 {
+            let canonical = format!(
+                "{{\"seq\":{seq},\"ts_unix_ms\":7,\"service\":\"retrieval\",\"action\":\"retrieve\",\"tenant_id\":\"t\",\"claim_id\":null,\"status\":200,\"outcome\":\"success\",\"reason\":\"a\\tb\",\"prev_hash\":\"{prev}\"}}"
+            );
+            let hash = auth::sha256_hex(canonical.as_bytes());
+            out.push_str(&format!(
+                "{{\"seq\":{seq},\"ts_unix_ms\":7,\"service\":\"retrieval\",\"action\":\"retrieve\",\"tenant_id\":\"t\",\"claim_id\":null,\"status\":200,\"outcome\":\"success\",\"reason\":\"a\\tb\",\"prev_hash\":\"{prev}\",\"hash\":\"{hash}\"}}\n"
+            ));
+            prev = hash;
+        }
+        std::fs::write(&path, out).expect("write");
+        append_audit_record(&path, 8, event()).expect("append");
+        let report = verify_file(&path, &VerifyOptions::default()).expect("verifies");
+        assert_eq!((report.legacy_records, report.v2_records), (2, 1));
+        let _ = std::fs::remove_file(path);
     }
-    let seq = match seq_value {
-        Some(JsonValue::Number(raw)) => raw
-            .parse::<u64>()
-            .map_err(|_| "audit seq must be u64".to_string())?,
-        _ => return Err("audit seq is missing or invalid".to_string()),
-    };
-    let hash = match hash_value {
-        Some(JsonValue::String(raw)) if is_sha256_hex(raw) => raw.clone(),
-        _ => return Err("audit hash is missing or invalid".to_string()),
-    };
-
-    Ok(Some(AuditChainState {
-        next_seq: seq.saturating_add(1),
-        last_hash: hash,
-    }))
-}
-
-pub(super) fn is_sha256_hex(raw: &str) -> bool {
-    raw.len() == 64 && raw.chars().all(|ch| ch.is_ascii_hexdigit())
 }

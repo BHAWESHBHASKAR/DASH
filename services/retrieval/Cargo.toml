@@ -28,3 +28,5 @@ dash-common = { path = "../common" }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+ingestion = { path = "../ingestion" }
+tempfile = "3"

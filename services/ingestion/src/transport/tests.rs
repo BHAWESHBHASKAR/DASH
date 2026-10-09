@@ -896,6 +896,7 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
 
 #[test]
 fn handle_request_post_batch_is_atomic_on_validation_failure() {
+    ensure_dev_mode_env();
     let wal_path = temp_wal_path();
     let wal = FileWal::open(&wal_path).expect("wal should open");
     let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
@@ -1482,6 +1483,7 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
 
 #[test]
 fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1553,6 +1555,7 @@ fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
 
 #[test]
 fn handle_request_write_route_reresolves_after_leader_promotion() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1646,6 +1649,7 @@ fn handle_request_write_route_reresolves_after_leader_promotion() {
 
 #[test]
 fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1736,6 +1740,7 @@ fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack(
 
 #[test]
 fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insufficient() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1787,6 +1792,7 @@ fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insuff
 
 #[test]
 fn debug_placement_endpoint_returns_structured_route_probe() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1932,6 +1938,7 @@ fn debug_document_parser_endpoint_reports_adapter_configuration() {
 
 #[test]
 fn segment_publish_writes_manifest_and_metrics() {
+    ensure_dev_mode_env();
     let mut root_dir = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
