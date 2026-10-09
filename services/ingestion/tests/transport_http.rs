@@ -14,14 +14,29 @@ use ingestion::transport::{IngestionRuntime, handle_http_request_bytes};
 use store::InMemoryStore;
 
 fn sample_runtime() -> Arc<Mutex<IngestionRuntime>> {
+    ensure_dev_mode_env();
     Arc::new(Mutex::new(
         IngestionRuntime::in_memory(InMemoryStore::new()),
     ))
 }
 
+/// Tests that exercise handlers without configuring credentials run in
+/// explicit dev mode (the only way to get an unauthenticated service).
+#[allow(unused_unsafe)]
+fn ensure_dev_mode_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+        std::env::set_var("DASH_STRICT_SECRETS", "0");
+    });
+}
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| {
+        ensure_dev_mode_env();
+        Mutex::new(())
+    })
 }
 
 #[allow(unused_unsafe)]
@@ -846,4 +861,215 @@ fn transport_allows_ingest_jwt_signed_with_kid_secret() {
         .expect("request should parse and return response");
     let response = String::from_utf8(response).expect("response should be UTF-8");
     assert!(response.starts_with("HTTP/1.1 200 OK"));
+}
+
+// ---------------------------------------------------------------------------
+// Deny-by-default regressions (SEC-02, SEC-03, SEC-06, SEC-08, SEC-09,
+// SEC-10). These drive the public handler with the policy built from the
+// DASH_INGEST_* environment, which is what the deployment manifests set.
+// ---------------------------------------------------------------------------
+
+const STRONG_JWT_SECRET: &str = "integration-hs256-signing-key-4b8e1d7a90c2f365";
+const STRONG_API_KEY: &str = "integration-api-key-7d41c8e09ab35f26";
+const STRONG_REPLICATION_TOKEN: &str = "integration-replication-token-3c9e51a7";
+
+fn status_of(raw_response: Vec<u8>) -> String {
+    let text = String::from_utf8(raw_response).expect("response should be UTF-8");
+    text.split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn ingest_request(extra_headers: &str) -> String {
+    let body = r#"{"claim":{"claim_id":"claim-auth","tenant_id":"tenant-http","canonical_text":"Auth regression check","confidence":0.9}}"#;
+    format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\n{extra_headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn send(runtime: &Arc<Mutex<IngestionRuntime>>, raw: &str) -> String {
+    status_of(handle_http_request_bytes(runtime, raw.as_bytes()).expect("request should parse"))
+}
+
+#[test]
+fn transport_ingestion_reads_dash_ingest_credentials_and_rejects_anonymous_requests() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    // The variable names the Helm chart and k8s manifests set.
+    let _api_key = EnvVarGuard::set("DASH_INGEST_API_KEY", OsStr::new(STRONG_API_KEY));
+    let runtime = sample_runtime();
+    assert_eq!(send(&runtime, &ingest_request("")), "401");
+    assert_eq!(
+        send(
+            &runtime,
+            &ingest_request(&format!("X-API-Key: {STRONG_API_KEY}\r\n"))
+        ),
+        "200"
+    );
+}
+
+#[test]
+fn transport_jwt_only_config_rejects_ingest_without_a_token() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set(
+        "DASH_INGEST_JWT_HS256_SECRET",
+        OsStr::new(STRONG_JWT_SECRET),
+    );
+    let runtime = sample_runtime();
+    for headers in [
+        "",
+        "Authorization: Bearer not-a-jwt\r\n",
+        "X-API-Key: anything\r\n",
+    ] {
+        assert_eq!(
+            send(&runtime, &ingest_request(headers)),
+            "401",
+            "headers {headers:?}"
+        );
+    }
+}
+
+#[test]
+fn transport_metrics_and_debug_require_authentication_but_probes_stay_open() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_INGEST_API_KEY", OsStr::new(STRONG_API_KEY));
+    let runtime = sample_runtime();
+    let get = |path: &str, headers: &str| {
+        send(
+            &runtime,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n"
+            ),
+        )
+    };
+    for path in ["/metrics", "/debug/placement", "/debug/document-parser"] {
+        assert_eq!(get(path, ""), "401", "{path} anonymous");
+        assert_eq!(
+            get(path, &format!("X-API-Key: {STRONG_API_KEY}\r\n")),
+            "200",
+            "{path} authenticated"
+        );
+    }
+    for probe in ["/live", "/health", "/ready"] {
+        assert_eq!(get(probe, ""), "200", "{probe}");
+    }
+}
+
+#[test]
+fn transport_replication_endpoints_are_closed_without_a_token_outside_dev_mode() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _dev = EnvVarGuard::set("DASH_INSECURE_DEV_MODE", OsStr::new("0"));
+    let previous_dash = std::env::var_os("DASH_INGEST_REPLICATION_TOKEN");
+    let previous_eme = std::env::var_os("EME_INGEST_REPLICATION_TOKEN");
+    restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", None);
+    restore_env_var_for_tests("EME_INGEST_REPLICATION_TOKEN", None);
+
+    let runtime = sample_runtime();
+    let export =
+        "GET /internal/replication/export HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let wal = "GET /internal/replication/wal?from_offset=0 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let ack = "POST /internal/replication/ack?commit_id=c&replica_id=r HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let results = [
+        send(&runtime, export),
+        send(&runtime, wal),
+        send(&runtime, ack),
+    ];
+
+    restore_env_var_for_tests("DASH_INGEST_REPLICATION_TOKEN", previous_dash.as_deref());
+    restore_env_var_for_tests("EME_INGEST_REPLICATION_TOKEN", previous_eme.as_deref());
+    assert_eq!(results, ["403", "403", "403"]);
+}
+
+#[test]
+fn transport_replication_token_must_match_exactly() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _dev = EnvVarGuard::set("DASH_INSECURE_DEV_MODE", OsStr::new("0"));
+    let _token = EnvVarGuard::set(
+        "DASH_INGEST_REPLICATION_TOKEN",
+        OsStr::new(STRONG_REPLICATION_TOKEN),
+    );
+    let runtime = sample_runtime();
+    let status_for = |header: &str| {
+        send(
+            &runtime,
+            &format!(
+                "GET /internal/replication/commit-status?commit_id=unknown HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n"
+            ),
+        )
+    };
+    assert_eq!(status_for(""), "403");
+    assert_eq!(status_for("X-Replication-Token: wrong\r\n"), "403");
+    // A prefix of the real token, and the token with extra bytes, both fail.
+    let prefix = &STRONG_REPLICATION_TOKEN[..STRONG_REPLICATION_TOKEN.len() - 1];
+    assert_eq!(
+        status_for(&format!("X-Replication-Token: {prefix}\r\n")),
+        "403"
+    );
+    assert_eq!(
+        status_for(&format!(
+            "X-Replication-Token: {STRONG_REPLICATION_TOKEN}x\r\n"
+        )),
+        "403"
+    );
+    // The correct token passes authorization (unknown commit id => 404).
+    assert_eq!(
+        status_for(&format!(
+            "X-Replication-Token: {STRONG_REPLICATION_TOKEN}\r\n"
+        )),
+        "404"
+    );
+}
+
+#[test]
+fn transport_rate_limiter_keeps_state_across_requests_and_sets_retry_after() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_INGEST_API_KEY", OsStr::new(STRONG_API_KEY));
+    let _rps = EnvVarGuard::set("DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS", OsStr::new("1"));
+    let _burst = EnvVarGuard::set("DASH_INGEST_RATE_LIMIT_BURST", OsStr::new("2"));
+    let runtime = sample_runtime();
+    let headers = format!("X-API-Key: {STRONG_API_KEY}\r\n");
+    let mut statuses = Vec::new();
+    let mut last = String::new();
+    for index in 0..4 {
+        let body = format!(
+            r#"{{"claim":{{"claim_id":"claim-rate-{index}","tenant_id":"tenant-http","canonical_text":"Rate limit check {index}","confidence":0.9}}}}"#
+        );
+        let request = format!(
+            "POST /v1/ingest HTTP/1.1\r\nHost: localhost\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let response = handle_http_request_bytes(&runtime, request.as_bytes())
+            .expect("request should parse and return response");
+        last = String::from_utf8(response).expect("response should be UTF-8");
+        statuses.push(
+            last.split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    assert_eq!(statuses, ["200", "200", "429", "429"]);
+    assert!(last.contains("Retry-After: "), "{last}");
+}
+
+#[test]
+fn transport_ingest_authorizes_before_calling_the_embedding_provider() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_INGEST_API_KEY", OsStr::new(STRONG_API_KEY));
+    // An unreachable provider makes any pre-auth embedding call visible: the
+    // old code answered 400 "embedding failed" before checking credentials.
+    let _provider = EnvVarGuard::set("DASH_EMBEDDING_PROVIDER", OsStr::new("ollama"));
+    let _endpoint = EnvVarGuard::set("DASH_OLLAMA_ENDPOINT", OsStr::new("http://127.0.0.1:1"));
+    let runtime = sample_runtime();
+    assert_eq!(send(&runtime, &ingest_request("")), "401");
+    assert_eq!(
+        send(
+            &runtime,
+            &ingest_request(&format!("X-API-Key: {STRONG_API_KEY}\r\n"))
+        ),
+        "400"
+    );
 }

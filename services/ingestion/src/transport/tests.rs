@@ -1,4 +1,7 @@
+use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
+
+mod authz_matrix;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
 use metadata_router::{ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader};
 use std::io::Read;
@@ -7,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn sample_runtime() -> SharedRuntime {
+pub(super) fn sample_runtime() -> SharedRuntime {
+    ensure_dev_mode_env();
     Arc::new(Mutex::new(
         IngestionRuntime::in_memory(InMemoryStore::new()),
     ))
@@ -27,9 +31,23 @@ fn temp_wal_path() -> PathBuf {
     wal_path
 }
 
-fn env_lock() -> &'static Mutex<()> {
+/// Tests that exercise handlers without configuring credentials run in
+/// explicit dev mode (the only way to get an unauthenticated service).
+#[allow(unused_unsafe)]
+fn ensure_dev_mode_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+        std::env::set_var("DASH_STRICT_SECRETS", "0");
+    });
+}
+
+pub(super) fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| {
+        ensure_dev_mode_env();
+        Mutex::new(())
+    })
 }
 
 #[allow(unused_unsafe)]
@@ -1065,7 +1083,7 @@ fn auth_policy_scoped_key_allows_configured_tenant() {
         headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         None,
@@ -1086,7 +1104,7 @@ fn auth_policy_scoped_key_rejects_other_tenants() {
         headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
+    let policy = test_auth_policy(None, None, None, None, Some("scope-a:tenant-a".to_string()));
     assert_eq!(
         authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Ingest),
         AuthDecision::Forbidden("tenant is not allowed for this API key")
@@ -1101,7 +1119,7 @@ fn auth_policy_scoped_key_rejects_unknown_key_when_required_keys_are_unset() {
         headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         None,
@@ -1122,7 +1140,7 @@ fn auth_policy_required_key_rejects_missing_key() {
         headers: HashMap::new(),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
+    let policy = test_auth_policy(Some("secret".to_string()), None, None, None, None);
     assert_eq!(
         authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Unauthorized("missing or invalid API key")
@@ -1137,7 +1155,7 @@ fn auth_policy_required_key_set_supports_rotation() {
         headers: HashMap::from([("x-api-key".to_string(), "new-key".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         Some("old-key".to_string()),
         Some("new-key,old-key-2".to_string()),
         None,
@@ -1158,7 +1176,7 @@ fn auth_policy_revoked_key_is_denied() {
         headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         Some("scope-a".to_string()),

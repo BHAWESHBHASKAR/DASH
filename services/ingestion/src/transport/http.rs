@@ -17,6 +17,8 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) content_type: &'static str,
     pub(crate) body: String,
+    /// Emitted as a `Retry-After` header (429 responses).
+    pub(crate) retry_after_secs: Option<u64>,
 }
 
 impl HttpResponse {
@@ -25,6 +27,7 @@ impl HttpResponse {
             status: 200,
             content_type: "application/json",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -33,6 +36,7 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -41,6 +45,7 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; charset=utf-8",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -49,6 +54,7 @@ impl HttpResponse {
             status: 400,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -57,6 +63,7 @@ impl HttpResponse {
             status: 404,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -65,6 +72,7 @@ impl HttpResponse {
             status: 403,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -73,6 +81,7 @@ impl HttpResponse {
             status: 409,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -81,6 +90,7 @@ impl HttpResponse {
             status: 405,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -89,6 +99,7 @@ impl HttpResponse {
             status: 401,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -97,6 +108,7 @@ impl HttpResponse {
             status: 500,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -105,6 +117,16 @@ impl HttpResponse {
             status: 503,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+        }
+    }
+
+    pub(crate) fn too_many_requests(message: &str, retry_after_secs: u64) -> Self {
+        Self {
+            status: 429,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: Some(retry_after_secs),
         }
     }
 
@@ -115,6 +137,7 @@ impl HttpResponse {
             403 => Self::forbidden(message),
             409 => Self::conflict(message),
             404 => Self::not_found(message),
+            429 => Self::too_many_requests(message, 1),
             405 => Self::method_not_allowed(message),
             503 => Self::service_unavailable(message),
             _ => Self::internal_server_error(message),
@@ -158,13 +181,18 @@ pub(crate) fn render_response_text(response: &HttpResponse) -> String {
         409 => "409 Conflict",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        429 => "429 Too Many Requests",
         503 => "503 Service Unavailable",
         500 => "500 Internal Server Error",
         _ => "500 Internal Server Error",
     };
     let body_len = response.body.len();
+    let retry_after = response
+        .retry_after_secs
+        .map(|secs| format!("Retry-After: {secs}\r\n"))
+        .unwrap_or_default();
     format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\n{retry_after}Connection: close\r\n\r\n{}",
         response.content_type, response.body
     )
 }

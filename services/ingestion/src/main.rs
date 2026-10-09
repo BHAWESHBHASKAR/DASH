@@ -87,15 +87,12 @@ fn main() {
         }
     };
 
-    if let Err(reason) = validate_startup_secrets() {
-        if dash_common::strict_secrets_enabled() {
-            tracing::error!("ingestion startup secret validation failed: {reason}");
-            std::process::exit(2);
-        } else {
-            tracing::error!(
-                "ingestion startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)"
-            );
-        }
+    // Fail closed: refuse to start without usable authentication unless
+    // DASH_INSECURE_DEV_MODE=1 is set explicitly. The validated policy is
+    // built once here and shared by every request.
+    if serve_mode && let Err(reason) = ingestion::transport::initialize_auth_policy() {
+        tracing::error!("ingestion startup refused: {reason}");
+        std::process::exit(2);
     }
 
     let input = IngestInput {
@@ -386,41 +383,6 @@ fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
-}
-
-fn validate_startup_secrets() -> Result<(), String> {
-    let api_key = env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY");
-    let api_keys = env_with_fallback("DASH_INGEST_API_KEYS", "EME_INGEST_API_KEYS");
-    let jwt_secret = env_with_fallback(
-        "DASH_INGEST_JWT_HS256_SECRET",
-        "EME_INGEST_JWT_HS256_SECRET",
-    );
-    let jwt_secrets = env_with_fallback(
-        "DASH_INGEST_JWT_HS256_SECRETS",
-        "EME_INGEST_JWT_HS256_SECRETS",
-    );
-
-    if let Some(value) = api_key.as_deref() {
-        dash_common::validate_secret(value, "DASH_INGEST_API_KEY")?;
-    }
-    if let Some(value) = api_keys.as_deref() {
-        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_API_KEYS")?;
-    }
-    if let Some(value) = jwt_secret.as_deref() {
-        dash_common::validate_secret(value, "DASH_INGEST_JWT_HS256_SECRET")?;
-    }
-    if let Some(value) = jwt_secrets.as_deref() {
-        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_JWT_HS256_SECRETS")?;
-    }
-
-    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
-        return Err(
-            "DASH_STRICT_SECRETS=1 requires at least one ingest API key (DASH_INGEST_API_KEY or DASH_INGEST_API_KEYS)"
-                .into(),
-        );
-    }
-
-    Ok(())
 }
 
 fn parse_env_with_fallback<T>(primary: &str, fallback: &str) -> Option<T>

@@ -263,14 +263,20 @@ pub(crate) fn parse_replication_export_frame(body: &str) -> Result<ReplicationEx
     })
 }
 
+/// Replication endpoints expose every tenant's data and accept acks, so they
+/// are closed unless a replication token is configured and presented. With no
+/// token configured they stay closed, except in explicit dev mode
+/// (`DASH_INSECURE_DEV_MODE=1`). The token is compared in constant time.
 pub(super) fn is_replication_request_authorized(request: &HttpRequest) -> bool {
     let Some(expected_token) = replication_token() else {
-        return true;
+        return dash_common::insecure_dev_mode_enabled();
     };
     request
         .headers
         .get("x-replication-token")
-        .is_some_and(|value| value == &expected_token)
+        .is_some_and(|value| {
+            dash_common::constant_time_eq(value.trim().as_bytes(), expected_token.as_bytes())
+        })
 }
 
 pub(super) fn run_replication_pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) {

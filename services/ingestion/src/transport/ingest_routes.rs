@@ -26,9 +26,6 @@ pub(super) fn handle_ingest_post(
     };
     match build_ingest_request_from_json(body) {
         Ok(mut api_req) => {
-            if let Err(err) = api_req.embed_claim_if_missing() {
-                return HttpResponse::bad_request(&err);
-            }
             let tenant_id = api_req.claim.tenant_id.clone();
             let claim_id = api_req.claim.claim_id.clone();
             match authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Ingest) {
@@ -64,9 +61,34 @@ pub(super) fn handle_ingest_post(
                     );
                     return HttpResponse::forbidden(reason);
                 }
+                AuthDecision::RateLimited { retry_after_secs } => {
+                    observe_authz_denied(runtime);
+                    emit_audit_event(
+                        runtime,
+                        audit_log_path,
+                        AuditEvent {
+                            action: "ingest",
+                            tenant_id: Some(&tenant_id),
+                            claim_id: Some(&claim_id),
+                            status: 429,
+                            outcome: "denied",
+                            reason: "rate limit exceeded",
+                        },
+                    );
+                    return HttpResponse::too_many_requests(
+                        "rate limit exceeded",
+                        retry_after_secs,
+                    );
+                }
                 AuthDecision::Allowed => {
                     observe_auth_success(runtime);
                 }
+            }
+
+            // Only spend an embedding provider call once the caller is
+            // authorized (and before the runtime lock is taken).
+            if let Err(err) = api_req.embed_claim_if_missing() {
+                return HttpResponse::bad_request(&err);
             }
 
             let mut audit_status = 500;
@@ -216,6 +238,25 @@ pub(super) fn handle_ingest_raw_post(
                         },
                     );
                     return HttpResponse::forbidden(reason);
+                }
+                AuthDecision::RateLimited { retry_after_secs } => {
+                    observe_authz_denied(runtime);
+                    emit_audit_event(
+                        runtime,
+                        audit_log_path,
+                        AuditEvent {
+                            action: "ingest_raw",
+                            tenant_id: Some(&tenant_id),
+                            claim_id: None,
+                            status: 429,
+                            outcome: "denied",
+                            reason: "rate limit exceeded",
+                        },
+                    );
+                    return HttpResponse::too_many_requests(
+                        "rate limit exceeded",
+                        retry_after_secs,
+                    );
                 }
                 AuthDecision::Allowed => {
                     observe_auth_success(runtime);
@@ -433,6 +474,25 @@ pub(super) fn handle_ingest_batch_post(
                     );
                     return HttpResponse::forbidden(reason);
                 }
+                AuthDecision::RateLimited { retry_after_secs } => {
+                    observe_authz_denied(runtime);
+                    emit_audit_event(
+                        runtime,
+                        audit_log_path,
+                        AuditEvent {
+                            action: "ingest_batch",
+                            tenant_id: Some(&tenant_id),
+                            claim_id: None,
+                            status: 429,
+                            outcome: "denied",
+                            reason: "rate limit exceeded",
+                        },
+                    );
+                    return HttpResponse::too_many_requests(
+                        "rate limit exceeded",
+                        retry_after_secs,
+                    );
+                }
                 AuthDecision::Allowed => {
                     observe_auth_success(runtime);
                 }
@@ -603,6 +663,25 @@ pub(super) fn handle_ingest_document_post(
                         },
                     );
                     return HttpResponse::forbidden(reason);
+                }
+                AuthDecision::RateLimited { retry_after_secs } => {
+                    observe_authz_denied(runtime);
+                    emit_audit_event(
+                        runtime,
+                        audit_log_path,
+                        AuditEvent {
+                            action: "ingest_document",
+                            tenant_id: Some(&tenant_id),
+                            claim_id: None,
+                            status: 429,
+                            outcome: "denied",
+                            reason: "rate limit exceeded",
+                        },
+                    );
+                    return HttpResponse::too_many_requests(
+                        "rate limit exceeded",
+                        retry_after_secs,
+                    );
                 }
                 AuthDecision::Allowed => {
                     observe_auth_success(runtime);
@@ -813,19 +892,19 @@ fn commit_status_for_progress(ack_count: usize, required_acks: usize) -> &'stati
     }
 }
 
-fn observe_auth_success(runtime: &SharedRuntime) {
+pub(super) fn observe_auth_success(runtime: &SharedRuntime) {
     if let Ok(mut guard) = runtime.lock() {
         guard.observe_auth_success();
     }
 }
 
-fn observe_auth_failure(runtime: &SharedRuntime) {
+pub(super) fn observe_auth_failure(runtime: &SharedRuntime) {
     if let Ok(mut guard) = runtime.lock() {
         guard.observe_auth_failure();
     }
 }
 
-fn observe_authz_denied(runtime: &SharedRuntime) {
+pub(super) fn observe_authz_denied(runtime: &SharedRuntime) {
     if let Ok(mut guard) = runtime.lock() {
         guard.observe_authz_denied();
     }

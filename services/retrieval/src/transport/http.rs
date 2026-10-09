@@ -121,12 +121,17 @@ pub(super) fn render_response_text(response: &HttpResponse) -> String {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        429 => "429 Too Many Requests",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
     let body_len = response.body.len();
+    let retry_after = response
+        .retry_after_secs
+        .map(|secs| format!("Retry-After: {secs}\r\n"))
+        .unwrap_or_default();
     format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\n{retry_after}Connection: close\r\n\r\n{}",
         response.content_type, response.body
     )
 }

@@ -28,11 +28,16 @@ mod segment_runtime;
 mod server_runtime;
 
 use audit::{AuditEvent, emit_audit_event};
-pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
+pub use authz::initialize_auth_policy;
+pub(crate) use authz::{
+    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
+    shared_auth_policy,
+};
 use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
 };
+use dash_common::AuthPolicy;
 use document_parser_debug::render_document_parser_debug_json;
 use http::{
     HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,

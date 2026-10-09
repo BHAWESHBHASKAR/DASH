@@ -33,13 +33,20 @@ use crate::api::{
 };
 mod audit;
 mod authz;
+#[cfg(test)]
+mod authz_matrix_tests;
 mod debug_render;
 mod http;
 mod payload;
 use audit::{AuditEvent, append_audit_record};
 #[cfg(test)]
 use audit::{audit_chain_states, is_sha256_hex};
-pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
+pub use authz::initialize_auth_policy;
+pub(crate) use authz::{
+    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
+    shared_auth_policy,
+};
+use dash_common::AuthPolicy;
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
@@ -1120,23 +1127,26 @@ fn handle_request_with_metrics_and_reload(
     placement_routing: Option<&PlacementRoutingRuntime>,
     placement_reload: Option<&PlacementReloadSnapshot>,
 ) -> HttpResponse {
+    let auth_policy = shared_auth_policy();
+    handle_request_with_policy(
+        store,
+        request,
+        metrics,
+        placement_routing,
+        placement_reload,
+        &auth_policy,
+    )
+}
+
+fn handle_request_with_policy(
+    store: &InMemoryStore,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_reload: Option<&PlacementReloadSnapshot>,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
     let (path, query) = split_target(&request.target);
-    let auth_policy = AuthPolicy::from_env(
-        env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY"),
-        env_with_fallback("DASH_RETRIEVAL_API_KEYS", "EME_RETRIEVAL_API_KEYS"),
-        env_with_fallback(
-            "DASH_RETRIEVAL_REVOKED_API_KEYS",
-            "EME_RETRIEVAL_REVOKED_API_KEYS",
-        ),
-        env_with_fallback(
-            "DASH_RETRIEVAL_ALLOWED_TENANTS",
-            "EME_RETRIEVAL_ALLOWED_TENANTS",
-        ),
-        env_with_fallback(
-            "DASH_RETRIEVAL_API_KEY_SCOPES",
-            "EME_RETRIEVAL_API_KEY_SCOPES",
-        ),
-    );
     let audit_log_path = env_with_fallback(
         "DASH_RETRIEVAL_AUDIT_LOG_PATH",
         "EME_RETRIEVAL_AUDIT_LOG_PATH",
@@ -1176,12 +1186,10 @@ fn handle_request_with_metrics_and_reload(
                 }
                 store::DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
-                        HttpResponse::error_with_status(
-                            503,
-                            &format!(
-                                "{{\"status\":\"not_ready\",\"reason\":\"disk unavailable: {reason}\"}}"
-                            ),
-                        )
+                        // The underlying reason may contain paths or OS
+                        // errors; keep it in the log, not in the response.
+                        eprintln!("retrieval readiness: disk unavailable: {reason}");
+                        HttpResponse::error_with_status(503, "not ready")
                     } else {
                         HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                     }
@@ -1189,6 +1197,18 @@ fn handle_request_with_metrics_and_reload(
             }
         }
         ("GET", "/metrics") => {
+            if !auth_policy.metrics_public()
+                && let Some(denied) = deny_unless_allowed(
+                    authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "metrics",
+                    None,
+                    false,
+                )
+            {
+                return denied;
+            }
             let body = if let Ok(guard) = metrics.lock() {
                 guard.render_prometheus(placement_routing, store.disk_status())
             } else {
@@ -1196,212 +1216,107 @@ fn handle_request_with_metrics_and_reload(
             };
             HttpResponse::ok_text(body)
         }
-        ("GET", "/debug/placement") => HttpResponse::ok_json(render_placement_debug_json(
-            placement_routing,
-            placement_reload,
-            &query,
-        )),
+        ("GET", "/debug/placement") => {
+            if let Some(denied) = deny_unless_allowed(
+                authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                metrics,
+                audit_log_path.as_deref(),
+                "debug_placement",
+                None,
+                false,
+            ) {
+                return denied;
+            }
+            HttpResponse::ok_json(render_placement_debug_json(
+                placement_routing,
+                placement_reload,
+                &query,
+            ))
+        }
         ("GET", "/debug/planner") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::ReadOnly,
+                if let Some(denied) = deny_unless_allowed(
+                    authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_planner",
+                    Some(&tenant_id),
+                    false,
                 ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            200,
-                            "success",
-                            "planner debug snapshot generated",
-                        );
-                        HttpResponse::ok_json(render_planner_debug_json(&snapshot))
-                    }
+                    return denied;
                 }
+                let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                emit_audit_event(
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_planner",
+                    Some(&tenant_id),
+                    200,
+                    "success",
+                    "planner debug snapshot generated",
+                );
+                HttpResponse::ok_json(render_planner_debug_json(&snapshot))
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
         ("GET", "/debug/storage-visibility") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::ReadOnly,
+                if let Some(denied) = deny_unless_allowed(
+                    authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_storage_visibility",
+                    Some(&tenant_id),
+                    false,
                 ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
-                        let (_, merge_snapshot) =
-                            execute_api_query_with_storage_snapshot(store, req.clone());
-                        let warn_delta_count = resolve_storage_divergence_warn_delta_count();
-                        let warn_ratio = resolve_storage_divergence_warn_ratio();
-                        let (warn, reason, ratio) = evaluate_storage_divergence_warning(
-                            &snapshot,
-                            warn_delta_count,
-                            warn_ratio,
-                        );
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
-                            guard.observe_storage_merge_execution(&merge_snapshot);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            200,
-                            if warn { "warning" } else { "success" },
-                            reason
-                                .as_deref()
-                                .unwrap_or("storage visibility snapshot generated"),
-                        );
-                        HttpResponse::ok_json(render_storage_visibility_debug_json(
-                            &snapshot,
-                            &merge_snapshot,
-                            warn_delta_count,
-                            warn_ratio,
-                            warn,
-                            reason.as_deref(),
-                            ratio,
-                        ))
-                    }
+                    return denied;
                 }
+                let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                let (_, merge_snapshot) =
+                    execute_api_query_with_storage_snapshot(store, req.clone());
+                let warn_delta_count = resolve_storage_divergence_warn_delta_count();
+                let warn_ratio = resolve_storage_divergence_warn_ratio();
+                let (warn, reason, ratio) =
+                    evaluate_storage_divergence_warning(&snapshot, warn_delta_count, warn_ratio);
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
+                    guard.observe_storage_merge_execution(&merge_snapshot);
+                }
+                emit_audit_event(
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_storage_visibility",
+                    Some(&tenant_id),
+                    200,
+                    if warn { "warning" } else { "success" },
+                    reason
+                        .as_deref()
+                        .unwrap_or("storage visibility snapshot generated"),
+                );
+                HttpResponse::ok_json(render_storage_visibility_debug_json(
+                    &snapshot,
+                    &merge_snapshot,
+                    warn_delta_count,
+                    warn_ratio,
+                    warn,
+                    reason.as_deref(),
+                    ratio,
+                ))
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
         ("GET", "/v1/retrieve") => match build_retrieve_transport_request_from_query(&query) {
-            Ok(transport_req) => {
-                let mut req = transport_req.request;
-                if let Err(err) = embed_query_if_missing(&mut req) {
-                    return HttpResponse::bad_request(&err);
-                }
-                let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::Retrieve,
-                ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_retrieve(401, 0.0, 0, None);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_retrieve(403, 0.0, 0, None);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let response = execute_retrieve_and_observe(
-                            store,
-                            req,
-                            transport_req.read_consistency,
-                            metrics,
-                            placement_routing,
-                        );
-                        let (outcome, reason) = if response.status < 400 {
-                            ("success", "retrieve accepted")
-                        } else {
-                            ("error", "retrieve rejected")
-                        };
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            response.status,
-                            outcome,
-                            reason,
-                        );
-                        response
-                    }
-                }
-            }
+            Ok(transport_req) => handle_authorized_retrieve(
+                store,
+                request,
+                transport_req,
+                auth_policy,
+                metrics,
+                placement_routing,
+                audit_log_path.as_deref(),
+            ),
             Err(err) => {
                 if let Ok(mut guard) = metrics.lock() {
                     guard.observe_retrieve(400, 0.0, 0, None);
@@ -1433,77 +1348,15 @@ fn handle_request_with_metrics_and_reload(
                 }
             };
             match build_retrieve_transport_request_from_json(body) {
-                Ok(transport_req) => {
-                    let mut req = transport_req.request;
-                    if let Err(err) = embed_query_if_missing(&mut req) {
-                        return HttpResponse::bad_request(&err);
-                    }
-                    let tenant_id = req.tenant_id.clone();
-                    match authorize_request_for_tenant(
-                        request,
-                        &tenant_id,
-                        &auth_policy,
-                        Role::Retrieve,
-                    ) {
-                        AuthDecision::Unauthorized(reason) => {
-                            observe_auth_failure(metrics);
-                            if let Ok(mut guard) = metrics.lock() {
-                                guard.observe_retrieve(401, 0.0, 0, None);
-                            }
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                401,
-                                "denied",
-                                reason,
-                            );
-                            HttpResponse::unauthorized(reason)
-                        }
-                        AuthDecision::Forbidden(reason) => {
-                            observe_authz_denied(metrics);
-                            if let Ok(mut guard) = metrics.lock() {
-                                guard.observe_retrieve(403, 0.0, 0, None);
-                            }
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                403,
-                                "denied",
-                                reason,
-                            );
-                            HttpResponse::forbidden(reason)
-                        }
-                        AuthDecision::Allowed => {
-                            observe_auth_success(metrics);
-                            let response = execute_retrieve_and_observe(
-                                store,
-                                req,
-                                transport_req.read_consistency,
-                                metrics,
-                                placement_routing,
-                            );
-                            let (outcome, reason) = if response.status < 400 {
-                                ("success", "retrieve accepted")
-                            } else {
-                                ("error", "retrieve rejected")
-                            };
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                response.status,
-                                outcome,
-                                reason,
-                            );
-                            response
-                        }
-                    }
-                }
+                Ok(transport_req) => handle_authorized_retrieve(
+                    store,
+                    request,
+                    transport_req,
+                    auth_policy,
+                    metrics,
+                    placement_routing,
+                    audit_log_path.as_deref(),
+                ),
                 Err(err) => {
                     if let Ok(mut guard) = metrics.lock() {
                         guard.observe_retrieve(400, 0.0, 0, None);
@@ -1513,25 +1366,34 @@ fn handle_request_with_metrics_and_reload(
             }
         }
         ("POST", "/v1/embeddings") => {
-            // OpenAI-compatible embeddings endpoint. No auth required at the
-            // HTTP layer (it accepts only the request body); a future
-            // version will wire JWT/API-key checks here.
+            // OpenAI-compatible embeddings endpoint. Requires valid
+            // credentials (and the retrieve role) before any provider call so
+            // anonymous callers cannot spend provider quota.
             //
-            // The embedding backend is selected at request time from the
+            // The embedding backend is selected from the
             // DASH_EMBEDDING_PROVIDER env var. The default is `hash`
             // (deterministic, no network) which is suitable for
             // testing and for environments that have not yet wired up
             // a real embedding model. Production deployments should
             // set `DASH_EMBEDDING_PROVIDER=ollama` or `=openai` so the
             // vectors are semantically meaningful.
+            if let Some(denied) = deny_unless_allowed(
+                authorize_request_any_tenant(request, auth_policy, Role::Retrieve),
+                metrics,
+                audit_log_path.as_deref(),
+                "embeddings",
+                None,
+                false,
+            ) {
+                return denied;
+            }
             let body = match std::str::from_utf8(&request.body) {
                 Ok(text) => text,
                 Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
             };
-            let provider = embeddings::select_embedding_provider_from_env();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
                 body,
-                provider.as_ref(),
+                embedding_provider().as_ref(),
             ) {
                 Ok(resp) => {
                     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
@@ -1540,11 +1402,7 @@ fn handle_request_with_metrics_and_reload(
                 Err(err) => {
                     let body = serde_json::to_string(&err)
                         .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
-                    HttpResponse {
-                        status: 400,
-                        content_type: "application/json",
-                        body,
-                    }
+                    HttpResponse::json_with_status(400, body)
                 }
             }
         }
@@ -1604,6 +1462,137 @@ fn observe_authz_denied(metrics: &Arc<Mutex<TransportMetrics>>) {
     }
 }
 
+/// Turn a non-`Allowed` decision into a response, recording auth metrics and
+/// an audit event. Returns `None` (after counting the success) when allowed.
+fn deny_unless_allowed(
+    decision: AuthDecision,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    audit_log_path: Option<&str>,
+    action: &str,
+    tenant_id: Option<&str>,
+    observe_retrieve: bool,
+) -> Option<HttpResponse> {
+    let (status, reason, response) = match decision {
+        AuthDecision::Allowed => {
+            // Only tenant-scoped requests count towards the auth success
+            // counter; operational endpoints (metrics, debug) do not.
+            if tenant_id.is_some() {
+                observe_auth_success(metrics);
+            }
+            return None;
+        }
+        AuthDecision::Unauthorized(reason) => {
+            observe_auth_failure(metrics);
+            (401, reason, HttpResponse::unauthorized(reason))
+        }
+        AuthDecision::Forbidden(reason) => {
+            observe_authz_denied(metrics);
+            (403, reason, HttpResponse::forbidden(reason))
+        }
+        AuthDecision::RateLimited { retry_after_secs } => {
+            observe_authz_denied(metrics);
+            (
+                429,
+                "rate limit exceeded",
+                HttpResponse::too_many_requests("rate limit exceeded", retry_after_secs),
+            )
+        }
+    };
+    if observe_retrieve && let Ok(mut guard) = metrics.lock() {
+        guard.observe_retrieve(status, 0.0, 0, None);
+    }
+    emit_audit_event(
+        metrics,
+        audit_log_path,
+        action,
+        tenant_id,
+        status,
+        "denied",
+        reason,
+    );
+    Some(response)
+}
+
+/// Shared tail of `GET`/`POST /v1/retrieve`: authorize first, and only then
+/// spend an embedding provider call on the query.
+fn handle_authorized_retrieve(
+    store: &InMemoryStore,
+    request: &HttpRequest,
+    transport_req: RetrieveTransportRequest,
+    auth_policy: &AuthPolicy,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    audit_log_path: Option<&str>,
+) -> HttpResponse {
+    let mut req = transport_req.request;
+    let tenant_id = req.tenant_id.clone();
+    if let Some(denied) = deny_unless_allowed(
+        authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Retrieve),
+        metrics,
+        audit_log_path,
+        "retrieve",
+        Some(&tenant_id),
+        true,
+    ) {
+        return denied;
+    }
+    if let Err(err) = embed_query_if_missing(&mut req) {
+        return HttpResponse::bad_request(&err);
+    }
+    let response = execute_retrieve_and_observe(
+        store,
+        req,
+        transport_req.read_consistency,
+        metrics,
+        placement_routing,
+    );
+    let (outcome, reason) = if response.status < 400 {
+        ("success", "retrieve accepted")
+    } else {
+        ("error", "retrieve rejected")
+    };
+    emit_audit_event(
+        metrics,
+        audit_log_path,
+        "retrieve",
+        Some(&tenant_id),
+        response.status,
+        outcome,
+        reason,
+    );
+    response
+}
+
+type SharedEmbeddingProvider = Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
+
+/// Embedding provider shared by requests. It is rebuilt only when the
+/// provider-related environment changes, instead of on every request.
+fn embedding_provider() -> SharedEmbeddingProvider {
+    use std::hash::{Hash, Hasher};
+    static CACHE: Mutex<Option<(u64, SharedEmbeddingProvider)>> = Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "DASH_EMBEDDING_PROVIDER",
+        "DASH_OLLAMA_ENDPOINT",
+        "DASH_OLLAMA_MODEL",
+        "DASH_OPENAI_API_KEY",
+        "DASH_OPENAI_MODEL",
+    ] {
+        std::env::var(name).ok().hash(&mut hasher);
+    }
+    let signature = hasher.finish();
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((cached, provider)) = cache.as_ref()
+        && *cached == signature
+    {
+        return Arc::clone(provider);
+    }
+    let provider: SharedEmbeddingProvider =
+        Arc::from(embeddings::select_embedding_provider_from_env());
+    *cache = Some((signature, Arc::clone(&provider)));
+    provider
+}
+
 fn emit_audit_event(
     metrics: &Arc<Mutex<TransportMetrics>>,
     audit_log_path: Option<&str>,
@@ -1648,7 +1637,7 @@ fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), String> {
     if req.query_embedding.is_some() {
         return Ok(());
     }
-    let provider = embeddings::select_embedding_provider_from_env();
+    let provider = embedding_provider();
     let vectors = provider
         .embed(std::slice::from_ref(&req.query))
         .map_err(|e| format!("embedding failed: {e}"))?;
@@ -2102,6 +2091,8 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) content_type: &'static str,
     pub(crate) body: String,
+    /// Emitted as a `Retry-After` header (429 responses).
+    pub(crate) retry_after_secs: Option<u64>,
 }
 
 impl HttpResponse {
@@ -2110,6 +2101,7 @@ impl HttpResponse {
             status: 200,
             content_type: "application/json",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -2118,6 +2110,7 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -2126,6 +2119,7 @@ impl HttpResponse {
             status: 400,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2134,6 +2128,7 @@ impl HttpResponse {
             status: 401,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2142,6 +2137,7 @@ impl HttpResponse {
             status: 403,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2150,6 +2146,7 @@ impl HttpResponse {
             status: 405,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2158,6 +2155,7 @@ impl HttpResponse {
             status: 404,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2166,6 +2164,7 @@ impl HttpResponse {
             status: 500,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2174,6 +2173,25 @@ impl HttpResponse {
             status: 503,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+        }
+    }
+
+    fn too_many_requests(message: &str, retry_after_secs: u64) -> Self {
+        Self {
+            status: 429,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: Some(retry_after_secs),
+        }
+    }
+
+    fn json_with_status(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body,
+            retry_after_secs: None,
         }
     }
 
@@ -2183,6 +2201,7 @@ impl HttpResponse {
             401 => Self::unauthorized(message),
             403 => Self::forbidden(message),
             404 => Self::not_found(message),
+            429 => Self::too_many_requests(message, 1),
             405 => Self::method_not_allowed(message),
             503 => Self::service_unavailable(message),
             _ => Self::internal_server_error(message),
@@ -2192,6 +2211,7 @@ impl HttpResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::authz::policy_from_parts as test_auth_policy;
     use super::*;
     use indexer::{Segment, Tier, persist_segments_atomic};
     use metadata_router::{
@@ -2209,6 +2229,7 @@ mod tests {
     };
 
     fn sample_store() -> InMemoryStore {
+        ensure_dev_mode_env();
         let mut store = InMemoryStore::new();
         store
             .ingest_bundle(
@@ -2273,9 +2294,23 @@ mod tests {
         file.flush().expect("placement file should flush");
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    /// Tests that exercise handlers without configuring credentials run in
+    /// explicit dev mode (the only way to get an unauthenticated service).
+    #[allow(unused_unsafe)]
+    pub(super) fn ensure_dev_mode_env() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+            std::env::set_var("DASH_STRICT_SECRETS", "0");
+        });
+    }
+
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        LOCK.get_or_init(|| {
+            ensure_dev_mode_env();
+            Mutex::new(())
+        })
     }
 
     #[allow(unused_unsafe)]
@@ -3413,7 +3448,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             None,
@@ -3434,8 +3469,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy =
-            AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
+        let policy = test_auth_policy(None, None, None, None, Some("scope-a:tenant-a".to_string()));
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Retrieve),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
@@ -3450,7 +3484,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             None,
@@ -3471,7 +3505,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::new(),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
+        let policy = test_auth_policy(Some("secret".to_string()), None, None, None, None);
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
@@ -3486,7 +3520,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "new-key".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             Some("old-key".to_string()),
             Some("new-key,old-key-2".to_string()),
             None,
@@ -3507,7 +3541,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             Some("scope-a".to_string()),

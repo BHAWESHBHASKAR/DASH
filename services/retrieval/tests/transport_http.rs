@@ -12,6 +12,7 @@ use schema::{Claim, ClaimType, Evidence, Stance};
 use store::InMemoryStore;
 
 fn sample_store() -> InMemoryStore {
+    ensure_dev_mode_env();
     let mut store = InMemoryStore::new();
     store
         .ingest_bundle(
@@ -48,9 +49,23 @@ fn sample_store() -> InMemoryStore {
     store
 }
 
+/// Tests that exercise handlers without configuring credentials run in
+/// explicit dev mode (the only way to get an unauthenticated service).
+#[allow(unused_unsafe)]
+fn ensure_dev_mode_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+        std::env::set_var("DASH_STRICT_SECRETS", "0");
+    });
+}
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| {
+        ensure_dev_mode_env();
+        Mutex::new(())
+    })
 }
 
 #[allow(unused_unsafe)]
@@ -492,4 +507,128 @@ fn transport_openai_embeddings_get_method_returns_405() {
 
     assert!(response.starts_with("HTTP/1.1 405"));
     assert!(response.contains("only POST is supported"));
+}
+
+// ---------------------------------------------------------------------------
+// Deny-by-default regressions (SEC-02, SEC-06, SEC-09, SEC-10). These drive
+// the public handler with the policy built from the environment.
+// ---------------------------------------------------------------------------
+
+const STRONG_JWT_SECRET: &str = "integration-hs256-signing-key-4b8e1d7a90c2f365";
+const STRONG_API_KEY: &str = "integration-api-key-7d41c8e09ab35f26";
+
+fn status_of(raw_response: Vec<u8>) -> String {
+    let text = String::from_utf8(raw_response).expect("response should be UTF-8");
+    text.split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn transport_jwt_only_config_rejects_requests_without_a_token() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _jwt_secret = EnvVarGuard::set(
+        "DASH_RETRIEVAL_JWT_HS256_SECRET",
+        OsStr::new(STRONG_JWT_SECRET),
+    );
+    let store = sample_store();
+    for headers in [
+        "",
+        "Authorization: Bearer not-a-jwt\r\n",
+        "X-API-Key: anything\r\n",
+    ] {
+        let request = format!(
+            "GET /v1/retrieve?tenant_id=tenant-other&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n"
+        );
+        let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+            .expect("request should parse and return response");
+        assert_eq!(status_of(response), "401", "headers {headers:?}");
+    }
+}
+
+#[test]
+fn transport_embeddings_metrics_and_debug_require_authentication() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_RETRIEVAL_API_KEY", OsStr::new(STRONG_API_KEY));
+    let store = sample_store();
+    let body = r#"{"input":"hello","model":"text-embedding-3-small"}"#;
+    let embeddings = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let authed_embeddings = format!(
+        "POST /v1/embeddings HTTP/1.1\r\nHost: localhost\r\nX-API-Key: {STRONG_API_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let anonymous =
+        |path: &str| format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let handle = |raw: &str| {
+        status_of(
+            retrieval::transport::handle_http_request_bytes(&store, raw.as_bytes())
+                .expect("request should parse and return response"),
+        )
+    };
+    assert_eq!(handle(&embeddings), "401");
+    assert_eq!(handle(&authed_embeddings), "200");
+    assert_eq!(handle(&anonymous("/metrics")), "401");
+    assert_eq!(handle(&anonymous("/debug/placement")), "401");
+    // Probes stay open and do not leak internals.
+    for probe in ["/live", "/health", "/ready"] {
+        assert_eq!(handle(&anonymous(probe)), "200", "{probe}");
+    }
+}
+
+#[test]
+fn transport_rate_limiter_keeps_state_across_requests_and_sets_retry_after() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_RETRIEVAL_API_KEY", OsStr::new(STRONG_API_KEY));
+    let _rps = EnvVarGuard::set("DASH_RETRIEVAL_RATE_LIMIT_PER_TENANT_RPS", OsStr::new("1"));
+    let _burst = EnvVarGuard::set("DASH_RETRIEVAL_RATE_LIMIT_BURST", OsStr::new("2"));
+    let store = sample_store();
+    let request = format!(
+        "GET /v1/retrieve?tenant_id=tenant-http&query=company+x&top_k=1 HTTP/1.1\r\nHost: localhost\r\nX-API-Key: {STRONG_API_KEY}\r\nConnection: close\r\n\r\n"
+    );
+    let mut statuses = Vec::new();
+    let mut last = String::new();
+    for _ in 0..4 {
+        let response = retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+            .expect("request should parse and return response");
+        last = String::from_utf8(response).expect("response should be UTF-8");
+        statuses.push(
+            last.split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    assert_eq!(statuses, ["200", "200", "429", "429"]);
+    assert!(last.contains("Retry-After: "), "{last}");
+}
+
+#[test]
+fn transport_authorizes_before_calling_the_embedding_provider() {
+    let _guard = env_lock().lock().expect("env lock should be available");
+    let _api_key = EnvVarGuard::set("DASH_RETRIEVAL_API_KEY", OsStr::new(STRONG_API_KEY));
+    // An unreachable provider makes any pre-auth embedding call visible: the
+    // old code answered 400 "embedding failed" before checking credentials.
+    let _provider = EnvVarGuard::set("DASH_EMBEDDING_PROVIDER", OsStr::new("ollama"));
+    let _endpoint = EnvVarGuard::set("DASH_OLLAMA_ENDPOINT", OsStr::new("http://127.0.0.1:1"));
+    let store = sample_store();
+    let body = r#"{"tenant_id":"tenant-http","query":"company x","top_k":1}"#;
+    let send = |auth: &str| {
+        let request = format!(
+            "POST /v1/retrieve HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        status_of(
+            retrieval::transport::handle_http_request_bytes(&store, request.as_bytes())
+                .expect("request should parse and return response"),
+        )
+    };
+    assert_eq!(send(""), "401");
+    assert_eq!(send(&format!("X-API-Key: {STRONG_API_KEY}\r\n")), "400");
 }
