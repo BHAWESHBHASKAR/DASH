@@ -128,19 +128,15 @@ type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider 
 /// Embedding provider shared by requests. It is rebuilt only when the
 /// provider-related environment changes, instead of on every request.
 fn shared_embedding_provider() -> SharedEmbeddingProvider {
-    static CACHE: std::sync::Mutex<Option<(u64, SharedEmbeddingProvider)>> =
-        std::sync::Mutex::new(None);
-    let signature = embeddings::provider_env_signature();
-    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((cached, provider)) = cache.as_ref()
-        && *cached == signature
-    {
-        return std::sync::Arc::clone(provider);
-    }
-    let provider: SharedEmbeddingProvider =
-        std::sync::Arc::from(embeddings::select_embedding_provider_from_env());
-    *cache = Some((signature, std::sync::Arc::clone(&provider)));
-    provider
+    PROVIDER_CACHE.get()
+}
+
+static PROVIDER_CACHE: embeddings::SharedProviderCache = embeddings::SharedProviderCache::new();
+
+/// How many times the ingest path has constructed an embedding provider.
+#[cfg(test)]
+pub(crate) fn embedding_provider_build_count() -> u64 {
+    PROVIDER_CACHE.build_count()
 }
 
 impl IngestApiRequest {

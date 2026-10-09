@@ -2,6 +2,7 @@ use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
 
 mod authz_matrix;
+mod provider_cache;
 mod review_fixes;
 mod write_path;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};

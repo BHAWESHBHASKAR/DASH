@@ -1718,18 +1718,15 @@ fn embedding_provider() -> SharedEmbeddingProvider {
     if let Some(provider) = PROVIDER_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return provider;
     }
-    static CACHE: Mutex<Option<(u64, SharedEmbeddingProvider)>> = Mutex::new(None);
-    let signature = embeddings::provider_env_signature();
-    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some((cached, provider)) = cache.as_ref()
-        && *cached == signature
-    {
-        return Arc::clone(provider);
-    }
-    let provider: SharedEmbeddingProvider =
-        Arc::from(embeddings::select_embedding_provider_from_env());
-    *cache = Some((signature, Arc::clone(&provider)));
-    provider
+    PROVIDER_CACHE.get()
+}
+
+static PROVIDER_CACHE: embeddings::SharedProviderCache = embeddings::SharedProviderCache::new();
+
+/// How many times the request path has constructed an embedding provider.
+#[cfg(test)]
+fn embedding_provider_build_count() -> u64 {
+    PROVIDER_CACHE.build_count()
 }
 
 fn emit_audit_event(
@@ -4136,6 +4133,47 @@ tenant-a,0,12,node-a,follower,healthy\n",
 
     fn embeddings_request(body: &str) -> HttpRequest {
         json_post("/v1/embeddings", body)
+    }
+
+    /// PERF-07: requests share one provider; only a change of a variable in
+    /// the provider environment signature builds a new one.
+    #[test]
+    fn requests_reuse_one_provider_until_the_environment_signature_changes() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("DASH_OLLAMA_MODEL");
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let embed = || {
+            handle_request_with_metrics(
+                &store,
+                &embeddings_request(r#"{"input":"hello","model":"m"}"#),
+                &metrics,
+            )
+            .status
+        };
+
+        set_env_var_for_tests("DASH_OLLAMA_MODEL", "model-a");
+        assert_eq!(embed(), 200);
+        let after_warmup = embedding_provider_build_count();
+        for _ in 0..50 {
+            assert_eq!(embed(), 200);
+        }
+        assert_eq!(
+            embedding_provider_build_count(),
+            after_warmup,
+            "unchanged environment must not rebuild the provider"
+        );
+
+        set_env_var_for_tests("DASH_OLLAMA_MODEL", "model-b");
+        for _ in 0..50 {
+            assert_eq!(embed(), 200);
+        }
+        assert_eq!(
+            embedding_provider_build_count(),
+            after_warmup + 1,
+            "a signature change must cause exactly one rebuild"
+        );
+        restore_env_var_for_tests("DASH_OLLAMA_MODEL", previous.as_deref());
     }
 
     #[test]

@@ -7,9 +7,15 @@ use store::FileWal;
 
 static BATCH_COMMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// The environment override is resolved once per process: this runs on every
+/// batch request, and a restart is the documented way to change it.
 pub(super) fn resolve_ingest_batch_max_items(default_ingest_batch_max_items: usize) -> usize {
-    parse_env_first_usize(&["DASH_INGEST_BATCH_MAX_ITEMS", "EME_INGEST_BATCH_MAX_ITEMS"])
-        .filter(|value| *value > 0)
+    static CONFIGURED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| {
+            parse_env_first_usize(&["DASH_INGEST_BATCH_MAX_ITEMS", "EME_INGEST_BATCH_MAX_ITEMS"])
+                .filter(|value| *value > 0)
+        })
         .unwrap_or(default_ingest_batch_max_items)
 }
 

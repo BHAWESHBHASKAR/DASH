@@ -1042,6 +1042,62 @@ pub fn provider_env_signature() -> u64 {
     hasher.finish()
 }
 
+/// Process-wide cache for the provider a service uses on its request path.
+/// The provider is constructed once per [`provider_env_signature`] and shared
+/// by every request; it is rebuilt only when a variable in the signature
+/// changes. Both services keep one `static` of this type so ingestion and
+/// retrieval rebuild under exactly the same conditions.
+pub struct SharedProviderCache {
+    slot: std::sync::Mutex<Option<(u64, Arc<dyn EmbeddingProvider + Send + Sync>)>>,
+    builds: AtomicU64,
+}
+
+impl SharedProviderCache {
+    pub const fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+            builds: AtomicU64::new(0),
+        }
+    }
+
+    /// The provider for the current environment.
+    pub fn get(&self) -> Arc<dyn EmbeddingProvider + Send + Sync> {
+        self.get_with(provider_env_signature(), || {
+            Arc::from(select_embedding_provider_from_env())
+        })
+    }
+
+    /// Like [`Self::get`] with an explicit signature and constructor.
+    pub fn get_with(
+        &self,
+        signature: u64,
+        build: impl FnOnce() -> Arc<dyn EmbeddingProvider + Send + Sync>,
+    ) -> Arc<dyn EmbeddingProvider + Send + Sync> {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached, provider)) = slot.as_ref()
+            && *cached == signature
+        {
+            return Arc::clone(provider);
+        }
+        let provider = build();
+        self.builds.fetch_add(1, Ordering::Relaxed);
+        *slot = Some((signature, Arc::clone(&provider)));
+        provider
+    }
+
+    /// How many times a provider has been constructed. Tests use it to prove
+    /// requests reuse one instance.
+    pub fn build_count(&self) -> u64 {
+        self.builds.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SharedProviderCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Build an [`EmbeddingProvider`] from the process environment. This is the
 /// single place service binaries read `DASH_EMBEDDING_PROVIDER` so the
 /// selection logic stays consistent between ingestion and retrieval.
@@ -2505,6 +2561,23 @@ mod tests {
                 retry_after_secs: 9
             }
         );
+    }
+
+    #[test]
+    fn shared_provider_cache_builds_once_per_signature() {
+        let cache = SharedProviderCache::new();
+        let build = || -> Arc<dyn EmbeddingProvider + Send + Sync> {
+            Arc::new(HashEmbeddingProvider::new(8))
+        };
+        let first = cache.get_with(1, build);
+        for _ in 0..100 {
+            let again = cache.get_with(1, build);
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+        assert_eq!(cache.build_count(), 1);
+        let other = cache.get_with(2, build);
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(cache.build_count(), 2);
     }
 
     /// Both services key their cached provider on this signature; every

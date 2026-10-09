@@ -236,12 +236,17 @@ pub fn handle_openai_embeddings(
     handle_openai_embeddings_with_provider(body, provider.as_ref())
 }
 
+/// Resolved once per process: it is read on every embeddings request, and a
+/// restart is the documented way to change it.
 fn max_total_chars() -> usize {
-    std::env::var("DASH_EMBEDDING_MAX_TOTAL_CHARS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_TOTAL_CHARS)
+    static CONFIGURED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CONFIGURED.get_or_init(|| {
+        std::env::var("DASH_EMBEDDING_MAX_TOTAL_CHARS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_TOTAL_CHARS)
+    })
 }
 
 fn token_ids_allowed() -> bool {
@@ -1010,6 +1015,20 @@ mod tests {
                 short: false,
             },
         )
+    }
+
+    #[test]
+    fn max_total_chars_is_resolved_once_per_process() {
+        let _guard = test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("DASH_EMBEDDING_MAX_TOTAL_CHARS");
+        let first = max_total_chars();
+        unsafe { std::env::set_var("DASH_EMBEDDING_MAX_TOTAL_CHARS", (first + 7).to_string()) };
+        let second = max_total_chars();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("DASH_EMBEDDING_MAX_TOTAL_CHARS", value) },
+            None => unsafe { std::env::remove_var("DASH_EMBEDDING_MAX_TOTAL_CHARS") },
+        }
+        assert_eq!(first, second, "the limit must not be re-read per request");
     }
 
     #[test]
