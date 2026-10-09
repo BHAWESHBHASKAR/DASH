@@ -57,7 +57,7 @@ The `supports` and `contradicts` counts come from the claim's evidence (`stance`
 
 ## Time-range filter
 
-`time_range` filters on the claim's `event_time_unix` and its validity window `[valid_from, valid_to]` (field names without a `_unix` suffix). When both an event time and a window exist, both must match; when only a window exists, it must overlap the range; claims with no temporal data are handled by the matching mode reported in `temporal_match_mode`. Open bounds (`null`) are treated as unbounded. A claim with `valid_from > valid_to` is rejected at ingest. Tests: `temporal_event_time_filter_excludes_older_claims`, `temporal_validity_window_inclusive`, `retrieve_with_time_range_requires_event_and_validity_match_when_both_present`.
+`time_range` filters on the claim's `event_time_unix` and its validity window `[valid_from, valid_to]` (field names without a `_unix` suffix). When both an event time and a window exist, both must match; when only a window exists, it must overlap the range; a claim with neither an event time nor a validity window never matches a request that sets a time range. The matching mode is reported per result in `temporal_match_mode`. An open bound on either side of the request range is unbounded. A claim with `valid_from > valid_to` is rejected at ingest. Tests: `temporal_event_time_filter_excludes_older_claims`, `temporal_validity_window_inclusive`, `retrieve_with_time_range_requires_event_and_validity_match_when_both_present`.
 
 ## Failure modes
 

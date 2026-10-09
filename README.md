@@ -50,7 +50,7 @@ curl -fsS -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
-The retrieval service is a read replica that follows the ingestion WAL by polling (250 ms in the compose file), so wait a moment, then retrieve with citations and drop any contradicted claim:
+The retrieval service is a read replica that follows the ingestion WAL by polling (250 ms in the compose file), so wait a moment, then retrieve with citations, dropping claims that have more contradicting than supporting evidence:
 
 ```bash
 sleep 2
