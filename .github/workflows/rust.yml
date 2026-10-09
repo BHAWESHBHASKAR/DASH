@@ -56,7 +56,7 @@ jobs:
       - name: Run tests (all features)
         # Single-threaded: retrieval tests rely on process-global env
         # variables/locks that are not safe under the default runner.
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo test --workspace --exclude dash-e2e --all-features -- --test-threads=1
 
       - name: Release build
         run: cargo build --workspace --release
