@@ -15,6 +15,10 @@ path = "src/bin/mem_profile.rs"
 name = "load_test"
 path = "src/bin/load_test.rs"
 
+[[bin]]
+name = "cold_start"
+path = "src/bin/cold_start.rs"
+
 [[bench]]
 name = "criterion_benches"
 harness = false
