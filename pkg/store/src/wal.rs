@@ -1308,10 +1308,12 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
     }
     let file = OpenOptions::new().write(true).open(path)?;
     if scan.torn_tail {
+        let saved = save_truncated_tail(path, scan.valid_len)?;
         eprintln!(
-            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes)",
+            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes; removed bytes saved to {})",
             path.display(),
-            scan.valid_len
+            scan.valid_len,
+            saved.display()
         );
         file.set_len(scan.valid_len)?;
         file.sync_all()?;
@@ -1324,9 +1326,55 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
     Ok(0)
 }
 
+/// Copies the bytes of `path` from `from` to EOF into a fresh, fsynced
+/// `<path>.truncated-<unix-ms>` sidecar so a truncation never destroys data
+/// irrecoverably. Returns the sidecar path.
+fn save_truncated_tail(path: &Path, from: u64) -> Result<PathBuf, StoreError> {
+    use std::io::{Seek, SeekFrom};
+    let mut src = OpenOptions::new().read(true).open(path)?;
+    src.seek(SeekFrom::Start(from))?;
+    let mut tail = Vec::new();
+    src.read_to_end(&mut tail)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut attempt = 0u32;
+    loop {
+        let mut name = path.to_path_buf().into_os_string();
+        if attempt == 0 {
+            name.push(format!(".truncated-{ts}"));
+        } else {
+            name.push(format!(".truncated-{ts}-{attempt}"));
+        }
+        let sidecar = PathBuf::from(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+        {
+            Ok(mut out) => {
+                out.write_all(&tail)?;
+                out.sync_all()?;
+                sync_parent_dir(&sidecar)?;
+                return Ok(sidecar);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 /// Physically truncates an unterminated commit group at the end of the log
 /// (see [`GROUP_BEGIN_PREFIX`]) so later appends cannot be mistaken for
 /// members of the torn group. Returns the number of dropped lines.
+///
+/// Interior corruption is never "repaired" by truncation: a `B2` line that
+/// fails to parse or verify, or any unreadable line inside the apparently
+/// open group, is a hard error naming the line (an unterminated group can
+/// only be a crash artifact, so every line in it must be intact). The
+/// removed bytes of a genuine torn group are first saved to a
+/// `<wal>.truncated-<ts>` sidecar.
 fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
     let scan = scan_wal(path)?;
     let mut open: Option<(usize, String)> = None;
@@ -1334,8 +1382,10 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         if !line.starts_with("B2\t") {
             continue;
         }
-        let Ok(PersistedRecord::BatchCommit(commit)) = line_to_record(line) else {
-            continue;
+        let commit = match line_to_record(line) {
+            Ok(PersistedRecord::BatchCommit(commit)) => commit,
+            Ok(_) => continue,
+            Err(err) => return Err(with_context(err, &format!("wal line {line_no}"))),
         };
         if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
             open = Some((*line_no, id.to_string()));
@@ -1349,6 +1399,16 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
     let Some((begin_line, _)) = open else {
         return Ok(0);
     };
+    for (line_no, line) in scan.lines.iter().filter(|(n, _)| *n > begin_line) {
+        if let Err(err) = line_to_record(line)
+            && !is_legacy_kind(record_kind(line))
+        {
+            return Err(with_context(
+                err,
+                &format!("wal line {line_no} (inside the open commit group starting at line {begin_line})"),
+            ));
+        }
+    }
     let mut bytes = Vec::new();
     OpenOptions::new()
         .read(true)
@@ -1362,9 +1422,11 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         offset += chunk.len();
     }
     let dropped = scan.lines.iter().filter(|(n, _)| *n >= begin_line).count();
+    let saved = save_truncated_tail(path, offset as u64)?;
     eprintln!(
-        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records)",
-        path.display()
+        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records; removed bytes saved to {})",
+        path.display(),
+        saved.display()
     );
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(offset as u64)?;
@@ -1810,15 +1872,16 @@ fn unpack_string_list(raw: &str) -> Result<Vec<String>, StoreError> {
             .parse::<usize>()
             .map_err(|_| StoreError::Parse("invalid packed list length in wal".to_string()))?;
         offset += 1;
-        if offset + len > bytes.len() {
-            return Err(StoreError::Parse(
-                "packed list length exceeds wal field size".to_string(),
-            ));
-        }
-        let value = std::str::from_utf8(&bytes[offset..offset + len])
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                StoreError::Parse("packed list length exceeds wal field size".to_string())
+            })?;
+        let value = std::str::from_utf8(&bytes[offset..end])
             .map_err(|_| StoreError::Parse("invalid UTF-8 in packed list field".to_string()))?;
         out.push(value.to_string());
-        offset += len;
+        offset = end;
     }
     Ok(out)
 }
