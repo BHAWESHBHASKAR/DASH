@@ -501,6 +501,13 @@ pub(crate) struct ReplicationFollowerState {
     pub(crate) started: Instant,
     pub(crate) max_lag_records: usize,
     pub(crate) max_staleness_ms: u64,
+    /// Replicated lines skipped because lenient replay would quarantine
+    /// them (legacy poison), cumulative.
+    pub(crate) skipped_records_total: u64,
+    /// Set while the follower cannot make progress for a reason retrying
+    /// will not fix (oversized response / commit group); reported by
+    /// `/ready` and `/metrics`.
+    pub(crate) blocked_reason: Option<&'static str>,
 }
 
 impl Default for ReplicationFollowerState {
@@ -518,8 +525,31 @@ impl Default for ReplicationFollowerState {
             started: Instant::now(),
             max_lag_records: DEFAULT_MAX_LAG_RECORDS,
             max_staleness_ms: DEFAULT_MAX_STALENESS_MS,
+            skipped_records_total: 0,
+            blocked_reason: None,
         }
     }
+}
+
+const BLOCKED_RESPONSE_TOO_LARGE: &str = "replication_response_too_large";
+const BLOCKED_GROUP_TOO_LARGE: &str = "replication_group_too_large";
+const RESPONSE_TOO_LARGE_MARKER: &str = "byte limit";
+
+/// Failures that retrying cannot fix: the leader's answer is permanently
+/// larger than this follower accepts, or a commit group cannot be shipped.
+fn classify_blocking_error(error: &str) -> Option<&'static str> {
+    if error.contains(BLOCKED_GROUP_TOO_LARGE) {
+        Some(BLOCKED_GROUP_TOO_LARGE)
+    } else if error.contains(RESPONSE_TOO_LARGE_MARKER) {
+        Some(BLOCKED_RESPONSE_TOO_LARGE)
+    } else {
+        None
+    }
+}
+
+/// First bytes of a non-200 response body, for the error message.
+fn body_excerpt(body: &str) -> String {
+    body.chars().take(200).collect()
 }
 
 impl IngestionRuntime {
@@ -543,6 +573,20 @@ impl IngestionRuntime {
                 .or_else(|| self.wal.as_ref().map(|wal| wal_state_path(wal.path())));
             if let Some(path) = path.as_deref() {
                 match read_state(path) {
+                    Some(saved)
+                        if self.wal.as_ref().and_then(|wal| wal.wal_record_count().ok())
+                            != Some(saved.offset) =>
+                    {
+                        // The local WAL does not hold what the cursor claims
+                        // (restored/truncated WAL, or no WAL at all): resuming
+                        // would silently skip records, so rebuild from the
+                        // leader's export.
+                        eprintln!(
+                            "ingestion replication follower: saved cursor (generation={:?} offset={}) does not match the local WAL; forcing full resync",
+                            saved.generation, saved.offset
+                        );
+                        self.replication_follower.force_resync = true;
+                    }
                     Some(saved) => {
                         self.replication_last_offset = saved.offset;
                         self.replication_follower.generation = saved.generation;
@@ -617,8 +661,11 @@ impl IngestionRuntime {
             let mut staged_store = self.store.clone_detached();
             #[cfg(test)]
             failpoint::maybe_panic();
+            let mut skipped = 0u64;
             for line in &frame.wal_lines {
-                staged_store.apply_persisted_record_line(line)?;
+                if !staged_store.apply_persisted_record_line_lenient(line)? {
+                    skipped += 1;
+                }
             }
 
             if let Some(wal) = self.wal.as_mut() {
@@ -647,7 +694,11 @@ impl IngestionRuntime {
             }
             self.replication_applied_records_total = self
                 .replication_applied_records_total
-                .saturating_add(frame.wal_lines.len() as u64);
+                .saturating_add(frame.wal_lines.len() as u64 - skipped);
+            self.replication_follower.skipped_records_total = self
+                .replication_follower
+                .skipped_records_total
+                .saturating_add(skipped);
         }
         self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
         self.replication_last_offset = frame.next_offset;
@@ -669,9 +720,16 @@ impl IngestionRuntime {
             wal_lines: frame.wal_lines,
         };
         let mut fresh = InMemoryStore::new_with_ann_tuning(self.store.ann_tuning().clone());
+        let mut skipped = 0u64;
         for line in export.snapshot_lines.iter().chain(export.wal_lines.iter()) {
-            fresh.apply_persisted_record_line(line)?;
+            if !fresh.apply_persisted_record_line_lenient(line)? {
+                skipped += 1;
+            }
         }
+        self.replication_follower.skipped_records_total = self
+            .replication_follower
+            .skipped_records_total
+            .saturating_add(skipped);
         if let Some(wal) = self.wal.as_mut() {
             wal.replace_with_replication_export(&export)?;
         }
@@ -716,7 +774,9 @@ impl IngestionRuntime {
         if !follower.enabled {
             return None;
         }
-        Some(if !follower.synced_once {
+        Some(if let Some(reason) = follower.blocked_reason {
+            Err(reason)
+        } else if !follower.synced_once {
             Err("replication_initial_sync_pending")
         } else if self.replication_lag_records() > follower.max_lag_records {
             Err("replication_lag_exceeded")
@@ -740,14 +800,19 @@ impl IngestionRuntime {
             Some(err) => format!("\"{}\"", json_escape(err)),
             None => "null".to_string(),
         };
+        let blocked = match self.replication_follower.blocked_reason {
+            Some(reason) => format!("\"{reason}\""),
+            None => "null".to_string(),
+        };
         Some(format!(
-            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"last_error\":{last_error}}}",
+            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"skipped_records_total\":{},\"blocked_reason\":{blocked},\"last_error\":{last_error}}}",
             self.replication_last_offset,
             self.replication_follower.leader_total_records,
             self.replication_lag_records(),
             self.replication_last_success_age_ms(),
             self.replication_follower.consecutive_failures,
             self.replication_resync_total,
+            self.replication_follower.skipped_records_total,
         ))
     }
 
@@ -763,11 +828,35 @@ dash_ingest_replication_last_success_age_ms {}\n\
 # TYPE dash_ingest_replication_consecutive_failures gauge\n\
 dash_ingest_replication_consecutive_failures {}\n\
 # TYPE dash_ingest_replication_generation gauge\n\
-dash_ingest_replication_generation {}\n",
+dash_ingest_replication_generation {}\n\
+# TYPE dash_ingest_replication_skipped_records_total counter\n\
+dash_ingest_replication_skipped_records_total {}\n\
+# TYPE dash_ingest_replication_blocked_response_too_large gauge\n\
+dash_ingest_replication_blocked_response_too_large {}\n\
+# TYPE dash_ingest_replication_blocked_group_too_large gauge\n\
+dash_ingest_replication_blocked_group_too_large {}\n",
             self.replication_lag_records(),
             self.replication_last_success_age_ms(),
             self.replication_follower.consecutive_failures,
             self.replication_follower.generation.unwrap_or(0),
+            self.replication_follower.skipped_records_total,
+            (self.replication_follower.blocked_reason == Some(BLOCKED_RESPONSE_TOO_LARGE)) as u8,
+            (self.replication_follower.blocked_reason == Some(BLOCKED_GROUP_TOO_LARGE)) as u8,
+        )
+    }
+
+    /// Leader-side replication metrics (served from the WAL).
+    pub(super) fn replication_leader_metrics_text(&self) -> String {
+        let Some(wal) = self.wal.as_ref() else {
+            return String::new();
+        };
+        format!(
+            "# TYPE dash_ingest_replication_group_too_large_total counter\n\
+dash_ingest_replication_group_too_large_total {}\n\
+# TYPE dash_ingest_replication_view_skipped_lines gauge\n\
+dash_ingest_replication_view_skipped_lines {}\n",
+            wal.replication_group_too_large_total(),
+            wal.replication_skipped_lines(),
         )
     }
 }
@@ -819,11 +908,13 @@ pub(super) fn run_replication_pull_tick(
     let mut guard = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match outcome {
         Ok(()) => {
+            guard.replication_follower.blocked_reason = None;
             guard.record_replication_pull_success();
             0
         }
         Err(err) => {
             eprintln!("replication pull tick failed: {err}");
+            guard.replication_follower.blocked_reason = classify_blocking_error(&err);
             guard.observe_replication_pull_failure(err);
             guard.replication_follower.consecutive_failures = guard
                 .replication_follower
@@ -882,8 +973,9 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
     )?;
     if delta_response.status != 200 {
         return Err(format!(
-            "replication source WAL delta returned status {}",
-            delta_response.status
+            "replication source WAL delta returned status {} ({})",
+            delta_response.status,
+            body_excerpt(&delta_response.body)
         ));
     }
     let delta_frame = parse_replication_delta_frame(&delta_response.body, config.max_records)?;
@@ -933,8 +1025,9 @@ fn resync_from_export(
     )?;
     if export_response.status != 200 {
         return Err(format!(
-            "replication export returned non-200 status: {}",
-            export_response.status
+            "replication export returned non-200 status: {} ({})",
+            export_response.status,
+            body_excerpt(&export_response.body)
         ));
     }
     let export_frame = parse_replication_export_frame(&export_response.body)?;
@@ -1443,6 +1536,147 @@ mod tests {
         assert_eq!(guard.replication_last_offset, 2);
         assert_eq!(guard.replication_pull_success_total, 1);
         assert_eq!(guard.replication_pull_failure_total, 0);
+    }
+
+    #[test]
+    fn extract_batch_commit_ids_reads_v2_lines_and_skips_group_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wal");
+        let mut wal = store::FileWal::open(&path).expect("open wal");
+        wal.begin_group("grp-1", 1).expect("begin group");
+        wal.append_batch_commit("batch-v2", 1, 2, &["c1".to_string()])
+            .expect("batch commit");
+        wal.append_batch_commit("grp-1", 0, 3, &[]).expect("end group");
+        wal.begin_group("c9", 5).expect("begin single group");
+        wal.append_batch_commit("~tx:c9", 1, 6, &["c9".to_string()])
+            .expect("single-ingest end marker");
+        wal.append_batch_commit("cr\rid", 1, 4, &["c2".to_string()])
+            .expect("batch commit with CR");
+        wal.flush_pending_sync().expect("flush");
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read wal")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(lines.iter().all(|l| l.starts_with("B2\t")), "{lines:?}");
+        let ids = extract_batch_commit_ids_from_wal_lines(&lines).expect("ids");
+        assert_eq!(
+            ids,
+            vec![
+                "batch-v2".to_string(),
+                "grp-1".to_string(),
+                "cr\rid".to_string()
+            ],
+            "group begin/single-ingest markers are framing, not batch commits"
+        );
+    }
+
+    #[test]
+    fn blocking_errors_are_classified_and_make_the_follower_not_ready() {
+        assert_eq!(
+            classify_blocking_error("replication response exceeds 100 byte limit"),
+            Some("replication_response_too_large")
+        );
+        assert_eq!(
+            classify_blocking_error(
+                "replication source WAL delta returned status 500 (internal persistence error: replication_group_too_large: ...)"
+            ),
+            Some("replication_group_too_large")
+        );
+        assert_eq!(classify_blocking_error("connection refused"), None);
+
+        let mut runtime = super::super::IngestionRuntime::in_memory(store::InMemoryStore::new());
+        runtime.replication_follower.enabled = true;
+        runtime.replication_follower.synced_once = true;
+        runtime.replication_follower.last_success = Some(Instant::now());
+        assert_eq!(runtime.replication_readiness(), Some(Ok(())));
+        runtime.replication_follower.blocked_reason = Some("replication_group_too_large");
+        assert_eq!(
+            runtime.replication_readiness(),
+            Some(Err("replication_group_too_large"))
+        );
+        assert!(
+            runtime
+                .replication_ready_json()
+                .expect("json")
+                .contains("\"blocked_reason\":\"replication_group_too_large\"")
+        );
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn mutated_frames_never_panic_the_frame_parsers() {
+        let delta = render_replication_delta_frame(&WalReplicationFrame {
+            generation: 9,
+            from_offset: 2,
+            next_offset: 4,
+            total_records: 10,
+            needs_resync: false,
+            wal_lines: vec![
+                "C\tc1\ttenant-a\ttext\t0.9\tnull\t\t".to_string(),
+                "B\tcommit-1\t1\t1700000000000\t2:c1".to_string(),
+            ],
+        });
+        let export = render_replication_export_frame(
+            &WalReplicationExport {
+                snapshot_lines: vec!["C\tc1\ttenant-a\ttext\t0.9\tnull\t\t".to_string()],
+                wal_lines: vec!["E\te1\tc1\tsource://x\tsupports\t0.8".to_string()],
+            },
+            11,
+        );
+        let huge = [
+            "18446744073709551615",
+            "18446744073709551614",
+            "9223372036854775808",
+            "-1",
+            "",
+        ];
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for iteration in 0..20_000 {
+            let seed = if iteration % 2 == 0 { &delta } else { &export };
+            let mut bytes = seed.clone().into_bytes();
+            for _ in 0..=rng.below(3) {
+                match rng.below(3) {
+                    0 if !bytes.is_empty() => {
+                        let i = rng.below(bytes.len());
+                        bytes[i] = (rng.next() & 0x7f) as u8;
+                    }
+                    1 if !bytes.is_empty() => {
+                        let i = rng.below(bytes.len());
+                        bytes.remove(i);
+                    }
+                    _ => {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let replaced = text.replacen(
+                            |c: char| c.is_ascii_digit(),
+                            huge[rng.below(huge.len())],
+                            1,
+                        );
+                        bytes = replaced.into_bytes();
+                    }
+                }
+            }
+            let Ok(body) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = parse_replication_delta_frame(&body, 512);
+                let _ = parse_replication_export_frame(&body);
+            }));
+            assert!(outcome.is_ok(), "frame parser panicked on {body:?}");
+        }
     }
 
     #[test]
