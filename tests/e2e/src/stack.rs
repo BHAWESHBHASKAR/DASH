@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use crate::http::{Client, Resp};
 use crate::leader::LeaderState;
-use crate::proc::{Proc, free_port, random_secret};
+use crate::proc::{Proc, SpawnOpts, free_port, random_secret};
 
 #[derive(Clone, Default)]
 pub struct StackOpts {
@@ -182,16 +182,43 @@ impl Stack {
     }
 
     pub fn start_ingest(&mut self) {
+        self.start_ingest_with(&SpawnOpts::default());
+    }
+
+    /// Start ingestion with extra process settings (for example a file
+    /// size limit) and wait until it is live.
+    pub fn start_ingest_with(&mut self, opts: &SpawnOpts) {
         let env = self.ingest_env();
-        let mut p = Proc::spawn(
+        let mut p = Proc::spawn_with(
             "ingestion",
             "ingestion",
             &[],
             &env,
             &self.path("ingestion.log"),
+            opts,
         );
         p.wait_live(self.ingest_addr(), "/live", Duration::from_secs(30));
         self.ingest = Some(p);
+    }
+
+    /// Status code of ingestion `GET /ready`, or `None` when it does not answer.
+    pub fn ingest_ready_status(&self) -> Option<u16> {
+        let mut c = self.ic();
+        c.timeout = Duration::from_secs(5);
+        c.request("GET", "/ready", &[], None).ok().map(|r| r.status)
+    }
+
+    /// Poll ingestion `/ready` until it answers 200.
+    pub fn wait_ingest_ready(&self, timeout: Duration) {
+        let end = Instant::now() + timeout;
+        while self.ingest_ready_status() != Some(200) {
+            assert!(
+                Instant::now() < end,
+                "ingestion never became ready\n{}",
+                self.ingest_log()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     pub fn start_retrieval(&mut self) {

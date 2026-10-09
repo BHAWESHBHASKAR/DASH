@@ -31,7 +31,7 @@ pub(super) fn handle_get_request(
         // disk persistence is healthy when a persistence path was
         // configured.
         "/ready" | "/v1/ready" => match runtime.lock() {
-            Ok(rt) => {
+            Ok(mut rt) => {
                 // After a failed fsync the WAL refuses writes until a restart
                 // re-reads it from disk: fail closed and leave the pool.
                 if let Some(reason) = rt.wal_poisoned_reason() {
@@ -40,6 +40,16 @@ pub(super) fn handle_get_request(
                         status: 503,
                         content_type: "application/json",
                         body: "{\"status\":\"not_ready\",\"reason\":\"wal_poisoned\"}".to_string(),
+                        retry_after_secs: None,
+                    };
+                }
+                // Writes are failing (full or broken WAL volume): leave the
+                // load balancer until space is back.
+                if let Err(reason) = rt.wal_write_readiness() {
+                    return HttpResponse {
+                        status: 503,
+                        content_type: "application/json",
+                        body: format!("{{\"status\":\"not_ready\",\"reason\":\"{reason}\"}}"),
                         retry_after_secs: None,
                     };
                 }

@@ -701,13 +701,17 @@ impl FileWal {
         if let Err(err) = sync_wal_data(&file) {
             return Err(self.poison(&err));
         }
-        if discards_records {
-            // Rolled-back lines may already have been served to followers.
-            self.bump_generation()?;
-        }
+        // The file is back at the rollback point: the counters must say so
+        // even if the generation bump below fails (a full disk can refuse
+        // the new generation file while the truncation succeeded).
         self.wal_records = point.wal_records;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
+        if discards_records {
+            failpoint!("wal.rollback_truncated");
+            // Rolled-back lines may already have been served to followers.
+            self.bump_generation()?;
+        }
         Ok(())
     }
 

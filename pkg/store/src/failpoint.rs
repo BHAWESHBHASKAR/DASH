@@ -247,6 +247,48 @@ mod tests {
     }
 
     #[test]
+    fn rollback_keeps_the_record_count_when_the_generation_bump_fails() {
+        // A full disk can let the truncation succeed and then refuse the new
+        // generation file. The in-memory record count must still match the
+        // file, or replication offsets and checkpoints drift from the WAL.
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("dash.wal");
+        let mut wal = FileWal::open(&wal_path).unwrap();
+        let mut store = committed_store(&mut wal, 2);
+        let committed = wal.wal_record_count().unwrap();
+        let size = fs::metadata(&wal_path).unwrap().len();
+
+        let point = wal.begin_rollback_point().unwrap();
+        wal.append_claim(&claim_builder("rolled", "tenant-a", "rolled back", 0.9))
+            .unwrap();
+        arm("wal.rollback_truncated");
+        let result = wal.rollback_to(point);
+        disarm();
+        assert!(result.is_err(), "the failpoint must fail the rollback");
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), size);
+        assert_eq!(wal.wal_record_count().unwrap(), committed);
+
+        store
+            .ingest_bundle_persistent(
+                &mut wal,
+                claim_builder("next", "tenant-a", "written after the rollback", 0.9),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let after = wal.wal_record_count().unwrap();
+        drop(wal);
+        let reopened = FileWal::open(&wal_path).unwrap();
+        assert_eq!(reopened.wal_record_count().unwrap(), after);
+        assert_eq!(
+            InMemoryStore::load_from_wal(&reopened)
+                .unwrap()
+                .claims_len(),
+            3
+        );
+    }
+
+    #[test]
     fn writes_after_a_crashed_checkpoint_are_not_duplicated_or_lost() {
         for point in POINTS {
             let dir = TempDir::new().unwrap();

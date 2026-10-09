@@ -331,7 +331,11 @@ pub(super) fn ingest_pipelined<'a>(
             Err(GroupCommitError::Poisoned(reason)) => {
                 return (guard, Err(IngestFailure::Poisoned(reason)));
             }
-            Err(other) => return (guard, Err(IngestFailure::Store(other.into()))),
+            Err(other) => {
+                let err = StoreError::from(other);
+                guard.observe_write_outcome(Err(&err));
+                return (guard, Err(IngestFailure::Store(err)));
+            }
         }
     };
     let seq = {
@@ -350,6 +354,13 @@ pub(super) fn ingest_pipelined<'a>(
     let mut guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
     while pipeline(&mut guard).applied != seq {
         guard = wait_turn(guard, &turn);
+    }
+    // Tell /ready whether the WAL accepted the batch (a failed append, for
+    // example on a full volume, makes the node not ready until space is back).
+    match &committed {
+        Ok(()) => guard.observe_write_outcome(Ok(true)),
+        Err(GroupCommitError::Failed(err)) => guard.observe_write_outcome(Err(err)),
+        Err(_) => {}
     }
     let applied = match committed {
         Ok(()) => guard

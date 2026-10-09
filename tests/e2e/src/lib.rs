@@ -14,7 +14,7 @@ pub mod tls;
 
 pub use http::{Client, Resp};
 pub use leader::LeaderState;
-pub use proc::{Proc, bin_path, free_port, random_secret};
+pub use proc::{Proc, SpawnOpts, bin_path, free_port, random_secret, rss_kib};
 pub use stack::{Stack, StackOpts};
 pub use tls::{TlsClient, wait_live_tls};
 

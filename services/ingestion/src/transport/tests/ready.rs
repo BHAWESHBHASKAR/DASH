@@ -159,3 +159,67 @@ fn ready_reports_disk_unavailable_without_the_failure_reason() {
         "no filesystem path in /ready: {body}"
     );
 }
+
+fn post_ingest(runtime: &SharedRuntime, claim_id: &str) -> u16 {
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: "/v1/ingest".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body: format!(
+            r#"{{"claim":{{"claim_id":"{claim_id}","tenant_id":"tenant-a","canonical_text":"volume test {claim_id}","confidence":0.9}}}}"#
+        )
+        .into_bytes(),
+    };
+    handle_request(runtime, &request).status
+}
+
+#[test]
+fn ready_reports_failed_wal_writes_until_the_volume_is_writable_again() {
+    let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let volume = dir.path().join("volume");
+    let wal = FileWal::open(volume.join("ingest.wal")).expect("wal");
+    let runtime: SharedRuntime = Arc::new(Mutex::new(IngestionRuntime::persistent(
+        InMemoryStore::new(),
+        wal,
+        CheckpointPolicy::default(),
+    )));
+    assert_eq!(post_ingest(&runtime, "before"), 200);
+    assert_eq!(ready(&runtime).0, 200);
+
+    // The volume goes away (unmounted): appends fail with an I/O error.
+    let away = dir.path().join("volume-away");
+    std::fs::rename(&volume, &away).expect("unmount volume");
+    assert_eq!(post_ingest(&runtime, "lost"), 500);
+    let (status, body) = ready(&runtime);
+    assert_eq!(status, 503, "{body}");
+    let value = assert_clean(&body);
+    assert_eq!(value["reason"], "wal_write_failed");
+    let metrics = runtime.lock().expect("lock").metrics_text();
+    assert!(
+        metrics.contains("dash_ingest_wal_write_failing 1"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dash_ingest_wal_write_failure_total 1"),
+        "{metrics}"
+    );
+
+    // The volume is back: the readiness probe succeeds and writes go through.
+    std::fs::rename(&away, &volume).expect("remount volume");
+    assert_eq!(ready(&runtime).0, 200);
+    assert_eq!(post_ingest(&runtime, "after"), 200);
+    let metrics = runtime.lock().expect("lock").metrics_text();
+    assert!(
+        metrics.contains("dash_ingest_wal_write_failing 0"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dash_ingest_wal_write_recovered_total 1"),
+        "{metrics}"
+    );
+    assert!(
+        !volume.join("ingest.wal.space-probe").exists(),
+        "the probe file must be removed"
+    );
+}

@@ -141,6 +141,13 @@ pub struct IngestionRuntime {
     wal_flush_last_synced_records: u64,
     wal_flush_last_sync_latency_micros: u64,
     wal_async_flush_tick_total: u64,
+    /// Set when a write could not be persisted (WAL append, fsync or
+    /// interval flush failed with an I/O error, for example a full disk).
+    /// While set, `/ready` reports `wal_write_failed`; it clears after a
+    /// persisted write or a successful space probe.
+    wal_write_error: Option<String>,
+    wal_write_failure_total: u64,
+    wal_write_recovered_total: u64,
     replication_pull_success_total: u64,
     replication_pull_failure_total: u64,
     replication_applied_records_total: u64,
@@ -258,6 +265,9 @@ impl IngestionRuntime {
             wal_flush_last_synced_records: 0,
             wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
+            wal_write_error: None,
+            wal_write_failure_total: 0,
+            wal_write_recovered_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
             replication_applied_records_total: 0,
@@ -335,6 +345,9 @@ impl IngestionRuntime {
             wal_flush_last_synced_records: 0,
             wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
+            wal_write_error: None,
+            wal_write_failure_total: 0,
+            wal_write_recovered_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
             replication_applied_records_total: 0,
@@ -466,6 +479,18 @@ impl IngestionRuntime {
     }
 
     fn ingest(&mut self, request: IngestApiRequest) -> Result<IngestApiResponse, StoreError> {
+        let result = self.ingest_unobserved(request);
+        // An unchanged replay writes nothing, so it says nothing about the disk.
+        let wrote = matches!(&result, Ok((_, true)));
+        self.observe_write_outcome(result.as_ref().map(|_| wrote));
+        result.map(|(resp, _)| resp)
+    }
+
+    /// The write and whether it appended to the WAL.
+    fn ingest_unobserved(
+        &mut self,
+        request: IngestApiRequest,
+    ) -> Result<(IngestApiResponse, bool), StoreError> {
         let tenant_id = request.claim.tenant_id.clone();
         let ingested_claim_id = request.claim.claim_id.clone();
         let input = IngestInput {
@@ -490,10 +515,11 @@ impl IngestionRuntime {
         if applied {
             self.publish_segments_for_tenant(&tenant_id);
         }
-        Ok(self.ingest_response(
+        let response = self.ingest_response(
             ingested_claim_id,
             Some((checkpoint_stats, checkpoint_deferred)),
-        ))
+        );
+        Ok((response, applied))
     }
 
     /// Response of a committed single ingest. `checkpoint` is the outcome of
@@ -545,6 +571,16 @@ impl IngestionRuntime {
     }
 
     fn ingest_batch(
+        &mut self,
+        request: IngestBatchApiRequest,
+    ) -> Result<IngestBatchApiResponse, StoreError> {
+        let result = self.ingest_batch_unobserved(request);
+        let wrote = matches!(&result, Ok(resp) if !resp.idempotent_replay);
+        self.observe_write_outcome(result.as_ref().map(|_| wrote));
+        result
+    }
+
+    fn ingest_batch_unobserved(
         &mut self,
         request: IngestBatchApiRequest,
     ) -> Result<IngestBatchApiResponse, StoreError> {
@@ -900,6 +936,59 @@ impl IngestionRuntime {
         }
     }
 
+    /// Track whether writes can be persisted. `Ok(true)` is a write that
+    /// reached the WAL; `Ok(false)` wrote nothing (an idempotent replay); an
+    /// I/O error means the WAL could not be appended or synced.
+    pub(super) fn observe_write_outcome(&mut self, outcome: Result<bool, &StoreError>) {
+        match outcome {
+            Ok(true) => {
+                if self.wal.is_some() && self.wal_write_error.take().is_some() {
+                    self.wal_write_recovered_total += 1;
+                    eprintln!("ingestion: WAL writes succeed again; ready");
+                }
+            }
+            Ok(false) => {}
+            Err(StoreError::Io(reason)) => self.observe_wal_write_failure(reason),
+            Err(_) => {}
+        }
+    }
+
+    fn observe_wal_write_failure(&mut self, reason: &str) {
+        if self.wal.is_none() {
+            return;
+        }
+        self.wal_write_failure_total += 1;
+        if self.wal_write_error.is_none() {
+            eprintln!("ingestion: write could not be persisted, not ready: {reason}");
+        }
+        self.wal_write_error = Some(reason.to_string());
+    }
+
+    /// Readiness of the write path. After a failed write the WAL file must
+    /// exist and the WAL directory is probed with a scratch file of
+    /// [`WAL_SPACE_PROBE_BYTES`] (written, synced and removed); the service
+    /// is ready again once that succeeds.
+    pub(crate) fn wal_write_readiness(&mut self) -> Result<(), &'static str> {
+        if self.wal_write_error.is_none() {
+            return Ok(());
+        }
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(());
+        };
+        let path = lock_wal(wal).path().to_path_buf();
+        let probe =
+            std::fs::metadata(&path).and_then(|_| probe_wal_space(&path, WAL_SPACE_PROBE_BYTES));
+        match probe {
+            Ok(()) => {
+                self.wal_write_error = None;
+                self.wal_write_recovered_total += 1;
+                eprintln!("ingestion: WAL space probe succeeded; ready");
+                Ok(())
+            }
+            Err(_) => Err("wal_write_failed"),
+        }
+    }
+
     fn flush_wal_if_due(&mut self) {
         let Some(wal) = self.wal.as_ref() else {
             return;
@@ -923,6 +1012,9 @@ impl IngestionRuntime {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_failure_total += 1;
                 eprintln!("ingestion WAL interval flush failed: {err:?}");
+                if let StoreError::Io(reason) = &err {
+                    self.observe_wal_write_failure(reason);
+                }
             }
         }
     }
@@ -948,6 +1040,9 @@ impl IngestionRuntime {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_failure_total += 1;
                 eprintln!("ingestion WAL async flush failed: {err:?}");
+                if let StoreError::Io(reason) = &err {
+                    self.observe_wal_write_failure(reason);
+                }
             }
         }
     }
@@ -1384,6 +1479,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         ) + &self.group_commit_metrics_text()
+            + &self.wal_write_metrics_text()
     }
 
     fn group_commit_metrics_text(&self) -> String {
@@ -1394,6 +1490,49 @@ dash_ingest_wal_group_commit_enabled 0\n"
                 .to_string(),
         }
     }
+
+    fn wal_write_metrics_text(&self) -> String {
+        format!(
+            "# TYPE dash_ingest_wal_write_failure_total counter\n\
+dash_ingest_wal_write_failure_total {}\n\
+# TYPE dash_ingest_wal_write_recovered_total counter\n\
+dash_ingest_wal_write_recovered_total {}\n\
+# TYPE dash_ingest_wal_write_failing gauge\n\
+dash_ingest_wal_write_failing {}\n",
+            self.wal_write_failure_total,
+            self.wal_write_recovered_total,
+            self.wal_write_error.is_some() as u8
+        )
+    }
+}
+
+/// Size of the scratch file written to decide that a full WAL volume has
+/// space again (see [`IngestionRuntime::wal_write_readiness`]).
+pub(crate) const WAL_SPACE_PROBE_BYTES: usize = 1024 * 1024;
+
+/// Write `bytes` zeros to `<wal>.space-probe`, sync it and remove it.
+pub(crate) fn probe_wal_space(wal_path: &std::path::Path, bytes: usize) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut probe = wal_path.as_os_str().to_owned();
+    probe.push(".space-probe");
+    let probe = std::path::PathBuf::from(probe);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&probe)?;
+        let chunk = [0u8; 64 * 1024];
+        let mut left = bytes;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            file.write_all(&chunk[..n])?;
+            left -= n;
+        }
+        file.sync_data()
+    })();
+    let _ = std::fs::remove_file(&probe);
+    result
 }
 
 pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;

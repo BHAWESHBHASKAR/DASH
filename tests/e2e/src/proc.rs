@@ -1,6 +1,7 @@
 //! Child-process management for the real service binaries.
 
 use std::fs;
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -63,7 +64,10 @@ fn profile() -> &'static str {
     }
 }
 
-/// Directory holding private copies of the three service binaries.
+/// The binaries the harness runs: the three services and the offline WAL tool.
+const BINARIES: [&str; 4] = ["ingestion", "retrieval", "control-plane", "wal-inspect"];
+
+/// Directory holding private copies of the service binaries (and `wal-inspect`).
 ///
 /// The shared cargo target directory can be rebuilt by someone else at any
 /// time, so the binaries are copied once per content version and the tests
@@ -84,6 +88,8 @@ fn bin_dir() -> &'static PathBuf {
             "retrieval",
             "-p",
             "control-plane",
+            "-p",
+            "wal-inspect",
         ]);
         if profile() == "release" {
             cmd.arg("--release");
@@ -95,7 +101,7 @@ fn bin_dir() -> &'static PathBuf {
         );
         let src = target_dir().join(profile());
         let mut key = String::new();
-        for name in ["ingestion", "retrieval", "control-plane"] {
+        for name in BINARIES {
             let meta = fs::metadata(src.join(name))
                 .unwrap_or_else(|e| panic!("{name} binary missing: {e}"));
             let mtime = meta
@@ -114,7 +120,7 @@ fn bin_dir() -> &'static PathBuf {
         if !marker.exists() {
             let tmp = dst.with_extension(format!("tmp{}", std::process::id()));
             fs::create_dir_all(&tmp).unwrap();
-            for name in ["ingestion", "retrieval", "control-plane"] {
+            for name in BINARIES {
                 fs::copy(src.join(name), tmp.join(name))
                     .unwrap_or_else(|e| panic!("copy {name}: {e}"));
             }
@@ -131,6 +137,63 @@ fn bin_dir() -> &'static PathBuf {
 
 pub fn bin_path(name: &str) -> PathBuf {
     bin_dir().join(name)
+}
+
+/// Extra settings for [`Proc::spawn_with`].
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOpts {
+    /// Largest file the child may write, in bytes (`RLIMIT_FSIZE`). A write
+    /// past it fails with `EFBIG` (`SIGXFSZ` is ignored in the child), which
+    /// is how the disk-full tests simulate a full volume without privileges.
+    /// Unix only.
+    pub file_size_limit: Option<u64>,
+}
+
+#[cfg(unix)]
+fn limit_file_size(cmd: &mut Command, limit: u64) {
+    use std::os::unix::process::CommandExt;
+    let limit = limit as libc::rlim_t;
+    // SAFETY: the closure runs in the forked child before exec and only
+    // calls the async-signal-safe `signal` and `setrlimit`.
+    unsafe {
+        cmd.pre_exec(move || {
+            // An ignored disposition survives exec: writes past the limit
+            // then fail with EFBIG instead of killing the process.
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            // Only the soft limit is lowered, so a test can raise it again
+            // on the live process ("space came back") without privileges.
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &mut rl) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            rl.rlim_cur = limit.min(rl.rlim_max);
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn limit_file_size(_cmd: &mut Command, _limit: u64) {
+    panic!("file size limits need a unix host");
+}
+
+/// `VmRSS` of `pid` in KiB, read from `/proc/<pid>/status`.
+pub fn rss_kib(pid: u32) -> Option<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|l| {
+        l.strip_prefix("VmRSS:")?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// A running child process. Dropping it kills (SIGKILL) and reaps it.
@@ -150,26 +213,72 @@ impl Proc {
         envs: &[(String, String)],
         log_path: &Path,
     ) -> Proc {
+        Self::spawn_with(name, bin, args, envs, log_path, &SpawnOpts::default())
+    }
+
+    /// [`Proc::spawn`] with extra process settings (see [`SpawnOpts`]).
+    pub fn spawn_with(
+        name: &str,
+        bin: &str,
+        args: &[&str],
+        envs: &[(String, String)],
+        log_path: &Path,
+        opts: &SpawnOpts,
+    ) -> Proc {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)
             .expect("open log");
-        let log2 = log.try_clone().unwrap();
         let mut cmd = Command::new(bin_path(bin));
         cmd.args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2));
-        let child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {bin}: {e}"));
+            .stdin(Stdio::null());
+        if let Some(limit) = opts.file_size_limit {
+            // The limit would also apply to a log file the child writes
+            // itself, so output goes through pipes and this process appends
+            // it to the log.
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            limit_file_size(&mut cmd, limit);
+        } else {
+            let log2 = log.try_clone().unwrap();
+            cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log2));
+        }
+        let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {bin}: {e}"));
+        if opts.file_size_limit.is_some() {
+            let out = child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>);
+            let err = child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn Read + Send>);
+            for stream in [out, err].into_iter().flatten() {
+                let mut sink = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_path)
+                    .expect("open log");
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = std::io::copy(&mut stream, &mut sink);
+                });
+            }
+        }
         Proc {
             name: name.to_string(),
             child: Some(child),
             log_path: log_path.to_path_buf(),
         }
+    }
+
+    /// Resident set size of the process in KiB (`VmRSS` from
+    /// `/proc/<pid>/status`); `None` off Linux or once it has exited.
+    pub fn rss_kib(&self) -> Option<u64> {
+        rss_kib(self.pid())
     }
 
     pub fn pid(&self) -> u32 {
