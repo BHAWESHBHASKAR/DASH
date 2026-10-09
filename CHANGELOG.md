@@ -16,7 +16,7 @@ to [Semantic Versioning](https://semver.org/).
   a per-tenant `TenantVectorIndex` (`pkg/store/src/vector_index.rs`): an exact
   flat scan up to `DASH_*_VECTOR_FLAT_THRESHOLD` vectors (default 8192), then
   a `usearch` HNSW (cosine, `i8` scalar quantisation, connectivity 16,
-  `ef_construction` 128, `ef_search` 128) whose best 50 candidates
+  `ef_construction` 128, `ef_search` 256) whose best 50 candidates
   (`DASH_*_VECTOR_RERANK`) are re-scored with exact `f32` cosine against the
   stored vectors. The index holds about a third of the memory of an `f32` HNSW.
   Recall@10 against brute force on seeded clustered data (`pkg/store/tests/vector_recall.rs`):
@@ -43,7 +43,7 @@ to [Semantic Versioning](https://semver.org/).
   flags `--ann-max-neighbors-upper`, `--ann-search-expansion-factor` and
   `--ann-search-expansion-max` are gone too. `..._ANN_MAX_NEIGHBORS_BASE` now sets
   the HNSW connectivity (default 16, was 12) and `..._ANN_SEARCH_EXPANSION_MIN`
-  the `ef_search` floor (default 128, was 64). New: `..._ANN_EXPANSION_ADD`
+  the `ef_search` floor (default 256, was 64). New: `..._ANN_EXPANSION_ADD`
   (128), `..._VECTOR_FLAT_THRESHOLD` (8192) and `..._VECTOR_RERANK` (50), plus
   `DASH_BENCH_*` twins.
 - **API.** `store::AnnTuningConfig` now has the fields `connectivity`,

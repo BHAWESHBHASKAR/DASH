@@ -60,7 +60,7 @@ pub const ANN_CONNECTIVITY_DEFAULT: usize = 16;
 /// Construction beam (`ef_construction`).
 pub const ANN_EXPANSION_ADD_DEFAULT: usize = 128;
 /// Search beam floor (`ef_search`). usearch widens it to the requested count.
-pub const ANN_EXPANSION_SEARCH_DEFAULT: usize = 128;
+pub const ANN_EXPANSION_SEARCH_DEFAULT: usize = 256;
 /// Tenants with at most this many vectors are searched exactly.
 pub const VECTOR_FLAT_THRESHOLD_DEFAULT: usize = 8_192;
 /// Candidates re-scored with exact `f32` cosine after the quantised search.

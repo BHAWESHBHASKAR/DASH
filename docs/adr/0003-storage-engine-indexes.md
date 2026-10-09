@@ -399,7 +399,7 @@ Status of this ADR stays Proposed because segments, `tantivy`, the planner on ro
 indexes and WAL v2 are not built.
 
 - **Layers.** `FlatIndex` (exact, contiguous normalised `f32`), `HnswIndex` (`usearch`, cosine, `i8`, connectivity 16,
-  `ef_construction` 128, `ef_search` 128, exact `f32` rerank of 50 against the store's own `claim_vectors`, so no second
+  `ef_construction` 128, `ef_search` 256, exact `f32` rerank of 50 against the store's own `claim_vectors`, so no second
   full-precision copy), `TenantVectorIndex` (flat until 8192 vectors, then HNSW; claim id to `u64` key interning with key
   reuse). Non-normalised input is normalised for the index; final scores in retrieval are still computed by the store's
   `f64` cosine, so they are unchanged.
