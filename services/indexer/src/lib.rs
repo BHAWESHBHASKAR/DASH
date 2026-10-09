@@ -703,8 +703,9 @@ pub fn load_current_segments(
 }
 
 /// Cheap, order-independent fingerprint of everything that determines segment
-/// contents (claim ids and their tiers) plus a caller-provided config salt.
-pub fn claim_set_fingerprint(claims: &[Claim], salt: &str) -> u64 {
+/// contents (claim ids and their tiers) plus the publish settings that shape them (`config_key`). Change detection
+/// only; this is not a cryptographic hash.
+pub fn claim_set_fingerprint(claims: &[Claim], config_key: &str) -> u64 {
     let mut sum = 0u64;
     let mut xor = 0u64;
     for claim in claims {
@@ -715,7 +716,7 @@ pub fn claim_set_fingerprint(claims: &[Claim], salt: &str) -> u64 {
         sum = sum.wrapping_add(h);
         xor ^= h.rotate_left(17);
     }
-    let mut state = stable_hash64(salt);
+    let mut state = stable_hash64(config_key);
     for word in [claims.len() as u64, sum, xor] {
         state = fnv1a_update(state, &word.to_le_bytes());
     }
@@ -747,13 +748,13 @@ pub fn publish_claims_to_dir(
     claims: &[Claim],
     options: &SegmentPublishOptions,
 ) -> Result<SegmentPublishResult, SegmentStoreError> {
-    let salt = format!(
+    let config_key = format!(
         "{}|{}|{}",
         options.max_segment_size,
         options.scheduler.max_segments_per_tier,
         options.scheduler.max_compaction_input_segments
     );
-    let fingerprint = claim_set_fingerprint(claims, &salt);
+    let fingerprint = claim_set_fingerprint(claims, &config_key);
     if read_fingerprint(tenant_dir) == Some(fingerprint)
         && let Ok(Some(manifest)) = load_manifest(tenant_dir)
         && manifest

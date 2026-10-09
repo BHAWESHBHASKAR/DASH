@@ -63,7 +63,7 @@ fn validate_replication_config() -> Result<(), String> {
     match token {
         Some(token) => {
             if dash_common::strict_secrets_enabled() {
-                dash_common::validate_secret(&token, "DASH_INGEST_REPLICATION_TOKEN")?;
+                dash_common::validate_credential(&token, "DASH_INGEST_REPLICATION_TOKEN")?;
             }
         }
         None if follower && !dev => {

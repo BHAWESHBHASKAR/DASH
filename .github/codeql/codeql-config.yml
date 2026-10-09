@@ -1,0 +1,14 @@
+# CodeQL configuration for security.yml.
+#
+# Production code is scanned with the security-and-quality suite. Test-only
+# trees and throwaway benchmark spikes are excluded: they deliberately build
+# fixed keys, log server output verbatim and parse attacker-shaped input, which
+# only produces noise in the security results. Inline `#[cfg(test)]` modules in
+# production crates are still scanned.
+name: dash-codeql
+paths-ignore:
+  - tests/**
+  - "**/tests/**"
+  - spikes/**
+  - sdks/*/tests/**
+  - docs-site/**

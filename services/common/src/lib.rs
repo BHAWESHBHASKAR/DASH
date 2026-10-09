@@ -126,12 +126,12 @@ fn is_placeholder(lower: &str) -> bool {
 /// Validate that a secret is non-empty, is not a known placeholder, and meets
 /// the default minimum length ([`SECRET_MIN_LENGTH`]). The error never
 /// contains the secret value.
-pub fn validate_secret(value: &str, name: &str) -> Result<(), String> {
-    validate_secret_min_len(value, name, SECRET_MIN_LENGTH)
+pub fn validate_credential(value: &str, name: &str) -> Result<(), String> {
+    validate_credential_min_len(value, name, SECRET_MIN_LENGTH)
 }
 
-/// Like [`validate_secret`] with an explicit minimum length.
-pub fn validate_secret_min_len(value: &str, name: &str, min_len: usize) -> Result<(), String> {
+/// Like [`validate_credential`] with an explicit minimum length.
+pub fn validate_credential_min_len(value: &str, name: &str, min_len: usize) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(format!("{name} is empty"));
@@ -140,21 +140,20 @@ pub fn validate_secret_min_len(value: &str, name: &str, min_len: usize) -> Resul
         return Err(format!("{name} appears to be a placeholder value"));
     }
     if trimmed.chars().count() < min_len {
-        return Err(format!(
-            "{name} is too short ({len} chars, minimum {min_len})",
-            len = trimmed.chars().count(),
-        ));
+        // The message names the setting and the rule only: nothing derived
+        // from the value (not even its length) reaches logs.
+        return Err(format!("{name} is too short (minimum {min_len} chars)"));
     }
     Ok(())
 }
 
 /// Validate a comma-separated list of secrets, skipping empty entries.
-pub fn validate_secret_csv(values: Option<&str>, name: &str) -> Result<(), String> {
-    validate_secret_csv_min_len(values, name, SECRET_MIN_LENGTH)
+pub fn validate_credential_csv(values: Option<&str>, name: &str) -> Result<(), String> {
+    validate_credential_csv_min_len(values, name, SECRET_MIN_LENGTH)
 }
 
-/// Like [`validate_secret_csv`] with an explicit minimum length.
-pub fn validate_secret_csv_min_len(
+/// Like [`validate_credential_csv`] with an explicit minimum length.
+pub fn validate_credential_csv_min_len(
     values: Option<&str>,
     name: &str,
     min_len: usize,
@@ -163,7 +162,7 @@ pub fn validate_secret_csv_min_len(
         for part in raw.split(',') {
             let trimmed = part.trim();
             if !trimmed.is_empty() {
-                validate_secret_min_len(trimmed, name, min_len)?;
+                validate_credential_min_len(trimmed, name, min_len)?;
             }
         }
     }
@@ -376,11 +375,11 @@ mod tests {
             "secret",
             "password-password-password",
         ] {
-            let err = validate_secret(bad, "X").unwrap_err();
+            let err = validate_credential(bad, "X").unwrap_err();
             assert!(!err.contains(bad), "leaked: {err}");
             assert!(err.contains("placeholder"), "{err}");
         }
-        assert!(validate_secret("a8f3b1c9d2e47f60", "X").is_ok());
-        assert!(validate_secret_min_len("a8f3b1c9d2e47f60", "X", 32).is_err());
+        assert!(validate_credential("a8f3b1c9d2e47f60", "X").is_ok());
+        assert!(validate_credential_min_len("a8f3b1c9d2e47f60", "X", 32).is_err());
     }
 }

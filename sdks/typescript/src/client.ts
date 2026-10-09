@@ -17,6 +17,7 @@
 
 import { EmbeddingsService } from './embeddings.js';
 import { RetrieveService } from './retrieve.js';
+import { trimTrailingSlashes } from './url.js';
 
 /** Default per-request timeout, in milliseconds. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -83,7 +84,7 @@ export class DashClient {
       throw new Error('timeoutMs must be positive');
     }
 
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    this.baseUrl = trimTrailingSlashes(options.baseUrl);
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this._fetchImpl = options.fetch;
@@ -121,7 +122,7 @@ export class DashClient {
    * request URL.
    */
   _resolvePath(path: string): string {
-    const trimmedBase = this.baseUrl.replace(/\/+$/, '');
+    const trimmedBase = trimTrailingSlashes(this.baseUrl);
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     if (trimmedBase.endsWith('/v1') && normalizedPath.startsWith('/v1/')) {
       return `${trimmedBase}${normalizedPath.slice(3)}`;

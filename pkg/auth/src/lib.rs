@@ -230,7 +230,7 @@ fn verify_hs256_token_inner(
         return Err(JwtValidationError::UnsupportedAlgorithm);
     }
 
-    let candidates = select_hs256_secrets_for_header(&header, config)?;
+    let candidates = select_hs256_keys_for_header(&header, config)?;
     let mut last_sig_err: Option<JwtValidationError> = None;
 
     for secret in candidates {
@@ -273,7 +273,7 @@ fn verify_hs256_token_inner(
     Err(last_sig_err.unwrap_or(JwtValidationError::InvalidSignature))
 }
 
-fn select_hs256_secrets_for_header<'a>(
+fn select_hs256_keys_for_header<'a>(
     header: &Header,
     config: &'a JwtValidationConfig,
 ) -> Result<Vec<&'a str>, JwtValidationError> {
@@ -528,7 +528,11 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok, got {:?}",
+            result.as_ref().map(|_| ())
+        );
     }
 
     #[test]
@@ -564,7 +568,8 @@ mod tests {
             verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000_000_000);
         assert!(
             result.is_ok(),
-            "expected Ok on the good token, got {result:?}"
+            "expected Ok on the good token, got {:?}",
+            result.as_ref().map(|_| ())
         );
         let mut parts = token
             .split('.')
@@ -591,7 +596,11 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok, got {:?}",
+            result.as_ref().map(|_| ())
+        );
     }
 
     #[test]
@@ -609,7 +618,11 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000);
-        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok, got {:?}",
+            result.as_ref().map(|_| ())
+        );
     }
 
     #[test]
@@ -636,7 +649,11 @@ mod tests {
         )
         .unwrap();
         let result = verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000);
-        assert!(result.is_ok(), "expected Ok for array-aud, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for array-aud, got {:?}",
+            result.as_ref().map(|_| ())
+        );
     }
 
     #[test]
@@ -671,7 +688,8 @@ mod tests {
         let result = verify_hs256_token_for_tenant(&token, "tenant-b", &sample_config(), 1_000);
         assert!(
             result.is_ok(),
-            "expected Ok via tenants array, got {result:?}"
+            "expected Ok via tenants array, got {:?}",
+            result.as_ref().map(|_| ())
         );
     }
 
@@ -687,7 +705,11 @@ mod tests {
         let mut config = sample_config();
         config.allow_wildcard_tenant = true;
         let on = verify_hs256_token_for_tenant(&token, "any-tenant", &config, 1_000);
-        assert!(on.is_ok(), "expected Ok via wildcard, got {on:?}");
+        assert!(
+            on.is_ok(),
+            "expected Ok via wildcard, got {:?}",
+            on.as_ref().map(|_| ())
+        );
     }
 
     #[test]
@@ -700,7 +722,8 @@ mod tests {
         let result = verify_hs256_token_for_tenant(&token, "tenant-a", &sample_config(), 1_000);
         assert!(
             matches!(result, Err(JwtValidationError::MissingClaim("exp"))),
-            "{result:?}"
+            "{:?}",
+            result.as_ref().map(|_| ())
         );
     }
 

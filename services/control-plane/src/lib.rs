@@ -139,7 +139,7 @@ pub fn resolve_security_with(
     let token = token.map(str::trim).filter(|value| !value.is_empty());
     if let Some(token) = token {
         if strict_secrets {
-            dash_common::validate_secret_min_len(
+            dash_common::validate_credential_min_len(
                 token,
                 "DASH_CONTROL_PLANE_TOKEN",
                 TOKEN_MIN_LENGTH,

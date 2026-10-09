@@ -227,9 +227,11 @@ impl FingerprintKey {
         }
     }
 
-    /// 16 hex chars of HMAC-SHA256(key, secret).
-    pub fn fingerprint(&self, secret: &str) -> String {
-        hex_lower(&hmac_sha256(&self.key, secret.as_bytes())[..8])
+    /// 16 hex chars of HMAC-SHA256(key, credential). Keyed MAC over a
+    /// high-entropy API key or token to identify it in audit records; this is
+    /// not password storage.
+    pub fn fingerprint(&self, credential: &str) -> String {
+        hex_lower(&hmac_sha256(&self.key, credential.as_bytes())[..8])
     }
 }
 

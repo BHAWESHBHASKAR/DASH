@@ -13,6 +13,15 @@ to [Semantic Versioning](https://semver.org/).
   bearer token is now refused unless the control plane is on loopback or
   `DASH_ROUTER_ALLOW_INSECURE_HTTP=1` is set. The control plane's
   leader-acquired log line now says "epoch" for the lease epoch counter.
+- **Static-analysis findings addressed.** Credential validation errors no
+  longer carry anything derived from the value (the "too short" message drops
+  the length); credential helpers are named for what they check
+  (`validate_credential*`); auth tests no longer print validated claims; the
+  segment change-detection seed is named `config_key` (it is not a
+  cryptographic salt); the audit fingerprint documents that it is a keyed MAC
+  over high-entropy credentials, not password storage; the TypeScript SDK
+  trims trailing slashes with a linear scan instead of a backtracking regex.
+  CodeQL now skips test-only trees and spikes (`.github/codeql/codeql-config.yml`).
 
 ### Security (supply chain; register SEC-20, SEC-21)
 

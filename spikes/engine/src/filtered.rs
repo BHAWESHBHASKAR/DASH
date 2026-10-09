@@ -22,8 +22,8 @@ pub fn splitmix(mut x: u64) -> u64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
 }
-fn unit(i: usize, salt: u64) -> f64 {
-    (splitmix(i as u64 ^ salt) >> 11) as f64 / (1u64 << 53) as f64
+fn unit(i: usize, stream: u64) -> f64 {
+    (splitmix(i as u64 ^ stream) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 pub fn load_or_build(kind: &str, n: usize, data: &[f32]) -> Index {

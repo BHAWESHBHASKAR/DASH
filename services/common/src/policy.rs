@@ -36,7 +36,7 @@ use auth::{
 use crate::audit::{self, hex_lower, hmac_sha256, random_bytes};
 use crate::{
     JWT_SECRET_MIN_LENGTH, SECRET_MIN_LENGTH, constant_time_eq, strict_secrets_from,
-    validate_secret_csv_min_len, validate_secret_min_len,
+    validate_credential_csv_min_len, validate_credential_min_len,
 };
 
 /// Source of configuration values (environment, optionally overlaid with the
@@ -819,7 +819,7 @@ fn parse_scoped_api_keys(
     Ok(scoped)
 }
 
-fn parse_secret_list(raw: Option<&str>) -> Vec<String> {
+fn parse_hs256_key_list(raw: Option<&str>) -> Vec<String> {
     raw.map(|raw| {
         raw.split(',')
             .map(str::trim)
@@ -830,7 +830,7 @@ fn parse_secret_list(raw: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-fn parse_secrets_by_kid(raw: Option<&str>) -> HashMap<String, String> {
+fn parse_keys_by_kid(raw: Option<&str>) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for entry in scoped_entries(raw) {
         let Some((kid, secret)) = entry.split_once(':') else {
@@ -860,8 +860,8 @@ fn non_empty(raw: Option<&str>) -> Option<String> {
 
 fn parse_hs256_config(raw: &RawAuthConfig) -> Option<JwtValidationConfig> {
     let primary = non_empty(raw.jwt_hs256_secret.as_deref());
-    let mut fallback = parse_secret_list(raw.jwt_hs256_secrets.as_deref());
-    let by_kid = parse_secrets_by_kid(raw.jwt_hs256_secrets_by_kid.as_deref());
+    let mut fallback = parse_hs256_key_list(raw.jwt_hs256_secrets.as_deref());
+    let by_kid = parse_keys_by_kid(raw.jwt_hs256_secrets_by_kid.as_deref());
 
     let primary = match primary {
         Some(primary) => primary,
@@ -989,32 +989,32 @@ fn parse_oidc_config(
 /// setting, never the value.
 fn validate_raw_secrets(raw: &RawAuthConfig, svc: &ServiceAuthEnv) -> Result<(), String> {
     if let Some(value) = raw.api_key.as_deref().filter(|v| !v.trim().is_empty()) {
-        validate_secret_min_len(value, &svc.dash("API_KEY"), SECRET_MIN_LENGTH)?;
+        validate_credential_min_len(value, &svc.dash("API_KEY"), SECRET_MIN_LENGTH)?;
     }
-    validate_secret_csv_min_len(
+    validate_credential_csv_min_len(
         raw.api_keys.as_deref(),
         &svc.dash("API_KEYS"),
         SECRET_MIN_LENGTH,
     )?;
     for entry in scoped_entries(raw.api_key_scopes.as_deref()) {
         let key = entry.split(':').next().unwrap_or_default();
-        validate_secret_min_len(key, &svc.dash("API_KEY_SCOPES"), SECRET_MIN_LENGTH)?;
+        validate_credential_min_len(key, &svc.dash("API_KEY_SCOPES"), SECRET_MIN_LENGTH)?;
     }
     if let Some(value) = raw
         .jwt_hs256_secret
         .as_deref()
         .filter(|v| !v.trim().is_empty())
     {
-        validate_secret_min_len(value, &svc.dash("JWT_HS256_SECRET"), JWT_SECRET_MIN_LENGTH)?;
+        validate_credential_min_len(value, &svc.dash("JWT_HS256_SECRET"), JWT_SECRET_MIN_LENGTH)?;
     }
-    validate_secret_csv_min_len(
+    validate_credential_csv_min_len(
         raw.jwt_hs256_secrets.as_deref(),
         &svc.dash("JWT_HS256_SECRETS"),
         JWT_SECRET_MIN_LENGTH,
     )?;
     for entry in scoped_entries(raw.jwt_hs256_secrets_by_kid.as_deref()) {
         let secret = entry.split_once(':').map(|(_, s)| s).unwrap_or_default();
-        validate_secret_min_len(
+        validate_credential_min_len(
             secret,
             &svc.dash("JWT_HS256_SECRETS_BY_KID"),
             JWT_SECRET_MIN_LENGTH,
