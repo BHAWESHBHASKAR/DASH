@@ -2,6 +2,8 @@
 name = "store"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 
 [features]
 # Historical GPU compute path. The code is feature-gated so it can be

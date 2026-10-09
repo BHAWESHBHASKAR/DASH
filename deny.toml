@@ -1,0 +1,86 @@
+# cargo-deny policy for the DASH workspace.
+#
+# Run locally:   cargo deny check
+# CI:            .github/workflows/security.yml (job `cargo-deny`)
+#
+# Four checks:
+#   advisories  RustSec database: vulnerabilities, unmaintained, unsound, yanked
+#   licenses    every dependency must be under a license on the allow-list
+#   bans        duplicate versions (warn), wildcard requirements (deny)
+#   sources     crates may only come from crates.io
+#
+# Any exception below must carry a reason and the issue that tracks it.
+
+[graph]
+# Check every platform the release builds for (and the dev targets), not
+# only the host.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# Vulnerabilities and unsound crates always fail the check (cargo-deny
+# denies them without a knob). `unmaintained` covers the whole graph
+# (direct and transitive) and fails the check, because an unmaintained
+# crate will not receive the next security fix. `yanked` fails the check.
+unmaintained = "all"
+yanked = "deny"
+# No ignored advisories. To add one, give the advisory id, a reason, and
+# the issue that tracks its removal, for example:
+#   { id = "RUSTSEC-0000-0000", reason = "transitive via <crate>; no fixed release yet (SEC-xx)" },
+ignore = []
+
+[licenses]
+# The workspace itself is Apache-2.0 (LICENSE). Allowed are permissive
+# licenses compatible with distributing Apache-2.0 binaries; copyleft
+# licenses (GPL, LGPL, AGPL, MPL) are not on the list and fail the check.
+# This list is exactly the set the dependency graph uses today.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "warn"
+
+[licenses.private]
+ignore = false
+
+[bans]
+# Two versions of one crate are common in a graph this size (windows-sys,
+# thiserror 1/2, ...). Report them, do not fail on them.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+# No crate is banned outright and no duplicate subtree is skipped: every
+# duplicate shows up as a warning in the CI log (today: getrandom, syn,
+# thiserror, tower, tower-http, untrusted, webpki-roots).
+skip-tree = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
