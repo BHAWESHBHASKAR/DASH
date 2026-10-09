@@ -1,10 +1,13 @@
-{{- /* Ingestion workload - mirror of retrieval on port 8081. */ -}}
+{{- /*
+Ingestion workload: the single writer (WAL + redb). Fixed at one replica;
+retrieval pods replicate from it. Do not scale or autoscale it.
+*/ -}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "dash.componentName" (list . "ingestion") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingestion
@@ -23,14 +26,14 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "dash.componentName" (list . "ingestion") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingestion
 spec:
   serviceName: {{ include "dash.componentName" (list . "ingestion") }}
-  replicas: {{ .Values.replicas.ingestion }}
-  podManagementPolicy: Parallel
+  replicas: 1
+  podManagementPolicy: OrderedReady
   selector:
     matchLabels:
       {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
@@ -38,9 +41,9 @@ spec:
     metadata:
       labels:
         {{- include "dash.ingestionSelectorLabels" . | nindent 8 }}
-      {{- with .Values.podLabels }}
-      {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -48,7 +51,7 @@ spec:
     spec:
       serviceAccountName: {{ include "dash.ingestionServiceAccountName" . }}
       automountServiceAccountToken: false
-      {{- with .Values.imagePullSecrets }}
+      {{- if .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- include "dash.imagePullSecrets" . | nindent 8 }}
       {{- end }}
@@ -67,51 +70,50 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+      {{- include "dash.initDataDirs" (list . (include "dash.ingestionImage" .) "/var/lib/dash/wal /var/lib/dash/state /var/lib/dash/segments /var/lib/dash/audit") | nindent 6 }}
       containers:
       - name: ingestion
         image: {{ include "dash.ingestionImage" . | quote }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        # Matches the image ENTRYPOINT; DASH_BIN selects the binary.
         command: ["/opt/dash/bin/dash-entrypoint"]
         args: ["--serve"]
         env:
         - name: DASH_BIN
           value: "ingestion"
-        - name: DASH_HEALTHCHECK_URL
-          value: "http://127.0.0.1:8081{{ .Values.probes.liveness.path }}"
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config
         - secretRef:
-            name: {{ include "dash.fullname" . }}-ingestion-secrets
+            name: {{ include "dash.ingestionSecretName" . }}
         ports:
         - name: http
           containerPort: 8081
           protocol: TCP
         resources:
-          {{- $r := merge (deepCopy .Values.resources) (default (dict) .Values.resources.ingestion) }}
-          {{- $req := dig "requests" (dict) $r }}
-          {{- $lim := dig "limits" (dict) $r }}
-          requests:
-            {{- toYaml $req | nindent 12 }}
-          limits:
-            {{- toYaml $lim | nindent 12 }}
+          {{- include "dash.resources" (list . "ingestion") | nindent 10 }}
         startupProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.startup.path }}"]
+          httpGet:
+            path: {{ .Values.probes.startup.path }}
+            port: http
           initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
           failureThreshold: {{ .Values.probes.startup.failureThreshold }}
         livenessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.liveness.path }}"]
+          httpGet:
+            path: {{ .Values.probes.liveness.path }}
+            port: http
+          initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
         readinessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.readiness.path }}"]
+          httpGet:
+            path: {{ .Values.probes.readiness.path }}
+            port: http
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
@@ -121,19 +123,19 @@ spec:
         volumeMounts:
         - name: data
           mountPath: {{ .Values.config.persistencePath }}
+        # Writable scratch space. /opt/dash is NOT mounted over: it holds
+        # the image's binaries and entrypoint.
         - name: tmp
           mountPath: /tmp
-        - name: home
-          mountPath: /opt/dash
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
-      - name: home
-        emptyDir:
-          medium: Memory
-          sizeLimit: 32Mi
+      {{- if not .Values.persistence.enabled }}
+      - name: data
+        emptyDir: {}
+      {{- end }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
   - metadata:
