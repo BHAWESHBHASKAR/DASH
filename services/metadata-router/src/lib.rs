@@ -1,9 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::Path,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +95,14 @@ impl Default for RouterConfig {
 pub fn route_to_shard(tenant_id: &str, entity_key: &str, shard_count: u32) -> ShardAssignment {
     let shard_count = shard_count.max(1);
     let mut hash: u64 = 1469598103934665603;
-    for b in tenant_id.as_bytes().iter().chain(entity_key.as_bytes()) {
+    // 0xFF never occurs in UTF-8, so ("ab","c") and ("a","bc") cannot collide
+    // by concatenation.
+    for b in tenant_id
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0xFFu8))
+        .chain(entity_key.as_bytes())
+    {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(1099511628211);
     }
@@ -109,7 +118,7 @@ pub fn route_with_replicas(
     entity_key: &str,
     config: &RouterConfig,
 ) -> RoutingPlan {
-    let ring = build_ring(config);
+    let ring = cached_ring(config);
     if ring.is_empty() {
         return RoutingPlan {
             primary: route_to_shard(tenant_id, entity_key, 1),
@@ -118,14 +127,18 @@ pub fn route_with_replicas(
     }
 
     let target = hash_key(&format!("{tenant_id}|{entity_key}"));
-    let mut ordered: Vec<u32> = ring
+    // Walk the ring clockwise and keep the first occurrence of each shard.
+    // `Vec::dedup` only removes adjacent duplicates, which leaves repeats when
+    // virtual nodes of different shards interleave.
+    let mut seen: HashSet<u32> = HashSet::new();
+    let ordered: Vec<u32> = ring
         .range(target..)
         .chain(ring.range(..target))
         .map(|(_, shard_id)| *shard_id)
+        .filter(|shard_id| seen.insert(*shard_id))
         .collect();
-    ordered.dedup();
 
-    let primary_shard = *ordered.first().unwrap_or(&config.shard_ids[0]);
+    let primary_shard = *ordered.first().unwrap_or(&0);
     let primary = ShardAssignment {
         tenant_id: tenant_id.to_string(),
         entity_key: entity_key.to_string(),
@@ -283,30 +296,168 @@ pub fn load_shard_placements_csv(path: &Path) -> Result<Vec<ShardPlacement>, Str
     parse_shard_placements_csv(&raw)
 }
 
+/// Options controlling how placements are fetched from the control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementSourceOptions {
+    /// When the control plane is configured but unreachable, fall back to the
+    /// local placement file only if this is set. Off by default: a stale file
+    /// can name a deposed leader and cause split-brain writes.
+    pub allow_stale_placement: bool,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub write_timeout: Duration,
+    /// Upper bound on the response size accepted from the control plane.
+    pub max_response_bytes: usize,
+    /// Bearer token presented to the control plane.
+    pub bearer_token: Option<String>,
+}
+
+impl Default for PlacementSourceOptions {
+    fn default() -> Self {
+        Self {
+            allow_stale_placement: false,
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            max_response_bytes: 8 * 1024 * 1024,
+            bearer_token: None,
+        }
+    }
+}
+
+impl PlacementSourceOptions {
+    /// Defaults plus environment overrides:
+    /// `DASH_ROUTER_CONTROL_PLANE_TOKEN` (fallback `DASH_CONTROL_PLANE_TOKEN`),
+    /// `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`, and
+    /// `DASH_ROUTER_CONTROL_PLANE_{CONNECT,READ,WRITE}_TIMEOUT_MS`.
+    pub fn from_env() -> Self {
+        let mut options = Self {
+            bearer_token: env_non_empty("DASH_ROUTER_CONTROL_PLANE_TOKEN")
+                .or_else(|| env_non_empty("DASH_CONTROL_PLANE_TOKEN")),
+            allow_stale_placement: matches!(
+                env_non_empty("DASH_ROUTER_ALLOW_STALE_PLACEMENT").as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            ),
+            ..Self::default()
+        };
+        if let Some(value) = env_millis("DASH_ROUTER_CONTROL_PLANE_CONNECT_TIMEOUT_MS") {
+            options.connect_timeout = value;
+        }
+        if let Some(value) = env_millis("DASH_ROUTER_CONTROL_PLANE_READ_TIMEOUT_MS") {
+            options.read_timeout = value;
+        }
+        if let Some(value) = env_millis("DASH_ROUTER_CONTROL_PLANE_WRITE_TIMEOUT_MS") {
+            options.write_timeout = value;
+        }
+        options
+    }
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_millis(name: &str) -> Option<Duration> {
+    env_non_empty(name)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+}
+
 pub fn load_shard_placements_from_source(
     placement_file: Option<&Path>,
     control_plane_base_url: Option<&str>,
+) -> Result<Vec<ShardPlacement>, String> {
+    load_shard_placements_from_source_with_options(
+        placement_file,
+        control_plane_base_url,
+        &PlacementSourceOptions::from_env(),
+    )
+}
+
+pub fn load_shard_placements_from_source_with_options(
+    placement_file: Option<&Path>,
+    control_plane_base_url: Option<&str>,
+    options: &PlacementSourceOptions,
 ) -> Result<Vec<ShardPlacement>, String> {
     let mut control_plane_error: Option<String> = None;
     if let Some(base_url) = control_plane_base_url {
         let trimmed = base_url.trim();
         if !trimmed.is_empty() {
-            match load_shard_placements_from_control_plane(trimmed) {
+            match load_shard_placements_from_control_plane_with_options(trimmed, options) {
                 Ok(placements) => return Ok(placements),
                 Err(err) => control_plane_error = Some(err),
             }
         }
     }
+    if let Some(err) = control_plane_error {
+        // The control plane is configured but did not answer. Serving from a
+        // possibly stale file is only acceptable when explicitly requested.
+        if options.allow_stale_placement
+            && let Some(path) = placement_file
+        {
+            return load_shard_placements_csv(path).map_err(|file_err| {
+                format!("{err}; stale placement fallback also failed: {file_err}")
+            });
+        }
+        return Err(format!(
+            "{err} (refusing to fall back to the placement file; set DASH_ROUTER_ALLOW_STALE_PLACEMENT=1 to allow stale placements)"
+        ));
+    }
     if let Some(path) = placement_file {
         return load_shard_placements_csv(path);
     }
-    Err(control_plane_error.unwrap_or_else(|| {
-        "placement source is unconfigured: set DASH_ROUTER_CONTROL_PLANE_URL or DASH_ROUTER_PLACEMENT_FILE".to_string()
-    }))
+    Err(
+        "placement source is unconfigured: set DASH_ROUTER_CONTROL_PLANE_URL or DASH_ROUTER_PLACEMENT_FILE"
+            .to_string(),
+    )
+}
+
+/// Reject a candidate placement set that moves any shard's epoch backwards
+/// relative to `current`. Callers that hold placements in memory (ingestion,
+/// retrieval) should apply this before swapping in a reloaded set.
+pub fn ensure_no_epoch_regression(
+    current: &[ShardPlacement],
+    candidate: &[ShardPlacement],
+) -> Result<(), String> {
+    let current_epochs: HashMap<(&str, u32), u64> = current
+        .iter()
+        .map(|placement| {
+            (
+                (placement.tenant_id.as_str(), placement.shard_id),
+                placement.epoch,
+            )
+        })
+        .collect();
+    for placement in candidate {
+        if let Some(current_epoch) =
+            current_epochs.get(&(placement.tenant_id.as_str(), placement.shard_id))
+            && placement.epoch < *current_epoch
+        {
+            return Err(format!(
+                "epoch regression for tenant '{}' shard {}: current={}, candidate={}",
+                placement.tenant_id, placement.shard_id, current_epoch, placement.epoch
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn load_shard_placements_from_control_plane(
     base_url: &str,
+) -> Result<Vec<ShardPlacement>, String> {
+    load_shard_placements_from_control_plane_with_options(
+        base_url,
+        &PlacementSourceOptions::from_env(),
+    )
+}
+
+pub fn load_shard_placements_from_control_plane_with_options(
+    base_url: &str,
+    options: &PlacementSourceOptions,
 ) -> Result<Vec<ShardPlacement>, String> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
@@ -314,27 +465,102 @@ pub fn load_shard_placements_from_control_plane(
     }
     let url = format!("{base_url}/v1/control-plane/placement?format=csv");
     let (authority, path) = parse_http_url(&url)?;
-    let mut stream = TcpStream::connect(&authority)
-        .map_err(|err| format!("failed connecting control-plane '{authority}': {err}"))?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    let response = http_get(&authority, &path, options)?;
+    if response.status != 200 {
+        return Err(format!(
+            "control-plane placement request failed with HTTP status {}",
+            response.status
+        ));
+    }
+    if response
+        .header("x-dash-leader")
+        .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+    {
+        return Err(
+            "control-plane node is not the leader; refusing its placement data".to_string(),
+        );
+    }
+    let body = String::from_utf8(response.body)
+        .map_err(|_| "control-plane response is not valid UTF-8".to_string())?;
+    parse_shard_placements_csv(&body)
+}
+
+#[derive(Debug)]
+struct HttpClientResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl HttpClientResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+
+fn http_get(
+    authority: &str,
+    path: &str,
+    options: &PlacementSourceOptions,
+) -> Result<HttpClientResponse, String> {
+    let addrs: Vec<_> = authority
+        .to_socket_addrs()
+        .map_err(|err| format!("failed resolving control-plane '{authority}': {err}"))?
+        .collect();
+    let mut last_err = format!("control-plane '{authority}' resolved to no addresses");
+    let mut stream = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, options.connect_timeout) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(err) => last_err = format!("failed connecting control-plane '{authority}': {err}"),
+        }
+    }
+    let mut stream = stream.ok_or(last_err)?;
+    stream
+        .set_read_timeout(Some(options.read_timeout))
+        .and_then(|_| stream.set_write_timeout(Some(options.write_timeout)))
+        .map_err(|err| format!("failed configuring control-plane socket: {err}"))?;
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    if let Some(token) = options.bearer_token.as_deref() {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
     stream
         .write_all(request.as_bytes())
+        .and_then(|_| stream.flush())
         .map_err(|err| format!("failed sending control-plane request: {err}"))?;
-    stream
-        .flush()
-        .map_err(|err| format!("failed flushing control-plane request: {err}"))?;
 
-    let mut response_bytes = Vec::new();
-    stream
-        .read_to_end(&mut response_bytes)
-        .map_err(|err| format!("failed reading control-plane response: {err}"))?;
-    let response = String::from_utf8(response_bytes)
-        .map_err(|_| "control-plane response is not valid UTF-8".to_string())?;
-    let (header_block, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "control-plane response missing HTTP header terminator".to_string())?;
-    let status_line = header_block
-        .lines()
+    // Overall budget so a server that trickles bytes cannot hold us forever.
+    let deadline = Instant::now() + options.read_timeout.saturating_mul(2);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = find_header_end(&buf) {
+            break pos;
+        }
+        if buf.len() > MAX_RESPONSE_HEADER_BYTES {
+            return Err("control-plane response headers too large".to_string());
+        }
+        let n = read_with_deadline(&mut stream, &mut chunk, deadline)?;
+        if n == 0 {
+            return Err("control-plane response missing HTTP header terminator".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let header_text = std::str::from_utf8(&buf[..header_end])
+        .map_err(|_| "control-plane response headers are not valid UTF-8".to_string())?
+        .to_string();
+    let mut lines = header_text.lines();
+    let status_line = lines
         .next()
         .ok_or_else(|| "control-plane response missing status line".to_string())?;
     let status = status_line
@@ -346,12 +572,89 @@ pub fn load_shard_placements_from_control_plane(
                 .parse::<u16>()
                 .map_err(|_| "control-plane response has invalid status code".to_string())
         })?;
-    if status != 200 {
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    let mut response = HttpClientResponse {
+        status,
+        headers,
+        body: Vec::new(),
+    };
+    if response
+        .header("transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+    {
+        return Err("control-plane sent a chunked response, which is not supported".to_string());
+    }
+    let content_length = match response.header("content-length") {
+        Some(raw) => Some(
+            raw.parse::<usize>()
+                .map_err(|_| "control-plane response has invalid content-length".to_string())?,
+        ),
+        None => None,
+    };
+    if let Some(len) = content_length
+        && len > options.max_response_bytes
+    {
         return Err(format!(
-            "control-plane placement request failed with HTTP status {status}"
+            "control-plane response of {len} bytes exceeds limit of {}",
+            options.max_response_bytes
         ));
     }
-    parse_shard_placements_csv(body)
+
+    let mut body = buf.split_off(header_end + 4);
+    loop {
+        if let Some(len) = content_length
+            && body.len() >= len
+        {
+            body.truncate(len);
+            break;
+        }
+        if body.len() > options.max_response_bytes {
+            return Err(format!(
+                "control-plane response exceeds limit of {} bytes",
+                options.max_response_bytes
+            ));
+        }
+        let n = read_with_deadline(&mut stream, &mut chunk, deadline)?;
+        if n == 0 {
+            if content_length.is_some() {
+                return Err("control-plane response body truncated".to_string());
+            }
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    response.body = body;
+    Ok(response)
+}
+
+fn read_with_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<usize, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("control-plane response timed out".to_string());
+    }
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|err| format!("failed configuring control-plane socket: {err}"))?;
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(format!("failed reading control-plane response: {err}")),
+        }
+    }
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 pub fn render_shard_placements_csv(placements: &[ShardPlacement]) -> String {
@@ -513,6 +816,34 @@ fn build_ring(config: &RouterConfig) -> BTreeMap<u64, u32> {
             ring.insert(hash_key(&key), shard_id);
         }
     }
+    ring
+}
+
+type RingKey = (Vec<u32>, u32);
+
+const RING_CACHE_MAX_ENTRIES: usize = 32;
+
+/// Return the hash ring for `config`, building it once per distinct shard set
+/// and virtual-node count instead of once per routed claim.
+fn cached_ring(config: &RouterConfig) -> Arc<BTreeMap<u64, u32>> {
+    static CACHE: OnceLock<Mutex<HashMap<RingKey, Arc<BTreeMap<u64, u32>>>>> = OnceLock::new();
+    let mut shard_ids = config.shard_ids.clone();
+    shard_ids.sort_unstable();
+    shard_ids.dedup();
+    let key: RingKey = (shard_ids, config.virtual_nodes_per_shard.max(1));
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = cache.lock() else {
+        // A poisoned cache only costs us the optimisation.
+        return Arc::new(build_ring(config));
+    };
+    if let Some(ring) = guard.get(&key) {
+        return Arc::clone(ring);
+    }
+    let ring = Arc::new(build_ring(config));
+    if guard.len() >= RING_CACHE_MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(key, Arc::clone(&ring));
     ring
 }
 
@@ -748,5 +1079,292 @@ mod tests {
                 .expect("url should parse");
         assert_eq!(authority, "127.0.0.1:8090");
         assert_eq!(path, "/v1/control-plane/placement?format=csv");
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn quick_options() -> PlacementSourceOptions {
+        PlacementSourceOptions {
+            connect_timeout: Duration::from_millis(500),
+            read_timeout: Duration::from_millis(300),
+            write_timeout: Duration::from_millis(300),
+            ..PlacementSourceOptions::default()
+        }
+    }
+
+    /// Spawn a one-shot server that reads the request head, hands the stream
+    /// to `respond`, and returns the base URL plus a handle yielding the
+    /// request head text.
+    fn one_shot_server(
+        respond: impl FnOnce(&mut TcpStream) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            respond(&mut stream);
+            String::from_utf8_lossy(&head).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    const CSV: &str = "tenant-a,0,3,node-a,leader,healthy\n";
+
+    #[test]
+    fn client_reads_by_content_length_without_waiting_for_close() {
+        let (url, handle) = one_shot_server(|stream| {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                CSV.len(),
+                CSV
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            // Keep the connection open: the old read_to_end client hung here.
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let started = Instant::now();
+        let placements =
+            load_shard_placements_from_control_plane_with_options(&url, &quick_options())
+                .expect("response framed by Content-Length should parse");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(placements[0].epoch, 3);
+        drop(handle);
+    }
+
+    #[test]
+    fn client_reads_until_close_without_content_length() {
+        let (url, handle) = one_shot_server(|stream| {
+            stream
+                .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{CSV}").as_bytes())
+                .unwrap();
+        });
+        let placements =
+            load_shard_placements_from_control_plane_with_options(&url, &quick_options()).unwrap();
+        assert_eq!(placements.len(), 1);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn client_times_out_on_unresponsive_server() {
+        let (url, handle) = one_shot_server(|_stream| {
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let started = Instant::now();
+        let err = load_shard_placements_from_control_plane_with_options(&url, &quick_options())
+            .expect_err("silent server must time out");
+        assert!(started.elapsed() < Duration::from_secs(2), "{err}");
+        assert!(err.contains("control-plane"));
+        drop(handle);
+    }
+
+    #[test]
+    fn client_enforces_response_size_cap() {
+        let (url, handle) = one_shot_server(|stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\n\r\n")
+                .unwrap();
+        });
+        let mut options = quick_options();
+        options.max_response_bytes = 1024;
+        let err =
+            load_shard_placements_from_control_plane_with_options(&url, &options).unwrap_err();
+        assert!(err.contains("exceeds limit"), "{err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn client_sends_bearer_token() {
+        let (url, handle) = one_shot_server(|stream| {
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{CSV}",
+                        CSV.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let mut options = quick_options();
+        options.bearer_token = Some("s3cret".to_string());
+        load_shard_placements_from_control_plane_with_options(&url, &options).unwrap();
+        let request = handle.join().unwrap();
+        assert!(
+            request.contains("Authorization: Bearer s3cret\r\n"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn client_rejects_follower_control_plane_response() {
+        let (url, handle) = one_shot_server(|stream| {
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nX-Dash-Leader: false\r\nContent-Length: {}\r\n\r\n{CSV}",
+                        CSV.len()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let err = load_shard_placements_from_control_plane_with_options(&url, &quick_options())
+            .unwrap_err();
+        assert!(err.contains("not the leader"), "{err}");
+        handle.join().unwrap();
+    }
+
+    fn dead_control_plane_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn temp_placement_file(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dash-router-{tag}-{}-{nanos}.csv",
+            std::process::id()
+        ));
+        fs::write(&path, "tenant-a,0,1,node-stale,leader,healthy\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn unreachable_control_plane_does_not_fall_back_to_stale_file_by_default() {
+        let file = temp_placement_file("nofallback");
+        let err = load_shard_placements_from_source_with_options(
+            Some(&file),
+            Some(&dead_control_plane_url()),
+            &quick_options(),
+        )
+        .expect_err("must not silently use the stale file");
+        assert!(err.contains("refusing to fall back"), "{err}");
+    }
+
+    #[test]
+    fn explicit_allow_stale_placement_falls_back_to_file() {
+        let file = temp_placement_file("allowstale");
+        let mut options = quick_options();
+        options.allow_stale_placement = true;
+        let placements = load_shard_placements_from_source_with_options(
+            Some(&file),
+            Some(&dead_control_plane_url()),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(placements[0].replicas[0].node_id, "node-stale");
+    }
+
+    #[test]
+    fn file_only_source_still_works_without_control_plane() {
+        let file = temp_placement_file("fileonly");
+        let placements =
+            load_shard_placements_from_source_with_options(Some(&file), None, &quick_options())
+                .unwrap();
+        assert_eq!(placements.len(), 1);
+    }
+
+    #[test]
+    fn epoch_regression_is_rejected() {
+        let mk = |epoch| {
+            vec![ShardPlacement {
+                tenant_id: "t".to_string(),
+                shard_id: 1,
+                epoch,
+                replicas: vec![],
+            }]
+        };
+        assert!(ensure_no_epoch_regression(&mk(5), &mk(5)).is_ok());
+        assert!(ensure_no_epoch_regression(&mk(5), &mk(6)).is_ok());
+        let err = ensure_no_epoch_regression(&mk(5), &mk(4)).unwrap_err();
+        assert!(err.contains("epoch regression"));
+    }
+
+    #[test]
+    fn route_to_shard_separates_tenant_and_entity() {
+        // Without a separator ("ab","c") and ("a","bc") hash identically for
+        // every shard count.
+        let differs = (2..64u32).any(|count| {
+            route_to_shard("ab", "c", count).shard_id != route_to_shard("a", "bc", count).shard_id
+        });
+        assert!(differs);
+    }
+
+    #[test]
+    fn route_to_shard_placement_is_pinned_for_sample_keys() {
+        // Changing the hash re-homes every entity. If this test fails the
+        // change must be deliberate and come with a data migration plan.
+        let sample = [
+            ("tenant-a", "entity-x"),
+            ("tenant-a", "entity-y"),
+            ("tenant-b", "claim-1"),
+            ("acme", "user:42"),
+            ("", "empty-tenant"),
+        ];
+        let actual: Vec<u32> = sample
+            .iter()
+            .map(|(tenant, entity)| route_to_shard(tenant, entity, 16).shard_id)
+            .collect();
+        assert_eq!(actual, PINNED_SHARDS);
+    }
+
+    const PINNED_SHARDS: [u32; 5] = [4, 7, 13, 11, 0];
+
+    #[test]
+    fn route_with_replicas_never_repeats_a_shard() {
+        let config = RouterConfig {
+            shard_ids: vec![9, 3, 7, 1],
+            virtual_nodes_per_shard: 64,
+            replica_count: 4,
+        };
+        for i in 0..500 {
+            let plan = route_with_replicas("tenant-a", &format!("entity-{i}"), &config);
+            let mut shards = vec![plan.primary.shard_id];
+            shards.extend(plan.replicas.iter().map(|replica| replica.shard_id));
+            let unique: HashSet<u32> = shards.iter().copied().collect();
+            assert_eq!(unique.len(), shards.len(), "duplicate shard in {shards:?}");
+            assert_eq!(
+                shards.len(),
+                4,
+                "all four shards should be used: {shards:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ring_cache_returns_shared_ring_for_same_shard_set() {
+        let a = RouterConfig {
+            shard_ids: vec![21, 22, 23],
+            virtual_nodes_per_shard: 8,
+            replica_count: 1,
+        };
+        let b = RouterConfig {
+            shard_ids: vec![23, 21, 22],
+            ..a.clone()
+        };
+        assert!(Arc::ptr_eq(&cached_ring(&a), &cached_ring(&b)));
+        let c = RouterConfig {
+            shard_ids: vec![21, 22],
+            ..a.clone()
+        };
+        assert!(!Arc::ptr_eq(&cached_ring(&a), &cached_ring(&c)));
     }
 }
