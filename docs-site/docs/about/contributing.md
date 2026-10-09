@@ -85,12 +85,11 @@ git checkout -b feature/add-hnsw-index
 Use clear, imperative commit messages:
 
 ```text
-Add HNSW vector index integration
+Add tenant allowlist check to the retrieval path
 
-- Integrate usearch crate for ANN search
-- Add IndexBuilder trait for pluggable indexes
-- Implement IndexedStore with vector retrieval path
-- Add benchmark comparing linear scan vs HNSW
+- Reject tenants outside the configured allowlist before embedding
+- Return 403 with a stable error message
+- Add a regression test that fails without the check
 ```
 
 ### 4. Push and open a PR
@@ -166,7 +165,7 @@ Looking for a place to start? Check issues labeled [`good-first-issue`](https://
 
 ### High complexity (but high impact!)
 
-- Integrate ANN vector index (HNSW via `usearch` or `hora`)
+- Replace the in-repo ANN graph with a maintained HNSW library (evaluate `usearch` or `hora`; see register IDX-01)
 - Build pluggable embedding model API
 - Implement multi-hop graph traversal
 - Design segment storage with object store backend (S3)

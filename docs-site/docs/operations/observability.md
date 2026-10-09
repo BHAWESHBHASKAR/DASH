@@ -123,7 +123,7 @@ DASH emits logs as one JSON object per line on stdout. The fields:
 }
 ```
 
-The level is controlled by `DASH_LOG_LEVEL` (default: `info`; supported: `trace`, `debug`, `info`, `warn`, `error`). The format is **always** JSON — there is no text-mode log output.
+The filter is controlled by the standard `RUST_LOG` variable (default `info`; `DASH_LOG_LEVEL` does not exist). The format is compact text by default; set `DASH_LOG_FORMAT=json` for JSON lines. The field names in the sample above are illustrative, not a stable schema.
 
 In Kubernetes, the logs are picked up by the standard `kubectl logs` path. A `Fluent Bit` or `Vector` sidecar forwards them to the log backend. The JSON shape is stable; downstream parsers should key on `ts`, `level`, `service`, `tenant_id`, and `msg`.
 
@@ -137,7 +137,7 @@ When it ships, the trace shape will be:
 HTTP server span (POST /v1/retrieve)
   ├── JWT verify span
   ├── Embedding provider span (calls Ollama or OpenAI)
-  ├── ANN search span (usearch)
+  ├── ANN search span
   ├── Lexical rerank span (BM25)
   └── Response build span
 ```

@@ -1,6 +1,6 @@
 # Architecture decisions
 
-DASH is shaped by a small set of explicit, dated decisions. Each is recorded as an Architecture Decision Record (ADR) — a one-page document that captures the context, the options considered, the decision, and the consequences. The current ADRs are summarized below; the full source-of-truth ADRs live in `docs/rfcs/` in the source tree.
+DASH is shaped by a small set of explicit, dated decisions. Each is recorded as an Architecture Decision Record (ADR) — a one-page document that captures the context, the options considered, the decision, and the consequences. The current ADRs are summarized below; the ADRs below are the only copy; there is no `docs/rfcs/` directory.
 
 ## ADR-001: Why redb over sled/rocksdb
 
@@ -26,7 +26,7 @@ Use `redb`. The decision is justified by:
 ### Consequences
 
 - The single-process write lock is a constraint. We accept it because DASH is designed to scale horizontally with more processes, not more concurrency inside a process. See [Scaling → Horizontal scaling](../operations/scaling.md#horizontal-scaling).
-- The PR 1 (additive, default off) and PR 3 (replication) plan is built around redb's lock semantics. See [Persistence](../concepts/persistence.md) and [Scaling → redb PR 3 replication](../operations/scaling.md#redb-pr-3-replication).
+- redb is enabled by default when a WAL path is configured (it was introduced as an additive, default-off layer and was switched to default-on). Replication today is WAL-based polling, not redb-based. See [Persistence](../concepts/persistence.md) and [Scaling](../operations/scaling.md).
 - A migration off redb is **not** in the roadmap. The commitment is durable.
 
 ## ADR-002: Why semantic-first over lexical-first
@@ -63,7 +63,7 @@ DASH's HTTP services could be built on top of `axum` (the de-facto Rust web fram
 
 ### Decision
 
-Use `std::net::TcpStream` with a thread-per-connection model. Configure the worker count with `DASH_INGEST_WORKERS` / `DASH_RETRIEVAL_WORKERS`.
+Use `std::net::TcpStream` with a thread-per-connection model. Configure the worker count with `DASH_INGEST_HTTP_WORKERS` / `DASH_RETRIEVAL_HTTP_WORKERS`.
 
 The decision is justified by:
 
@@ -114,7 +114,7 @@ DASH could have shipped a custom wire protocol for `/v1/embeddings`, or it could
 
 ### Decision
 
-OpenAI drop-in. The `/v1/embeddings` endpoint is byte-compatible with the OpenAI v1 spec, including the error envelope, the `usage` field, and the `encoding_format` switch.
+OpenAI-compatible. The `/v1/embeddings` endpoint follows the OpenAI v1 request and response shape, including an OpenAI-style error object, a `usage` field (an estimate) and the `encoding_format` switch (`float`, `base64`). Compatibility is covered by unit and HTTP-level tests, not by a test against the official SDKs.
 
 The decision is justified by:
 

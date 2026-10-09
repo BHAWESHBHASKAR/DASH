@@ -1,36 +1,21 @@
 # Data model
 
-DASH's data model is small and explicit. Six types cover everything that lives in the database, the audit log, or the response payloads. This page describes each one with the wire-level JSON shape, the relationship to the other types, and the cardinality rules.
+DASH's data model is small and explicit. Three stored record types (`Claim`, `Evidence`, `ClaimEdge`), a derived contradiction signal, an optional vector per claim, and an append-only audit record. The authoritative definitions are in `pkg/schema/src/lib.rs`; this page mirrors them.
 
-## The six types
+| Type | Stored in | Cardinality |
+|---|---|---|
+| `Claim` | WAL, redb, in-memory store | unbounded per tenant |
+| `Evidence` | WAL, redb, in-memory store | zero or more per claim |
+| `ClaimEdge` | WAL, redb, in-memory store | zero or more per claim |
+| Vector | WAL, redb, ANN graph | at most one per claim |
+| Contradiction | derived at query time | derived counters on each result |
+| Audit record | JSON-lines file, if enabled | one per audited request |
 
-| Type            | Lives in               | Cardinality per tenant           |
-| --------------- | ---------------------- | -------------------------------- |
-| `Tenant`        | redb, control plane    | one per deployment customer      |
-| `Vector`        | redb, ANN index        | one per claim (per tenant)       |
-| `Claim`         | redb, WAL, ANN         | unbounded                        |
-| `Evidence`      | redb, WAL              | zero-to-many per claim           |
-| `Contradiction` | derived, in response   | zero-to-many per claim (derived) |
-| `AuditEvent`    | hash-chained log file  | one per state-changing request   |
-
-## `Tenant`
-
-A tenant is the unit of isolation. Every `Claim`, `Evidence`, `Vector`, and `AuditEvent` carries a `tenant_id`, and the retrieval API scopes its query to a single tenant.
-
-```json
-{
-  "tenant_id": "t1",
-  "display_name": "Acme Corp",
-  "rate_limit_rps": 100,
-  "created_at_unix": 1718300000
-}
-```
-
-There is no cross-tenant query path. A retrieval request that names tenant `t1` will never return a claim from tenant `t2`, even if the query text is identical and the vector is closer. The enforcement is at the storage layer (per-tenant key spaces in redb) and at the API layer (a request without a `tenant_id` is rejected with `400 Bad Request`).
+There is no `Tenant` record. A tenant is just the `tenant_id` string on claims; see [Multi-tenancy](multi-tenancy.md).
 
 ## `Claim`
 
-A claim is an atomic, source-bound assertion. It is the primary data primitive.
+A claim is an atomic, source-bound assertion and the primary data primitive.
 
 ```json
 {
@@ -39,30 +24,34 @@ A claim is an atomic, source-bound assertion. It is the primary data primitive.
   "canonical_text": "Company X acquired Company Y",
   "confidence": 0.95,
   "event_time_unix": 1718300000,
-  "valid_from_unix": 1718300000,
-  "valid_to_unix": null,
-  "extraction_model": "llm-extractor-v1",
-  "created_at_unix": 1718300050
+  "entities": ["Company X", "Company Y"],
+  "embedding_ids": [],
+  "claim_type": "factual",
+  "valid_from": 1718300000,
+  "valid_to": null,
+  "created_at": null,
+  "updated_at": null
 }
 ```
 
-Field rules:
+Field rules (from `validate_claim`):
 
-- `claim_id` is unique within a tenant. Re-ingesting the same `claim_id` updates the existing record (idempotent, see [Ingest](../guides/ingest.md#idempotency)).
-- `confidence` is in `[0, 1]`. Out-of-range values are rejected.
-- `event_time_unix` is the wall-clock time of the *event* the claim is about (not the time the claim was extracted).
-- `valid_from_unix` / `valid_to_unix` define the temporal validity window. A `null` upper bound means "valid indefinitely". A retrieval with `time_range: { from_unix, to_unix }` filters out claims whose `[valid_from, valid_to]` does not intersect the requested range.
-- `extraction_model` records which model produced the claim. It is part of the audit trail.
+- `claim_id`, `tenant_id`, `canonical_text` are required and non-blank. `claim_id` is unique across the deployment's store (a different tenant reusing it gets a 409).
+- `confidence` is in `[0, 1]`; out-of-range values are rejected.
+- `event_time_unix` is the time of the event the claim is about. Optional.
+- `valid_from` / `valid_to` define the temporal validity window (unix seconds). If both are set, `valid_from <= valid_to`. A `null` bound is open. A retrieval `time_range` filters on the event time and the window; see the tests `retrieve_with_time_range_*` in `pkg/store`.
+- `claim_type` is optional: `factual`, `opinion`, `prediction`, `temporal`, `causal`.
+- `entities` and `embedding_ids` are non-blank string lists used for filtering.
+- There is no `extraction_model` on a claim and no `*_unix` suffix on the validity fields; `extraction_model` belongs to evidence.
 
 ## `Evidence`
 
-Evidence is the record that ties a claim to a source. It is the field that makes the citation *defensible*.
+Evidence ties a claim to a source. It is what makes the citation defensible.
 
 ```json
 {
   "evidence_id": "e1",
   "claim_id": "c1",
-  "tenant_id": "t1",
   "source_id": "news://nyt/2024/05/12/acme-x",
   "stance": "supports",
   "source_quality": 0.95,
@@ -71,94 +60,76 @@ Evidence is the record that ties a claim to a source. It is the field that makes
   "span_end": 1280,
   "doc_id": "nyt-2024-05-12-acme-x",
   "extraction_model": "llm-extractor-v1",
-  "created_at_unix": 1718300051
+  "ingested_at": 1718300051
 }
 ```
 
-Field rules:
+- `stance`: `supports`, `contradicts` or `neutral`.
+- `source_quality` is required and in `[0, 1]`; there is no default.
+- `chunk_id` must be non-blank if present. `span_start` and `span_end` must both be present or both absent, with `span_start <= span_end`.
+- `source_id` is an opaque string. DASH does not parse it.
+- Evidence has no `tenant_id`; it belongs to the claim named by `claim_id`.
+- Evidence is not idempotent in v0.2.x (duplicates on retry and restart, register DATA-01). v0.3.0 makes writes upserts keyed by `evidence_id`.
 
-- `stance` is one of `supports`, `contradicts`, `neutral`.
-- `source_quality` is in `[0, 1]`. The default is `0.5` if the ingestion request omits it.
-- `chunk_id`, `span_start`, `span_end` are optional. When present, they let a downstream UI deep-link to the exact characters in the source.
-- `source_id` is an opaque URI. DASH does not parse it; the convention is `<scheme>://<authority>/<path>`.
+## Vector
 
-## `Vector`
+An optional embedding per claim, supplied as `claim.embedding_vector` (or top-level `claim_embedding`) on ingest or computed by the configured provider. Vectors are stored in the WAL and redb as raw `f32` data and fed to the per-tenant ANN graph. The dimension is pinned per tenant when its first vector is stored; a later vector of a different dimension is rejected as an invalid vector (400). The default hash provider produces 384-dimension vectors; the ingestion-side `hash_vector` provider defaults to 64 dimensions. There is no 768-dimension default. Re-ingesting a claim currently drops its in-memory vector while redb keeps it (register DATA-04).
 
-A vector is a fixed-dimensional embedding associated with a claim.
+## Contradiction (derived)
 
-```json
-{
-  "claim_id": "c1",
-  "tenant_id": "t1",
-  "dim": 768,
-  "values_b64": "AaBbCcDdEe..."
-}
-```
+A contradiction is not a stored type. A result's `contradicts` counter counts evidence with `stance: contradicts` and incoming `contradicts` edges; `supports` counts the supportive counterparts. `stance_mode: support_only` removes claims with more contradictions than supports; `balanced` keeps them and lowers their score. Tests: `support_only_drops_claim_with_more_contradictions_than_supports`, `balanced_mode_keeps_contradicted_claims_with_neutral_score`, `edge_contradicts_evidence_increments_contradict_count` in `pkg/store/tests/integration_retrieval.rs`.
 
-The vector is stored **base64-encoded** in the wire format and the on-disk format, decoded into `&[f32]` for ANN search. The default dimension is 768 (matching `nomic-embed-text`); the dimension is pinned per tenant at first ingest. Mismatched dimensions on subsequent ingests are rejected with `409 Conflict`.
+## `ClaimEdge`
 
-## `Contradiction` (derived)
-
-A contradiction is **not** a stored type. It is a *derived* field on a retrieval response. A `Contradiction` exists when a claim has at least one `Evidence` with `stance: contradicts`, or at least one `ClaimEdge` with `relation: contradicts` from another claim. The retrieval response exposes this as the `contradicts: N` counter on each result.
-
-## `ClaimEdge` (graph)
-
-A `ClaimEdge` is a typed relationship between two claims in the same tenant.
+A typed, weighted relationship from one claim to another.
 
 ```json
 {
   "edge_id": "g1",
-  "tenant_id": "t1",
-  "src_claim_id": "c1",
-  "dst_claim_id": "c2",
+  "from_claim_id": "c1",
+  "to_claim_id": "c2",
   "relation": "supports",
-  "weight": 0.8
+  "strength": 0.8,
+  "reason_codes": [],
+  "created_at": null
 }
 ```
 
-`relation` is one of `supports`, `contradicts`, `refines`, `supersedes`. The `supersedes` relation is used to mark a claim as the temporal successor of another (e.g. "the 2024-10-K supersedes the 2023-10-K for this disclosure").
+`relation` is one of `supports`, `contradicts`, `refines`, `duplicates`, `depends_on` (there is no `supersedes`). `strength` is in `[0, 1]`. On ingest, `from_claim_id` must equal the claim in the request. `to_claim_id` is not checked for existence or tenant today, and edges are not idempotent in v0.2.x.
 
-## `AuditEvent`
+## Audit record
 
-An `AuditEvent` is the hash-chained record of every authenticated state change.
+When `DASH_INGEST_AUDIT_LOG_PATH` or `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set, the service appends one JSON line per audited request:
 
 ```json
 {
   "seq": 17,
-  "ts_unix": 1718300060,
-  "actor": "jwt:sub=alice@acme",
+  "ts_unix_ms": 1718300060000,
+  "service": "ingestion",
+  "action": "ingest",
   "tenant_id": "t1",
-  "action": "claim.ingest",
-  "subject_ids": ["c1", "e1"],
-  "payload_sha256": "5b8f...c1",
+  "claim_id": "c1",
+  "status": 200,
+  "outcome": "success",
+  "reason": "ingest accepted",
   "prev_hash": "3a2b...9f",
   "hash": "9c0d...71"
 }
 ```
 
-Field rules:
+`hash` is SHA-256 over the canonical JSON of the record (including `prev_hash`). The chain is **unkeyed**: it detects accidental edits but anyone who can rewrite the file can recompute it. There is no actor or principal field, no request or response hash, and no JWT `jti`. The ingestion service's chain hashes keys in sorted order while `scripts/verify_audit_chain.sh` hashes in insertion order, so ingestion logs do not verify (register SEC-17, fix planned). Audit is off unless the path variable is set.
 
-- `seq` is a monotonically increasing per-tenant sequence number.
-- `hash = sha256( seq || ts_unix || actor || action || subject_ids || payload_sha256 || prev_hash )`.
-- The chain is **tamper-evident**: any modification to an earlier event invalidates every subsequent `hash`. Verification is a linear scan with `scripts/verify_audit_chain.sh`.
-
-## Relationships and cardinality
+## Relationships
 
 ```text
-Tenant 1──* Claim 1──* Evidence
-                │
-                ├──1 Vector
-                │
-                └──* ClaimEdge ──► Claim (same tenant)
+Claim 1──* Evidence
+Claim 1──0..1 Vector
+Claim 1──* ClaimEdge ──► Claim
 ```
 
-- One `Tenant` has many `Claim`s.
-- One `Claim` has many `Evidence` records.
-- One `Claim` has exactly one `Vector` (the embedding). Re-ingest replaces the vector.
-- One `Claim` has many outgoing `ClaimEdge`s, many incoming `ClaimEdge`s. Edges are between claims in the *same* tenant.
+## Not in the data model
 
-## What's not in the data model
-
-- **No cross-tenant graph.** Edges are within a tenant. Cross-tenant retrieval is not a feature.
-- **No free-form metadata on claims.** The fields above are exhaustive. A future PR may add a `metadata: Map<String, Value>` field, gated by a feature flag.
-- **No versioning of claims.** Re-ingesting a `claim_id` overwrites. A `history` table is a known gap; see the [Changelog](../about/changelog.md#known-limitations) for the current limitations.
+- No tenant record, display name or per-tenant settings.
+- No free-form metadata map on claims.
+- No claim versioning or history: re-ingesting a `claim_id` for the same tenant updates the claim.
+- No delete or tombstone. There is no way to remove a claim, evidence or edge (register DATA-14, planned P2).

@@ -1,117 +1,44 @@
 # Persistence
 
-DASH persists every state change to disk. The persistence story has two layers: an append-only **write-ahead log (WAL)** that is the first thing written, and a **`redb` snapshot** that is the durable, queryable on-disk representation. This page describes both layers, the crash-recovery semantics, and the backup procedure.
+DASH persists state in two layers: an append-only **write-ahead log (WAL)** file with an optional compacted **snapshot**, and an optional **`redb`** database that mirrors writes to disk. This page describes what the code does today and where it has known defects. It replaces an earlier version that described a binary WAL with CRC-32c records, redb sequence numbers and idempotency-key tables; none of those exist.
 
-## redb architecture
+## Write-ahead log
 
-[`redb`](https://github.com/cberner/redb) is a pure-Rust, ACID, single-file embedded database. DASH uses redb PR 1 (additive, default off; enable with `DASH_INGEST_PERSISTENCE_PATH` / `DASH_RETRIEVAL_PERSISTENCE_PATH`).
+The WAL is a **text file with one record per line**, tab-separated, with a one-letter record type: `C` claim, `E` evidence, `G` edge, `V` claim vector, `B` batch commit. It is implemented by `FileWal` in `pkg/store/src/wal.rs`. There is no per-record checksum and no length prefix; values are escaped (`\t`, newline) inside fields.
 
-### File layout
+- **Path:** `DASH_INGEST_WAL_PATH` (the ingestion service only keeps state across restarts when this is set; without it the service is in-memory). The retrieval service can also replay a local WAL via `DASH_RETRIEVAL_WAL_PATH`, but normally it follows ingestion by replication.
+- **Durability policy:** by default every record is fsynced. Batching knobs (`DASH_INGEST_WAL_SYNC_EVERY_RECORDS`, `..._APPEND_BUFFER_RECORDS`, `..._SYNC_INTERVAL_MS`, `..._BACKGROUND_FLUSH_ONLY`) are guarded: values beyond the safe limits make the service exit unless `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true`.
+- **Checkpoints:** when `DASH_CHECKPOINT_MAX_WAL_RECORDS` or `DASH_CHECKPOINT_MAX_WAL_BYTES` is exceeded, the log is compacted into a snapshot file next to the WAL (`<wal path>.snapshot`, header `SNAP\t1`) and the WAL is truncated. On restart the snapshot is loaded, then the WAL delta is replayed.
+- **Atomicity:** a single ingest appends claim, evidence, edges and vector as separate records with no commit marker, so a crash between records can leave a partial bundle (register DATA-10).
 
-A redb file is a single file on disk. DASH uses one redb file per service, so a typical deployment has:
+### Recovery
 
-```text
-/var/lib/dash/
-├── ingest.redb         # the ingestion service's redb
-└── retrieval.redb      # the retrieval service's redb
-```
+On start, the service replays the snapshot and then the WAL into the in-memory store (`load_from_wal_with_stats_and_ann_tuning`) and logs counts (`claims_loaded`, `evidence_loaded`, `snapshot_records`, `wal_delta_records`). If the WAL cannot be parsed or replayed, the service logs the error and exits with status 1.
 
-The file is mmap'd at startup. redb manages its own page cache; DASH does not pin pages in the OS page cache explicitly.
+Changes in v0.3.0: a torn tail record (partial last line after a crash) is truncated on recovery instead of failing startup, and WAL generation ids force a follower to resync from a full export after the primary compacts, so followers cannot apply a stale offset to a compacted log. Both are listed in the [changelog](../about/changelog.md) as planned for 0.3.0 and are not in v0.2.x.
 
-### Tables
+## redb
 
-The table layout is described in [Multi-tenancy → Per-tenant key spaces](multi-tenancy.md#per-tenant-key-spaces-in-redb). The short version: one table per type, with `(tenant_id, id)` keys.
+[`redb`](https://github.com/cberner/redb) is an embedded, ACID, single-file key-value database. DASH's `DiskBackedStore` (`pkg/store/src/disk.rs`) mirrors claims, evidence, edges, vectors, tenant dimensions, the tenant-to-claims membership set and batch-commit records into redb tables (`dash_claims`, `dash_evidence`, `dash_edges`, `dash_claim_vectors`, `dash_tenant_dims`, `dash_tenant_claims_set`, plus batch commits).
 
-### Transactions
+- **On by default** when a WAL path is configured: `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`. Override with `DASH_INGEST_PERSISTENCE_PATH` / `DASH_RETRIEVAL_PERSISTENCE_PATH`. Turn off with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`. An earlier version of this page said redb was off by default; that was wrong.
+- **Failure behavior:** if the file cannot be opened (for example a read-only filesystem), the service logs an error and continues in memory with `disk_status = Unavailable`. `/ready` returns 503 in that case only when a persistence path was explicitly configured.
+- **Write order:** each mutation is written to redb before the in-memory state changes; a redb write failure aborts the apply.
+- **Single process:** redb takes a file lock; one service process per file.
+- Tests: `disk_persistence_round_trip`, `disk_fallback_to_wal_only_on_open_failure`, `disk_open_failure_does_not_crash_service`, `disk_bulk_load_rebuilds_ann_index` in `pkg/store/tests/integration_retrieval.rs`.
 
-redb is ACID. DASH uses **one transaction per ingest** (a `Claim` + its `Evidence` + its `ClaimEdge`s + its `Vector` are committed atomically) and **one transaction per retrieval-side mutation** (none, in the current design — the retrieval service is read-only against redb).
+### Known defects (v0.2.x)
 
-A failed transaction rolls back the file to the previous commit point. The file is never partially written.
+- Evidence is appended without de-duplication, so restart paths that combine a redb bulk load with WAL replay can duplicate evidence (DATA-01, fixed in v0.3.0 by idempotent upserts).
+- Re-upserting a claim drops its in-memory vector while redb keeps it, so memory and disk can diverge (DATA-04).
+- The ANN graph is not persisted; it is rebuilt in memory from stored vectors at startup, and the rebuild cost is quadratic in the number of vectors (IDX-01, planned P2).
 
-### Why redb (and not sled / rocksdb)
+## Replication offset
 
-The full decision is in [ADR-001](../reference/architecture-decisions.md#adr-001-why-redb-over-sledrocksdb). The short version: redb is pure Rust (no CGo, no `librocksdb` to vendor), has a tiny API surface, and its on-disk format is forward-compatible across versions. The trade-off — single-process write lock — is acceptable because DASH is designed to scale horizontally with more processes, not more concurrency inside a process.
+The retrieval follower stores the last applied WAL offset in `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH` (default `/var/lib/dash/state/retrieval-replication.offset`) and pulls deltas from ingestion's `/internal/replication/wal`.
 
-## WAL fallback
+## Backup
 
-When `DASH_*_PERSISTENCE_PATH` is **unset** (the default), the ingestion service runs in **WAL-only mode**. Every `IngestRequest` is appended to the WAL as a length-prefixed, CRC-32c-checked record, and the in-memory state is updated. The redb snapshot is not written.
+Use `scripts/backup_state_bundle.sh` and `scripts/restore_state_bundle.sh` (see [Backup](../operations/backup.md)). Copying a live redb or WAL file with `cp` is not guaranteed consistent; stop the service or use the bundle script. The earlier example here that used `systemctl reload` as a checkpoint trigger, `redb-checksum` and `DASH_INGEST_CHECKPOINT_ON_SIGHUP` referred to features that do not exist.
 
-This is the pre-redb behavior, preserved bit-for-bit. The motivation is to keep the deployment surface area small: an operator who is not ready to commit to a redb file lifecycle can run DASH in WAL-only mode and replay on every restart.
-
-The WAL lives at the path configured by `DASH_INGEST_WAL_PATH` (default: `/var/lib/dash/ingest.wal`).
-
-### WAL record format
-
-```text
-┌──────────┬──────────┬─────────────┬────────────────┐
-│ len: u32 │ crc: u32 │ kind: u8    │ payload bytes  │
-└──────────┴──────────┴─────────────┴────────────────┘
-```
-
-- `len` — total record length including the header.
-- `crc` — CRC-32c over the payload bytes.
-- `kind` — `1 = Ingest`, `2 = TenantCreate`, `3 = TenantDelete`.
-- `payload` — bincode-encoded `IngestRecord` (or the analogous type).
-
-A corrupted record (CRC mismatch) terminates replay with an error. The recovery procedure is documented below.
-
-## Crash recovery semantics
-
-DASH's recovery story is **WAL-replay-into-redb**, with the redb snapshot as a restart-time accelerator.
-
-### Restart in WAL-only mode
-
-1. The ingestion service starts.
-2. It opens the WAL with `FileWal::open`.
-3. It reads records sequentially, validates CRCs, and re-applies each `IngestRecord` to the `InMemoryStore`.
-4. The first CRC failure halts the replay. The service starts with the partial state recovered up to that point and logs the position of the failed record.
-
-### Restart with redb enabled
-
-1. The ingestion service starts.
-2. It opens the redb file with `DiskBackedStore::open`.
-3. It loads the `claims`, `evidence`, `vectors`, and `ann_index` tables into the in-memory caches.
-4. It opens the WAL and replays any records with `seq > last_redb_seq`. The `last_redb_seq` is stored in a redb-internal key.
-5. The ANN graph is rebuilt from the recovered vectors (the on-disk HNSW is treated as advisory; the in-memory graph is the source of truth during a process's lifetime).
-
-The result is **at-least-once** durability with **exactly-once** semantics on the application level (idempotency keys on `IngestRequest` make a re-replay safe).
-
-### What "exactly-once" means
-
-A `POST /v1/ingest` with `idempotency_key: "abc"` can be safely retried by the client. The ingestion service stores the `(tenant_id, idempotency_key) → result` mapping in redb; a retry with the same key returns the original result without re-applying the bundle. See [Ingest → Idempotency](../guides/ingest.md#idempotency).
-
-## Backup procedure
-
-The recommended backup procedure is **filesystem-level snapshot + WAL archive**. Run periodically (cron, `systemd` timer, or a Kubernetes `CronJob`):
-
-```bash
-#!/usr/bin/env bash
-# Backup DASH state. Run from a host with read-only access to the data dir.
-set -euo pipefail
-
-DATA=/var/lib/dash
-BACKUP=/var/backups/dash/$(date -u +%Y%m%dT%H%M%SZ)
-mkdir -p "$BACKUP"
-
-# 1. Flush redb to disk (durable, fsync'd)
-systemctl reload dash-ingestion   # SIGHUP triggers a checkpoint
-systemctl reload dash-retrieval
-
-# 2. Snapshot the redb files
-install -m 0644 "$DATA/ingest.redb"    "$BACKUP/ingest.redb"
-install -m 0644 "$DATA/retrieval.redb" "$BACKUP/retrieval.redb"
-
-# 3. Archive the WAL (in case the redb snapshot is older than the WAL head)
-install -m 0644 "$DATA/ingest.wal"     "$BACKUP/ingest.wal"
-
-# 4. Verify
-redb-checksum "$BACKUP/ingest.redb"
-redb-checksum "$BACKUP/retrieval.redb"
-
-# 5. Upload to object storage
-aws s3 cp --recursive "$BACKUP" "s3://my-bucket/dash-backups/$(basename "$BACKUP")/"
-```
-
-For cross-region durability, ship the snapshot to a second region immediately after step 4. The replication target is responsible for re-running step 5 against the second bucket.
-
-For an in-depth operations runbook, see [Backup](../operations/backup.md).
+Nothing DASH writes to disk is encrypted by DASH. Use an encrypted volume.

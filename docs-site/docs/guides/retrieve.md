@@ -1,14 +1,16 @@
 # Retrieve
 
-The retrieval endpoint is the read path. It accepts a `tenant_id`, a `query`, an optional pre-computed `query_vector`, a `top_k`, an optional `time_range`, and a `stance_mode`, and returns the top-*k* claims with their citations.
+The retrieval endpoint is the read path. It takes a `tenant_id`, a `query`, an optional pre-computed `query_embedding`, a `top_k`, an optional `time_range` and a `stance_mode`, and returns the top-*k* claims with their citations. The exact request fields and response shape are in the [HTTP API reference](../reference/api.md#retrieval-service); this page explains behavior.
 
 ## `POST /v1/retrieve`
 
 ```text
 POST /v1/retrieve
 Content-Type: application/json
-Authorization: Bearer <jwt>
+x-api-key: <retrieval api key>      (or Authorization: Bearer <key or JWT>)
+```
 
+```json
 {
   "tenant_id": "t1",
   "query": "Company X acquired Company Y",
@@ -18,92 +20,53 @@ Authorization: Bearer <jwt>
 }
 ```
 
-The response:
+The response is `{ "results": [ ... ], "graph": null, "read_policy": "one", "read_quorum_met": true, "serving_replica": null }`. Each result is flat: `claim_id`, `canonical_text`, `score`, `claim_confidence`, `confidence_band`, `dominant_stance`, `contradiction_risk`, `supports`, `contradicts`, `citations[]`, and the claim's temporal fields. There is no nested `claim` object and no `took_us` field; latency is exposed on `/metrics`. `GET /v1/retrieve` takes the same fields as query parameters.
 
-```json
-{
-  "results": [
-    {
-      "claim": {
-        "claim_id": "c1",
-        "tenant_id": "t1",
-        "canonical_text": "Company X acquired Company Y",
-        "confidence": 0.95
-      },
-      "score": 1.0,
-      "supports": 1,
-      "contradicts": 0,
-      "citations": [
-        {
-          "source_id": "news://nyt/2024/05/12/acme-x",
-          "stance": "supports",
-          "source_quality": 0.95,
-          "chunk_id": "chunk-7",
-          "span_start": 1024,
-          "span_end": 1280
-        }
-      ]
-    }
-  ],
-  "took_us": 1240
-}
-```
+Use the retrieval key, not the ingestion key. The retrieval service sees new writes only after it has replicated them from ingestion, which takes up to one poll interval.
 
-The `took_us` field is the wall-clock time the server spent on the request, in microseconds. It is intended for client-side latency dashboards; the canonical server-side latency is exposed via `dash_retrieve_latency_seconds` on `/metrics`.
+## Request fields
 
-## `RetrievalRequest`
+| Field | Default | Notes |
+|---|---|---|
+| `tenant_id` | required | Non-empty. The credential must allow this tenant. |
+| `query` | required | Non-empty string. |
+| `query_embedding` | computed | Array of floats. If absent, the query is embedded with the configured provider (`DASH_EMBEDDING_PROVIDER`). The dimension must match the tenant's stored vectors. |
+| `top_k` | `5` | Positive integer. There is no enforced maximum. |
+| `stance_mode` | `balanced` | `balanced` or `support_only`. There is no `all` or `contradict_only` mode. |
+| `time_range` | none | `{ "from_unix", "to_unix" }`, either bound optional. |
+| `entity_filters`, `embedding_id_filters` | `[]` | String arrays that restrict candidates. |
+| `return_graph` | `false` | Include expanded graph nodes and edges. |
+| `read_consistency` | `one` | `one`, `quorum`, `all`; relevant only with placement routing. |
 
-| Field            | Type             | Required | Default        | Notes                                                       |
-| ---------------- | ---------------- | -------- | -------------- | ----------------------------------------------------------- |
-| `tenant_id`      | string           | yes      | —              | Must match the JWT's tenant scope.                         |
-| `query`          | string           | yes      | —              | The natural-language query (≤ 4 KiB).                       |
-| `query_vector`   | array of float   | no       | (computed)     | A pre-computed 768-dim vector; bypasses the embed call.     |
-| `top_k`          | integer          | no       | `10`           | Number of results to return (≤ 100).                        |
-| `stance_mode`    | enum             | no       | `all`          | `all` / `support_only` / `contradict_only`.                 |
-| `time_range`     | object           | no       | (no filter)    | `{ from_unix: int, to_unix: int }`.                         |
-| `min_confidence` | float            | no       | `0.0`          | Drop claims with `confidence < min_confidence`.             |
-| `hybrid_alpha`   | float            | no       | `0.7`          | The semantic-vs-lexical weight; see [Ranking](#ranking-dense-vs-sparse-vs-hybrid). |
-| `ann_top_n`      | integer          | no       | `top_k * 10`   | The number of ANN candidates before reranking.              |
+There are no `min_confidence`, `hybrid_alpha` or `ann_top_n` parameters, and no 4 KiB query limit.
 
-## Ranking: dense vs sparse vs hybrid
+## Ranking
 
-DASH has three ranking modes, controlled by `hybrid_alpha`:
+Candidates come from lexical (BM25-style), entity, temporal and ANN lookups, restricted to the tenant. When a query vector is present (it is by default, because the query is embedded), dense similarity is the primary signal and the lexical score is a tie-breaker (`InMemoryStore::retrieve_semantic`). The final score also reflects claim confidence, evidence `source_quality`, and a penalty for contradicting evidence (`pkg/ranking`). With the default hash embedder, vector similarity is not semantic, so ranking is effectively lexical; configure a real provider for semantic search. There is no tunable blend between dense and sparse scores.
 
-- **Dense (semantic-first)** — `hybrid_alpha = 1.0`. The cosine similarity between `query_vector` (or the embedding of `query`) and each candidate's vector is the primary score, in `[0, 1]`. The lexical/BM25 score is computed but used only as a tie-breaker. This is the default in the OpenAI-drop-in path.
-- **Sparse (lexical-first)** — `hybrid_alpha = 0.0`. The BM25 score is the primary score. The vector is still used to recall candidates (the ANN search), but the reranker weights the lexical match. This mode is useful for queries that are exact terms of art (legal citations, drug names).
-- **Hybrid** — `hybrid_alpha ∈ (0, 1)`. The final score is `alpha * dense + (1 - alpha) * sparse`. The default `0.7` favors dense but lets a strong lexical match break through.
-
-The semantic-first path is `InMemoryStore::retrieve_semantic` in `pkg/store`. It is exercised by 3 integration tests in `tests/store/integration_retrieval.rs`.
+Tests: `retrieve_semantic_ranks_aligned_claim_first`, `retrieve_semantic_uses_dense_similarity_as_primary_signal`, `retrieve_semantic_with_tenant_isolation_filters_other_tenants` in `pkg/store/tests/integration_retrieval.rs`; `scoring_penalizes_contradictions` in `pkg/ranking`.
 
 ## Stance filter
 
-The `stance_mode` field controls which claims survive the filter:
+| Mode | Behavior |
+|---|---|
+| `balanced` (default) | Contradicted claims are kept, with a lower score. |
+| `support_only` | Claims with more contradictions than supports are dropped. |
 
-| Mode               | Behavior                                              |
-| ------------------ | ----------------------------------------------------- |
-| `all` (default)    | Every claim is returned, in score order.              |
-| `support_only`     | Claims with `contradicts > 0` are dropped.            |
-| `contradict_only`  | Only claims with `contradicts > 0` are returned.      |
-
-The "supports" / "contradicts" counts on the result are computed from the `Evidence` records and the `ClaimEdge`s with `relation: contradicts`. A single `Evidence` with `stance: contradicts` is enough to set `contradicts: 1` on the claim.
+The `supports` and `contradicts` counts come from the claim's evidence (`stance`) and from `contradicts` edges. One contradicting evidence record gives `contradicts: 1`; whether that drops the claim in `support_only` depends on the supports count. Tests: `support_only_drops_claim_with_more_contradictions_than_supports`, `balanced_mode_keeps_contradicted_claims_with_neutral_score` in `pkg/store/tests/integration_retrieval.rs`.
 
 ## Time-range filter
 
-The `time_range` field constrains the result to claims whose `[valid_from_unix, valid_to_unix]` window **intersects** the requested range. A claim with `valid_to_unix: null` (valid indefinitely) is included in any range whose `from_unix` is greater than `valid_from_unix`.
-
-A claim with `valid_from_unix > valid_to_unix` is rejected at ingest time and will never appear in a retrieval result.
+`time_range` filters on the claim's `event_time_unix` and its validity window `[valid_from, valid_to]` (field names without a `_unix` suffix). When both an event time and a window exist, both must match; when only a window exists, it must overlap the range; claims with no temporal data are handled by the matching mode reported in `temporal_match_mode`. Open bounds (`null`) are treated as unbounded. A claim with `valid_from > valid_to` is rejected at ingest. Tests: `temporal_event_time_filter_excludes_older_claims`, `temporal_validity_window_inclusive`, `retrieve_with_time_range_requires_event_and_validity_match_when_both_present`.
 
 ## Failure modes
 
-| Condition                                       | HTTP | `error.code`                 |
-| ----------------------------------------------- | ---: | ---------------------------- |
-| Missing or invalid JWT                          |  401 | `dash_unauthenticated`       |
-| JWT scope does not include `claims:read`        |  403 | `dash_forbidden_scope`       |
-| `tenant_id` mismatch with JWT                   |  403 | `dash_tenant_mismatch`       |
-| Tenant not found                                |  404 | `dash_tenant_not_found`      |
-| `query_vector` length does not match tenant dim |  400 | `dash_dimension_mismatch`    |
-| `top_k > 100`                                   |  400 | `dash_validation_error`      |
-| Rate limit exceeded                             |  429 | `dash_rate_limited`          |
-| Internal error                                  |  500 | `dash_internal_error`        |
+| Condition | HTTP | Body |
+|---|---:|---|
+| Missing or invalid credential | 401 | `{"error":"..."}` |
+| Tenant or role not allowed | 403 | `{"error":"..."}` |
+| Bad JSON, missing `tenant_id` or `query`, bad `top_k`, bad `stance_mode`, wrong `Content-Type`, embedding failure | 400 | `{"error":"..."}` |
+| Read route rejected by placement (consistency unavailable, no readable replica) | 503 | `{"error":"..."}` |
+| Rate limit exceeded | 429 in v0.3.0; not enforced today | |
 
-For the full error envelope, see [HTTP API → Error codes](../reference/api.md#error-codes).
+There is no "tenant not found" error: a tenant with no data returns an empty `results` array. See the [HTTP API errors table](../reference/api.md#errors).

@@ -33,7 +33,6 @@ That is the entire differentiator. DASH is not the fastest pure-vector index, an
 DASH stands on the shoulders of giants:
 
 - [`redb`](https://github.com/cberner/redb) — pure-Rust, ACID, embedded KV.
-- [`usearch`](https://github.com/unum-cloud/usearch) — the HNSW implementation that powers the ANN search.
 - [`jsonwebtoken`](https://github.com/Keats/jsonwebtoken), [`serde`](https://serde.rs/), [`tokio`](https://tokio.rs/) (build-time only) — the Rust crates that make the auth and the wire format tractable.
 - The OpenAI v1 embeddings spec — the wire format DASH is a drop-in for.
 - The 46 open-source contributors who have filed issues, sent PRs, and reviewed code.

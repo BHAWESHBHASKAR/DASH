@@ -35,7 +35,6 @@ DASH depends on a number of open-source crates and libraries. The full list, wit
 | Crate           | License    | Notes                                                |
 | --------------- | ---------- | ---------------------------------------------------- |
 | `redb`          | MIT / Apache-2.0 | The embedded KV store.                          |
-| `usearch`       | Apache-2.0 | The HNSW ANN index.                                  |
 | `jsonwebtoken`  | MIT        | JWT verification.                                    |
 | `serde`         | MIT / Apache-2.0 | Serialization framework.                        |
 | `tokio`         | MIT        | Build-time only (the runtime is `std::net`).         |

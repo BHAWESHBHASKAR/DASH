@@ -1,36 +1,16 @@
 # Ingest
 
-The ingestion endpoint accepts a `Claim`, its supporting `Evidence` records, and the `ClaimEdge`s that connect it to other claims. This page describes the request shape, the idempotency contract, and the bulk-ingest path.
+The ingestion service accepts a `Claim`, its supporting `Evidence` records and the `ClaimEdge`s that connect it to other claims. This page describes the write routes that exist today, the validation rules, and what is and is not idempotent. The exact field list is in the [HTTP API reference](../reference/api.md#ingestion-service).
 
 ## `POST /v1/ingest`
 
 ```text
 POST /v1/ingest
 Content-Type: application/json
-Authorization: Bearer <jwt>   (or DashKey <ak_...>)
-
-{
-  "claim": { ... },
-  "evidence": [ ... ],
-  "edges":   [ ... ]
-}
+x-api-key: <ingestion api key>       (or Authorization: Bearer <key or JWT>)
 ```
 
-The response is HTTP 202 Accepted with the IDs of the records that were created:
-
-```json
-{
-  "claim_id": "c1",
-  "evidence_ids": ["e1", "e2"],
-  "edge_ids": ["g1"],
-  "ingest_seq": 17,
-  "idempotent_replay": false
-}
-```
-
-If the same `idempotency_key` is replayed, the response is identical and `idempotent_replay: true` is set. See [Idempotency](#idempotency).
-
-## `IngestRequest`
+Send the ingestion key, not the retrieval key. The request is one claim plus its evidence and edges:
 
 ```json
 {
@@ -40,92 +20,91 @@ If the same `idempotency_key` is replayed, the response is identical and `idempo
     "canonical_text": "Company X acquired Company Y",
     "confidence": 0.95,
     "event_time_unix": 1718300000,
-    "valid_from_unix": 1718300000,
-    "valid_to_unix": null,
-    "extraction_model": "llm-extractor-v1"
+    "valid_from": 1718300000,
+    "valid_to": null
   },
   "evidence": [
     {
       "evidence_id": "e1",
       "claim_id": "c1",
-      "tenant_id": "t1",
       "source_id": "news://nyt/2024/05/12/acme-x",
       "stance": "supports",
       "source_quality": 0.95,
       "chunk_id": "chunk-7",
       "span_start": 1024,
-      "span_end": 1280
+      "span_end": 1280,
+      "extraction_model": "llm-extractor-v1"
     }
   ],
-  "edges": [],
-  "idempotency_key": "ingest-2024-05-12-c1"
+  "edges": []
 }
 ```
 
-### Field rules
-
-- `claim.claim_id` — required, unique within the tenant.
-- `claim.tenant_id` — required, must match the JWT's tenant scope.
-- `claim.canonical_text` — required, ≤ 4 KiB.
-- `claim.confidence` — required, in `[0, 1]`.
-- `claim.event_time_unix` — optional, defaults to "now".
-- `claim.valid_from_unix` / `valid_to_unix` — optional, used for time-range filtering at retrieval.
-- `claim.extraction_model` — optional, recorded in the audit log.
-- `evidence[].claim_id` — must equal the outer `claim.claim_id`. Mismatches are rejected with HTTP 400.
-- `evidence[].tenant_id` — must equal the outer `claim.tenant_id`.
-- `evidence[].stance` — one of `supports`, `contradicts`, `neutral`.
-- `edges[].src_claim_id` — must equal the outer `claim.claim_id`.
-- `edges[].dst_claim_id` — must name an existing claim in the same tenant (a forward-reference to a not-yet-ingested claim is allowed; the edge is stored but not traversable until both endpoints exist).
-- `idempotency_key` — optional but strongly recommended. See below.
-
-## Idempotency
-
-The ingestion endpoint is **idempotent on `(tenant_id, idempotency_key)`**. The recommended pattern:
-
-```bash
-IDEM="ingest-$(date -u +%Y%m%dT%H%M%S)-$(uuidgen)"
-
-curl -X POST http://localhost:8081/v1/ingest \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: $IDEM" \
-  -d @request.json
-```
-
-The header form is equivalent to the body field. A replay with the same `Idempotency-Key` returns the original result with `idempotent_replay: true` and HTTP 200 (not 202) so the caller can distinguish a fresh ingest from a replay.
-
-The `(tenant_id, idempotency_key) → result` mapping is stored in redb. Keys are retained for `DASH_IDEMPOTENCY_RETENTION_DAYS` (default: 30) and then garbage-collected.
-
-If a replay uses the same `idempotency_key` but a **different** request body, the response is HTTP 409 Conflict with a `dash_idempotency_mismatch` error code. The caller is expected to use a new key for a new request.
-
-## Bulk ingest
-
-For workloads that move many claims at once, the ingestion endpoint accepts a `bundles: [...]` field on the request body. The single-bundle shape is the same; the response is an array:
+A successful write returns **HTTP 200** with:
 
 ```json
 {
-  "results": [
-    { "claim_id": "c1", "evidence_ids": ["e1"], "edge_ids": [], "ingest_seq": 17 },
-    { "claim_id": "c2", "evidence_ids": ["e2"], "edge_ids": [], "ingest_seq": 18 }
-  ]
+  "ingested_claim_id": "c1",
+  "claims_total": 1,
+  "ack_count": 1,
+  "required_acks": 1,
+  "commit_status": "replication_quorum_met",
+  "checkpoint_triggered": false
 }
 ```
 
-The bulk path is **all-or-nothing per bundle** but **not** all-or-nothing across the array. A validation failure on bundle #3 returns an error pointing at bundle #3 and the prior bundles are already committed. The caller is expected to retry the failed bundle alone with its own `idempotency_key`.
+### Field rules (enforced by `pkg/schema` and the store)
 
-A bulk request is limited to `DASH_INGEST_MAX_BUNDLES_PER_REQUEST` (default: 1 000) bundles.
+- `claim.claim_id`, `claim.tenant_id`, `claim.canonical_text`: required, non-blank.
+- `claim.confidence`: required, in `[0, 1]`.
+- `claim.valid_from` / `claim.valid_to`: optional; if both are set, `valid_from <= valid_to`. These (with `event_time_unix`) drive `time_range` filtering at retrieval. The field names are `valid_from` / `valid_to`, not `valid_from_unix`.
+- `claim.claim_type`: optional, one of `factual`, `opinion`, `prediction`, `temporal`, `causal`.
+- `claim.embedding_vector` or top-level `claim_embedding`: optional pre-computed vector. If absent, the service computes one with the configured provider.
+- `evidence[].claim_id` must equal `claim.claim_id`, otherwise the request is rejected with 400 (`missing claim`). Evidence has no `tenant_id` field; it inherits the claim's tenant.
+- `evidence[].stance`: `supports`, `contradicts` or `neutral`. `source_quality` in `[0, 1]`. `span_start` and `span_end` must be given together, with `span_start <= span_end`.
+- `extraction_model` is an optional field **on evidence** (it records which model produced the evidence), not on the claim.
+- `edges[].from_claim_id` must equal `claim.claim_id`. `to_claim_id` may name any claim id; it is not checked for existence or tenant today (see [Multi-tenancy](../concepts/multi-tenancy.md#known-gaps)). `relation`: `supports`, `contradicts`, `refines`, `duplicates` or `depends_on`. `strength` in `[0, 1]`.
+- A `claim_id` already used by a *different* tenant is rejected with 409.
+
+## Idempotency
+
+There is no `idempotency_key` field and no `Idempotency-Key` header on `POST /v1/ingest`. Be precise about what happens on a retry in v0.2.x:
+
+- Re-sending a claim with the same `claim_id` and tenant updates the claim.
+- Re-sending the same **evidence** or **edges** appends duplicates, and evidence is also duplicated on restart and on replication re-apply (register DATA-01). Duplicated evidence inflates citation counts and ranking.
+- **v0.3.0** makes evidence and edge writes idempotent upserts keyed by `evidence_id` and `edge_id`. Until you run v0.3.0, avoid blind retries of ingest calls.
+
+The only replay-safe write today is the batch route, which de-duplicates on `commit_id`.
+
+## Batch: `POST /v1/ingest/batch`
+
+```json
+{
+  "commit_id": "load-2026-10-09-001",
+  "items": [ { "claim": {}, "evidence": [], "edges": [] } ]
+}
+```
+
+`items` holds ingest bodies as above, all for the same tenant; at most `DASH_INGEST_BATCH_MAX_ITEMS` (default 128). Replaying a `commit_id` returns the earlier result with `idempotent_replay: true`. The replay check compares ids, not content (register DATA-12), so do not reuse a `commit_id` for edited content. The field `bundles` and the setting `DASH_INGEST_MAX_BUNDLES_PER_REQUEST` do not exist.
+
+## Raw text and documents
+
+- `POST /v1/ingest/raw` takes `{tenant_id, document_id, source_id, text, ...}` and extracts sentence-level claims (extraction provider `rule_sentence` by default).
+- `POST /v1/ingest/document` takes `{tenant_id, document_id, source_id, mime_type, text | content_base64, ...}`. The built-in parser accepts UTF-8 text MIME types (`text/*`, JSON, XML, YAML, CSV, Markdown); other types need `DASH_INGEST_DOCUMENT_PARSER_PROVIDER=adapter_command` and an adapter command.
+
+Both responses include `commit_id`, `idempotent_replay`, `extracted_count`, `ingested_claim_ids`, and embedding counts.
 
 ## Failure modes
 
-| Condition                                          | HTTP | `error.code`                |
-| -------------------------------------------------- | ---: | --------------------------- |
-| Missing or invalid JWT                             |  401 | `dash_unauthenticated`      |
-| JWT scope does not include `claims:write`          |  403 | `dash_forbidden_scope`      |
-| `tenant_id` mismatch with JWT                      |  403 | `dash_tenant_mismatch`      |
-| Validation failure (out-of-range confidence, etc.) |  400 | `dash_validation_error`     |
-| `claim_id` already exists with different content   |  409 | `dash_claim_conflict`       |
-| Idempotency key replay with a different body       |  409 | `dash_idempotency_mismatch` |
-| Request body too large                             |  413 | `dash_payload_too_large`    |
-| Rate limit exceeded                                |  429 | `dash_rate_limited`         |
-| Internal error                                     |  500 | `dash_internal_error`       |
+| Condition | HTTP | Body |
+|---|---:|---|
+| Missing or invalid API key / JWT | 401 | `{"error":"missing or invalid API key"}` |
+| Tenant or role not allowed for the credential | 403 | `{"error":"tenant is not allowed for this API key"}` |
+| Validation failure, bad JSON, wrong `Content-Type`, mismatched `claim_id`, invalid vector | 400 | `{"error":"validation error: ..."}` |
+| `claim_id` belongs to another tenant, or other state conflict | 409 | `{"error":"state conflict: ..."}` |
+| Request body over 16 MiB | 400 | `content-length exceeds max body size` |
+| Worker queue full, or this node is not the shard leader | 503 | `{"error":"..."}` |
+| Persistence error | 500 | `{"error":"internal persistence error: ..."}` |
+| Rate limit exceeded | 429 in v0.3.0; not enforced today | |
 
-For the full error envelope and the wire-level error codes, see [HTTP API → Error codes](../reference/api.md#error-codes).
+See [HTTP API](../reference/api.md#errors) for the complete status table.
