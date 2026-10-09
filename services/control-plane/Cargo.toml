@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 auth = { path = "../../pkg/auth" }
 dash-common = { path = "../common" }
+dash-config = { path = "../../pkg/config" }
 libc = "0.2"
 metadata-router = { path = "../metadata-router" }
 axum = { workspace = true }
