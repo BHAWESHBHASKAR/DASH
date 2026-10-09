@@ -211,6 +211,7 @@ Network providers (`ollama`, `openai`) are wrapped in a circuit breaker and a co
 | `DASH_BIN` | `retrieval` | `ingestion` \| `retrieval` \| `control-plane` \| `segment-maintenance-daemon` | Which binary the image entrypoint runs. Read by the shell scripts in `deploy/container/scripts/`, not by the Rust services. |  |
 | `DASH_HOME` | `/opt/dash` | path | Install directory inside the image. Read by the container shell scripts. |  |
 | `DASH_HEALTHCHECK_URL` | unset | URL | URL probed by the container health check. Read by the container shell scripts. |  |
+| `DASH_HEALTHCHECK_CA_FILE` | unset | path | CA bundle the container health check verifies an `https://` service against (the service certificate must name `127.0.0.1`). Without it the loopback probe of a TLS listener skips verification; it sends no credentials. Read by the container shell scripts. |  |
 | `DASH_PUBLISH_ADDR` | `127.0.0.1` | string | Host address the compose file publishes ports on. Read by docker compose, not by the services. |  |
 | `DASH_DEV_UID` | `1000` | integer | User id for the development compose stack. Read by docker compose. |  |
 | `DASH_DEV_GID` | `1000` | integer | Group id for the development compose stack. Read by docker compose. |  |

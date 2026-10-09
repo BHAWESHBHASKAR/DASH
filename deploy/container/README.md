@@ -47,7 +47,7 @@ docker build -f deploy/container/Dockerfile --build-arg SERVICE=ingestion -t das
 - `HEALTHCHECK` runs `dash-healthcheck`, which probes `/v1/ready`
   (`/v1/control-plane/ready` for the control plane) on the service's port.
 - Published ports bind to `127.0.0.1`. Set `DASH_PUBLISH_ADDR=0.0.0.0` only
-  behind a TLS-terminating proxy.
+  with the TLS overlay (see [TLS](#tls)) or behind a TLS-terminating proxy.
 
 ## Quickstart
 

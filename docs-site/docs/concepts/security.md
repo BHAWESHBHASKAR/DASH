@@ -20,7 +20,7 @@ Between services:
 - **Replication** (`/internal/replication/*`): `x-replication-token` must equal `DASH_INGEST_REPLICATION_TOKEN`; without a token the endpoints answer 403 and an ingestion follower refuses to start (outside dev mode).
 - **Control plane**: `Authorization: Bearer <DASH_CONTROL_PLANE_TOKEN>` on every route except health and ready; the service refuses to start without a token outside dev mode.
 
-Both are shared secrets over plain HTTP; mutual TLS is not implemented (planned P1/P3). Secret strength is validated at startup by default (`DASH_STRICT_SECRETS`): at least 16 characters for keys and tokens, 32 for HS256 secrets, no placeholders. The control-plane token has no length check.
+Both are shared secrets. Every listener can serve HTTPS itself and verify client certificates (off by default; see [TLS and mutual TLS](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/tls.md)): ingestion can require a verified follower certificate on the replication routes, on top of the token, and pin follower certificates by SHA-256 fingerprint, and followers always verify the leader certificate. Without TLS the tokens travel over plain HTTP. Secret strength is validated at startup by default (`DASH_STRICT_SECRETS`): at least 16 characters for keys and tokens, 32 for HS256 secrets, no placeholders. The control-plane token has no length check.
 
 ### What changed in 0.3.0
 
@@ -50,7 +50,7 @@ When `DASH_INGEST_AUDIT_LOG_PATH` / `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set, each
 
 ## Encryption
 
-DASH does not encrypt data at rest and does not terminate TLS. Use an encrypted volume and a TLS-terminating proxy. `pkg/encryption` is an AES-256-GCM library with an environment-key provider; no service calls it, so `DASH_ENCRYPTION_*` settings have no effect (SEC-16, planned P4). The WAL carries per-record CRC-32 checksums for corruption detection; they are not a security control. The OpenAI embedding provider uses HTTPS, and refuses to send its key over plaintext HTTP to a non-loopback host.
+DASH does not encrypt data at rest; use an encrypted volume. In transit, each service can terminate TLS itself (TLS 1.2/1.3 via rustls, optional mutual TLS, certificate reload without restart; [TLS and mutual TLS](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/tls.md)), or sit behind a TLS-terminating proxy. `pkg/encryption` is an AES-256-GCM library with an environment-key provider; no service calls it, so `DASH_ENCRYPTION_*` settings have no effect (SEC-16, planned P4). The WAL carries per-record CRC-32 checksums for corruption detection; they are not a security control. The OpenAI embedding provider uses HTTPS, and refuses to send its key over plaintext HTTP to a non-loopback host.
 
 ## What was documented before and is not true
 

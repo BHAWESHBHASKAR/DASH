@@ -100,7 +100,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - Authentication and authorization (`services/common`, `pkg/auth`): deny by default, HS256 JWT validation (kid rotation, `iss`/`aud`, tenant claims, `exp` required, lifetime cap, `jti` denylist), scoped API keys, key revocation lists, a role hierarchy (`admin`, `ingest`, `retrieve`, `read_only`), per-tenant token-bucket rate limiting (429) and SIGHUP reload. Details: [`docs/operations/auth.md`](docs/operations/auth.md).
 
 **Beta (works, with known gaps listed in the register or below):**
-- HTTP services on a hand-written thread-per-connection transport (ingestion, retrieval, control-plane) with bounded headers, bodies and whole-request deadlines. Since 0.3.0 the services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1`; strict secret validation (>= 16 characters for keys and tokens, >= 32 for JWT secrets, placeholders rejected) is on by default; `/v1/embeddings`, `/debug/*` and `/metrics` require auth; replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`. TLS is not terminated by DASH; put a proxy in front.
+- HTTP services on a hand-written thread-per-connection transport (ingestion, retrieval, control-plane) with bounded headers, bodies and whole-request deadlines. Since 0.3.0 the services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1`; strict secret validation (>= 16 characters for keys and tokens, >= 32 for JWT secrets, placeholders rejected) is on by default; `/v1/embeddings`, `/debug/*` and `/metrics` require auth; replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`. Optional native TLS on every listener (rustls, TLS 1.2/1.3, ALPN `http/1.1`), client-certificate verification, replication over mutual TLS with per-follower certificate pinning, and certificate reload without restart; off by default ([`docs/operations/tls.md`](docs/operations/tls.md)).
 - Evidence and edge writes are idempotent upserts (evidence by `evidence_id`, edges by endpoints and relation), so retries, restarts and replication re-apply do not duplicate citations.
 - Single-writer ingestion plus polling read replicas that follow the WAL generation-aware (resync on checkpoint, `/ready` reflects lag), a file-lease control plane with fenced leases and lag-guarded promotion, and CSV placement files. This is not consensus replication.
 - `redb` on-disk persistence is **on by default** when a WAL path is configured (default `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`; opt out with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`). If the file cannot be opened the service logs an error and continues in memory. Snapshot values are written by an in-tree versioned codec; snapshots written by earlier releases (the `bincode` 1.x layout) still load.
@@ -115,7 +115,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 **Planned (do not rely on):**
 - Keyed (HMAC) audit chain and external anchoring; the current chain is unkeyed.
 - Encryption at rest / CMEK. `pkg/encryption` is a standalone AES-256-GCM library with an env-key provider; no storage code calls it, so nothing on disk is encrypted by DASH.
-- mTLS between services (tokens are shared secrets over plain HTTP), an external penetration test, and published SOC 2 evidence.
+- An external penetration test and published SOC 2 evidence. TLS on by default in the shipped deployment artifacts (today it is one setting away; see above).
 - GPU vector backend. `pkg/store/src/gpu.rs` is a placeholder that never returns a GPU engine; scoring runs on CPU.
 - Consensus replication (Raft), automatic failover, sharded cluster mode.
 - Delete, tenant management and reindex APIs (`/v1/delete`, `/v1/tenants`, `/v1/admin/reindex` do not exist; see [Planned API](docs-site/docs/reference/planned-api.md)).
@@ -167,7 +167,7 @@ Counts are static (computed 2026-10-09: the Rust figure with `cargo test --works
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1210 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1244 |
 | Python SDK | 69 |
 | Go SDK | 92 |
 | TypeScript SDK | 71 |

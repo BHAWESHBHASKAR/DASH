@@ -988,6 +988,16 @@ pub static REGISTRY: &[Entry] = &[
     .readers(ALL_SERVICES)
     .external(),
     Entry::new(
+        "DASH_HEALTHCHECK_CA_FILE",
+        Common,
+        T_CONTAINER,
+        Kind::Path,
+        "",
+        "CA bundle the container health check verifies an `https://` service against (the service certificate must name `127.0.0.1`). Without it the loopback probe of a TLS listener skips verification; it sends no credentials. Read by the container shell scripts.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
         "DASH_PUBLISH_ADDR",
         Common,
         T_CONTAINER,
