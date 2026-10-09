@@ -1,5 +1,7 @@
 # rust.yml
-# CI for the DASH Rust workspace: fmt, clippy, tests, release build.
+# CI for the DASH Rust workspace: fmt, clippy, tests, release build, plus
+# deploy-artifact validation (helm lint/template, kustomize, kubeconform,
+# compose config, shellcheck, env-var check) and a container image build.
 # Runs on every push/PR to main across Ubuntu and macOS.
 # Expected runtime: ~8-15 minutes per matrix leg.
 name: Rust CI
@@ -22,6 +24,8 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust
     if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -72,5 +78,168 @@ jobs:
       - name: Set up Docker Compose
         run: docker compose version
 
+      - name: Generate secrets for the compose stack
+        run: scripts/generate-secrets.sh --force
+
       - name: Run backup/restore drill
         run: bash scripts/backup_restore_drill.sh
+
+  deploy-manifests:
+    name: Deploy artifacts (helm, kustomize, compose, systemd)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check deploy env vars against the code
+        run: scripts/check_deploy_env.sh
+
+      - name: shellcheck deploy scripts
+        run: |
+          shellcheck -S warning \
+            scripts/generate-secrets.sh \
+            scripts/check_deploy_env.sh \
+            scripts/deploy_systemd.sh \
+            scripts/deploy_container.sh \
+            scripts/backup_restore_drill.sh \
+            deploy/container/scripts/entrypoint.sh \
+            deploy/container/scripts/healthcheck.sh
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          version=v0.6.7
+          curl -fsSL -o kubeconform.tgz \
+            "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz"
+          echo "95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  kubeconform.tgz" | sha256sum -c -
+          tar -xzf kubeconform.tgz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+
+      - name: Helm chart must refuse to render without secrets
+        run: |
+          if helm template dash deploy/helm/dash >/dev/null 2>&1; then
+            echo "helm template succeeded without secrets" >&2
+            exit 1
+          fi
+
+      - name: Helm lint and template (generated secrets)
+        run: |
+          set -euo pipefail
+          gen() { openssl rand -hex 32; }
+          args=(
+            --set "secret.retrieval.apiKey=$(gen)"
+            --set "secret.retrieval.hs256Secret=$(gen)"
+            --set "secret.ingestion.apiKey=$(gen)"
+            --set "secret.ingestion.hs256Secret=$(gen)"
+            --set "secret.replicationToken=$(gen)"
+            --set "secret.controlPlane.token=$(gen)"
+          )
+          helm lint deploy/helm/dash --strict "${args[@]}"
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" > helm-default.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set config.embeddingProvider=ollama \
+            --set networkPolicy.ollama.enabled=true \
+            --set ingress.exposeIngestion=false > helm-ollama.yaml
+          # Existing-Secret mode needs no secret values.
+          helm template dash deploy/helm/dash --namespace dash-system \
+            --set secret.existingSecret.retrieval=r \
+            --set secret.existingSecret.ingestion=i \
+            --set secret.existingSecret.controlPlane=c > helm-existing.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            helm-default.yaml helm-ollama.yaml helm-existing.yaml
+
+      - name: Kustomize build and kubeconform
+        run: |
+          set -euo pipefail
+          kubectl kustomize deploy/k8s > k8s.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 k8s.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 deploy/k8s/optional/ollama-egress.yaml
+
+      - name: Compose config (generated secrets)
+        run: |
+          set -euo pipefail
+          scripts/generate-secrets.sh --force
+          docker compose -f deploy/container/docker-compose.yml config -q
+          docker compose -f deploy/container/docker-compose.yml --profile control-plane config -q
+          docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.dev.yml config -q
+
+      - name: Compose must refuse to start without secrets
+        run: |
+          rm -f deploy/container/.env
+          if docker compose -f deploy/container/docker-compose.yml config -q >/dev/null 2>&1; then
+            echo "compose config succeeded without secrets" >&2
+            exit 1
+          fi
+
+      - name: Verify systemd units
+        run: |
+          set -euo pipefail
+          # The service binaries do not exist on the runner, so "is not
+          # executable" is expected; any other finding is fatal.
+          out="$(systemd-analyze verify --man=no deploy/systemd/*.service 2>&1 || true)"
+          echo "${out}"
+          if echo "${out}" | grep -v 'is not executable' | grep -q .; then
+            exit 1
+          fi
+
+  docker-build:
+    name: Docker image build (no push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build retrieval image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          target: runtime
+          build-args: |
+            SERVICE=retrieval
+          load: true
+          push: false
+          tags: dash-retrieval:ci
+          cache-from: type=gha,scope=dash-image
+          cache-to: type=gha,mode=max,scope=dash-image
+
+      - name: Build control-plane image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          target: runtime
+          build-args: |
+            SERVICE=control-plane
+          load: true
+          push: false
+          tags: dash-control-plane:ci
+          cache-from: type=gha,scope=dash-image
+
+      - name: Check image contents
+        run: |
+          set -euo pipefail
+          for svc in retrieval control-plane; do
+            img="dash-${svc}:ci"
+            test "$(docker run --rm --entrypoint sh "${img}" -c 'echo "${DASH_BIN}"')" = "${svc}"
+            # Binaries are root-owned and not writable by the runtime user.
+            docker run --rm --entrypoint sh "${img}" -c '
+              set -eu
+              for f in /opt/dash/bin/*; do
+                [ "$(stat -c %U "$f")" = root ] || { echo "$f not root-owned" >&2; exit 1; }
+                [ ! -w "$f" ] || { echo "$f writable by $(id -un)" >&2; exit 1; }
+              done
+              [ "$(id -u)" != 0 ]'
+          done

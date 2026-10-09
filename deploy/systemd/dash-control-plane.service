@@ -1,22 +1,21 @@
 [Unit]
-Description=DASH Retrieval Service
-After=network.target dash-ingestion.service
-Wants=dash-ingestion.service
+Description=DASH Control Plane
+After=network.target
 
 [Service]
 Type=simple
 User=dash
 Group=dash
 WorkingDirectory=/opt/dash
-EnvironmentFile=/etc/dash/retrieval.env
-ExecStart=/opt/dash/bin/retrieval --serve
+EnvironmentFile=/etc/dash/control-plane.env
+ExecStart=/opt/dash/bin/control-plane --serve
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=30
 
 # Writable state lives under /var/lib/<StateDirectory>; systemd creates it,
 # owns it by the service user, and makes it writable despite ProtectSystem=strict.
-StateDirectory=dash/retrieval
+StateDirectory=dash/control-plane
 StateDirectoryMode=0750
 
 # Sandboxing

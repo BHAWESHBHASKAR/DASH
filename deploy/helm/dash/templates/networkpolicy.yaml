@@ -1,14 +1,18 @@
 {{- if .Values.networkPolicy.enabled -}}
+{{- $ns := include "dash.namespace" . -}}
+{{- $cidrs := .Values.networkPolicy.internalCIDRs -}}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "dash.fullname" . }}-default-deny
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ $ns }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
 spec:
-  podSelector: {}
+  podSelector:
+    matchLabels:
+      {{- include "dash.selectorLabels" . | nindent 6 }}
   policyTypes:
   - Ingress
   - Egress
@@ -17,11 +21,13 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "dash.fullname" . }}-allow-dns
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ $ns }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
 spec:
-  podSelector: {}
+  podSelector:
+    matchLabels:
+      {{- include "dash.selectorLabels" . | nindent 6 }}
   policyTypes:
   - Egress
   egress:
@@ -36,11 +42,12 @@ spec:
     - port: 53
       protocol: TCP
 ---
+# Retrieval: replicate from ingestion, reach external HTTPS providers.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ include "dash.fullname" . }}-retrieval-egress
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ $ns }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: retrieval
@@ -56,13 +63,13 @@ spec:
         matchLabels:
           {{- include "dash.ingestionSelectorLabels" . | nindent 10 }}
     ports:
-    - port: 8081
+    - port: http
       protocol: TCP
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
         except:
-        {{- range .Values.networkPolicy.internalCIDRs }}
+        {{- range $cidrs }}
         - {{ . }}
         {{- end }}
     ports:
@@ -71,17 +78,82 @@ spec:
       protocol: {{ .protocol | default "TCP" }}
     {{- end }}
 ---
+# Ingestion: external HTTPS providers only (inbound traffic is allowed below).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "dash.fullname" . }}-allow-nginx
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  name: {{ include "dash.fullname" . }}-ingestion-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        {{- range $cidrs }}
+        - {{ . }}
+        {{- end }}
+    ports:
+    {{- range .Values.networkPolicy.externalEgressPorts }}
+    - port: {{ .port }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+{{- if .Values.networkPolicy.ollama.enabled }}
+---
+# In-cluster Ollama on private CIDRs (retrieval and ingestion pods).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-ollama-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app.kubernetes.io/instance
+      operator: In
+      values: [{{ .Release.Name | quote }}]
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    {{- range (default $cidrs .Values.networkPolicy.ollama.cidrs) }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+    ports:
+    - port: {{ .Values.networkPolicy.ollama.port }}
+      protocol: TCP
+{{- end }}
+---
+# Ingress controller -> retrieval and ingestion HTTP ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-allow-ingress-controller
+  namespace: {{ $ns }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "dash.retrievalSelectorLabels" . | nindent 6 }}
+      {{- include "dash.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
   policyTypes:
   - Ingress
   ingress:
@@ -94,6 +166,84 @@ spec:
     ports:
     - port: http
       protocol: TCP
-    - port: http-alt
+---
+# Retrieval pods -> ingestion (WAL replication).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-retrieval-to-ingestion
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          {{- include "dash.retrievalSelectorLabels" . | nindent 10 }}
+    ports:
+    - port: http
       protocol: TCP
+{{- if .Values.controlPlane.enabled }}
+---
+# Retrieval and ingestion <-> control plane.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-control-plane
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.controlPlaneSelectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          {{- include "dash.selectorLabels" . | nindent 10 }}
+        matchExpressions:
+        - key: app.kubernetes.io/component
+          operator: In
+          values: [retrieval, ingestion]
+    ports:
+    - port: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-control-plane-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          {{- include "dash.controlPlaneSelectorLabels" . | nindent 10 }}
+    ports:
+    - port: http
+      protocol: TCP
+{{- end }}
 {{- end }}
