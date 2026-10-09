@@ -361,6 +361,7 @@ pub(super) fn handle_ingest_raw_post(
                         document_id,
                         commit_id: batch_resp.commit_id,
                         idempotent_replay: batch_resp.idempotent_replay,
+                        updated: batch_resp.updated,
                         extracted_count: batch_resp.batch_size,
                         embedding_provider,
                         embeddings_generated,
@@ -375,6 +376,7 @@ pub(super) fn handle_ingest_raw_post(
                         checkpoint_snapshot_records: batch_resp.checkpoint_snapshot_records,
                         checkpoint_truncated_wal_records: batch_resp
                             .checkpoint_truncated_wal_records,
+                        checkpoint_deferred: batch_resp.checkpoint_deferred,
                     };
                     audit_status = 200;
                     audit_outcome = "success";
@@ -790,6 +792,7 @@ pub(super) fn handle_ingest_document_post(
                         parser_provider: parsed_parser_provider,
                         commit_id: batch_resp.commit_id,
                         idempotent_replay: batch_resp.idempotent_replay,
+                        updated: batch_resp.updated,
                         extracted_count: batch_resp.batch_size,
                         embedding_provider,
                         embeddings_generated,
@@ -804,6 +807,7 @@ pub(super) fn handle_ingest_document_post(
                         checkpoint_snapshot_records: batch_resp.checkpoint_snapshot_records,
                         checkpoint_truncated_wal_records: batch_resp
                             .checkpoint_truncated_wal_records,
+                        checkpoint_deferred: batch_resp.checkpoint_deferred,
                     };
                     audit_status = 200;
                     audit_outcome = "success";

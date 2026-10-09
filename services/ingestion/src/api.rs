@@ -401,6 +401,10 @@ pub struct IngestApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +412,10 @@ pub struct IngestApiResponse {
 pub struct IngestBatchApiResponse {
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub ingested_claim_ids: Vec<String>,
     pub batch_size: usize,
     pub claims_total: usize,
@@ -421,6 +429,10 @@ pub struct IngestBatchApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +441,10 @@ pub struct IngestRawApiResponse {
     pub document_id: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -446,6 +462,10 @@ pub struct IngestRawApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +476,10 @@ pub struct IngestDocumentApiResponse {
     pub parser_provider: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -473,6 +497,10 @@ pub struct IngestDocumentApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[cfg(test)]
@@ -534,6 +562,7 @@ mod tests {
             checkpoint_triggered: true,
             checkpoint_snapshot_records: Some(10),
             checkpoint_truncated_wal_records: Some(5),
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: IngestApiResponse = serde_json::from_str(&json).unwrap();
@@ -552,6 +581,7 @@ mod tests {
             checkpoint_triggered: false,
             checkpoint_snapshot_records: None,
             checkpoint_truncated_wal_records: None,
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("commit_epoch"));

@@ -115,8 +115,7 @@ pub fn build_ingest_raw_output_from_request(
         ));
     }
 
-    let tenant_component = sanitize_id_component(tenant_id, 48);
-    let document_component = sanitize_id_component(document_id, 80);
+    let (tenant_component, document_component) = id_components(tenant_id, document_id);
     let extraction_model = request.extraction_model.clone();
     let embedding_model = request.embedding_model.clone();
     let embedding_provider = resolve_embedding_provider(request.generate_embeddings)?;
@@ -210,13 +209,15 @@ pub fn build_ingest_batch_from_document_request(
         return Err("mime_type is required".to_string());
     }
 
+    // The text is deliberately NOT trimmed: extraction spans are byte
+    // offsets into this exact string (DATA-13), so trimming here would shift
+    // every span by the leading whitespace.
     let (text, parser_provider) = if let Some(text) = request
         .text
         .as_ref()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
     {
-        (text.to_string(), "inline_text".to_string())
+        (text.clone(), "inline_text".to_string())
     } else {
         let content_base64 = request
             .content_base64
@@ -227,8 +228,7 @@ pub fn build_ingest_batch_from_document_request(
         let bytes = decode_base64(content_base64)?;
         let provider = resolve_document_parser_provider()?;
         let parsed = parse_document_bytes(&provider, &mime_type, &bytes)?;
-        let parsed = parsed.trim().to_string();
-        if parsed.is_empty() {
+        if parsed.trim().is_empty() {
             return Err("document parser yielded empty text".to_string());
         }
         (parsed, provider.cache_key_component())
@@ -266,8 +266,7 @@ fn raw_commit_id(
     provider_component: &str,
     embedding_provider_component: &str,
 ) -> String {
-    let tenant_component = sanitize_id_component(tenant_id, 48);
-    let document_component = sanitize_id_component(document_id, 80);
+    let (tenant_component, document_component) = id_components(tenant_id, document_id);
     format!(
         "raw:{tenant_component}:{document_component}:p{provider_component}:e{embedding_provider_component}:m{min_sentence_chars}:k{max_claims}"
     )
@@ -816,14 +815,43 @@ fn normalize_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Readable, collision-free id components for a (tenant, document) pair
+/// (DATA-12). The readable prefixes are sanitized and truncated, so they are
+/// not unique on their own; the trailing hash covers the RAW, untruncated
+/// tenant and document ids (length-prefixed, so `a:b`/`c` and `a`/`b:c`
+/// differ) and makes the pair unique.
+fn id_components(tenant_id: &str, document_id: &str) -> (String, String) {
+    let tenant = sanitize_id_component(tenant_id, 24);
+    let document = sanitize_id_component(document_id, 48);
+    let mut state: u64 = 0xcbf29ce484222325;
+    for part in [tenant_id, document_id] {
+        for byte in (part.len() as u64).to_le_bytes().iter().chain(part.as_bytes()) {
+            state ^= u64::from(*byte);
+            state = state.wrapping_mul(0x100000001b3);
+        }
+    }
+    // Second, independent pass so the suffix is 128 bits wide.
+    let mut state2: u64 = 0x84222325cbf29ce4;
+    for part in [document_id, tenant_id] {
+        for byte in (part.len() as u64).to_le_bytes().iter().chain(part.as_bytes()) {
+            state2 = state2.rotate_left(5) ^ u64::from(*byte);
+            state2 = state2.wrapping_mul(0x9e3779b97f4a7c15);
+        }
+    }
+    (tenant, format!("{document}:{state:016x}{state2:016x}"))
+}
+
+/// Maps an untrusted value onto `[A-Za-z0-9_-]` (case preserved, everything
+/// else becomes `-`) and truncates to `max_len` characters. Not injective:
+/// callers needing uniqueness must append a hash (see [`id_components`]).
 fn sanitize_id_component(input: &str, max_len: usize) -> String {
     let mut out = String::with_capacity(max_len.min(input.len()));
     for ch in input.chars() {
         if out.len() >= max_len {
             break;
         }
-        let c = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':') {
-            ch.to_ascii_lowercase()
+        let c = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            ch
         } else {
             '-'
         };
@@ -984,7 +1012,14 @@ mod tests {
         let batch = build_ingest_batch_from_raw_request(&sample_request()).unwrap();
         assert_eq!(
             batch.commit_id.as_deref(),
-            Some("raw:tenant-a:doc-100:prule_sentence:edisabled:m10:k8")
+            Some(
+                format!(
+                    "raw:{}:{}:prule_sentence:edisabled:m10:k8",
+                    id_components("tenant-a", "doc-100").0,
+                    id_components("tenant-a", "doc-100").1
+                )
+                .as_str()
+            )
         );
         assert_eq!(batch.items.len(), 2);
         assert_eq!(batch.items[0].claim.tenant_id, "tenant-a");
@@ -1100,7 +1135,14 @@ mod tests {
         assert_eq!(output.embedding_dimensions, Some(16));
         assert_eq!(
             output.batch.commit_id.as_deref(),
-            Some("raw:tenant-a:doc-100:prule_sentence:ehash16:m10:k8")
+            Some(
+                format!(
+                    "raw:{}:{}:prule_sentence:ehash16:m10:k8",
+                    id_components("tenant-a", "doc-100").0,
+                    id_components("tenant-a", "doc-100").1
+                )
+                .as_str()
+            )
         );
         assert_eq!(
             output.batch.items[0].claim.embedding_ids,
@@ -1161,7 +1203,7 @@ mod tests {
     #[test]
     fn sanitize_id_component_normalizes_untrusted_text() {
         let out = sanitize_id_component("Doc ID / weird\tvalue", 32);
-        assert_eq!(out, "doc-id---weird-value");
+        assert_eq!(out, "Doc-ID---weird-value");
     }
 
     #[test]
@@ -1186,5 +1228,85 @@ mod tests {
         let _cmd = EnvVarGuard::set("DASH_INGEST_RAW_ADAPTER_CMD", OsStr::new("cat"));
         let err = build_ingest_batch_from_raw_request(&sample_request()).unwrap_err();
         assert!(err.contains("model-extraction-adapter"));
+    }
+
+    fn first_claim_id(tenant: &str, doc: &str) -> String {
+        let mut req = sample_request();
+        req.tenant_id = tenant.into();
+        req.document_id = doc.into();
+        build_ingest_batch_from_raw_request(&req).unwrap().items[0]
+            .claim
+            .claim_id
+            .clone()
+    }
+
+    fn commit_id_of(tenant: &str, doc: &str) -> String {
+        let mut req = sample_request();
+        req.tenant_id = tenant.into();
+        req.document_id = doc.into();
+        build_ingest_batch_from_raw_request(&req)
+            .unwrap()
+            .commit_id
+            .unwrap()
+    }
+
+    #[test]
+    fn ids_do_not_collide_across_tenant_and_document_boundaries() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let _provider = EnvVarGuard::set(
+            "DASH_INGEST_RAW_EXTRACTION_PROVIDER",
+            OsStr::new("rule_sentence"),
+        );
+        // tenant 'a:b' / doc 'c' vs tenant 'a' / doc 'b:c'
+        assert_ne!(first_claim_id("a:b", "c"), first_claim_id("a", "b:c"));
+        assert_ne!(commit_id_of("a:b", "c"), commit_id_of("a", "b:c"));
+        // case-only and punctuation-only differences
+        assert_ne!(first_claim_id("t", "Doc"), first_claim_id("t", "doc"));
+        assert_ne!(first_claim_id("t", "a/b"), first_claim_id("t", "a b"));
+        // identical inputs stay stable
+        assert_eq!(first_claim_id("t", "doc"), first_claim_id("t", "doc"));
+    }
+
+    #[test]
+    fn ids_do_not_collide_for_long_document_ids() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let _provider = EnvVarGuard::set(
+            "DASH_INGEST_RAW_EXTRACTION_PROVIDER",
+            OsStr::new("rule_sentence"),
+        );
+        let base = "d".repeat(199);
+        let a = first_claim_id("tenant", &format!("{base}1"));
+        let b = first_claim_id("tenant", &format!("{base}2"));
+        assert_ne!(a, b);
+        assert!(a.len() < 160, "ids stay bounded: {}", a.len());
+    }
+
+    #[test]
+    fn document_spans_index_original_bytes_with_leading_whitespace_and_utf8() {
+        let _guard = env_lock().lock().expect("env lock should be available");
+        let _provider = EnvVarGuard::set(
+            "DASH_INGEST_RAW_EXTRACTION_PROVIDER",
+            OsStr::new("rule_sentence"),
+        );
+        let text = "  \n\t Zażółć gęślą jaźń is the first sentence. Second sentence ends here.";
+        let mut req = sample_document_request();
+        req.text = Some(text.to_string());
+        req.min_sentence_chars = Some(10);
+        let result = build_ingest_batch_from_document_request(&req).unwrap();
+        assert_eq!(result.batch.items.len(), 2);
+        for item in &result.batch.items {
+            let evidence = &item.evidence[0];
+            let start = evidence.span_start.unwrap() as usize;
+            let end = evidence.span_end.unwrap() as usize;
+            assert_eq!(
+                normalize_whitespace(&text[start..=end]),
+                item.claim.canonical_text,
+                "span must slice the original document"
+            );
+        }
+        assert_eq!(
+            result.batch.items[0].evidence[0].span_start,
+            Some(text.find("Zażółć").unwrap() as u32)
+        );
     }
 }
