@@ -189,7 +189,7 @@ describe('OpenAI drop-in compatibility', () => {
     expect(calls[0]!.body).toEqual({
       tenant_id: 't',
       query: 'q',
-      top_k: 10,
+      top_k: 5,
       stance_mode: 'balanced',
     });
   });

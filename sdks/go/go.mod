@@ -1,4 +1,4 @@
-module github.com/anomalyco/dash-go
+module github.com/BHAWESHBHASKAR/DASH/sdks/go
 
 go 1.21
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dash-py"
-version = "0.1.0"
+version = "0.2.0"
 description = "Idiomatic Python client for the DASH retrieval engine"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -45,7 +45,7 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dash-retrieval/dash"
+Homepage = "https://github.com/BHAWESHBHASKAR/DASH"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dash"]

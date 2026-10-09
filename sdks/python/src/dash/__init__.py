@@ -26,9 +26,12 @@ from .types import (
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
+    GraphEdge,
+    RetrieveGraph,
     RetrieveRequest,
     RetrieveResponse,
     RetrieveResult,
+    TimeRange,
 )
 
 __all__ = [
@@ -49,7 +52,10 @@ __all__ = [
     "EmbeddingRequest",
     "EmbeddingResponse",
     "EmbeddingUsage",
+    "GraphEdge",
+    "RetrieveGraph",
     "RetrieveRequest",
     "RetrieveResponse",
     "RetrieveResult",
+    "TimeRange",
 ]
