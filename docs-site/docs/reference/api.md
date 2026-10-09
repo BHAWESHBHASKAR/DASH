@@ -72,7 +72,7 @@ The write path. See [Ingest guide](../guides/ingest.md) for the full walkthrough
         "event_time_unix": 1718300000,
         "valid_from_unix": 1718300000,
         "valid_to_unix": null,
-        "extraction_model": "claude-opus-4-7"
+        "extraction_model": "llm-extractor-v1"
       },
       "evidence": [
         {

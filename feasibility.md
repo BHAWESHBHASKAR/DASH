@@ -210,7 +210,7 @@ Confidence Scoring → Contradiction Detection → Evidence Graph Construction
 
 This pipeline is inherently **model-dependent** and should be designed as a **pluggable interface**:
 - Define a `ClaimExtractor` trait in Rust
-- Provide a reference implementation using an LLM API (OpenAI, Anthropic, or local models via Ollama)
+- Provide a reference implementation using an LLM API (a hosted LLM API such as OpenAI, or local models via Ollama)
 - Let the community build specialized extractors for domains (legal, medical, financial)
 
 ### 5.3 Scalability Path

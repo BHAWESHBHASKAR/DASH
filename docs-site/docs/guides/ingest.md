@@ -42,7 +42,7 @@ If the same `idempotency_key` is replayed, the response is identical and `idempo
     "event_time_unix": 1718300000,
     "valid_from_unix": 1718300000,
     "valid_to_unix": null,
-    "extraction_model": "claude-opus-4-7"
+    "extraction_model": "llm-extractor-v1"
   },
   "evidence": [
     {

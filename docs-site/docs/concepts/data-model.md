@@ -41,7 +41,7 @@ A claim is an atomic, source-bound assertion. It is the primary data primitive.
   "event_time_unix": 1718300000,
   "valid_from_unix": 1718300000,
   "valid_to_unix": null,
-  "extraction_model": "claude-opus-4-7",
+  "extraction_model": "llm-extractor-v1",
   "created_at_unix": 1718300050
 }
 ```
@@ -70,7 +70,7 @@ Evidence is the record that ties a claim to a source. It is the field that makes
   "span_start": 1024,
   "span_end": 1280,
   "doc_id": "nyt-2024-05-12-acme-x",
-  "extraction_model": "claude-opus-4-7",
+  "extraction_model": "llm-extractor-v1",
   "created_at_unix": 1718300051
 }
 ```
