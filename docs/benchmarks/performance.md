@@ -123,6 +123,9 @@ the ANN index for every candidate. Acceptable for interactive RAG
 |---:|---:|---:|---:|
 | 645 | 848 | 945 | 1,479 |
 
+These numbers were measured against the in-repo graph that P2 removed; see
+"Vector index after P2" below for the replacement's numbers.
+
 ### wal_replay_throughput
 
 | p50 (ms) | p95 (ms) | p99 (ms) |
@@ -169,27 +172,50 @@ regression to a specific code path. Concrete differences:
 In short, `main.rs` is the production gate, `perf_bench` is the
 engineer's microscope.
 
+## Vector index after P2 (2026-10-09)
+
+Measured with a throwaway driver (not committed) on the same 4 vCPU Xeon box as
+ADR 0003, release build, seeded Gaussian mixture of 32 clusters with isotropic
+noise (|noise| about 0.8, a harder shape than the ADR's low-dimensional
+clusters), top-10, 200 timed queries, recall@10 against
+`exact_vector_top_candidates` on the first 50. "Build" is claim ingest plus
+vector upserts into an empty store, single-threaded. Single runs on a shared box.
+
+| Vectors | Dim | Index | Build | p50 | p99 | Recall@10 |
+|---:|---:|---|---:|---:|---:|---:|
+| 5 000 | 384 | removed graph | 11.3 s | 463 us | 626 us | 0.280 |
+| 10 000 | 384 | removed graph | 54.4 s | 631 us | 901 us | 0.518 |
+| 20 000 | 384 | removed graph | 327.3 s | 1,121 us | 1,511 us | 0.580 |
+| 20 000 | 384 | flat/HNSW | 4.3 s | 299 us | 976 us | 1.000 |
+| 20 000 | 64 | flat/HNSW | 1.5 s | 119 us | 610 us | 1.000 |
+| 100 000 | 384 | flat/HNSW | 74.7 s | 1,028 us | 1,905 us | 0.964 |
+
+The `ann_search_throughput_at_scale` scenario of `perf_bench` (10 000 uniform random 384-d vectors, which are harder for HNSW than clustered data) now reports `build_ms` and
+`vector_index_bytes`; in the unoptimised dev profile (C++ `usearch` is always built with -O3, the Rust loops are not) it measured build 4.8 s,
+p50 1.29 ms, p99 3.5 ms and 18 MB of index on this box. It is not comparable with the 2026-06-15 release numbers above.
+
+Cold start with 100 000 x 384-d vectors in a WAL (`load_from_wal`, 4 threads for
+the index build): 24.0 s, of which 18.6 s is the HNSW build (a second run:
+26.4 s and 24.8 s total). The same inserts done one by one take 74.7 s, and raw
+`usearch` `i8` single-thread insertion of the same vectors takes 73.6 s, so the
+wrapper adds no measurable overhead; the per-vector cost is the library's on this
+data (the ADR's lower-dimensional clusters built about 3x faster). The index is
+not persisted, so every restart pays this; persisting or memory-mapping it is the
+follow-up that removes it. Memory: the `i8` HNSW holds `dim` bytes plus the graph
+per vector and no `f32` copy (the full-precision vectors stay in `claim_vectors`);
+`StoreIndexStats::vector_index_bytes` reports it. Tenants at or below the flat
+threshold (default 8192) keep one extra normalised `f32` copy.
+
 ## Known bottlenecks
 
 The numbers above point to three dominant cost centers in the
 retrieval engine today:
 
-1. **ANN graph build is O(N²) at level 0.** Each
-   `upsert_claim_vector` call iterates all previously inserted
-   vectors in `select_ann_neighbors` to pick the new node's
-   neighbors. Empirically:
-
-   - 10 000 vectors at 384-dim takes ~30 s to build (release build,
-     single thread).
-   - 30 000 vectors takes ~4 minutes.
-   - 100 000 vectors is projected at ~45 minutes, which is why the
-     default ANN scenario uses 10 000 rather than the 100 000 in the
-     original spec. The fix is a `usearch` (or similar SIMD-ANN)
-   - backed HNSW or a layered graph that only does exhaustive search
-   - at level 0 for the local neighborhood and approximate search
-   - above. Tracked in
-   - `docs/plans/2026-06-13-dash-modernization-roadmap.md` (section
-   - on the ANN build bottleneck).
+1. **ANN graph build was O(N²) at level 0 (fixed in P2, IDX-01).** The
+   in-repo graph scanned every previously inserted vector per insert:
+   10 000 vectors at 384-dim took ~30 s, 20 000 took 321 s in the ADR 0003
+   spike. It was replaced by a per-tenant flat/`usearch` HNSW index; see the
+   next section for the measured build time, recall and startup cost.
 
 2. **WAL append + `sync_data` is per-record at `sync_every_records=1`.**
    The persistent-ingest path at ~133 ops/sec is dominated by the
@@ -222,11 +248,10 @@ retrieval engine today:
   (`docs/plans/2026-06-13-dash-modernization-roadmap.md`) covers the
   broader plan to retire `main.rs` in favor of composable per-path
   scenarios.
-- **Add `usearch` (or equivalent) backed ANN** so the
-  `ann_search_throughput_at_scale` scenario can move from 10 000
-  vectors at 30 s of build to 100 000+ vectors at <1 s of build.
-  That change will shift the dominant cost from "build the graph" to
-  "search the graph" and reshape the rest of the pipeline.
+- **Persist or memory-map the vector index.** The `usearch` backed index
+  landed in P2 (see "Vector index after P2"); it is still rebuilt at
+  startup, and `view` of a saved index took 45 ms for 500k vectors in the
+  ADR 0003 spike.
 - **Add a WAL group-commit scenario** that compares
   `sync_every_records=1` against `sync_every_records=32,128,512` so
   the durability/throughput tradeoff is quantified, not guessed.

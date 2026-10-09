@@ -268,12 +268,12 @@ fn main() {
             tracing::info!("ingestion transport listening on http://{bind_addr}");
             tracing::info!("ingestion transport workers: {http_workers}");
             tracing::info!(
-                "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-                store.ann_tuning().max_neighbors_base,
-                store.ann_tuning().max_neighbors_upper,
-                store.ann_tuning().search_expansion_factor,
-                store.ann_tuning().search_expansion_min,
-                store.ann_tuning().search_expansion_max
+                "ingestion vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+                store.ann_tuning().connectivity,
+                store.ann_tuning().expansion_add,
+                store.ann_tuning().expansion_search,
+                store.ann_tuning().flat_threshold,
+                store.ann_tuning().rerank
             );
             tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
             tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
@@ -325,12 +325,12 @@ fn main() {
             tracing::info!("ingestion transport listening on http://{bind_addr}");
             tracing::info!("ingestion transport workers: {http_workers}");
             tracing::info!(
-                "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-                store.ann_tuning().max_neighbors_base,
-                store.ann_tuning().max_neighbors_upper,
-                store.ann_tuning().search_expansion_factor,
-                store.ann_tuning().search_expansion_min,
-                store.ann_tuning().search_expansion_max
+                "ingestion vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+                store.ann_tuning().connectivity,
+                store.ann_tuning().expansion_add,
+                store.ann_tuning().expansion_search,
+                store.ann_tuning().flat_threshold,
+                store.ann_tuning().rerank
             );
             tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
             tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
@@ -527,46 +527,36 @@ fn validate_wal_durability_guardrails(config: &WalDurabilityConfig) -> Result<()
 fn parse_ann_tuning_config() -> AnnTuningConfig {
     let defaults = AnnTuningConfig::default();
     AnnTuningConfig {
-        max_neighbors_base: parse_env_first::<usize>(&[
+        connectivity: parse_env_first::<usize>(&[
             "DASH_INGEST_ANN_MAX_NEIGHBORS_BASE",
             "DASH_ANN_MAX_NEIGHBORS_BASE",
             "EME_INGEST_ANN_MAX_NEIGHBORS_BASE",
             "EME_ANN_MAX_NEIGHBORS_BASE",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_base),
-        max_neighbors_upper: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_MAX_NEIGHBORS_UPPER",
-            "DASH_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_INGEST_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_ANN_MAX_NEIGHBORS_UPPER",
+        .unwrap_or(defaults.connectivity),
+        expansion_add: parse_env_first::<usize>(&[
+            "DASH_INGEST_ANN_EXPANSION_ADD",
+            "DASH_ANN_EXPANSION_ADD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_upper),
-        search_expansion_factor: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_SEARCH_EXPANSION_FACTOR",
-            "DASH_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_INGEST_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_ANN_SEARCH_EXPANSION_FACTOR",
-        ])
-        .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_factor),
-        search_expansion_min: parse_env_first::<usize>(&[
+        .unwrap_or(defaults.expansion_add),
+        expansion_search: parse_env_first::<usize>(&[
             "DASH_INGEST_ANN_SEARCH_EXPANSION_MIN",
             "DASH_ANN_SEARCH_EXPANSION_MIN",
             "EME_INGEST_ANN_SEARCH_EXPANSION_MIN",
             "EME_ANN_SEARCH_EXPANSION_MIN",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_min),
-        search_expansion_max: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_SEARCH_EXPANSION_MAX",
-            "DASH_ANN_SEARCH_EXPANSION_MAX",
-            "EME_INGEST_ANN_SEARCH_EXPANSION_MAX",
-            "EME_ANN_SEARCH_EXPANSION_MAX",
+        .unwrap_or(defaults.expansion_search),
+        flat_threshold: parse_env_first::<usize>(&[
+            "DASH_INGEST_VECTOR_FLAT_THRESHOLD",
+            "DASH_VECTOR_FLAT_THRESHOLD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_max),
+        .unwrap_or(defaults.flat_threshold),
+        rerank: parse_env_first::<usize>(&["DASH_INGEST_VECTOR_RERANK", "DASH_VECTOR_RERANK"])
+            .unwrap_or(defaults.rerank),
     }
 }
 

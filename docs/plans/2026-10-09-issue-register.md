@@ -116,8 +116,8 @@ Phase column refers to the master plan phases (P0 … P7).
 
 | ID | Sev | Issue | Evidence | Phase |
 |---|---|---|---|---|
-| IDX-01 | S1 | ANN is a home-grown string-keyed graph, not `usearch` (dependency unused). Insert scans every vector of every tenant per level ⇒ O(N²) cold start. | `pkg/store/src/ann.rs`; `lib.rs:1678-1695` | P2 |
-| IDX-02 | S2 | ANN deletes leave graph unrepaired; pruning one-directional ⇒ recall decay. | `pkg/store/src/lib.rs:1639-1668, 1746-1792` | P2 |
+| IDX-01 | S1 | ANN is a home-grown string-keyed graph, not `usearch` (dependency unused). Insert scans every vector of every tenant per level ⇒ O(N²) cold start. **Fixed in P2 step 1** (flat/`usearch` HNSW vector index; evidence in `2026-10-09-p0-status.md`). | `pkg/store/src/ann.rs`; `lib.rs:1678-1695` | P2 |
+| IDX-02 | S2 | ANN deletes leave graph unrepaired; pruning one-directional ⇒ recall decay. **Fixed in P2 step 1** (usearch soft delete with slot reuse; the graph code is gone). | `pkg/store/src/lib.rs:1639-1668, 1746-1792` | P2 |
 | IDX-03 | S1 | Retrieval fallbacks: no token hits ⇒ score every claim in tenant; empty ANN result (e.g. wrong dim) ⇒ brute force over **all tenants'** vectors. | `pkg/store/src/lib.rs:843-853, 946-960, 1004-1015` | P0 (tenant scope) / P2 |
 | IDX-04 | S2 | Tokenizer ASCII-only (no Unicode, no stemming, no multilingual); BM25 average length recomputed over tenant per query. | `pkg/schema/src/lib.rs` `tokenize`; `pkg/store/src/lib.rs:1179-1186` | P2 |
 | IDX-05 | S1 | **Ranking can be gamed / is wrong**: edge direction inverted ("A supports B" counts for A); dangling edges count; unbounded linear support bonus (+0.08 per edge) from self-authored edges. | `pkg/store/src/lib.rs:551-567`; `pkg/graph/src/lib.rs:12-28`; `pkg/ranking/src/lib.rs:86` | P0 (direction/dangling/cap) / P5 |

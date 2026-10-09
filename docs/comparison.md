@@ -16,7 +16,7 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Temporal validity windows | first-class (`event_time_unix`, `valid_from`, `valid_to`, `time_range` filter) | metadata only | manual | manual | manual | manual |
 | OpenAI-compatible `/v1/embeddings` | yes, native | partial | yes | via proxy layer | via proxy layer | yes |
 | Swap embedding provider | trait-based (`EmbeddingProvider`) | n/a | plugin-based | n/a | n/a | function-based |
-| HNSW-style ANN | yes (in-repo graph in `pkg/store/src/ann.rs`; not `usearch`; recall at scale unmeasured) | yes, proprietary | yes | yes | yes | yes |
+| HNSW-style ANN | yes (`usearch` HNSW with `i8` quantisation and exact rerank, flat scan for small tenants; recall@10 >= 0.95 on seeded clustered data; rebuilt at startup, not persisted) | yes, proprietary | yes | yes | yes | yes |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
 | Hash-chained audit log | partial: unkeyed SHA-256 chain with a shared verifier (`tools/audit-verify`), off unless a path is configured | no | no | no | no | no |
 | Tenant isolation (strict authz) | partial: allowlist + scoped keys; one known isolation gap: the claim-id namespace is global (register SEC-18) | yes | yes (OIDC) | yes | partial | no |

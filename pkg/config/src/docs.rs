@@ -132,7 +132,7 @@ fn topic_prose(scope: Scope, topic: &str) -> (&'static str, &'static str) {
             "Verify a log with `tools/audit-verify` or `scripts/verify_audit_chain.sh`.",
         ),
         (Scope::Common, t) if t == T_ANN => (
-            "Each variable can be set per service (`DASH_INGEST_ANN_*`, `DASH_RETRIEVAL_ANN_*`) or shared (`DASH_ANN_*`); the per-service name wins, then the shared name, then the `EME_` forms. Values must be positive integers. The index is an in-repo HNSW-style graph, not `usearch`.",
+            "Each variable can be set per service (`DASH_INGEST_ANN_*`, `DASH_RETRIEVAL_ANN_*`) or shared (`DASH_ANN_*`); the per-service name wins, then the shared name, then the `EME_` forms. Values must be positive integers (`VECTOR_RERANK` may be `0`). The index is a per-tenant exact flat scan below `VECTOR_FLAT_THRESHOLD` vectors and a `usearch` HNSW (cosine, `i8` quantisation, exact `f32` rerank) above it. The previous in-repo graph and its `ANN_MAX_NEIGHBORS_UPPER`, `ANN_SEARCH_EXPANSION_FACTOR` and `ANN_SEARCH_EXPANSION_MAX` settings were removed; if still set they are ignored.",
             "There is no `DASH_ANN_M`, `DASH_ANN_EF_CONSTRUCTION`, `DASH_ANN_EF_SEARCH` or `DASH_ANN_REBUILD_THRESHOLD`.",
         ),
         (Scope::Common, t) if t == T_PLACEMENT => (

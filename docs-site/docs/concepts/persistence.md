@@ -37,7 +37,7 @@ Offline tooling: `wal-inspect inspect|verify|repair` (build with `cargo build --
 
 - Evidence is upserted by `evidence_id` and edges by `(from, to, relation)`, in memory, in redb, on bulk load and on replication re-apply, so a restart that combines a redb bulk load with WAL replay no longer duplicates evidence (DATA-01).
 - Re-upserting a claim keeps its vector and ANN entry, in memory and in redb (DATA-04).
-- The ANN graph is not persisted; it is rebuilt in memory from stored vectors at startup, and the rebuild cost is quadratic in the number of vectors (IDX-01, planned P2).
+- The vector index is not persisted; it is rebuilt in memory from the stored vectors at startup. Replay collects the vectors first and then builds each tenant once (a tenant at or below the flat threshold costs a copy; a larger one builds a `usearch` HNSW from several threads). Measured: replaying a WAL with 100,000 x 384-d vectors takes about 24 s on 4 vCPUs, 18.6 s of it the index build; building the same index one insert at a time takes about 75 s. Persisting or memory-mapping the index is a follow-up (ADR 0003 measured a 45 ms `view` of a 500k-vector index).
 - Services still cold-start from the WAL (and snapshot), not from redb (DATA-11, planned P2).
 
 ## Replication offset

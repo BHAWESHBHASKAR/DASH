@@ -128,15 +128,15 @@ Verify a log with `tools/audit-verify` or `scripts/verify_audit_chain.sh`.
 
 ### ANN tuning
 
-Each variable can be set per service (`DASH_INGEST_ANN_*`, `DASH_RETRIEVAL_ANN_*`) or shared (`DASH_ANN_*`); the per-service name wins, then the shared name, then the `EME_` forms. Values must be positive integers. The index is an in-repo HNSW-style graph, not `usearch`.
+Each variable can be set per service (`DASH_INGEST_ANN_*`, `DASH_RETRIEVAL_ANN_*`) or shared (`DASH_ANN_*`); the per-service name wins, then the shared name, then the `EME_` forms. Values must be positive integers (`VECTOR_RERANK` may be `0`). The index is a per-tenant exact flat scan below `VECTOR_FLAT_THRESHOLD` vectors and a `usearch` HNSW (cosine, `i8` quantisation, exact `f32` rerank) above it. The previous in-repo graph and its `ANN_MAX_NEIGHBORS_UPPER`, `ANN_SEARCH_EXPANSION_FACTOR` and `ANN_SEARCH_EXPANSION_MAX` settings were removed; if still set they are ignored.
 
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
-| `DASH_INGEST_ANN_MAX_NEIGHBORS_BASE` / `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` (shared: `DASH_ANN_MAX_NEIGHBORS_BASE`) | `12` | integer >= 1 | Max neighbors on the base layer. |  |
-| `DASH_INGEST_ANN_MAX_NEIGHBORS_UPPER` / `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` (shared: `DASH_ANN_MAX_NEIGHBORS_UPPER`) | `6` | integer >= 1 | Max neighbors on upper layers. |  |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_FACTOR` / `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_FACTOR` (shared: `DASH_ANN_SEARCH_EXPANSION_FACTOR`) | `16` | integer >= 1 | Candidate expansion multiplier. |  |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_MIN` / `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` (shared: `DASH_ANN_SEARCH_EXPANSION_MIN`) | `64` | integer >= 1 | Minimum candidates examined. |  |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_MAX` / `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX` (shared: `DASH_ANN_SEARCH_EXPANSION_MAX`) | `4096` | integer >= 1 | Maximum candidates examined. |  |
+| `DASH_INGEST_ANN_MAX_NEIGHBORS_BASE` / `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` (shared: `DASH_ANN_MAX_NEIGHBORS_BASE`) | `16` | integer >= 1 | HNSW connectivity `M` (usearch `connectivity`): neighbours per node. Higher is more accurate and uses more memory. The previous in-repo graph used 12. |  |
+| `DASH_INGEST_ANN_EXPANSION_ADD` / `DASH_RETRIEVAL_ANN_EXPANSION_ADD` (shared: `DASH_ANN_EXPANSION_ADD`) | `128` | integer >= 1 | HNSW `ef_construction` (usearch `expansion_add`): beam width while inserting a vector. Higher builds a better graph more slowly. | DASH only. |
+| `DASH_INGEST_ANN_SEARCH_EXPANSION_MIN` / `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` (shared: `DASH_ANN_SEARCH_EXPANSION_MIN`) | `128` | integer >= 1 | HNSW `ef_search` floor (usearch `expansion_search`): beam width while searching; it is widened to the number of requested candidates when that is larger. |  |
+| `DASH_INGEST_VECTOR_FLAT_THRESHOLD` / `DASH_RETRIEVAL_VECTOR_FLAT_THRESHOLD` (shared: `DASH_VECTOR_FLAT_THRESHOLD`) | `8192` | integer >= 1 | A tenant with at most this many vectors is searched exactly (flat scan); above it an HNSW index is built. The same number bounds filtered searches that are scanned exactly instead of through the HNSW. | DASH only. |
+| `DASH_INGEST_VECTOR_RERANK` / `DASH_RETRIEVAL_VECTOR_RERANK` (shared: `DASH_VECTOR_RERANK`) | `50` | integer | HNSW candidates re-scored with exact `f32` cosine after the quantised (`i8`) search. `0` returns the quantised scores unchanged. | DASH only. |
 
 There is no `DASH_ANN_M`, `DASH_ANN_EF_CONSTRUCTION`, `DASH_ANN_EF_SEARCH` or `DASH_ANN_REBUILD_THRESHOLD`.
 
@@ -436,11 +436,11 @@ All six server settings are DASH only and the server ignores values of 0 or unpa
 | `DASH_BENCH_MIN_ITERATIONS` | `5` | integer >= 1 | Minimum iterations for a valid benchmark run. |  |
 | `DASH_BENCH_GUARD_MIN_ITERATIONS` | `5` | integer >= 1 | Minimum iterations required by the history regression guard. |  |
 | `DASH_BENCH_HISTORY_CSV_OUT` | unset | path | Write the benchmark history as CSV to this path. |  |
-| `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE` | `12` | integer >= 1 | ANN tuning used by the benchmark store (base layer neighbors). |  |
-| `DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER` | `6` | integer >= 1 | ANN tuning used by the benchmark store (upper layer neighbors). |  |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR` | `16` | integer >= 1 | ANN tuning used by the benchmark store (expansion factor). |  |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_MIN` | `64` | integer >= 1 | ANN tuning used by the benchmark store (minimum expansion). |  |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_MAX` | `4096` | integer >= 1 | ANN tuning used by the benchmark store (maximum expansion). |  |
+| `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE` | `16` | integer >= 1 | Vector index tuning used by the benchmark store (HNSW connectivity). |  |
+| `DASH_BENCH_ANN_EXPANSION_ADD` | `128` | integer >= 1 | Vector index tuning used by the benchmark store (HNSW construction beam). |  |
+| `DASH_BENCH_ANN_SEARCH_EXPANSION_MIN` | `128` | integer >= 1 | Vector index tuning used by the benchmark store (HNSW search beam floor). |  |
+| `DASH_BENCH_VECTOR_FLAT_THRESHOLD` | `8192` | integer >= 1 | Vector index tuning used by the benchmark store (flat-to-HNSW threshold). |  |
+| `DASH_BENCH_VECTOR_RERANK` | `50` | integer | Vector index tuning used by the benchmark store (exact rerank width; 0 disables). |  |
 | `DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT` | `95.0` | number | Gate for the `large` profile: minimum candidate reduction in percent. |  |
 | `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS` | `120.0` | number | Gate for the `large` profile: maximum average latency in milliseconds. |  |
 | `DASH_BENCH_LARGE_MIN_ANN_RECALL_AT_100` | `0.98` | number | Gate for the `large` profile: minimum ANN recall at 100. |  |

@@ -224,7 +224,12 @@ every transaction. To trade durability for throughput, see
 ~100x throughput at the cost of losing the last 99 records on a
 crash).
 
-### `ann_vs_brute_force` — when does the index help?
+### `ann_vs_brute_force` — when does the index help? (removed graph, 2026-06-15)
+
+> The table below was measured against the in-repo graph that P2 removed. With the
+> current index a tenant of up to `DASH_*_VECTOR_FLAT_THRESHOLD` (8192) vectors is
+> searched by the same exact scan, so there is no crossover below the threshold; see
+> `docs/benchmarks/performance.md` ("Vector index after P2") for the HNSW numbers.
 
 | n (vectors) | ANN (ns) | Brute-force (ns) | Verdict |
 |---:|---:|---:|---|
@@ -238,11 +243,12 @@ sparse top level, so the constant overhead per query is high
 hop). For n in the 1k-10k range, the scan cost is dominated by
 L1/L2 cache hits and SIMD-friendly loops, so brute force wins.
 
-**Implication for production**: the ANN index only beats brute
-force when the corpus is large enough that scan cost exceeds
-graph traversal cost. In practice, that crossover is around
-50k-100k vectors. Below that, `exact_vector_top_candidates` is
-the right call; above it, `ann_vector_top_candidates` wins.
+**Implication for production (old graph)**: the ANN index only beat brute
+force when the corpus was large enough that scan cost exceeded
+graph traversal cost. The replacement handles that itself:
+`ann_vector_top_candidates` scans exactly up to the flat threshold and
+uses the `usearch` HNSW above it; `exact_vector_top_candidates` remains the
+brute-force reference used by the tests.
 
 ### `ingest_in_memory`
 

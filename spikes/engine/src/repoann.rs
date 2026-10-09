@@ -1,5 +1,10 @@
-//! The in-repo ANN, driven through `store`'s public API only
+//! The store's vector search, driven through its public API only
 //! (`ingest_bundle` + `upsert_claim_vector`, then `ann_vector_top_candidates`).
+//!
+//! The committed `results/A_vector.jsonl` rows with kind "repo" were measured against the
+//! in-repo graph that P2 removed (the `max_neighbors_*` / `search_expansion_*` knobs); this
+//! driver now exercises the replacement (flat scan, then `usearch` HNSW above the threshold),
+//! where `ef` is `expansion_search` and every `set_ann_tuning` rebuilds the index.
 
 use crate::common::*;
 use crate::vecbench::row;
@@ -28,11 +33,8 @@ pub fn claim(i: usize, text: String) -> Claim {
 
 fn tuning(ef: usize) -> AnnTuningConfig {
     AnnTuningConfig {
-        max_neighbors_base: 12,
-        max_neighbors_upper: 6,
-        search_expansion_factor: 1,
-        search_expansion_min: ef,
-        search_expansion_max: ef,
+        expansion_search: ef,
+        ..AnnTuningConfig::default()
     }
 }
 
@@ -84,7 +86,7 @@ pub fn run(a: &Args) {
     let queries = g.queries();
     let rss_base = rss_mb();
     let base = json!({"exp":"A","kind":"repo","dim":DIM,"threads_build":1,
-        "params":{"max_neighbors_base":12,"max_neighbors_upper":6,"levels":4},"rss_base_mb":rss_base.round()});
+        "params":{"connectivity":16,"expansion_add":128,"flat_threshold":8192,"rerank":50},"rss_base_mb":rss_base.round()});
     let mut store = InMemoryStore::new_with_ann_tuning(tuning(128));
     let eval_at: Vec<usize> = a.s("eval_at", "10000").split(',').map(|x| x.parse().unwrap()).collect();
     let t0 = Instant::now();
