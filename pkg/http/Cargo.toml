@@ -1,0 +1,7 @@
+[package]
+name = "dash-http"
+version = "0.1.0"
+edition = "2024"
+description = "Shared std-thread HTTP/1.1 server and strict request parser for DASH services"
+
+[dependencies]
