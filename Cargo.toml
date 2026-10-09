@@ -19,6 +19,8 @@ members = [
   "tools/audit-verify",
   "tools/wal-inspect",
 ]
+# Standalone benchmark crate with its own workspace (P2 engine spike).
+exclude = ["spikes/engine"]
 resolver = "2"
 
 [workspace.package]
