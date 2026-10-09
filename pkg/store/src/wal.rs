@@ -128,6 +128,16 @@ pub struct WalReplayBoundary {
     pub wal_generation: u64,
 }
 
+/// A point in the WAL: `records` lines of the WAL lineage `generation`
+/// (the snapshot, if any, is part of that lineage). A persisted vector index
+/// records the position it reflects so a restart can replay only the lines
+/// after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WalPosition {
+    pub generation: u64,
+    pub records: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalReplicationDelta {
     pub from_offset: usize,
@@ -567,6 +577,16 @@ impl FileWal {
         Ok(self.wal_records)
     }
 
+    /// Current position: this lineage and every record appended so far
+    /// (including records still in the append buffer; flush first when the
+    /// position must be durable).
+    pub fn position(&self) -> WalPosition {
+        WalPosition {
+            generation: self.generation,
+            records: self.wal_records,
+        }
+    }
+
     pub fn wal_size_bytes(&self) -> Result<u64, StoreError> {
         Ok(std::fs::metadata(&self.path)?.len())
     }
@@ -836,7 +856,15 @@ impl FileWal {
     /// Parses the snapshot and WAL (plus the unflushed append buffer)
     /// into replayable items, applying `policy` to lines that cannot be
     /// parsed. See [`ReplayPolicy`] and `docs/operations/wal-recovery.md`.
-    pub(crate) fn replay_with_policy(&self, policy: ReplayPolicy) -> Result<WalReplay, StoreError> {
+    ///
+    /// With `collect_vectors_from = Some(n)` the replay also reports the
+    /// claim ids of the vector records after the first `n` WAL lines (the
+    /// catch-up set of a persisted vector index saved at line `n`).
+    pub(crate) fn replay_with_policy(
+        &self,
+        policy: ReplayPolicy,
+        collect_vectors_from: Option<usize>,
+    ) -> Result<WalReplay, StoreError> {
         let mut sink = QuarantineSink::load(self.quarantine_path())?;
         let mut parser = ReplayParser::new(policy);
         let mut items = Vec::new();
@@ -854,16 +882,33 @@ impl FileWal {
             n
         };
         let scan = scan_wal(&self.path)?;
+        // Claim ids of the vector records after line `from` (see
+        // `WalReplay::vector_claim_ids_after`); impossible when the WAL is
+        // shorter than `from`.
+        let mut vector_ids = collect_vectors_from
+            .filter(|from| *from <= scan.lines.len())
+            .map(|_| HashSet::new());
+        let collect_from = collect_vectors_from.unwrap_or(usize::MAX);
         let mut wal_items = Vec::new();
-        for (line_no, line) in scan.lines {
+        for (index, (line_no, line)) in scan.lines.into_iter().enumerate() {
             let origin = format!("wal line {line_no}");
             if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                if index >= collect_from
+                    && let (Some(ids), PersistedRecord::ClaimVector(v)) =
+                        (vector_ids.as_mut(), &item.record)
+                {
+                    ids.insert(v.claim_id.clone());
+                }
                 wal_items.push(item);
             }
         }
         for line in &self.append_buffer {
+            let record = line_to_record(line)?;
+            if let (Some(ids), PersistedRecord::ClaimVector(v)) = (vector_ids.as_mut(), &record) {
+                ids.insert(v.claim_id.clone());
+            }
             wal_items.push(ReplayItem {
-                record: line_to_record(line)?,
+                record,
                 legacy: false,
                 raw: None,
                 origin: "unflushed wal buffer".to_string(),
@@ -890,6 +935,7 @@ impl FileWal {
             stats,
             sink,
             quarantined_claim_ids: parser.quarantined_claim_ids,
+            vector_claim_ids_after: vector_ids,
         })
     }
 
@@ -1063,7 +1109,7 @@ fn write_line(file: &mut File, line: &str) -> Result<(), StoreError> {
 /// fsync the directory containing `path` so that creations, renames and
 /// truncations of directory entries are durable. No-op on platforms where
 /// directories cannot be opened for syncing.
-fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -1081,13 +1127,13 @@ fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
 }
 
 /// `File::sync_all` with a test-only trace of the operation order.
-fn sync_file(file: &File) -> std::io::Result<()> {
+pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
     trace_op!("fsync_file");
     file.sync_all()
 }
 
 /// `fs::rename` with a test-only trace of the operation order.
-fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
     trace_op!("rename");
     rename(from, to)
 }
@@ -1303,6 +1349,9 @@ pub(crate) struct WalReplay {
     pub(crate) sink: QuarantineSink,
     /// Claim ids of legacy claim lines quarantined at parse time.
     pub(crate) quarantined_claim_ids: HashSet<String>,
+    /// Claim ids of the vector records after the requested WAL line; `None`
+    /// when none was requested or the WAL is shorter than that line.
+    pub(crate) vector_claim_ids_after: Option<HashSet<String>>,
 }
 
 /// Collects quarantined raw lines and appends them (fsynced) to

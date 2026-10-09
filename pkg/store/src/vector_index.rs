@@ -119,6 +119,9 @@ pub enum VectorIndexError {
     InvalidVector(&'static str),
     #[error("vector index backend error: {0}")]
     Backend(String),
+    /// A persisted index failed a structural check while loading.
+    #[error("persisted vector index is corrupt: {0}")]
+    Corrupt(String),
 }
 
 /// Full-precision vectors for reranking, addressed by index key.
@@ -177,6 +180,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// L2-normalised copy of `v`, or why it cannot be normalised.
 fn normalized(v: &[f32]) -> Result<Vec<f32>, VectorIndexError> {
+    let inv = (1.0 / checked_norm_sq(v)?.sqrt()) as f32;
+    Ok(v.iter().map(|x| x * inv).collect())
+}
+
+/// Squared L2 norm, or why `v` has no direction.
+fn checked_norm_sq(v: &[f32]) -> Result<f64, VectorIndexError> {
     if v.is_empty() {
         return Err(VectorIndexError::InvalidVector("empty vector"));
     }
@@ -187,8 +196,48 @@ fn normalized(v: &[f32]) -> Result<Vec<f32>, VectorIndexError> {
     if norm_sq <= f64::MIN_POSITIVE {
         return Err(VectorIndexError::InvalidVector("zero-norm vector"));
     }
-    let inv = (1.0 / norm_sq.sqrt()) as f32;
-    Ok(v.iter().map(|x| x * inv).collect())
+    Ok(norm_sq)
+}
+
+/// `true` when `v` can be indexed under the cosine metric (non-empty,
+/// finite, non-zero norm). Vectors that fail it are stored but never indexed.
+pub fn is_indexable(v: &[f32]) -> bool {
+    checked_norm_sq(v).is_ok()
+}
+
+/// 64-bit fingerprint of a raw vector's exact bit pattern (length included).
+/// Not cryptographic: it detects a persisted index that no longer matches the
+/// stored vectors, which an accidental mismatch defeats with odds of about
+/// one in 2^64.
+pub fn vector_fingerprint(v: &[f32]) -> u64 {
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut lanes: [u64; 4] = [
+        0x243F_6A88_85A3_08D3,
+        0x1319_8A2E_0370_7344,
+        0xA409_3822_299F_31D0,
+        0x082E_FA98_EC4E_6C89,
+    ];
+    let (chunks, rest) = v.as_chunks::<8>();
+    for chunk in chunks {
+        for (lane, state) in lanes.iter_mut().enumerate() {
+            let word = u64::from(chunk[2 * lane].to_bits())
+                | (u64::from(chunk[2 * lane + 1].to_bits()) << 32);
+            *state = (*state ^ word).wrapping_mul(K).rotate_left(29);
+        }
+    }
+    let mut h = (v.len() as u64).wrapping_mul(K);
+    for state in lanes {
+        h = (h ^ state).wrapping_mul(K).rotate_left(31);
+    }
+    for x in rest {
+        h = (h ^ u64::from(x.to_bits())).wrapping_mul(K).rotate_left(29);
+    }
+    // splitmix64 finaliser.
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ (h >> 31)
 }
 
 /// Cosine of a unit `query` against an arbitrary (not normalised) `v`.
@@ -518,18 +567,63 @@ impl HnswIndex {
     }
 
     fn deep_copy(&self) -> Result<usearch::Index, VectorIndexError> {
+        Self::load_native(self.dim, &self.config, &self.serialize()?, self.threads)
+    }
+
+    /// The usearch index in its own serialised format.
+    fn serialize(&self) -> Result<Vec<u8>, VectorIndexError> {
         let mut buffer = vec![0u8; self.index.serialized_length()];
         self.index
             .save_to_buffer(&mut buffer)
             .map_err(backend_err)?;
-        let copy =
-            usearch::new_index(&Self::options(self.dim, &self.config)).map_err(backend_err)?;
-        copy.load_from_buffer(&buffer).map_err(backend_err)?;
-        copy.change_expansion_add(self.config.expansion_add.max(1));
-        copy.change_expansion_search(self.config.expansion_search.max(1));
-        copy.reserve_capacity_and_threads(copy.size() + MIN_CAPACITY_STEP, self.threads)
+        Ok(buffer)
+    }
+
+    /// A writable usearch index loaded (copied) from `buffer`, with this
+    /// layer's beam widths and room to grow.
+    fn load_native(
+        dim: usize,
+        config: &AnnTuningConfig,
+        buffer: &[u8],
+        threads: usize,
+    ) -> Result<usearch::Index, VectorIndexError> {
+        let index = usearch::new_index(&Self::options(dim, config)).map_err(backend_err)?;
+        index.load_from_buffer(buffer).map_err(backend_err)?;
+        index.change_expansion_add(config.expansion_add.max(1));
+        index.change_expansion_search(config.expansion_search.max(1));
+        index
+            .reserve_capacity_and_threads(index.size() + MIN_CAPACITY_STEP, threads)
             .map_err(backend_err)?;
-        Ok(copy)
+        Ok(index)
+    }
+
+    /// Rebuild a handle from [`Self::serialize`] output holding `len` live
+    /// vectors. The dimension stored in the buffer must equal `dim`.
+    fn from_serialized(
+        dim: usize,
+        config: &AnnTuningConfig,
+        buffer: &[u8],
+        len: usize,
+    ) -> Result<Self, VectorIndexError> {
+        if dim == 0 {
+            return Err(VectorIndexError::InvalidVector("zero dimensions"));
+        }
+        let threads = index_threads().max(MIN_SEARCH_SLOTS);
+        let index = Self::load_native(dim, config, buffer, threads)?;
+        if index.dimensions() != dim {
+            return Err(corrupt("HNSW dimension differs from the header"));
+        }
+        if index.size() != len {
+            return Err(corrupt("HNSW size differs from the header"));
+        }
+        Ok(Self {
+            index: Arc::new(index),
+            gate: Arc::new(SlotGate::new(threads)),
+            dim,
+            len,
+            threads,
+            config: config.clone(),
+        })
     }
 }
 
@@ -645,10 +739,15 @@ impl VectorIndex for HnswIndex {
 
 /// Dense `u64` keys for claim ids. Released keys are reused, so the key
 /// space (and the HNSW slot table) stays proportional to the live count.
+///
+/// Every live key also carries the [`vector_fingerprint`] of the raw vector
+/// it was indexed with. A persisted index stores them so a restart can prove
+/// the loaded index matches the vectors replayed from the WAL.
 #[derive(Debug, Clone, Default)]
 struct KeyInterner {
     by_id: HashMap<Arc<str>, u64>,
     by_key: Vec<Option<Arc<str>>>,
+    fingerprints: Vec<u64>,
     free: Vec<u64>,
 }
 
@@ -661,15 +760,17 @@ impl KeyInterner {
         self.by_key.get(key as usize)?.as_deref()
     }
 
-    fn alloc(&mut self, id: &str) -> u64 {
+    fn alloc(&mut self, id: &str, fingerprint: u64) -> u64 {
         let id: Arc<str> = Arc::from(id);
         let key = match self.free.pop() {
             Some(key) => {
                 self.by_key[key as usize] = Some(Arc::clone(&id));
+                self.fingerprints[key as usize] = fingerprint;
                 key
             }
             None => {
                 self.by_key.push(Some(Arc::clone(&id)));
+                self.fingerprints.push(fingerprint);
                 (self.by_key.len() - 1) as u64
             }
         };
@@ -677,16 +778,146 @@ impl KeyInterner {
         key
     }
 
+    fn set_fingerprint(&mut self, key: u64, fingerprint: u64) {
+        if let Some(slot) = self.fingerprints.get_mut(key as usize) {
+            *slot = fingerprint;
+        }
+    }
+
     fn release(&mut self, id: &str) {
         if let Some(key) = self.by_id.remove(id) {
             self.by_key[key as usize] = None;
+            self.fingerprints[key as usize] = 0;
             self.free.push(key);
         }
     }
 
+    /// `(key, claim id, fingerprint)` of every live key.
+    fn live(&self) -> impl Iterator<Item = (u64, &str, u64)> {
+        self.by_key
+            .iter()
+            .zip(&self.fingerprints)
+            .enumerate()
+            .filter_map(|(key, (id, fp))| Some((key as u64, id.as_deref()?, *fp)))
+    }
+
+    fn live_count(&self) -> usize {
+        self.by_id.len()
+    }
+
     fn heap_bytes(&self) -> usize {
         let text: usize = self.by_key.iter().flatten().map(|id| id.len() + 16).sum();
-        text + self.by_id.capacity() * 32 + self.by_key.capacity() * 16 + self.free.capacity() * 8
+        text + self.by_id.capacity() * 32
+            + self.by_key.capacity() * 16
+            + self.fingerprints.capacity() * 8
+            + self.free.capacity() * 8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.by_key.len() as u64);
+        for (id, fp) in self.by_key.iter().zip(&self.fingerprints) {
+            match id {
+                Some(id) => {
+                    out.push(1);
+                    put_u64(out, id.len() as u64);
+                    out.extend_from_slice(id.as_bytes());
+                    put_u64(out, *fp);
+                }
+                None => out.push(0),
+            }
+        }
+    }
+
+    fn decode(input: &mut Reader<'_>) -> Result<Self, VectorIndexError> {
+        let slots = input.len_prefix(1)?;
+        let mut this = KeyInterner {
+            by_id: HashMap::with_capacity(slots),
+            by_key: Vec::with_capacity(slots),
+            fingerprints: Vec::with_capacity(slots),
+            free: Vec::new(),
+        };
+        for key in 0..slots as u64 {
+            match input.u8()? {
+                0 => {
+                    this.by_key.push(None);
+                    this.fingerprints.push(0);
+                    this.free.push(key);
+                }
+                1 => {
+                    let len = input.len_prefix(1)?;
+                    let id = std::str::from_utf8(input.bytes(len)?)
+                        .map_err(|_| corrupt("claim id is not UTF-8"))?;
+                    let id: Arc<str> = Arc::from(id);
+                    let fp = input.u64()?;
+                    if this.by_id.insert(Arc::clone(&id), key).is_some() {
+                        return Err(corrupt("duplicate claim id in key table"));
+                    }
+                    this.by_key.push(Some(id));
+                    this.fingerprints.push(fp);
+                }
+                _ => return Err(corrupt("bad key table entry")),
+            }
+        }
+        // Hand out the lowest free key first.
+        this.free.reverse();
+        Ok(this)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialisation helpers
+// ---------------------------------------------------------------------------
+
+fn corrupt(what: &str) -> VectorIndexError {
+    VectorIndexError::Corrupt(what.to_string())
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Bounds-checked little-endian reader over a persisted index section.
+pub(crate) struct Reader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], VectorIndexError> {
+        if self.data.len() < len {
+            return Err(corrupt("truncated section"));
+        }
+        let (head, tail) = self.data.split_at(len);
+        self.data = tail;
+        Ok(head)
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8, VectorIndexError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64, VectorIndexError> {
+        let raw = self.bytes(8)?;
+        let mut word = [0u8; 8];
+        word.copy_from_slice(raw);
+        Ok(u64::from_le_bytes(word))
+    }
+
+    /// A length prefix counting items of at least `min_item_bytes` each;
+    /// rejects lengths the remaining input cannot possibly hold.
+    pub(crate) fn len_prefix(&mut self, min_item_bytes: usize) -> Result<usize, VectorIndexError> {
+        let len = usize::try_from(self.u64()?).map_err(|_| corrupt("length overflow"))?;
+        if len.saturating_mul(min_item_bytes.max(1)) > self.data.len() {
+            return Err(corrupt("length exceeds section"));
+        }
+        Ok(len)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 
@@ -761,7 +992,7 @@ impl TenantVectorIndex {
                 continue;
             }
             let Ok(unit) = normalized(v) else { continue };
-            units.push((ids.alloc(id), unit));
+            units.push((ids.alloc(id, vector_fingerprint(v)), unit));
         }
         let backend = if units.len() > config.flat_threshold {
             let rows: Vec<(u64, &[f32])> = units.iter().map(|(k, v)| (*k, v.as_slice())).collect();
@@ -811,8 +1042,14 @@ impl TenantVectorIndex {
                 got: vector.len(),
             });
         }
-        let existing = self.ids.key_of(claim_id);
-        let key = existing.unwrap_or_else(|| self.ids.alloc(claim_id));
+        let fingerprint = vector_fingerprint(vector);
+        let key = match self.ids.key_of(claim_id) {
+            Some(key) => {
+                self.ids.set_fingerprint(key, fingerprint);
+                key
+            }
+            None => self.ids.alloc(claim_id, fingerprint),
+        };
         if let Err(err) = self.backend.as_index_mut().insert(key, vector) {
             self.backend.as_index_mut().remove(key);
             self.ids.release(claim_id);
@@ -874,7 +1111,117 @@ impl TenantVectorIndex {
     pub fn heap_bytes(&self) -> usize {
         self.backend.as_index().heap_bytes() + self.ids.heap_bytes()
     }
+
+    /// `(claim id, vector fingerprint)` of every indexed claim.
+    pub fn fingerprints(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.ids.live().map(|(_, id, fp)| (id, fp))
+    }
+
+    /// Serialise the whole index (key table with fingerprints, then the flat
+    /// rows or the usearch HNSW in its own format). Inverse of
+    /// [`Self::decode`].
+    pub fn encode(&self) -> Result<Vec<u8>, VectorIndexError> {
+        let mut out = Vec::new();
+        out.push(match self.backend {
+            Backend::Flat(_) => BACKEND_FLAT,
+            Backend::Hnsw(_) => BACKEND_HNSW,
+        });
+        put_u64(&mut out, self.dim as u64);
+        self.ids.encode(&mut out);
+        match &self.backend {
+            Backend::Flat(flat) => {
+                put_u64(&mut out, flat.len() as u64);
+                out.reserve(flat.len() * (8 + 4 * self.dim));
+                for (key, row) in flat.rows() {
+                    put_u64(&mut out, key);
+                    for x in row {
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+            Backend::Hnsw(hnsw) => {
+                put_u64(&mut out, hnsw.len as u64);
+                let native = hnsw.serialize()?;
+                put_u64(&mut out, native.len() as u64);
+                out.extend_from_slice(&native);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Load an index written by [`Self::encode`]. The caller has already
+    /// verified the bytes against a checksum; this checks that the structure
+    /// is self-consistent (every indexed key is in the key table and vice
+    /// versa) and that it was built for `dim`.
+    pub fn decode(
+        bytes: &[u8],
+        dim: usize,
+        config: AnnTuningConfig,
+    ) -> Result<Self, VectorIndexError> {
+        let mut input = Reader::new(bytes);
+        let kind = input.u8()?;
+        let stored_dim = usize::try_from(input.u64()?).map_err(|_| corrupt("dimension"))?;
+        if stored_dim != dim {
+            return Err(VectorIndexError::DimensionMismatch {
+                expected: dim,
+                got: stored_dim,
+            });
+        }
+        let ids = KeyInterner::decode(&mut input)?;
+        let backend = match kind {
+            BACKEND_FLAT => {
+                let rows = input.len_prefix(8 + 4 * dim)?;
+                if rows != ids.live_count() {
+                    return Err(corrupt("flat row count differs from the key table"));
+                }
+                let mut flat = FlatIndex::new(dim);
+                flat.data.reserve(rows * dim);
+                for _ in 0..rows {
+                    let key = input.u64()?;
+                    if ids.id_of(key).is_none() || flat.slot.contains_key(&key) {
+                        return Err(corrupt("flat row key is not a unique live key"));
+                    }
+                    flat.slot.insert(key, flat.keys.len());
+                    flat.keys.push(key);
+                    for raw in input.bytes(4 * dim)?.as_chunks::<4>().0 {
+                        let x = f32::from_le_bytes(*raw);
+                        if !x.is_finite() {
+                            return Err(corrupt("non-finite flat row"));
+                        }
+                        flat.data.push(x);
+                    }
+                }
+                Backend::Flat(flat)
+            }
+            BACKEND_HNSW => {
+                let len = usize::try_from(input.u64()?).map_err(|_| corrupt("length"))?;
+                if len != ids.live_count() {
+                    return Err(corrupt("HNSW size differs from the key table"));
+                }
+                let native_len = input.len_prefix(1)?;
+                let native = input.bytes(native_len)?;
+                let hnsw = HnswIndex::from_serialized(dim, &config, native, len)?;
+                if ids.live().any(|(key, _, _)| !hnsw.index.contains(key)) {
+                    return Err(corrupt("HNSW is missing a key of the key table"));
+                }
+                Backend::Hnsw(hnsw)
+            }
+            _ => return Err(corrupt("unknown backend kind")),
+        };
+        if !input.is_empty() {
+            return Err(corrupt("trailing bytes after the index"));
+        }
+        Ok(Self {
+            dim,
+            config,
+            backend,
+            ids,
+        })
+    }
 }
+
+const BACKEND_FLAT: u8 = 1;
+const BACKEND_HNSW: u8 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -1287,6 +1634,93 @@ mod tests {
             })
         ));
         assert!(!index.contains("b"));
+    }
+
+    fn churned_index(n: usize, flat_threshold: usize, seed: u64) -> TenantVectorIndex {
+        let vectors = clustered(n, seed);
+        let config = AnnTuningConfig {
+            flat_threshold,
+            ..AnnTuningConfig::default()
+        };
+        let mut index = TenantVectorIndex::new(DIM, config);
+        for (i, v) in vectors.iter().enumerate() {
+            index.upsert(&format!("c{i}"), v).unwrap();
+        }
+        // Removals leave free keys and HNSW soft deletes; a replace changes a
+        // fingerprint in place.
+        for i in (0..n).step_by(7) {
+            assert!(index.remove(&format!("c{i}")));
+        }
+        index.upsert("c1", &[3.0; DIM]).unwrap();
+        index
+    }
+
+    fn assert_same_index(a: &TenantVectorIndex, b: &TenantVectorIndex, seed: u64) {
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.is_hnsw(), b.is_hnsw());
+        let mut fa: Vec<(String, u64)> = a.fingerprints().map(|(i, f)| (i.into(), f)).collect();
+        let mut fb: Vec<(String, u64)> = b.fingerprints().map(|(i, f)| (i.into(), f)).collect();
+        fa.sort();
+        fb.sort();
+        assert_eq!(fa, fb);
+        let raw: HashMap<String, Vec<f32>> = HashMap::new();
+        for q in clustered(20, seed) {
+            assert_eq!(a.search(&q, 10, None, &raw), b.search(&q, 10, None, &raw));
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trips_flat_and_hnsw() {
+        for (n, threshold) in [(300, 8_192), (2_000, 100)] {
+            let index = churned_index(n, threshold, 30);
+            let bytes = index.encode().unwrap();
+            let decoded = TenantVectorIndex::decode(&bytes, DIM, index.config.clone()).unwrap();
+            assert_same_index(&index, &decoded, 31);
+            // The decoded index stays writable and reuses freed keys.
+            let mut decoded = decoded;
+            decoded.upsert("fresh", &[1.0; DIM]).unwrap();
+            assert_eq!(decoded.len(), index.len() + 1);
+            assert!(decoded.ids.key_of("fresh").unwrap() < n as u64);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_damaged_or_mismatched_input() {
+        let index = churned_index(1_000, 100, 32);
+        let bytes = index.encode().unwrap();
+        let config = index.config.clone();
+        assert!(matches!(
+            TenantVectorIndex::decode(&bytes, DIM + 1, config.clone()),
+            Err(VectorIndexError::DimensionMismatch { .. })
+        ));
+        for cut in [0, 1, 9, bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                TenantVectorIndex::decode(&bytes[..cut], DIM, config.clone()).is_err(),
+                "truncated at {cut}"
+            );
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(TenantVectorIndex::decode(&trailing, DIM, config.clone()).is_err());
+        let mut bad_kind = bytes;
+        bad_kind[0] = 9;
+        assert!(TenantVectorIndex::decode(&bad_kind, DIM, config).is_err());
+    }
+
+    #[test]
+    fn fingerprints_track_the_raw_vector() {
+        let a = [1.0f32, 2.0, 3.0];
+        let mut b = a;
+        b[2] = f32::from_bits(b[2].to_bits() ^ 1);
+        assert_ne!(vector_fingerprint(&a), vector_fingerprint(&b));
+        assert_ne!(vector_fingerprint(&a), vector_fingerprint(&a[..2]));
+        assert_eq!(vector_fingerprint(&a), vector_fingerprint(&[1.0, 2.0, 3.0]));
+        let mut index = TenantVectorIndex::new(3, AnnTuningConfig::default());
+        index.upsert("x", &a).unwrap();
+        index.upsert("x", &b).unwrap();
+        let fps: Vec<(&str, u64)> = index.fingerprints().collect();
+        assert_eq!(fps, vec![("x", vector_fingerprint(&b))]);
+        assert!(!is_indexable(&[0.0, 0.0]) && !is_indexable(&[]) && is_indexable(&a));
     }
 
     #[test]

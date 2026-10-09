@@ -19,11 +19,16 @@ pub use disk::{DiskBackedStore, DiskStatus};
 mod gpu;
 mod metrics;
 pub mod vector_index;
+mod vector_persist;
 mod wal;
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
 pub use vector_index::AnnTuningConfig;
 use vector_index::{TenantVectorIndex, exact_top_k};
+pub use vector_persist::{
+    VECTOR_INDEX_FORMAT_VERSION, VectorIndexPersistence, VectorIndexRestore, VectorIndexSaveStats,
+    VectorIndexSnapshot,
+};
 
 #[derive(Default)]
 pub(crate) struct Bm25Context {
@@ -38,9 +43,9 @@ pub(crate) use wal::{
 };
 pub use wal::{
     CheckpointPolicy, FileWal, ReplayPolicy, WAL_REPLAY_STRICT_ENV, WalCheckpointStats, WalEvent,
-    WalInspection, WalInvalidLine, WalRepairOptions, WalRepairReport, WalReplayBoundary,
-    WalReplayStats, WalReplicationDelta, WalReplicationExport, WalReplicationFrame,
-    WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
+    WalInspection, WalInvalidLine, WalPosition, WalRepairOptions, WalRepairReport,
+    WalReplayBoundary, WalReplayStats, WalReplicationDelta, WalReplicationExport,
+    WalReplicationFrame, WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
@@ -237,6 +242,11 @@ pub struct InMemoryStore {
     /// Claim ids of legacy claim records a replication follower skipped, so
     /// records depending on them are skipped too.
     replica_skipped_claims: HashSet<String>,
+    /// The WAL position this state reflects, when the owner of the WAL keeps
+    /// it here (set by the WAL loaders and the replication follower). A
+    /// persisted vector index records it. Kept by `commit_staged` and
+    /// `replace_state_from`: only the WAL owner moves it.
+    wal_position: Option<WalPosition>,
 }
 
 impl Clone for InMemoryStore {
@@ -358,7 +368,36 @@ impl InMemoryStore {
             disk_status: self.disk_status.clone(),
             staged_disk_ops: Some(Vec::new()),
             replica_skipped_claims: self.replica_skipped_claims.clone(),
+            wal_position: self.wal_position,
         }
+    }
+
+    /// The WAL position this state reflects, if the WAL owner recorded one.
+    pub fn wal_position(&self) -> Option<WalPosition> {
+        self.wal_position
+    }
+
+    /// Record the WAL position this state reflects. Call it while holding
+    /// whatever serialises WAL appends with store mutations, right after the
+    /// mutation that the last appended record describes.
+    pub fn set_wal_position(&mut self, position: Option<WalPosition>) {
+        self.wal_position = position;
+    }
+
+    /// A point-in-time copy of every tenant's vector index for saving with
+    /// [`VectorIndexSnapshot::save`]. Cheap: an HNSW index is shared
+    /// copy-on-write (the next write to the live index copies it once while
+    /// the snapshot is alive); a flat index (at most the flat threshold of
+    /// vectors) is copied. `position` must be the WAL position this state
+    /// reflects.
+    pub fn vector_index_snapshot(&self, position: WalPosition) -> VectorIndexSnapshot {
+        let mut tenants: Vec<(String, TenantVectorIndex)> = self
+            .vector_indexes
+            .iter()
+            .map(|(tenant, index)| (tenant.clone(), index.clone()))
+            .collect();
+        tenants.sort_by(|a, b| a.0.cmp(&b.0));
+        VectorIndexSnapshot::new(position, self.ann_tuning.clone(), tenants)
     }
 
     /// Adopt a staged clone produced by [`InMemoryStore::clone_detached`]
@@ -378,6 +417,7 @@ impl InMemoryStore {
         let disk = self.disk.take();
         let disk_status = self.disk_status.clone();
         let mut own_staging = self.staged_disk_ops.take();
+        let wal_position = self.wal_position;
         let mut ring = std::mem::take(&mut self.wal);
         ring.total = ring.total.max(staged.wal.total);
         ring.events.append(&mut staged.wal.events);
@@ -387,6 +427,7 @@ impl InMemoryStore {
         self.wal = ring;
         self.disk = disk;
         self.disk_status = disk_status;
+        self.wal_position = wal_position;
 
         match self.disk.clone() {
             Some(disk) => {
@@ -421,6 +462,7 @@ impl InMemoryStore {
         let disk = self.disk.take();
         let disk_status = self.disk_status.clone();
         let own_staging = self.staged_disk_ops.take();
+        let wal_position = self.wal_position;
         let mut ring = std::mem::take(&mut self.wal);
         ring.total = ring.total.max(fresh.wal.total);
         ring.events.append(&mut fresh.wal.events);
@@ -431,6 +473,7 @@ impl InMemoryStore {
         self.disk = disk;
         self.disk_status = disk_status;
         self.staged_disk_ops = own_staging;
+        self.wal_position = wal_position;
 
         if let Some(disk) = self.disk.clone()
             && let Err(reason) = disk.clear_all().and_then(|()| disk.checkpoint_from(self))
@@ -543,8 +586,26 @@ impl InMemoryStore {
         ann_tuning: AnnTuningConfig,
         policy: ReplayPolicy,
     ) -> Result<(Self, StoreLoadStats), StoreError> {
+        Self::load_from_wal_with_vector_index(wal, ann_tuning, policy, None)
+    }
+
+    /// Like [`Self::load_from_wal_with_policy`], restoring the vector indexes
+    /// from the persisted index at `vector_index_path` instead of building
+    /// them, when that file is intact and matches: same format version and
+    /// tuning, saved for the current WAL generation. Only the vector records
+    /// after the saved WAL position are then applied (catch-up), and the
+    /// result is verified against every replayed vector before it is used.
+    /// Any mismatch or corruption logs a warning and falls back to building
+    /// the indexes from the replayed vectors, so a stale or corrupt index is
+    /// never served. `stats.vector_index` reports which path was taken.
+    pub fn load_from_wal_with_vector_index(
+        wal: &FileWal,
+        ann_tuning: AnnTuningConfig,
+        policy: ReplayPolicy,
+        vector_index_path: Option<&std::path::Path>,
+    ) -> Result<(Self, StoreLoadStats), StoreError> {
         let mut store = Self::new_with_ann_tuning(ann_tuning);
-        let stats = store.replay_wal(wal, policy)?;
+        let stats = store.replay_wal_with_vector_index(wal, policy, vector_index_path)?;
         Ok((store, stats))
     }
 
@@ -561,20 +622,49 @@ impl InMemoryStore {
         wal: &FileWal,
         policy: ReplayPolicy,
     ) -> Result<StoreLoadStats, StoreError> {
-        // Vectors are collected first and indexed once at the end, building
-        // each tenant's index in bulk (multi-threaded) instead of one
-        // insert per record.
+        self.replay_wal_with_vector_index(wal, policy, None)
+    }
+
+    fn replay_wal_with_vector_index(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+        vector_index_path: Option<&std::path::Path>,
+    ) -> Result<StoreLoadStats, StoreError> {
+        // Vectors are collected first and indexed once at the end: restored
+        // from the persisted index, or built per tenant in bulk
+        // (multi-threaded) instead of one insert per record.
         self.defer_vector_index = true;
-        let result = self.replay_wal_records(wal, policy);
-        self.rebuild_vector_indexes();
-        result
+        // The saved position decides which vector records replay reports as
+        // the catch-up set; the file itself is fully verified afterwards.
+        let collect_from = vector_index_path
+            .and_then(vector_persist::peek_saved_position)
+            .filter(|saved| saved.generation == wal.generation())
+            .map(|saved| saved.records);
+        let (mut stats, caught_up) = match self.replay_wal_records(wal, policy, collect_from) {
+            Ok(result) => result,
+            Err(err) => {
+                self.rebuild_vector_indexes();
+                return Err(err);
+            }
+        };
+        stats.vector_index = match vector_index_path {
+            Some(path) => self.restore_vector_indexes(path, wal, caught_up),
+            None => {
+                self.rebuild_vector_indexes();
+                VectorIndexRestore::NotConfigured
+            }
+        };
+        self.wal_position = Some(wal.position());
+        Ok(stats)
     }
 
     fn replay_wal_records(
         &mut self,
         wal: &FileWal,
         policy: ReplayPolicy,
-    ) -> Result<StoreLoadStats, StoreError> {
+        collect_vectors_from: Option<usize>,
+    ) -> Result<(StoreLoadStats, Option<HashSet<String>>), StoreError> {
         fn hard(err: StoreError, origin: &str) -> StoreError {
             match err {
                 StoreError::Validation(_)
@@ -584,7 +674,8 @@ impl InMemoryStore {
             }
         }
         let lenient = policy == ReplayPolicy::Lenient;
-        let replay = wal.replay_with_policy(policy)?;
+        let replay = wal.replay_with_policy(policy, collect_vectors_from)?;
+        let caught_up = replay.vector_claim_ids_after;
         let mut stats = replay.stats;
         let mut sink = replay.sink;
         let mut bad_claims = replay.quarantined_claim_ids;
@@ -671,13 +762,17 @@ impl InMemoryStore {
             }
         }
         sink.flush()?;
-        Ok(StoreLoadStats {
-            replay: stats,
-            claims_loaded,
-            evidence_loaded,
-            edges_loaded,
-            vectors_loaded,
-        })
+        Ok((
+            StoreLoadStats {
+                replay: stats,
+                claims_loaded,
+                evidence_loaded,
+                edges_loaded,
+                vectors_loaded,
+                vector_index: VectorIndexRestore::NotConfigured,
+            },
+            caught_up,
+        ))
     }
 
     pub fn ingest_bundle(

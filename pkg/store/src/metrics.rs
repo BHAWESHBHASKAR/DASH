@@ -59,6 +59,9 @@ pub struct StoreLoadStats {
     pub evidence_loaded: usize,
     pub edges_loaded: usize,
     pub vectors_loaded: usize,
+    /// How the vector indexes were obtained: loaded from the persisted
+    /// index (plus WAL catch-up) or built from the replayed vectors.
+    pub vector_index: crate::VectorIndexRestore,
 }
 
 /// Snapshot of the in-memory index sizes, suitable for `/metrics`
