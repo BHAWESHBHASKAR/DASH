@@ -159,6 +159,22 @@ fn handle_connection(
     Ok(())
 }
 
+/// Accept exactly one connection and serve it on the calling thread, without
+/// admission control. A connection whose peer address cannot be read is
+/// closed unanswered.
+pub fn serve_once<A: Acceptor>(
+    listener: &A,
+    cfg: &ServerConfig,
+    handler: &Handler,
+    hooks: &dyn ServerHooks,
+) -> std::io::Result<()> {
+    let (stream, _) = listener.accept()?;
+    let Some(mut conn) = Conn::unmanaged(stream) else {
+        return Ok(());
+    };
+    handle_connection(&mut conn, cfg, handler, hooks)
+}
+
 type SharedRx = Arc<Mutex<mpsc::Receiver<Conn>>>;
 
 /// Serve connections from `listener` until `shutdown` fires.
@@ -238,17 +254,18 @@ pub fn serve<A: Acceptor>(
         let dispatch = |ready: &mut Vec<(Lane, Conn)>| {
             for (lane, conn) in ready.drain(..) {
                 hooks.on_enqueued();
-                let target = if lane == Lane::Health { &health_tx } else { &tx };
+                let target = if lane == Lane::Health {
+                    &health_tx
+                } else {
+                    &tx
+                };
                 match target.try_send(conn) {
                     Ok(()) => {}
                     Err(mpsc::TrySendError::Full(conn)) => {
                         hooks.on_dequeued();
                         hooks.on_reject(RejectReason::QueueFull);
                         if let Err(err) = write_overload(conn.stream, cfg) {
-                            eprintln!(
-                                "{} transport backpressure response failed: {err}",
-                                cfg.name
-                            );
+                            eprintln!("{} transport backpressure response failed: {err}", cfg.name);
                         }
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => {

@@ -1,12 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -48,16 +46,12 @@ pub(crate) use authz::{
     authorize_request_ops, shared_auth_policy,
 };
 use dash_common::AuthPolicy;
-use dash_common::conn::{Conn, ConnConfig, ConnFrontend, Lane, PENDING_POLL_INTERVAL, Rejected};
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
     resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
 };
-use http::{
-    parse_request_line, query_encoding_is_invalid, read_http_request_until, render_response_text,
-    resolve_request_timeout, split_target, write_response,
-};
+use http::{query_encoding_is_invalid, render_response_text, server_config, split_target};
 #[cfg(test)]
 use payload::build_retrieve_request_from_json;
 #[cfg(test)]
@@ -68,12 +62,7 @@ use payload::{
 };
 
 const METRICS_WINDOW_SIZE: usize = 2048;
-const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
-const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
-/// Workers reserved for health-class requests (`/health`, `/live`, ...).
-const HEALTH_WORKERS: usize = 2;
-const HEALTH_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT: usize = 1_000;
 const DEFAULT_STORAGE_DIVERGENCE_WARN_RATIO: f64 = 0.25;
@@ -123,6 +112,24 @@ impl TransportBackpressureMetrics {
             &self.read_error_4xx_total
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl dash_http::ServerHooks for TransportBackpressureMetrics {
+    fn on_enqueued(&self) {
+        self.observe_enqueued();
+    }
+
+    fn on_dequeued(&self) {
+        self.observe_dequeued();
+    }
+
+    fn on_reject(&self, _reason: dash_http::RejectReason) {
+        self.observe_rejected();
+    }
+
+    fn on_read_error(&self, status: u16) {
+        self.observe_read_error(status);
     }
 }
 
@@ -940,30 +947,6 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     .unwrap_or(default_capacity)
 }
 
-/// Bounded exponential backoff (10ms .. 100ms) for repeated accept failures.
-fn accept_error_backoff(streak: u32) -> Duration {
-    let millis = 10u64.saturating_mul(1u64 << streak.saturating_sub(1).min(4));
-    Duration::from_millis(millis.min(100))
-}
-
-const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: retrieval worker queue full";
-
-pub(crate) fn backpressure_rejection_response() -> HttpResponse {
-    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
-}
-
-fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-    let response = backpressure_rejection_response();
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response.content_type,
-        response.body.len(),
-        response.body
-    );
-    stream.write_all(response.as_bytes())
-}
-
 pub fn serve_http(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let shutdown = dash_common::ShutdownSignal::install();
     serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
@@ -983,146 +966,34 @@ pub fn serve_http_with_workers(
     if let Ok(mut guard) = metrics.lock() {
         guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
     }
-    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
-        |reason| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid placement routing configuration: {reason}"),
-            )
-        },
-    )?));
-    let (tx, rx) = mpsc::sync_channel::<Conn>(queue_capacity);
-    let rx = Arc::new(Mutex::new(rx));
-    // Reserved lane for health-class requests so slow work can never starve
-    // liveness/readiness probes.
-    let (health_tx, health_rx) =
-        mpsc::sync_channel::<Conn>(queue_capacity.min(HEALTH_QUEUE_CAPACITY));
-    let health_rx = Arc::new(Mutex::new(health_rx));
-    let request_timeout = resolve_request_timeout();
-
-    std::thread::scope(|scope| {
-        for lane_rx in std::iter::repeat_n(&rx, worker_count)
-            .chain(std::iter::repeat_n(&health_rx, HEALTH_WORKERS))
-        {
-            let metrics = Arc::clone(&metrics);
-            let rx = Arc::clone(lane_rx);
-            let placement_routing = Arc::clone(&placement_routing);
-            let backpressure_metrics = Arc::clone(&backpressure_metrics);
-            let store = Arc::clone(&store);
-            scope.spawn(move || {
-                loop {
-                    let mut conn = {
-                        let guard = match rx.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => break,
-                        };
-                        match guard.recv() {
-                            Ok(conn) => {
-                                backpressure_metrics.observe_dequeued();
-                                conn
-                            }
-                            Err(_) => break,
-                        }
-                    };
-                    // A connection that already waited out its request
-                    // deadline in the queue is closed without any work.
-                    if conn.is_stale(request_timeout) {
-                        continue;
-                    }
-                    let deadline = conn.deadline(request_timeout);
-                    if let Err(err) = handle_connection(
-                        &store,
-                        &mut conn.stream,
-                        deadline,
-                        &metrics,
-                        &placement_routing,
-                        &backpressure_metrics,
-                    ) {
-                        eprintln!("retrieval transport error: {err}");
-                    }
-                }
-            });
-        }
-
-        // Set the listener non-blocking so we can interleave
-        // accept() calls with shutdown-flag polling. The 50ms
-        // sleep caps shutdown latency at ~50ms p99 and bounds
-        // CPU usage in the idle case.
-        listener
-            .set_nonblocking(true)
-            .expect("set listener non-blocking");
-        let mut accept_error_streak: u32 = 0;
-        let mut frontend = ConnFrontend::new(ConnConfig::from_env());
-        let mut ready: Vec<(Lane, Conn)> = Vec::new();
-        loop {
-            if shutdown.is_triggered() {
-                eprintln!("retrieval: shutdown signal received, draining in-flight requests");
-                break;
-            }
-            if frontend.has_pending() && frontend.poll_due() {
-                frontend.poll(&mut ready);
-                for (lane, conn) in ready.drain(..) {
-                    backpressure_metrics.observe_enqueued();
-                    let target = if lane == Lane::Health {
-                        &health_tx
-                    } else {
-                        &tx
-                    };
-                    match target.try_send(conn) {
-                        Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(conn)) => {
-                            backpressure_metrics.observe_dequeued();
-                            backpressure_metrics.observe_rejected();
-                            if let Err(err) = write_backpressure_response(conn.stream) {
-                                eprintln!(
-                                    "retrieval transport backpressure response failed: {err}"
-                                );
-                            }
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            backpressure_metrics.observe_dequeued();
-                            eprintln!("retrieval transport worker queue closed");
-                        }
-                    }
-                }
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    accept_error_streak = 0;
-                    if let Err(Rejected(stream)) = frontend.admit(stream) {
-                        // Per-IP cap or pending bound exceeded.
-                        backpressure_metrics.observe_rejected();
-                        if let Err(err) = write_backpressure_response(stream) {
-                            eprintln!("retrieval transport backpressure response failed: {err}");
-                        }
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    let nap = if frontend.has_pending() {
-                        PENDING_POLL_INTERVAL
-                    } else {
-                        Duration::from_millis(50)
-                    };
-                    std::thread::sleep(nap);
-                    continue;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    // Transient failures (EMFILE, ECONNABORTED, ...) must not
-                    // take the server down; back off briefly and keep serving.
-                    // Only the shutdown flag ends this loop.
-                    accept_error_streak = accept_error_streak.saturating_add(1);
-                    eprintln!("retrieval transport accept error: {err}");
-                    std::thread::sleep(accept_error_backoff(accept_error_streak));
-                    continue;
-                }
-            }
-        }
-        drop(tx);
-        drop(health_tx);
+    let placement_routing = new_placement_routing()?;
+    let handler: dash_http::Handler = Arc::new(move |request| {
+        handle_connection_request(
+            &store,
+            &HttpRequest::from(request),
+            &metrics,
+            &placement_routing,
+        )
+        .into()
     });
+    dash_http::serve(
+        listener,
+        server_config(worker_count, queue_capacity),
+        handler,
+        dash_http::default_health_classifier,
+        &|| shutdown.is_triggered(),
+        backpressure_metrics,
+    )
+}
 
-    Ok(())
+fn new_placement_routing() -> std::io::Result<SharedPlacementRouting> {
+    let state = PlacementRoutingState::from_env().map_err(|reason| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid placement routing configuration: {reason}"),
+        )
+    })?;
+    Ok(Arc::new(Mutex::new(state)))
 }
 
 pub fn serve_http_once(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
@@ -1135,22 +1006,20 @@ pub fn serve_http_once_with_listener(
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
-        |reason| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid placement routing configuration: {reason}"),
-            )
-        },
-    )?));
-    let (mut stream, _) = listener.accept()?;
-    let deadline = Instant::now() + resolve_request_timeout();
-    handle_connection(
-        &store,
-        &mut stream,
-        deadline,
-        &metrics,
-        &placement_routing,
+    let placement_routing = new_placement_routing()?;
+    let handler: dash_http::Handler = Arc::new(move |request| {
+        handle_connection_request(
+            &store,
+            &HttpRequest::from(request),
+            &metrics,
+            &placement_routing,
+        )
+        .into()
+    });
+    dash_http::serve_once(
+        &listener,
+        &server_config(1, 1),
+        &handler,
         &TransportBackpressureMetrics::default(),
     )
 }
@@ -1159,50 +1028,9 @@ pub fn handle_http_request_bytes(
     store: &InMemoryStore,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let request_text =
-        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
-    let (header_block, body) = request_text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
-    let (method, target) = parse_request_line(request_line)?;
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
-    };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
-        ));
-    }
-    if content_length != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-
-    let request = HttpRequest {
-        method,
-        target,
-        headers,
-        body: body.as_bytes().to_vec(),
-    };
+    let request = dash_http::parse_request_bytes(raw_request, &server_config(1, 1))
+        .map_err(|err| err.message)?;
+    let request = HttpRequest::from(request);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
     let mut placement_routing = PlacementRoutingState::from_env()?;
     let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
@@ -1224,34 +1052,12 @@ pub fn handle_http_request_bytes(
     Ok(render_response_text(&response).into_bytes())
 }
 
-fn handle_connection(
+fn handle_connection_request(
     store: &Arc<RwLock<InMemoryStore>>,
-    stream: &mut TcpStream,
-    deadline: Instant,
+    request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
-    backpressure: &TransportBackpressureMetrics,
-) -> std::io::Result<()> {
-    stream.set_nonblocking(false)?;
-    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-
-    // The read deadline covers the whole request (headers and body), not
-    // each individual read, so slow-trickle clients are dropped. It is
-    // measured from accept, so queue wait counts against it.
-    let request = match read_http_request_until(stream, deadline) {
-        Ok(Some(request)) => request,
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            backpressure.observe_read_error(err.status);
-            let result = write_response(
-                stream,
-                HttpResponse::error_with_status(err.status, &err.message),
-            );
-            dash_common::conn::linger_close(stream);
-            return result;
-        }
-    };
-
+) -> HttpResponse {
     let (routing_snapshot, reload_snapshot) = match placement_routing.lock() {
         Ok(mut guard) => {
             if let Some(state) = guard.as_mut() {
@@ -1262,11 +1068,8 @@ fn handle_connection(
             }
         }
         Err(_) => {
-            return write_response(
-                stream,
-                HttpResponse::internal_server_error(
-                    "failed to acquire retrieval placement routing lock",
-                ),
+            return HttpResponse::internal_server_error(
+                "failed to acquire retrieval placement routing lock",
             );
         }
     };
@@ -1276,14 +1079,13 @@ fn handle_connection(
     // The store lock is taken only for the short in-memory read sections inside
     // the handler (never across embedding calls) and is released before the
     // response is written to the socket.
-    let response = handle_request_with_metrics_and_reload(
+    handle_request_with_metrics_and_reload(
         &**store,
-        &request,
+        request,
         metrics,
         routing_snapshot.as_ref(),
         Some(&reload_snapshot),
-    );
-    write_response(stream, response)
+    )
 }
 
 #[cfg(test)]
@@ -2525,15 +2327,6 @@ impl HttpResponse {
     fn internal_server_error(message: &str) -> Self {
         Self {
             status: 500,
-            content_type: "application/json",
-            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
-            retry_after_secs: None,
-        }
-    }
-
-    fn service_unavailable(message: &str) -> Self {
-        Self {
-            status: 503,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,

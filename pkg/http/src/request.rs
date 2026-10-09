@@ -92,7 +92,7 @@ pub fn split_target(target: &str) -> (String, HashMap<String, String>) {
 
 /// True when the query string of `target` contains an invalid
 /// percent-encoding.
-pub(crate) fn query_encoding_is_invalid(target: &str) -> bool {
+pub fn query_encoding_is_invalid(target: &str) -> bool {
     let Some((_, query)) = target.split_once('?') else {
         return false;
     };

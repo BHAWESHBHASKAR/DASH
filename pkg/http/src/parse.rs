@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn parses_a_simple_request() {
-        let request = parse("POST /x?a=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi").unwrap();
+        let request =
+            parse("POST /x?a=1 HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi").unwrap();
         assert_eq!(request.method, "POST");
         assert_eq!(request.header("Host"), Some("h"));
         assert_eq!(request.body, b"hi");
@@ -367,7 +368,10 @@ mod tests {
             status("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\na"),
             501
         );
-        assert_eq!(status("GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n"), 417);
+        assert_eq!(
+            status("GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n"),
+            417
+        );
         assert_eq!(status("GET / HTTP/1.1\r\nHost : x\r\n\r\n"), 400);
         assert_eq!(status("GET / HTTP/1.1\r\nA: b\r\n c\r\n\r\n"), 400);
         assert_eq!(status("GET / HTTP/2.0\r\n\r\n"), 505);
@@ -398,7 +402,10 @@ mod tests {
         config.max_body_bytes = 4;
         let ok = parse_request_bytes(b"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcd", &config);
         assert!(ok.is_ok());
-        let over = parse_request_bytes(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabcde", &config);
+        let over = parse_request_bytes(
+            b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nabcde",
+            &config,
+        );
         assert_eq!(over.unwrap_err().status, 413);
         let many = format!("GET / HTTP/1.1\r\n{}\r\n", "A: b\r\n".repeat(101));
         assert_eq!(parse(&many).unwrap_err().status, 431);

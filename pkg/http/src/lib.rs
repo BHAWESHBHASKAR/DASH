@@ -23,9 +23,9 @@ pub use conn::{
     linger_close,
 };
 pub use parse::{ReadError, parse_request_bytes, read_request};
-pub use request::{Request, percent_decode, split_target};
+pub use request::{Request, percent_decode, query_encoding_is_invalid, split_target};
 pub use response::{Response, json_escape, render_response, status_line};
 pub use server::{
     Acceptor, Handler, HealthClassifier, NeverShutdown, NoHooks, RejectReason, ServerHooks,
-    Shutdown, serve,
+    Shutdown, serve, serve_once,
 };

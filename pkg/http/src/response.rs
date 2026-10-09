@@ -144,7 +144,9 @@ mod tests {
             .with_header("X-Bad", "a\r\nInjected: 1")
             .with_header("X-Ok", "v");
         let text = render_response(&response);
-        assert!(text.contains("Content-Length: 2\r\nRetry-After: 3\r\nX-Ok: v\r\nConnection: close\r\n\r\n{}"));
+        assert!(text.contains(
+            "Content-Length: 2\r\nRetry-After: 3\r\nX-Ok: v\r\nConnection: close\r\n\r\n{}"
+        ));
         assert!(!text.contains("Injected"));
     }
 

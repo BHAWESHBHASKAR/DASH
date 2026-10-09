@@ -311,9 +311,15 @@ mod tests {
     fn classifies_request_lines() {
         let c = default_health_classifier;
         assert_eq!(classify(b"GET /health HTTP/1.1\r\n", c), Some(Lane::Health));
-        assert_eq!(classify(b"GET /v1/ready?x=1 HTTP/1.1", c), Some(Lane::Health));
+        assert_eq!(
+            classify(b"GET /v1/ready?x=1 HTTP/1.1", c),
+            Some(Lane::Health)
+        );
         assert_eq!(classify(b"GET /metrics ", c), Some(Lane::Health));
-        assert_eq!(classify(b"GET /v1/retrieve HTTP/1.1", c), Some(Lane::General));
+        assert_eq!(
+            classify(b"GET /v1/retrieve HTTP/1.1", c),
+            Some(Lane::General)
+        );
         assert_eq!(classify(b"POST /health HTTP/1.1", c), Some(Lane::General));
         assert_eq!(classify(b"GE", c), None);
         assert_eq!(classify(b"GET /hea", c), None);
