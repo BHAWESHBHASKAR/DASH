@@ -30,7 +30,7 @@
 #       -f deploy/container/Dockerfile --build-arg SERVICE=retrieval \
 #       -t dash-retrieval:local --load .
 
-ARG RUST_VERSION=1.97
+ARG RUST_VERSION=1.99
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder

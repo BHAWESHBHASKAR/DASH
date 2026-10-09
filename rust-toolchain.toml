@@ -1,0 +1,8 @@
+# One Rust version for local builds, CI and the container image, so a new
+# compiler (and its new lints) arrives when we choose to upgrade, not as a
+# surprise CI failure. To upgrade: change `channel` here and RUST_VERSION in
+# deploy/container/Dockerfile together, then fix any new warnings.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
