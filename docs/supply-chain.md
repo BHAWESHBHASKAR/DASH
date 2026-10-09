@@ -5,7 +5,7 @@
 > `ghcr.io/<owner>/dash-<service>`, and generates an SBOM with `anchore/sbom-action`; `.github/workflows/security.yml`
 > runs `cargo audit`, a Trivy filesystem scan, CodeQL and Gitleaks. **NOT IMPLEMENTED:** `cargo cyclonedx` SBOMs
 > attached as `dash-<version>-sbom.spdx.json`, Sigstore/cosign image signing, signed provenance (SLSA) attestations,
-> digest-pinned base images, SHA-pinned actions (register SEC-21, planned for phase P7). No release has been
+> digest-pinned base images, SHA-pinned actions (the Trivy action is pinned to a release tag, the others are tag-pinned; register SEC-21, planned for phase P7). No release has been
 > tagged, so no signed or unsigned release artifacts exist yet. Sections 2 and 3 below describe the intended end
 > state, not the current pipeline.
 

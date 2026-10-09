@@ -13,7 +13,7 @@ scripts/backup_state_bundle.sh \
 
 Options (from `--help`): `--wal-path` (default `DASH_INGEST_WAL_PATH` or `DASH_RETRIEVAL_WAL_PATH`), `--segment-dir`, `--placement-file`, `--output-dir` (default `dist/backups`), `--bundle-label`, and `--s3-uri` to upload the bundle. The output is `dash-backup-<label>.tar.gz` containing the WAL, its snapshot file, the optional directories, and a `CHECKSUMS.sha256` file.
 
-The script reads the files while the service may be running. To get a quiesced copy, stop ingestion (or snapshot the volume with your filesystem or cloud tooling) before running it.
+The script reads the files while the service may be running. To get a quiesced copy, stop ingestion (or snapshot the volume with your filesystem or cloud tooling) before running it. Before relying on a backup, run `wal-inspect verify <wal>` (and on the `.snapshot` file) against the source files: exit status 0 means no damaged interior line (see [WAL recovery](wal-recovery.md)). The bundle contains the WAL and its snapshot only; the generation file (`<wal>.gen`) and any `<wal>.quarantine` file are not included.
 
 ## Restore
 
@@ -29,7 +29,7 @@ scripts/restore_state_bundle.sh \
   --force true
 ```
 
-`--bundle` also accepts an `s3://` URI. The script refuses to overwrite existing targets unless `--force true`. After restoring, start ingestion: it replays the snapshot and WAL into memory. If a stale `redb` file exists from before the restore, remove it (or leave `DASH_INGEST_PERSISTENCE_DISABLE=1` for the first start) so it cannot disagree with the restored WAL. Retrieval followers resync from ingestion by replication; reset their offset file (`DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) if the restored WAL is shorter than what they had applied.
+`--bundle` also accepts an `s3://` URI. The script refuses to overwrite existing targets unless `--force true`. After restoring, start ingestion: it replays the snapshot and WAL into memory. If a stale `redb` file exists from before the restore, remove it (or leave `DASH_INGEST_PERSISTENCE_DISABLE=1` for the first start) so it cannot disagree with the restored WAL. Retrieval followers resync from ingestion by replication; reset their offset file (`DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`, by default `<retrieval WAL>.replication`) if the restored WAL is shorter than what they had applied. Followers store `(generation, offset)`, and a restored WAL without its `.gen` file starts a new generation, which makes followers resync from a full export.
 
 ## Drill
 
@@ -40,4 +40,4 @@ scripts/restore_state_bundle.sh \
 - There is no built-in continuous WAL archiving, point-in-time recovery tooling or cross-region replication. Archiving WAL files with a generic tool (rsync, object-storage sync) is possible but untested here.
 - Backups are not encrypted by DASH. Encrypt the destination.
 - Restore drills should be run on a schedule that you own; none is automated beyond the CI job above.
-- State-bundle consistency while the service is writing is not guaranteed (see register DATA-10 on non-atomic multi-record writes).
+- State-bundle consistency while the service is writing is not guaranteed: the WAL is a single file with atomic commit groups, but a live copy can still catch a partial last record (the next start truncates a torn tail) and the snapshot and WAL are copied at different moments. Stop ingestion for a consistent bundle.

@@ -1,5 +1,8 @@
 # Authentication and authorization (retrieval and ingestion)
 
+!!! note
+    This page is a copy of [`docs/operations/auth.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/auth.md) in the repository, which is canonical.
+
 This page describes what the `retrieval` and `ingestion` services enforce
 today. In every variable name below, `*` is `RETRIEVAL` or `INGEST`
 (`DASH_RETRIEVAL_*`, `DASH_INGEST_*`; the legacy `EME_*` names still work as

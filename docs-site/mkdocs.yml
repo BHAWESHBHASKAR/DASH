@@ -75,6 +75,10 @@ nav:
       - Observability: operations/observability.md
       - Scaling: operations/scaling.md
       - Backup: operations/backup.md
+      - Authentication: operations/auth.md
+      - WAL recovery: operations/wal-recovery.md
+      - Audit chain: operations/audit-chain.md
+      - Upgrading: operations/upgrading.md
       - Security & audit: operations/security-audit.md
   - Reference:
       - Overview: reference/index.md

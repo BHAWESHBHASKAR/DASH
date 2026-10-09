@@ -114,6 +114,7 @@ In practice:
 - Capability claims in `README.md` are listed in `docs/claims-ledger.md` with the test that proves them. Run `scripts/check_claims_ledger.sh` after changing either file; it fails if a referenced test or file does not exist, or if the README test count is stale.
 - Changes to security, storage format or replication need a second reviewer and an update to `docs/threat-model.md` (or an ADR line) when behavior changes.
 - Configuration and API reference pages must list only what the code reads and serves. When you add an environment variable or a route, update `docs-site/docs/reference/configuration.md` or `api.md` in the same PR.
+- `scripts/check_config_docs.sh` fails if an environment variable read by the Rust code (`DASH_*` or `EME_*` string literals in `services/*/src`, `pkg/*/src`, `tools/*/src`, plus the per-service auth and audit names built at runtime) is not mentioned in `docs-site/docs/reference/configuration.md`. Run it whenever you add or rename an environment variable.
 
 ---
 

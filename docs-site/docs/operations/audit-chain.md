@@ -1,5 +1,8 @@
 # Audit chain
 
+!!! note
+    This page is a copy of [`docs/operations/audit-chain.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/audit-chain.md) in the repository, which is canonical.
+
 Both services append JSON lines to `DASH_INGEST_AUDIT_LOG_PATH` /
 `DASH_RETRIEVAL_AUDIT_LOG_PATH`. The writer, the canonical encoding and the
 verifier live in one place: `services/common/src/audit.rs`. The verifier is

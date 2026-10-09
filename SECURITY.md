@@ -12,7 +12,8 @@ filed.
 
 | Version  | Supported                  | Notes                                              |
 |----------|----------------------------|----------------------------------------------------|
-| 0.2.x    | :white_check_mark: Active  | Current development line. Receives all patches.    |
+| 0.3.x    | :white_check_mark: Active  | Hardening release (0.3.0 is not yet tagged).        |
+| 0.2.x    | :white_check_mark: Active  | Receives all patches until 0.3.0 is released.       |
 | 0.1.x    | :white_check_mark: Patches  | Receives security patches only; no new features.   |
 | < 0.1.0  | :x: End of life            | Not supported. Please upgrade.                     |
 

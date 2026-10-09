@@ -7,7 +7,7 @@ This page describes the security checks and audit tooling that exist in the repo
 | Job | What it runs | Notes |
 |---|---|---|
 | `cargo-audit` | `cargo install cargo-audit --locked` then `cargo audit` | Checks `Cargo.lock` against the RustSec database. It uses default behavior, not `--deny warnings`. There is no `deny.toml` in the repository. |
-| Trivy filesystem scan | `trivy fs` with `ignore-unfixed`, severity HIGH/CRITICAL, SARIF upload | A scan of the source tree, not of a built container image. The action is referenced as `@master` (register SEC-21). |
+| Trivy filesystem scan | `trivy fs` with `ignore-unfixed`, severity HIGH/CRITICAL, SARIF upload | A scan of the source tree, not of a built container image. The action is pinned to a tag (`0.28.0`), not to a commit SHA (register SEC-21). |
 | CodeQL | `github/codeql-action` with `security-and-quality`, per language matrix | Findings appear in the repository's code-scanning tab. |
 | Gitleaks | `gitleaks/gitleaks-action@v2` | Secret scanning on the repository. |
 
@@ -19,7 +19,7 @@ On a `v*` tag it cross-compiles binaries, builds and pushes images to `ghcr.io/<
 
 ## Audit log tooling
 
-`scripts/verify_audit_chain.sh --path <file> [--service ingestion|retrieval]` checks `seq`, `prev_hash` linkage and the SHA-256 of each record. Limitations, in short: the chain is unkeyed (rewritable), ingestion-written logs fail verification today (SEC-17), and auditing is off unless `DASH_INGEST_AUDIT_LOG_PATH` / `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set. See [Security](../concepts/security.md#audit-log) and the [data model](../concepts/data-model.md#audit-record).
+`tools/audit-verify` (wrapped by `scripts/verify_audit_chain.sh --path <file> [--service ingestion|retrieval] [--expect-last-seq N --expect-last-hash HEX]`) verifies both services' logs, in the current v2 encoding and in the legacy encodings. It checks the SHA-256 of each record, consecutive `seq`, `prev_hash` linkage, the service filter, torn tails, unexplained restarts at genesis and `chain_restart` records. The wrapper builds nothing: build the binary first (`cargo build --release -p audit-verify`), or it falls back to a limited legacy-only Python check. Limitations, in short: the chain is unkeyed (rewritable), truncating the tail is detected only if you pass the last `seq` and hash recorded earlier, and auditing is off unless `DASH_INGEST_AUDIT_LOG_PATH` / `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set. Full details: [Audit chain](audit-chain.md). See also [Security](../concepts/security.md#audit-log) and the [data model](../concepts/data-model.md#audit-record).
 
 ## Release sign-off scripts
 
