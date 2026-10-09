@@ -316,6 +316,10 @@ fn main() {
             if let Some(persistence) = vector_index_persistence {
                 runtime = runtime.with_vector_index_persistence(persistence);
             }
+            match runtime.group_commit_summary() {
+                Some(summary) => tracing::info!("ingestion wal group commit: enabled, {summary}"),
+                None => tracing::info!("ingestion wal group commit: disabled"),
+            }
             if let Some(reason) = runtime.placement_routing_error() {
                 tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);

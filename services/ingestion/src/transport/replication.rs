@@ -25,7 +25,7 @@ use std::{
 
 use store::{InMemoryStore, StoreError, WalReplicationExport, WalReplicationFrame};
 
-use super::{IngestionRuntime, SharedRuntime, http::HttpRequest};
+use super::{IngestionRuntime, SharedRuntime, group_commit, http::HttpRequest, lock_wal};
 
 const DEFAULT_REPLICATION_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_REPLICATION_MAX_RECORDS: usize = 512;
@@ -468,17 +468,18 @@ impl IngestionRuntime {
     fn replication_cursor(&mut self, config: &ReplicationPullConfig) -> (usize, Option<u64>, bool) {
         if !self.replication_follower.state_loaded {
             self.replication_follower.state_loaded = true;
-            let path = config
-                .offset_path
-                .clone()
-                .or_else(|| self.wal.as_ref().map(|wal| wal_state_path(wal.path())));
+            let path = config.offset_path.clone().or_else(|| {
+                self.wal
+                    .as_ref()
+                    .map(|wal| wal_state_path(lock_wal(wal).path()))
+            });
             if let Some(path) = path.as_deref() {
                 match read_state(path) {
                     Some(saved)
                         if self
                             .wal
                             .as_ref()
-                            .and_then(|wal| wal.wal_record_count().ok())
+                            .and_then(|wal| lock_wal(wal).wal_record_count().ok())
                             != Some(saved.offset) =>
                     {
                         // The local WAL does not hold what the cursor claims
@@ -508,7 +509,7 @@ impl IngestionRuntime {
                         let populated = self
                             .wal
                             .as_ref()
-                            .and_then(|wal| wal.wal_record_count().ok())
+                            .and_then(|wal| lock_wal(wal).wal_record_count().ok())
                             .is_some_and(|count| count > 0);
                         if populated {
                             self.replication_follower.force_resync = true;
@@ -534,8 +535,8 @@ impl IngestionRuntime {
             offset: self.replication_last_offset,
         };
         // The WAL must be durable before the cursor claims it.
-        if let Some(wal) = self.wal.as_mut()
-            && let Err(err) = wal.flush_pending_sync_if_unsynced()
+        if let Some(wal) = self.wal.as_ref()
+            && let Err(err) = lock_wal(wal).flush_pending_sync_if_unsynced()
         {
             eprintln!("ingestion replication: WAL flush before persisting cursor failed: {err:?}");
             return;
@@ -572,7 +573,8 @@ impl IngestionRuntime {
                 }
             }
 
-            if let Some(wal) = self.wal.as_mut() {
+            if let Some(wal) = self.wal.as_ref() {
+                let mut wal = lock_wal(wal);
                 let rollback_point = wal.begin_rollback_point()?;
                 let append_result = (|| {
                     for line in &frame.wal_lines {
@@ -634,8 +636,8 @@ impl IngestionRuntime {
             .replication_follower
             .skipped_records_total
             .saturating_add(skipped);
-        if let Some(wal) = self.wal.as_mut() {
-            wal.replace_with_replication_export(&export)?;
+        if let Some(wal) = self.wal.as_ref() {
+            lock_wal(wal).replace_with_replication_export(&export)?;
         }
         if let Err(err) = self.store.replace_state_from(fresh) {
             eprintln!("replication resync: disk rewrite degraded: {err:?}");
@@ -770,6 +772,7 @@ dash_ingest_replication_commit_status_evicted_total {}\n",
         let Some(wal) = self.wal.as_ref() else {
             return String::new();
         };
+        let wal = lock_wal(wal);
         format!(
             "# TYPE dash_ingest_replication_group_too_large_total counter\n\
 dash_ingest_replication_group_too_large_total {}\n\
@@ -857,8 +860,9 @@ fn apply_guarded<T>(
     runtime: &SharedRuntime,
     apply: impl FnOnce(&mut IngestionRuntime) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
-    let mut guard = runtime
-        .lock()
+    // Replication writes the WAL and the store directly: wait for pipelined
+    // single ingests to finish first.
+    let mut guard = group_commit::lock_drained(runtime)
         .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))?;
     match catch_unwind(AssertUnwindSafe(|| apply(&mut guard))) {
         Ok(result) => result,

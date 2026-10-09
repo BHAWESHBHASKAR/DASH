@@ -1085,6 +1085,39 @@ pub static REGISTRY: &[Entry] = &[
     .blank_ok()
     .eme(),
     Entry::new(
+        "DASH_INGEST_WAL_GROUP_COMMIT",
+        Ingestion,
+        T_WAL,
+        Kind::BOOL,
+        "`true`",
+        "Group commit for `POST /v1/ingest`: concurrent single ingests are appended together and share one fsync; each request is still acknowledged only after its record is durable. `false` makes every single ingest write and fsync on its own.",
+    )
+    .notes("An unrecognized value logs a warning and keeps group commit on."),
+    Entry::new(
+        "DASH_INGEST_WAL_GROUP_COMMIT_MAX_WAIT_US",
+        Ingestion,
+        T_WAL,
+        Kind::Int { min: 0, max: 10_000 },
+        "0",
+        "Microseconds a group-commit batch may stay open waiting for more requests after the first one arrives. `0` starts every batch at once (batches still form from the requests that arrive during the previous fsync). Values above 10000 are clamped to 10000.",
+    ),
+    Entry::new(
+        "DASH_INGEST_WAL_GROUP_COMMIT_MAX_BATCH_BYTES",
+        Ingestion,
+        T_WAL,
+        Kind::POSITIVE,
+        "1048576",
+        "A group-commit batch is closed once it holds this many bytes of encoded WAL lines. A single larger request still forms a batch of its own.",
+    ),
+    Entry::new(
+        "DASH_INGEST_WAL_GROUP_COMMIT_QUEUE_CAPACITY",
+        Ingestion,
+        T_WAL,
+        Kind::POSITIVE,
+        "1024",
+        "Single ingests that may wait for the group committer. When the queue is full the request is rejected with 503 `wal_group_commit_queue_full` and `Retry-After: 1`.",
+    ),
+    Entry::new(
         "DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY",
         Ingestion,
         T_WAL,

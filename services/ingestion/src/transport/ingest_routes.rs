@@ -120,50 +120,75 @@ pub(super) fn handle_ingest_post(
                     );
                 }
             };
-            guard.flush_wal_if_due();
-            let response =
-                match guard.ensure_local_write_route_for_claim(&api_req.claim, write_consistency) {
-                    Ok(route_resolution) => match guard.ingest(api_req) {
-                        Ok(mut resp) => {
-                            resp.commit_epoch = if route_resolution.epoch > 0 {
-                                Some(route_resolution.epoch)
-                            } else {
-                                None
-                            };
-                            resp.ack_count = route_resolution.ack_count;
-                            resp.required_acks = route_resolution.required_acks;
-                            resp.commit_status =
-                                commit_status_for_progress(resp.ack_count, resp.required_acks)
-                                    .to_string();
-                            guard.record_commit_status(
-                                &resp.ingested_claim_id,
-                                resp.commit_epoch,
-                                resp.ack_count,
-                                resp.required_acks,
-                            );
-                            audit_status = 200;
-                            audit_outcome = "success";
-                            audit_reason = "ingest accepted".to_string();
-                            HttpResponse::ok_json(render_ingest_response_json(&resp))
-                        }
-                        Err(err) => {
-                            guard.observe_failure();
-                            let (status, message) = map_store_error(&err);
-                            audit_status = status;
-                            audit_reason = message.clone();
-                            HttpResponse::error_with_status(status, &message)
-                        }
-                    },
-                    Err(route_err) => {
-                        guard.observe_failure();
-                        guard.observe_write_route_rejection(&route_err);
-                        audit_outcome = "denied";
-                        let (status, message) = map_write_route_error(&route_err);
-                        audit_status = status;
-                        audit_reason = message.clone();
-                        HttpResponse::error_with_status(status, &message)
-                    }
+            let (mut guard, outcome) = if guard.group_commit_active() {
+                group_commit::ingest_pipelined(runtime, guard, api_req, write_consistency)
+            } else {
+                guard.flush_wal_if_due();
+                let outcome = match guard
+                    .ensure_local_write_route_for_claim(&api_req.claim, write_consistency)
+                {
+                    Ok(route_resolution) => guard
+                        .ingest(api_req)
+                        .map(|resp| (resp, route_resolution))
+                        .map_err(group_commit::IngestFailure::Store),
+                    Err(route_err) => Err(group_commit::IngestFailure::Route(route_err)),
                 };
+                (guard, outcome)
+            };
+            let response = match outcome {
+                Ok((mut resp, route_resolution)) => {
+                    resp.commit_epoch = if route_resolution.epoch > 0 {
+                        Some(route_resolution.epoch)
+                    } else {
+                        None
+                    };
+                    resp.ack_count = route_resolution.ack_count;
+                    resp.required_acks = route_resolution.required_acks;
+                    resp.commit_status =
+                        commit_status_for_progress(resp.ack_count, resp.required_acks).to_string();
+                    guard.record_commit_status(
+                        &resp.ingested_claim_id,
+                        resp.commit_epoch,
+                        resp.ack_count,
+                        resp.required_acks,
+                    );
+                    audit_status = 200;
+                    audit_outcome = "success";
+                    audit_reason = "ingest accepted".to_string();
+                    HttpResponse::ok_json(render_ingest_response_json(&resp))
+                }
+                Err(group_commit::IngestFailure::Store(err)) => {
+                    guard.observe_failure();
+                    let (status, message) = map_store_error(&err);
+                    audit_status = status;
+                    audit_reason = message.clone();
+                    HttpResponse::error_with_status(status, &message)
+                }
+                Err(group_commit::IngestFailure::Route(route_err)) => {
+                    guard.observe_failure();
+                    guard.observe_write_route_rejection(&route_err);
+                    audit_outcome = "denied";
+                    let (status, message) = map_write_route_error(&route_err);
+                    audit_status = status;
+                    audit_reason = message.clone();
+                    HttpResponse::error_with_status(status, &message)
+                }
+                Err(group_commit::IngestFailure::Overloaded) => {
+                    guard.observe_failure();
+                    audit_status = 503;
+                    audit_reason = "wal group commit queue full".to_string();
+                    let mut response =
+                        HttpResponse::service_unavailable("wal_group_commit_queue_full");
+                    response.retry_after_secs = Some(1);
+                    response
+                }
+                Err(group_commit::IngestFailure::Poisoned(reason)) => {
+                    guard.observe_failure();
+                    audit_status = 503;
+                    audit_reason = format!("{}: {reason}", store::WAL_POISONED_PREFIX);
+                    HttpResponse::service_unavailable(store::WAL_POISONED_PREFIX)
+                }
+            };
             drop(guard);
             emit_audit_event(
                 runtime,
@@ -295,7 +320,7 @@ pub(super) fn handle_ingest_raw_post(
             let mut audit_outcome = "error";
             let mut audit_reason = "runtime lock unavailable".to_string();
             refresh_placement(runtime);
-            let mut guard = match runtime.lock() {
+            let mut guard = match group_commit::lock_drained(runtime) {
                 Ok(guard) => guard,
                 Err(_) => {
                     emit_audit_event(
@@ -523,7 +548,7 @@ pub(super) fn handle_ingest_batch_post(
             let mut audit_outcome = "error";
             let mut audit_reason = "runtime lock unavailable".to_string();
             refresh_placement(runtime);
-            let mut guard = match runtime.lock() {
+            let mut guard = match group_commit::lock_drained(runtime) {
                 Ok(guard) => guard,
                 Err(_) => {
                     emit_audit_event(
@@ -736,7 +761,7 @@ pub(super) fn handle_ingest_document_post(
             let mut audit_outcome = "error";
             let mut audit_reason = "runtime lock unavailable".to_string();
             refresh_placement(runtime);
-            let mut guard = match runtime.lock() {
+            let mut guard = match group_commit::lock_drained(runtime) {
                 Ok(guard) => guard,
                 Err(_) => {
                     emit_audit_event(

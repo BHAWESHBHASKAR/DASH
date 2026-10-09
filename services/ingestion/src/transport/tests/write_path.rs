@@ -160,11 +160,23 @@ fn single_ingest_retry_is_a_noop_and_does_not_grow_the_wal() {
     let dir = tempfile::tempdir().unwrap();
     let mut runtime = persistent_runtime(dir.path(), CheckpointPolicy::default());
     runtime.ingest(item("s1", "Single claim text")).unwrap();
-    let records = runtime.wal.as_ref().unwrap().wal_record_count().unwrap();
+    let records = runtime
+        .wal
+        .as_ref()
+        .map(lock_wal)
+        .unwrap()
+        .wal_record_count()
+        .unwrap();
     let retry = runtime.ingest(item("s1", "Single claim text")).unwrap();
     assert!(!retry.checkpoint_deferred);
     assert_eq!(
-        runtime.wal.as_ref().unwrap().wal_record_count().unwrap(),
+        runtime
+            .wal
+            .as_ref()
+            .map(lock_wal)
+            .unwrap()
+            .wal_record_count()
+            .unwrap(),
         records,
         "an identical retry must not append to the WAL"
     );

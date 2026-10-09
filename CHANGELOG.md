@@ -90,6 +90,41 @@ to [Semantic Versioning](https://semver.org/).
   operations (the file is derived data: safe to delete while stopped, not
   needed in backups).
 
+### Changed (WAL group commit)
+
+- **Concurrent single ingests share fsyncs.** `POST /v1/ingest` now goes
+  through a group committer (`pkg/store/src/group_commit.rs`): a request is
+  validated and encoded under the runtime lock, queued, and the lock is
+  released while one committer thread appends everything queued and syncs it
+  with a single `fdatasync`. Each request is still answered only after its
+  batch is durable, and records become visible in memory and redb in WAL
+  order. Requests that touch the same claim, an edge target or a tenant's
+  first vector dimension are serialized, so the result always equals a serial
+  replay of the WAL. Batch, raw and document ingests and replication apply
+  drain the pipeline first and are otherwise unchanged. Checkpoints only run
+  when no write is between commit and apply. On by default; settings
+  `DASH_INGEST_WAL_GROUP_COMMIT`, `DASH_INGEST_WAL_GROUP_COMMIT_MAX_WAIT_US`
+  (default 0), `..._MAX_BATCH_BYTES` (1 MiB) and `..._QUEUE_CAPACITY` (1024).
+  A full queue answers `503 wal_group_commit_queue_full` with `Retry-After: 1`.
+- **One fsync per single ingest.** Even with group commit off, a single
+  ingest's commit group is written with one `write` and one `fdatasync`
+  (before: one fsync per record, about five per ingest).
+- **A failed fsync poisons the WAL (fail closed).** After an `fdatasync`
+  error the WAL is never synced again by this process: the failing batch is
+  rejected without touching memory or redb, every later write answers
+  `503 wal_poisoned`, `/ready` reports `not_ready` with reason
+  `wal_poisoned`, and `dash_ingest_wal_poisoned` is 1 until a restart re-reads
+  the log. A write error that is not an fsync error truncates the partial
+  batch and leaves the WAL usable.
+- New metrics `dash_ingest_wal_group_commit_*` and `dash_ingest_wal_poisoned`.
+- Measured on a shared 4 vCPU VM (WAL only, 32 clients): 106 requests/s before,
+  968 with the single-fsync commit group, 2063 with group commit (6.5 requests
+  per fsync). With the default redb mirror the per-write redb transactions
+  now dominate (32 clients: 287 before, 575 off, 624 on in one round; 110,
+  217 and 393 in a second, busier round). Method, full table
+  and caveats: [`docs/operations/wal-durability.md`](docs/operations/wal-durability.md);
+  reproduce with `scripts/benchmark_ingest_group_commit.sh`.
+
 ### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
 
 - **Semantic retrieval now finds the true nearest neighbours.** The in-repo
