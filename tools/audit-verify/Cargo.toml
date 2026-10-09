@@ -1,0 +1,11 @@
+[package]
+name = "audit-verify"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "audit-verify"
+path = "src/main.rs"
+
+[dependencies]
+dash-common = { path = "../../services/common" }

@@ -5,11 +5,22 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/verify_audit_chain.sh --path <audit_log.jsonl> [--service ingestion|retrieval]
+                                [--expect-last-seq N --expect-last-hash HEX]
 
 Options:
   --path       Audit JSONL file path to verify.
   --service    Optional service filter. When set, every chained record must match.
+  --expect-last-seq / --expect-last-hash
+               Out-of-band checkpoint note; detects tail truncation (Rust verifier only).
   --help       Show this help text.
+
+This script is a thin wrapper around the Rust verifier `audit-verify`
+(tools/audit-verify), which validates both services' logs, v2 and legacy
+records, chain restarts and torn tails. The binary is located via
+DASH_AUDIT_VERIFY_BIN, then target/{release,debug}/audit-verify (honouring
+CARGO_TARGET_DIR). If it is not built, a limited legacy-only Python fallback
+runs (retrieval-style insertion-order records; it cannot verify v2 records
+or ingestion records written by the old sorted-key encoder).
 
 Verification checks:
   - chained fields exist together: seq, prev_hash, hash
@@ -21,6 +32,7 @@ EOF
 
 AUDIT_PATH=""
 SERVICE_FILTER=""
+PASSTHROUGH=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --path)
@@ -29,6 +41,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --service)
       SERVICE_FILTER="${2:-}"
+      shift 2
+      ;;
+    --expect-last-seq|--expect-last-hash)
+      PASSTHROUGH+=("$1" "${2:-}")
       shift 2
       ;;
     --help|-h)
@@ -48,6 +64,28 @@ if [[ -z "${AUDIT_PATH}" ]]; then
   usage >&2
   exit 1
 fi
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+VERIFY_BIN=""
+for candidate in "${DASH_AUDIT_VERIFY_BIN:-}" "${TARGET_DIR}/release/audit-verify" "${TARGET_DIR}/debug/audit-verify"; do
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+    VERIFY_BIN="${candidate}"
+    break
+  fi
+done
+if [[ -n "${VERIFY_BIN}" ]]; then
+  ARGS=(--path "${AUDIT_PATH}")
+  if [[ -n "${SERVICE_FILTER}" ]]; then
+    ARGS+=(--service "${SERVICE_FILTER}")
+  fi
+  exec "${VERIFY_BIN}" "${ARGS[@]}" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+fi
+if [[ ${#PASSTHROUGH[@]} -gt 0 ]]; then
+  echo "[audit-verify] checkpoint options need the Rust verifier (cargo build -p audit-verify)" >&2
+  exit 1
+fi
+echo "[audit-verify] warning: audit-verify binary not built; using limited legacy fallback" >&2
 
 python3 - "${AUDIT_PATH}" "${SERVICE_FILTER}" <<'PY'
 import hashlib

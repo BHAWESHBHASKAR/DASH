@@ -154,6 +154,19 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 
   scripts/verify_audit_chain.sh --path "${TMP_AUDIT}" --service ingestion >/dev/null
+
+  # Rust verifier: legacy records above must verify, and a tampered copy must not.
+  cargo build -q -p audit-verify
+  export DASH_AUDIT_VERIFY_BIN="${CARGO_TARGET_DIR:-target}/debug/audit-verify"
+  scripts/verify_audit_chain.sh --path "${TMP_AUDIT}" --service ingestion >/dev/null
+  TMP_TAMPERED="${TMP_AUDIT}.tampered"
+  sed 's/"outcome":"success"/"outcome":"denied"/' "${TMP_AUDIT}" >"${TMP_TAMPERED}"
+  if scripts/verify_audit_chain.sh --path "${TMP_TAMPERED}" >/dev/null 2>&1; then
+    echo "[ci] audit verifier accepted a tampered log" >&2
+    rm -f "${TMP_TAMPERED}"
+    exit 1
+  fi
+  rm -f "${TMP_TAMPERED}"
 )
 
 echo "[ci] slo guard functional smoke"
