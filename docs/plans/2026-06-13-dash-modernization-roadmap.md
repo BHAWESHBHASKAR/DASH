@@ -1,5 +1,9 @@
 # DASH Modernization Roadmap
 
+> **Superseded (2026-10-09):** several items marked done/fixed here were found broken in the
+> 2026-10-09 deep review. See [`2026-10-09-production-readiness-master-plan.md`](./2026-10-09-production-readiness-master-plan.md)
+> and [`2026-10-09-issue-register.md`](./2026-10-09-issue-register.md) for the current status.
+
 Date: 2026-06-13
 Status: **Production hardening complete.** 354 tests passing, 0 build errors, 0 clippy warnings, comprehensive integration tests in place. Transport axum migration and redb persistent indexes remain as future work.
 

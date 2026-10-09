@@ -1,5 +1,9 @@
 # DASH Production-Readiness Remediation Plan
 
+> **Superseded (2026-10-09):** several items marked done/fixed here were found broken in the
+> 2026-10-09 deep review. See [`2026-10-09-production-readiness-master-plan.md`](./2026-10-09-production-readiness-master-plan.md)
+> and [`2026-10-09-issue-register.md`](./2026-10-09-issue-register.md) for the current status.
+
 Date: 2026-08-09  
 Status: in progress — M1 e2e data path and M2 embedding provider selection implemented  
 Target: make the DASH vector/RAG engine safe to run in a production environment.
