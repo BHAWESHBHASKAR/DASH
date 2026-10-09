@@ -7,6 +7,9 @@ This page describes how the store treats damaged or old-format write-ahead
 log (WAL) and snapshot files at startup, and how to inspect and repair them
 with `wal-inspect`.
 
+When a write is acknowledged, how group commit batches fsyncs and what a
+failed fsync does are described in [WAL durability](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/wal-durability.md).
+
 Files involved, for a WAL at `<wal>` (for example the path in
 `DASH_INGEST_WAL_PATH` or `DASH_RETRIEVAL_WAL_PATH`):
 
