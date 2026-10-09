@@ -40,6 +40,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -74,6 +77,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Set up Docker Compose
         run: docker compose version
@@ -257,6 +263,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
@@ -282,6 +291,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
