@@ -1084,22 +1084,6 @@ fn write_state(path: &str, state: &FollowerState) -> std::io::Result<()> {
     Ok(())
 }
 
-fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn env_u64(primary: &str, fallback: &str) -> Option<u64> {
     env_with_fallback(primary, fallback)
         .and_then(|value| value.trim().parse::<u64>().ok())
