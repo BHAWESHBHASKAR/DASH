@@ -3,6 +3,7 @@ use super::*;
 
 mod authz_matrix;
 mod provider_cache;
+mod ready;
 mod review_fixes;
 mod write_path;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};

@@ -701,7 +701,9 @@ impl IngestionRuntime {
             .map(|g| g.to_string())
             .unwrap_or_else(|| "null".to_string());
         let last_error = match self.replication_last_error.as_deref() {
-            Some(err) => format!("\"{}\"", json_escape(err)),
+            // A stable code, never the raw text (hosts, paths, upstream
+            // bodies); the raw error stays in logs and metrics only.
+            Some(err) => format!("\"{}\"", dash_common::replication_client::error_code(err)),
             None => "null".to_string(),
         };
         let blocked = match self.replication_follower.blocked_reason {

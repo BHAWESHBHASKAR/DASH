@@ -131,6 +131,49 @@ pub fn check_token_transport(
     Ok(())
 }
 
+/// Short, stable code for a follower failure, safe to expose on `/ready`.
+///
+/// The raw error text can carry hostnames, filesystem paths, `Debug` output of
+/// internal errors and up to a few hundred bytes of the leader's response
+/// body; it belongs in logs and in the in-process status only.
+pub fn error_code(raw: &str) -> &'static str {
+    let e = raw.to_ascii_lowercase();
+    let has = |needle: &str| e.contains(needle);
+    if has("replication_group_too_large") {
+        "group_too_large"
+    } else if has("byte limit") {
+        "response_too_large"
+    } else if has("refusing to send the replication token") {
+        "token_transport_refused"
+    } else if has("failed requesting replication source")
+        || has("failed connecting")
+        || has("failed resolving")
+    {
+        "source_unreachable"
+    } else if has("timed out") {
+        "source_timeout"
+    } else if has("status 401") || has("status 403") {
+        "source_rejected_credentials"
+    } else if has("returned status") {
+        "source_error_status"
+    } else if has("ack failed") {
+        "ack_failed"
+    } else if has("apply") || has("failed to append") || has("wal") || has("diverg") {
+        "apply_failed"
+    } else if has("payload")
+        || has("frame")
+        || has("export")
+        || has("truncated")
+        || has("utf-8")
+        || has("invalid")
+        || has("missing")
+    {
+        "invalid_response"
+    } else {
+        "replication_error"
+    }
+}
+
 /// Follower-side startup warning: a non-loopback `http://` source.
 pub fn plaintext_source_warning(source_url: &str) -> Option<String> {
     let url = parse_source_url(source_url).ok()?;
@@ -313,6 +356,45 @@ mod tests {
         ] {
             let url = parse_source_url(ok).unwrap();
             assert!(check_token_transport(&url, true, false).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn error_codes_hide_hosts_paths_and_bodies() {
+        let cases = [
+            (
+                "failed requesting replication source 'http://10.0.0.1:8081': refused",
+                "source_unreachable",
+            ),
+            (
+                "replication response exceeds 10 byte limit",
+                "response_too_large",
+            ),
+            ("replication response body is truncated", "invalid_response"),
+            (
+                "replication source returned status 500 (internal: replication_group_too_large)",
+                "group_too_large",
+            ),
+            (
+                "replication source returned status 500 (boom)",
+                "source_error_status",
+            ),
+            (
+                "replication ack failed for commit_id 'c' with status 403",
+                "source_rejected_credentials",
+            ),
+            (
+                "replication delta apply failed: Io(\"/var/lib/x\")",
+                "apply_failed",
+            ),
+            (
+                "refusing to send the replication token over plain http",
+                "token_transport_refused",
+            ),
+            ("something else entirely", "replication_error"),
+        ];
+        for (raw, code) in cases {
+            assert_eq!(error_code(raw), code, "{raw}");
         }
     }
 

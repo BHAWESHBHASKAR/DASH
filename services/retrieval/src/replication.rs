@@ -258,7 +258,7 @@ pub struct FollowerStatusSnapshot {
 }
 
 impl FollowerStatus {
-    fn new(config: &ReplicationFollowerConfig) -> Self {
+    pub(crate) fn new(config: &ReplicationFollowerConfig) -> Self {
         Self {
             has_generation: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -332,7 +332,9 @@ impl FollowerStatus {
             .map(|g| g.to_string())
             .unwrap_or_else(|| "null".to_string());
         let last_error = match snap.last_error.as_deref() {
-            Some(err) => format!("\"{}\"", json_escape(err)),
+            // A stable code, never the raw text (hosts, paths, upstream
+            // bodies); the raw error stays in logs and the in-process status.
+            Some(err) => format!("\"{}\"", dash_common::replication_client::error_code(err)),
             None => "null".to_string(),
         };
         let blocked = match blocked_reason_name(self.blocked.load(Ordering::Relaxed)) {
@@ -406,7 +408,7 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
         }
     }
 
-    fn record_success(&self) {
+    pub(crate) fn record_success(&self) {
         self.last_success_ms
             .store(now_ms().max(1), Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -417,7 +419,7 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
         }
     }
 
-    fn record_failure(&self, error: String) {
+    pub(crate) fn record_failure(&self, error: String) {
         self.blocked
             .store(classify_blocking_error(&error), Ordering::Relaxed);
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
@@ -425,6 +427,20 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = Some(error);
         }
+    }
+}
+
+/// Attach `status` to `store` as if a follower were running (tests only),
+/// with `skipped` quarantined records counted.
+#[cfg(test)]
+pub(crate) fn attach_status_for_tests(
+    store: &Arc<RwLock<InMemoryStore>>,
+    status: &Arc<FollowerStatus>,
+    skipped: u64,
+) {
+    status.skipped_total.store(skipped, Ordering::Relaxed);
+    if let Ok(mut guard) = registry().lock() {
+        guard.insert(Arc::as_ptr(store) as usize, Arc::clone(status));
     }
 }
 

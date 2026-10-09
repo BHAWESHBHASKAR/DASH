@@ -4135,6 +4135,87 @@ tenant-a,0,12,node-a,follower,healthy\n",
         json_post("/v1/embeddings", body)
     }
 
+    fn ready_request() -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            target: "/ready".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// ROB-12: `/ready` is one JSON document and never carries the raw
+    /// follower error; quarantine counts are numbers.
+    #[test]
+    fn ready_json_is_single_encoded_and_has_no_raw_errors() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let store = Arc::new(RwLock::new(sample_store()));
+        let config = crate::replication::ReplicationFollowerConfig::new("http://10.9.8.7:8081");
+        let status = Arc::new(crate::replication::FollowerStatus::new(&config));
+        crate::replication::attach_status_for_tests(&store, &status, 4);
+        status.record_failure(
+            "failed requesting replication source 'http://10.9.8.7:8081': refused /var/lib/x"
+                .to_string(),
+        );
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let response =
+            handle_request_with_metrics_and_reload(&*store, &ready_request(), &metrics, None, None);
+        assert_eq!(response.status, 503, "{}", response.body);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert!(value["replication"].is_object(), "{}", response.body);
+        assert_eq!(value["replication"]["last_error"], "source_unreachable");
+        assert_eq!(value["replication"]["skipped_records_total"], 4);
+        for leaked in ["10.9.8.7", "http://", "refused", "/var/lib", "\\\""] {
+            assert!(
+                !response.body.contains(leaked),
+                "{leaked}: {}",
+                response.body
+            );
+        }
+
+        // Once the follower is healthy the quarantine count is still a number.
+        status.record_success();
+        let response =
+            handle_request_with_metrics_and_reload(&*store, &ready_request(), &metrics, None, None);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["replication"]["skipped_records_total"], 4);
+        assert!(value["replication"]["last_error"].is_null());
+    }
+
+    #[test]
+    fn ready_reports_disk_unavailable_without_the_failure_reason() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("dash-ready-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("blocker file");
+        let store = sample_store().attach_disk(blocker.join("store.redb"));
+        assert!(matches!(
+            store.disk_status(),
+            store::DiskStatus::Unavailable { .. }
+        ));
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let previous = std::env::var_os("DASH_RETRIEVAL_PERSISTENCE_PATH");
+        set_env_var_for_tests(
+            "DASH_RETRIEVAL_PERSISTENCE_PATH",
+            &blocker.join("store.redb").to_string_lossy(),
+        );
+        let response = handle_request_with_metrics(&store, &ready_request(), &metrics);
+        restore_env_var_for_tests("DASH_RETRIEVAL_PERSISTENCE_PATH", previous.as_deref());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(response.status, 503, "{}", response.body);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert_eq!(value["reason"], "disk_unavailable");
+        assert!(
+            !response.body.contains("dash-ready-disk"),
+            "{}",
+            response.body
+        );
+    }
+
     /// PERF-07: requests share one provider; only a change of a variable in
     /// the provider environment signature builds a new one.
     #[test]
