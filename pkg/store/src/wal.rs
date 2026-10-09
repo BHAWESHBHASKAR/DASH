@@ -317,6 +317,9 @@ pub struct FileWal {
     last_sync_at: Instant,
     generation: u64,
     torn_tail_dropped: usize,
+    /// Lines left out of the most recent replication view because lenient
+    /// replay would quarantine them.
+    replication_skipped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +395,7 @@ impl FileWal {
             last_sync_at: Instant::now(),
             generation,
             torn_tail_dropped,
+            replication_skipped: 0,
         })
     }
 
@@ -400,6 +404,14 @@ impl FileWal {
     /// export, or rolled back over already-flushed records.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Number of WAL/snapshot lines the most recent replication frame or
+    /// export left out because lenient replay quarantines them (unparseable
+    /// legacy lines and their dependents). They are never served to
+    /// followers; offsets index the served (filtered) view.
+    pub fn replication_skipped_lines(&self) -> usize {
+        self.replication_skipped
     }
 
     /// Torn tail lines discarded since this handle was opened.
@@ -562,7 +574,7 @@ impl FileWal {
                 "raw WAL record line must not be empty".to_string(),
             ));
         }
-        let _ = line_to_record(line)?;
+        check_replicated_line(line)?;
         self.append_raw_record_line_unchecked(line.to_string())
     }
 
@@ -607,7 +619,8 @@ impl FileWal {
         check_generation: bool,
     ) -> Result<WalReplicationFrame, StoreError> {
         self.flush_pending_sync()?;
-        let wal_lines = self.replay_wal_lines_raw()?;
+        let (wal_lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.note_replication_skipped(skipped);
         let total_records = wal_lines.len();
         let generation_ok = !check_generation
             || match from_generation {
@@ -640,10 +653,24 @@ impl FileWal {
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
         self.flush_pending_sync()?;
+        let (snapshot_lines, skipped_snapshot) =
+            filter_replication_lines(self.replay_snapshot_lines_raw()?);
+        let (wal_lines, skipped_wal) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.note_replication_skipped(skipped_snapshot + skipped_wal);
         Ok(WalReplicationExport {
-            snapshot_lines: self.replay_snapshot_lines_raw()?,
-            wal_lines: self.replay_wal_lines_raw()?,
+            snapshot_lines,
+            wal_lines,
         })
+    }
+
+    fn note_replication_skipped(&mut self, skipped: usize) {
+        if skipped != self.replication_skipped {
+            eprintln!(
+                "warning: replication view of {} leaves out {skipped} line(s) that lenient replay quarantines",
+                self.path.display()
+            );
+        }
+        self.replication_skipped = skipped;
     }
 
     pub fn replace_with_replication_export(
@@ -651,11 +678,8 @@ impl FileWal {
         export: &WalReplicationExport,
     ) -> Result<(), StoreError> {
         self.flush_pending_sync()?;
-        for line in &export.snapshot_lines {
-            let _ = line_to_record(line)?;
-        }
-        for line in &export.wal_lines {
-            let _ = line_to_record(line)?;
+        for line in export.snapshot_lines.iter().chain(&export.wal_lines) {
+            check_replicated_line(line)?;
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
@@ -1227,6 +1251,15 @@ impl QuarantineSink {
         })
     }
 
+    /// A sink that is never flushed to disk.
+    fn detached() -> Self {
+        Self {
+            path: PathBuf::new(),
+            seen: HashSet::new(),
+            pending: Vec::new(),
+        }
+    }
+
     pub(crate) fn push(&mut self, raw: &str) {
         if self.seen.insert(raw.to_string()) {
             self.pending.push(raw.to_string());
@@ -1263,6 +1296,9 @@ struct ReplayParser {
     /// an unrecognisable line directly after it is the remainder of the same
     /// record (a legacy field containing a raw newline).
     prev_failed: bool,
+    /// Suppress the per-line warning (replication views re-run the parser on
+    /// every poll).
+    quiet: bool,
 }
 
 impl ReplayParser {
@@ -1272,6 +1308,7 @@ impl ReplayParser {
             quarantined: 0,
             quarantined_claim_ids: HashSet::new(),
             prev_failed: false,
+            quiet: false,
         }
     }
 
@@ -1299,7 +1336,9 @@ impl ReplayParser {
                 if self.policy == ReplayPolicy::Strict || !(legacy || continuation) {
                     return Err(with_context(err, &origin));
                 }
-                eprintln!("warning: quarantining unreadable legacy record at {origin}: {err:?}");
+                if !self.quiet {
+                    eprintln!("warning: quarantining unreadable legacy record at {origin}: {err:?}");
+                }
                 if kind == "C"
                     && let Some(id) = line.split('\t').nth(1).and_then(|f| unescape_field(f).ok())
                 {
@@ -1312,6 +1351,58 @@ impl ReplayParser {
             }
         }
     }
+}
+
+/// A replicated line must parse, except legacy-format lines, which a
+/// follower mirrors verbatim (its own lenient replay quarantines them just
+/// like the leader's).
+fn check_replicated_line(line: &str) -> Result<(), StoreError> {
+    match line_to_record(line) {
+        Ok(_) => Ok(()),
+        Err(_) if is_legacy_kind(record_kind(line)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Drops the lines lenient replay would quarantine (unparseable legacy
+/// lines, continuation fragments and records depending on a quarantined
+/// legacy claim) from a replication view, using the replay parser itself so
+/// the decision cannot drift. Lines that only fail validation against the
+/// store state (control characters in ids, poisoned vectors) are still
+/// served; followers skip those (see
+/// `InMemoryStore::apply_persisted_record_line_lenient`). Returns the kept
+/// lines and the number dropped.
+fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
+    let mut parser = ReplayParser::new(ReplayPolicy::Lenient);
+    parser.quiet = true;
+    let mut sink = QuarantineSink::detached();
+    let mut bad_claims: HashSet<String> = HashSet::new();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut skipped = 0usize;
+    for line in lines {
+        // Fast path: only legacy lines (and fragments following a failed
+        // one) can be quarantined at parse level.
+        if !parser.prev_failed && bad_claims.is_empty() && !is_legacy_kind(record_kind(&line)) {
+            kept.push(line);
+            continue;
+        }
+        match parser.parse(line.clone(), String::new(), &mut sink) {
+            Ok(Some(item)) => {
+                if !bad_claims.is_empty() && item.depends_on(&bad_claims) {
+                    skipped += 1;
+                } else {
+                    kept.push(line);
+                }
+            }
+            Ok(None) => {
+                skipped += 1;
+                bad_claims.extend(parser.quarantined_claim_ids.iter().cloned());
+            }
+            // Not quarantinable: serve it unchanged, the receiver rejects it.
+            Err(_) => kept.push(line),
+        }
+    }
+    (kept, skipped)
 }
 
 /// Truncates a torn final WAL line (and terminates an otherwise valid
@@ -1963,7 +2054,7 @@ fn parse_optional_claim_type_field(raw: &str) -> Result<Option<ClaimType>, Store
     Ok(Some(str_to_claim_type(raw)?))
 }
 
-fn unescape_field(value: &str) -> Result<String, StoreError> {
+pub(crate) fn unescape_field(value: &str) -> Result<String, StoreError> {
     let mut output = String::with_capacity(value.len());
     let mut escaped = false;
     for ch in value.chars() {
