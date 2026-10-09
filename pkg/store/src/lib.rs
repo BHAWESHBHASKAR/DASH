@@ -42,7 +42,7 @@ pub use wal::{
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
-    complete_group_prefix_len, is_group_marker_commit_id,
+    batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

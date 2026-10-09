@@ -1054,38 +1054,7 @@ fn extract_batch_commit_ids_from_wal_lines(lines: &[String]) -> Result<Vec<Strin
 }
 
 fn parse_batch_commit_id_from_wal_line(line: &str) -> Result<Option<String>, String> {
-    if !line.starts_with("B\t") {
-        return Ok(None);
-    }
-    let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 5 {
-        return Err("batch commit wal line has invalid field count".to_string());
-    }
-    Ok(Some(unescape_wal_field(parts[1])?))
-}
-
-fn unescape_wal_field(value: &str) -> Result<String, String> {
-    let mut output = String::with_capacity(value.len());
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            match ch {
-                '\\' => output.push('\\'),
-                't' => output.push('\t'),
-                'n' => output.push('\n'),
-                other => return Err(format!("invalid escape sequence in WAL field: \\{other}")),
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else {
-            output.push(ch);
-        }
-    }
-    if escaped {
-        return Err("unterminated escape sequence in WAL field".to_string());
-    }
-    Ok(output)
+    Ok(store::batch_commit_id_from_wal_line(line))
 }
 
 fn url_encode_component(raw: &str) -> String {

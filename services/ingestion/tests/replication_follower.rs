@@ -671,3 +671,42 @@ fn leader_checkpoint_between_groups_forces_resync_and_converges() {
         vec!["k1", "k2", "k3", "k4"]
     );
 }
+
+#[test]
+fn follower_acks_batch_commits_so_the_leader_ack_count_advances() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(&dir.path().join("leader.wal"), None, no_checkpoint(), None);
+    leader.batch("batch-ack-1", &["a1", "a2"]);
+    let status_path = "/internal/replication/commit-status?commit_id=batch-ack-1";
+    let (code, body) = request(
+        &leader.addr,
+        "GET",
+        status_path,
+        "",
+        &[("x-replication-token", TOKEN)],
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"ack_count\":1"), "{body}");
+
+    set_env("DASH_NODE_ID", "follower-ack-node");
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    unset_env("DASH_NODE_ID");
+    wait_until(
+        "leader sees the follower ack for the batch commit",
+        Duration::from_secs(15),
+        || {
+            request(
+                &leader.addr,
+                "GET",
+                status_path,
+                "",
+                &[("x-replication-token", TOKEN)],
+            )
+            .1
+            .contains("\"ack_count\":2")
+        },
+    );
+    follower.stop();
+}

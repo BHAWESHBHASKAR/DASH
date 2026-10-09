@@ -244,6 +244,21 @@ fn extend_to_group_end(lines: &[String], from: usize, next: usize) -> usize {
     next
 }
 
+/// The commit id carried by a batch-commit WAL line (legacy `B` or checksummed
+/// `B2`), or `None` for any other line, an unreadable line, or a commit-group
+/// begin/end marker (markers are framing, not client-visible batch commits).
+pub fn batch_commit_id_from_wal_line(line: &str) -> Option<String> {
+    if !(line.starts_with("B\t") || line.starts_with("B2\t")) {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::BatchCommit(commit) if !is_group_marker_commit_id(&commit.commit_id) => {
+            Some(commit.commit_id)
+        }
+        _ => None,
+    }
+}
+
 pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
     commit_id.starts_with(GROUP_BEGIN_PREFIX) || commit_id.starts_with(SINGLE_TX_PREFIX)
 }
