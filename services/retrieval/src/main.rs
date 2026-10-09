@@ -1,10 +1,17 @@
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use retrieval::{
     replication::spawn_replication_follower, retrieve_for_rag, transport::serve_http_with_workers,
 };
 use schema::{Claim, Evidence, RetrievalRequest, Stance, StanceMode};
-use store::{AnnTuningConfig, FileWal, InMemoryStore};
+use store::{
+    AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, VectorIndexPersistence,
+    VectorIndexRestore,
+};
+
+/// Default `DASH_RETRIEVAL_VECTOR_INDEX_SAVE_INTERVAL_MS`.
+const DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS: u64 = 300_000;
 
 fn main() {
     dash_common::init_logging();
@@ -46,6 +53,7 @@ fn main() {
     .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
 
     let mut follower_wal: Option<FileWal> = None;
+    let mut vector_index_persistence: Option<Arc<VectorIndexPersistence>> = None;
     let store = if let Some(wal_path) =
         env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH")
     {
@@ -56,9 +64,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
+        vector_index_persistence = parse_vector_index_persistence(&wal_path);
+        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_vector_index(
             &wal,
             ann_tuning.clone(),
+            ReplayPolicy::from_env(),
+            vector_index_persistence.as_deref().map(|p| p.path()),
         ) {
             Ok(result) => result,
             Err(err) => {
@@ -66,6 +77,23 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        match &vector_index_persistence {
+            Some(persistence) => {
+                let restore = &load_stats.vector_index;
+                persistence.note_restored(restore);
+                let message = format!(
+                    "retrieval vector index '{}': {}",
+                    persistence.path().display(),
+                    restore.describe()
+                );
+                if matches!(restore, VectorIndexRestore::Rebuilt { .. }) {
+                    tracing::warn!("{message}");
+                } else {
+                    tracing::info!("{message}");
+                }
+            }
+            None => tracing::info!("retrieval vector index persistence: off"),
+        }
         tracing::info!(
             "retrieval startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
             load_stats.claims_loaded,
@@ -197,13 +225,55 @@ fn main() {
         // graceful shutdown: in-flight requests drain, the worker
         // threads finish, then the process exits cleanly.
         let shutdown = dash_common::ShutdownSignal::install();
+        let saver = vector_index_persistence.as_ref().map(|persistence| {
+            retrieval::vector_index::spawn_saver(Arc::clone(&shared_store), Arc::clone(persistence))
+        });
         tracing::error!("retrieval: serving on http://{bind_addr} (--cli to run without a port)");
-        if let Err(err) = serve_http_with_workers(shared_store, &bind_addr, http_workers, shutdown)
-        {
+        let served = serve_http_with_workers(
+            Arc::clone(&shared_store),
+            &bind_addr,
+            http_workers,
+            shutdown,
+        );
+        if let Some(persistence) = vector_index_persistence.as_ref() {
+            retrieval::vector_index::save_on_shutdown(&shared_store, persistence, saver);
+        }
+        if let Err(err) = served {
             tracing::error!("retrieval transport failed: {err}");
             std::process::exit(1);
         }
     }
+}
+
+/// Vector index persistence settings (on by default, file next to the WAL).
+/// Values were validated by `dash_config::startup_check`.
+fn parse_vector_index_persistence(wal_path: &str) -> Option<Arc<VectorIndexPersistence>> {
+    let enabled = parse_env_first::<String>(&[
+        "DASH_RETRIEVAL_VECTOR_INDEX_PERSIST",
+        "DASH_VECTOR_INDEX_PERSIST",
+    ])
+    .is_none_or(|raw| {
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    });
+    if !enabled {
+        return None;
+    }
+    let path = std::env::var("DASH_RETRIEVAL_VECTOR_INDEX_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| format!("{wal_path}.vindex"));
+    let interval_ms = parse_env_first::<u64>(&[
+        "DASH_RETRIEVAL_VECTOR_INDEX_SAVE_INTERVAL_MS",
+        "DASH_VECTOR_INDEX_SAVE_INTERVAL_MS",
+    ])
+    .unwrap_or(DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS);
+    Some(Arc::new(VectorIndexPersistence::new(
+        path,
+        (interval_ms > 0).then(|| Duration::from_millis(interval_ms)),
+    )))
 }
 
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {

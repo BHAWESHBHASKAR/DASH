@@ -125,6 +125,9 @@ Verify a log with `tools/audit-verify` or `scripts/verify_audit_chain.sh`.
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_WAL_REPLAY_STRICT` | `off` | bool | When on, WAL replay fails on the first record that lenient mode would quarantine, instead of quarantining it and continuing. See `docs/operations/wal-recovery.md`. | DASH only. |
+| `DASH_INGEST_VECTOR_INDEX_PERSIST` / `DASH_RETRIEVAL_VECTOR_INDEX_PERSIST` (shared: `DASH_VECTOR_INDEX_PERSIST`) | **on** | bool | Save the vector indexes to `DASH_{SVC}_VECTOR_INDEX_PATH` and, at startup, load them instead of rebuilding every HNSW from the replayed vectors; only the vector records written after the save are re-applied. A file that is corrupt, of another format version, built with other ANN tuning or saved for another WAL generation (for example before a checkpoint) is discarded with a warning and the indexes are rebuilt from the WAL. Needs a WAL path. `0`, `false`, `no` or `off` turns it off. | DASH only. |
+| `DASH_INGEST_VECTOR_INDEX_PATH` / `DASH_RETRIEVAL_VECTOR_INDEX_PATH` | `<WAL path>.vindex` | path | File the vector indexes are saved to (written atomically through `<path>.tmp`). Keep it on the same volume as the WAL. Safe to delete while the service is stopped: the next start rebuilds and saves it again. | DASH only. |
+| `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS` / `DASH_RETRIEVAL_VECTOR_INDEX_SAVE_INTERVAL_MS` (shared: `DASH_VECTOR_INDEX_SAVE_INTERVAL_MS`) | `300000` | milliseconds | How often a background thread saves the vector indexes when the WAL moved since the last save. `0` turns periodic saves off; the indexes are still saved after every WAL checkpoint (ingestion) and at a clean shutdown. | DASH only. |
 
 ### ANN tuning
 

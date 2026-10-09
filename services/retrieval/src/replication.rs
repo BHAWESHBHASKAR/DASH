@@ -814,6 +814,11 @@ impl Follower {
         if let Err(err) = guard.commit_staged(staged) {
             eprintln!("retrieval replication: disk mirror degraded after commit: {err:?}");
         }
+        // Under the write lock, so a vector index snapshot always pairs the
+        // state with the WAL position that produced it.
+        if let Some(wal) = self.wal.as_ref() {
+            guard.set_wal_position(Some(wal.position()));
+        }
         self.status
             .skipped_total
             .fetch_add(skipped, Ordering::Relaxed);
@@ -867,6 +872,7 @@ impl Follower {
             if let Err(err) = guard.replace_state_from(fresh) {
                 eprintln!("retrieval replication: disk resync degraded: {err:?}");
             }
+            guard.set_wal_position(self.wal.as_ref().map(FileWal::position));
         }
         let wal_len = export.export.wal_lines.len();
         self.state = FollowerState {

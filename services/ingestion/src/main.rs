@@ -3,7 +3,16 @@ use ingestion::{
     transport::IngestionRuntime, transport::serve_http_with_workers,
 };
 use schema::{Claim, Evidence, Stance};
-use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWritePolicy};
+use std::sync::Arc;
+use std::time::Duration;
+
+use store::{
+    AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, ReplayPolicy,
+    VectorIndexPersistence, VectorIndexRestore, WalWritePolicy,
+};
+
+/// Default `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS`.
+const DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS: u64 = 300_000;
 
 const SAFE_WAL_SYNC_EVERY_RECORDS_MAX: usize = 256;
 const SAFE_WAL_APPEND_BUFFER_RECORDS_MAX: usize = 256;
@@ -182,9 +191,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
+        let vector_index_persistence = parse_vector_index_persistence(&wal_path);
+        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_vector_index(
             &wal,
             ann_tuning.clone(),
+            ReplayPolicy::from_env(),
+            vector_index_persistence.as_deref().map(|p| p.path()),
         ) {
             Ok(result) => result,
             Err(err) => {
@@ -192,6 +204,22 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        match (&vector_index_persistence, &load_stats.vector_index) {
+            (Some(persistence), restore) => {
+                persistence.note_restored(restore);
+                let message = format!(
+                    "ingestion vector index '{}': {}",
+                    persistence.path().display(),
+                    restore.describe()
+                );
+                if matches!(restore, VectorIndexRestore::Rebuilt { .. }) {
+                    tracing::warn!("{message}");
+                } else {
+                    tracing::info!("{message}");
+                }
+            }
+            (None, _) => tracing::info!("ingestion vector index persistence: off"),
+        }
         // Default-on disk persistence (redb PR 2). The
         // `DASH_INGEST_PERSISTENCE_PATH` env var overrides the path;
         // setting `DASH_INGEST_PERSISTENCE_DISABLE=1` reverts to the
@@ -284,7 +312,10 @@ fn main() {
             if let Some(segment_dir) = segment_dir.as_deref() {
                 tracing::info!("ingestion segment publish dir: {segment_dir}");
             }
-            let runtime = IngestionRuntime::persistent(store, wal, policy);
+            let mut runtime = IngestionRuntime::persistent(store, wal, policy);
+            if let Some(persistence) = vector_index_persistence {
+                runtime = runtime.with_vector_index_persistence(persistence);
+            }
             if let Some(reason) = runtime.placement_routing_error() {
                 tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);
@@ -558,6 +589,37 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
         rerank: parse_env_first::<usize>(&["DASH_INGEST_VECTOR_RERANK", "DASH_VECTOR_RERANK"])
             .unwrap_or(defaults.rerank),
     }
+}
+
+/// Vector index persistence settings (on by default, file next to the WAL).
+/// Values were validated by `dash_config::startup_check`.
+fn parse_vector_index_persistence(wal_path: &str) -> Option<Arc<VectorIndexPersistence>> {
+    let enabled = parse_env_first::<String>(&[
+        "DASH_INGEST_VECTOR_INDEX_PERSIST",
+        "DASH_VECTOR_INDEX_PERSIST",
+    ])
+    .is_none_or(|raw| {
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    });
+    if !enabled {
+        return None;
+    }
+    let path = std::env::var("DASH_INGEST_VECTOR_INDEX_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| format!("{wal_path}.vindex"));
+    let interval_ms = parse_env_first::<u64>(&[
+        "DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS",
+        "DASH_VECTOR_INDEX_SAVE_INTERVAL_MS",
+    ])
+    .unwrap_or(DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS);
+    Some(Arc::new(VectorIndexPersistence::new(
+        path,
+        (interval_ms > 0).then(|| Duration::from_millis(interval_ms)),
+    )))
 }
 
 fn parse_env_first<T>(keys: &[&str]) -> Option<T>
