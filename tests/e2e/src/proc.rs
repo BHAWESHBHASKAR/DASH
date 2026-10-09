@@ -58,17 +58,28 @@ fn bin_dir() -> &'static PathBuf {
         }
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut cmd = Command::new(cargo);
-        cmd.current_dir(workspace_root())
-            .args(["build", "-p", "ingestion", "-p", "retrieval", "-p", "control-plane"]);
+        cmd.current_dir(workspace_root()).args([
+            "build",
+            "-p",
+            "ingestion",
+            "-p",
+            "retrieval",
+            "-p",
+            "control-plane",
+        ]);
         if profile() == "release" {
             cmd.arg("--release");
         }
         let status = cmd.status().expect("run cargo build for service binaries");
-        assert!(status.success(), "cargo build of the service binaries failed");
+        assert!(
+            status.success(),
+            "cargo build of the service binaries failed"
+        );
         let src = target_dir().join(profile());
         let mut key = String::new();
         for name in ["ingestion", "retrieval", "control-plane"] {
-            let meta = fs::metadata(src.join(name)).unwrap_or_else(|e| panic!("{name} binary missing: {e}"));
+            let meta = fs::metadata(src.join(name))
+                .unwrap_or_else(|e| panic!("{name} binary missing: {e}"));
             let mtime = meta
                 .modified()
                 .ok()
@@ -86,7 +97,8 @@ fn bin_dir() -> &'static PathBuf {
             let tmp = dst.with_extension(format!("tmp{}", std::process::id()));
             fs::create_dir_all(&tmp).unwrap();
             for name in ["ingestion", "retrieval", "control-plane"] {
-                fs::copy(src.join(name), tmp.join(name)).unwrap_or_else(|e| panic!("copy {name}: {e}"));
+                fs::copy(src.join(name), tmp.join(name))
+                    .unwrap_or_else(|e| panic!("copy {name}: {e}"));
             }
             fs::write(tmp.join(".complete"), b"ok").unwrap();
             fs::create_dir_all(dst.parent().unwrap()).unwrap();
@@ -113,7 +125,13 @@ pub struct Proc {
 impl Proc {
     /// Spawn `bin` with a cleared environment plus `envs`. stdout and stderr
     /// are appended to `log_path`.
-    pub fn spawn(name: &str, bin: &str, args: &[&str], envs: &[(String, String)], log_path: &Path) -> Proc {
+    pub fn spawn(
+        name: &str,
+        bin: &str,
+        args: &[&str],
+        envs: &[(String, String)],
+        log_path: &Path,
+    ) -> Proc {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -146,7 +164,9 @@ impl Proc {
 
     /// `Some(status)` when the process has exited.
     pub fn try_exit(&mut self) -> Option<ExitStatus> {
-        self.child.as_mut().and_then(|c| c.try_wait().ok().flatten())
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -176,7 +196,9 @@ impl Proc {
     /// SIGTERM (graceful shutdown) and wait up to `timeout`; falls back to
     /// SIGKILL. Returns true when the process exited on its own.
     pub fn terminate(&mut self, timeout: Duration) -> bool {
-        let Some(mut c) = self.child.take() else { return true };
+        let Some(mut c) = self.child.take() else {
+            return true;
+        };
         let _ = Command::new("kill")
             .args(["-TERM", &c.id().to_string()])
             .status();

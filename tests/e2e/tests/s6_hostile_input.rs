@@ -6,8 +6,8 @@ use std::io::{Read, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dash_e2e::*;
 use dash_e2e::http;
+use dash_e2e::*;
 use serde_json::{Value, json};
 
 const WORKERS: usize = 4;
@@ -90,11 +90,37 @@ impl Target<'_> {
         c.timeout = Duration::from_secs(30);
         let key = self.key();
         let started = Instant::now();
-        let r = c.post_json(self.path(), &[("x-api-key", &key)], &self.good_body(&after.replace(' ', "-")));
-        assert_eq!(r.status, 200, "normal request failed after: {after}: {}\n{}", r.body, self.log());
-        println!("[{}] healthy after '{after}' in {:?}", if self.svc == Svc::Retrieval { "retrieval" } else { "ingestion" }, started.elapsed());
-        assert!(started.elapsed() < limit, "normal request took {:?} (limit {limit:?}) after: {after}", started.elapsed());
-        assert_eq!(c.get("/live", &[]).status, 200, "liveness failed after: {after}");
+        let r = c.post_json(
+            self.path(),
+            &[("x-api-key", &key)],
+            &self.good_body(&after.replace(' ', "-")),
+        );
+        assert_eq!(
+            r.status,
+            200,
+            "normal request failed after: {after}: {}\n{}",
+            r.body,
+            self.log()
+        );
+        println!(
+            "[{}] healthy after '{after}' in {:?}",
+            if self.svc == Svc::Retrieval {
+                "retrieval"
+            } else {
+                "ingestion"
+            },
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < limit,
+            "normal request took {:?} (limit {limit:?}) after: {after}",
+            started.elapsed()
+        );
+        assert_eq!(
+            c.get("/live", &[]).status,
+            200,
+            "liveness failed after: {after}"
+        );
     }
 
     fn log(&self) -> String {
@@ -187,7 +213,11 @@ fn run_cases(t: &mut Target<'_>) {
     s.write_all(b"{\"tenant_id\":").unwrap();
     let outcome = http::read_optional(&mut s);
     assert_rejected("short body with Content-Length 1000", outcome);
-    assert!(started.elapsed() < Duration::from_secs(20), "server held a stalled body for {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "server held a stalled body for {:?}",
+        started.elapsed()
+    );
     t.assert_healthy("stalled body");
 
     // Content-Length smaller than the body actually sent.
@@ -256,7 +286,12 @@ fn run_cases(t: &mut Target<'_>) {
         t.key()
     );
     match c.raw(both.as_bytes()) {
-        Ok(Some(r)) => assert!(r.status < 500 || r.status == 501, "CL+TE answered {}: {}", r.status, r.body),
+        Ok(Some(r)) => assert!(
+            r.status < 500 || r.status == 501,
+            "CL+TE answered {}: {}",
+            r.status,
+            r.body
+        ),
         Ok(None) => {}
         Err(e) => panic!("CL+TE request hung: {e}"),
     }
@@ -264,11 +299,23 @@ fn run_cases(t: &mut Target<'_>) {
 
     // Binary garbage, bad HTTP versions and bare newlines.
     for (label, bytes) in [
-        ("binary garbage", vec![0u8, 255, 1, 254, 13, 10, 13, 10, 7, 7, 7]),
+        (
+            "binary garbage",
+            vec![0u8, 255, 1, 254, 13, 10, 13, 10, 7, 7, 7],
+        ),
         ("not http", b"HELLO WORLD\r\n\r\n".to_vec()),
-        ("bad version", b"GET /live HTTP/9.9\r\nHost: x\r\n\r\n".to_vec()),
-        ("lone LF headers", b"GET /live HTTP/1.1\nHost: x\n\n".to_vec()),
-        ("NUL in target", b"GET /li\0ve HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        (
+            "bad version",
+            b"GET /live HTTP/9.9\r\nHost: x\r\n\r\n".to_vec(),
+        ),
+        (
+            "lone LF headers",
+            b"GET /live HTTP/1.1\nHost: x\n\n".to_vec(),
+        ),
+        (
+            "NUL in target",
+            b"GET /li\0ve HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+        ),
     ] {
         match c.raw(&bytes) {
             Ok(_) => {}
@@ -291,7 +338,9 @@ fn run_cases(t: &mut Target<'_>) {
     for _ in 0..16 {
         let head = head.clone();
         drippers.push(thread::spawn(move || {
-            let Ok(mut s) = std::net::TcpStream::connect(addr) else { return None };
+            let Ok(mut s) = std::net::TcpStream::connect(addr) else {
+                return None;
+            };
             s.set_read_timeout(Some(Duration::from_millis(50))).ok();
             let started = Instant::now();
             let mut closed_after = None;
@@ -349,7 +398,10 @@ fn run_cases(t: &mut Target<'_>) {
 fn retrieval_survives_hostile_input() {
     let mut stack = Stack::new(opts());
     stack.start_all();
-    let mut t = Target { svc: Svc::Retrieval, stack: &mut stack };
+    let mut t = Target {
+        svc: Svc::Retrieval,
+        stack: &mut stack,
+    };
     run_cases(&mut t);
 }
 
@@ -357,10 +409,20 @@ fn retrieval_survives_hostile_input() {
 fn ingestion_survives_hostile_input() {
     let mut stack = Stack::new(opts());
     stack.start_all();
-    let mut t = Target { svc: Svc::Ingestion, stack: &mut stack };
+    let mut t = Target {
+        svc: Svc::Ingestion,
+        stack: &mut stack,
+    };
     run_cases(&mut t);
     // Nothing the abuse sent may have been ingested.
     let leader = stack.leader_state();
-    let stray: Vec<&String> = leader.claims.keys().filter(|c| !c.starts_with("h-")).collect();
-    assert!(stray.is_empty(), "hostile requests created claims: {stray:?}");
+    let stray: Vec<&String> = leader
+        .claims
+        .keys()
+        .filter(|c| !c.starts_with("h-"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "hostile requests created claims: {stray:?}"
+    );
 }

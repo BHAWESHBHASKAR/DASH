@@ -15,9 +15,12 @@ struct Results(BTreeMap<String, Value>);
 impl std::ops::Index<&str> for Results {
     type Output = Value;
     fn index(&self, id: &str) -> &Value {
-        self.0
-            .get(id)
-            .unwrap_or_else(|| panic!("claim {id} missing from results; have {:?}", self.0.keys().collect::<Vec<_>>()))
+        self.0.get(id).unwrap_or_else(|| {
+            panic!(
+                "claim {id} missing from results; have {:?}",
+                self.0.keys().collect::<Vec<_>>()
+            )
+        })
     }
 }
 
@@ -57,15 +60,31 @@ fn citations_edges_and_stance_semantics_survive_replication() {
     let mut y = bundle("tenant-a", "y", "reactor unsafe", 1);
     y["edges"] = json!([edge("e-y-x", "y", "x", "contradicts")]);
     ingest_ok(&s, "tenant-a", &y);
-    ingest_ok(&s, "tenant-a", &bundle("tenant-a", "y2", "reactor unsafe", 1));
+    ingest_ok(
+        &s,
+        "tenant-a",
+        &bundle("tenant-a", "y2", "reactor unsafe", 1),
+    );
 
     // Supports edge: q --supports--> p.
-    ingest_ok(&s, "tenant-a", &bundle("tenant-a", "p", "pump operational", 1));
-    ingest_ok(&s, "tenant-a", &bundle("tenant-a", "p2", "pump operational", 1));
+    ingest_ok(
+        &s,
+        "tenant-a",
+        &bundle("tenant-a", "p", "pump operational", 1),
+    );
+    ingest_ok(
+        &s,
+        "tenant-a",
+        &bundle("tenant-a", "p2", "pump operational", 1),
+    );
     let mut q = bundle("tenant-a", "q", "pump verified", 1);
     q["edges"] = json!([edge("e-q-p", "q", "p", "supports")]);
     ingest_ok(&s, "tenant-a", &q);
-    ingest_ok(&s, "tenant-a", &bundle("tenant-a", "q2", "pump verified", 1));
+    ingest_ok(
+        &s,
+        "tenant-a",
+        &bundle("tenant-a", "q2", "pump verified", 1),
+    );
 
     // Evidence of every stance on one claim: exactly one citation per evidence.
     let mut m = bundle("tenant-a", "multi", "valve status report", 0);
@@ -81,8 +100,16 @@ fn citations_edges_and_stance_semantics_survive_replication() {
     let a = by_id(s.retrieve("tenant-a", "reactor pump valve", 100));
 
     // Contradiction edge y -> x lowers the TARGET (x), never the author (y).
-    assert_eq!(a["x"]["contradicts"], 1, "target x must count the incoming contradiction: {}", a["x"]);
-    assert_eq!(a["y"]["contradicts"], 0, "author y must not be contradicted: {}", a["y"]);
+    assert_eq!(
+        a["x"]["contradicts"], 1,
+        "target x must count the incoming contradiction: {}",
+        a["x"]
+    );
+    assert_eq!(
+        a["y"]["contradicts"], 0,
+        "author y must not be contradicted: {}",
+        a["y"]
+    );
     assert!(
         score(&a["x"]) < score(&a["x2"]),
         "contradicted target should score lower than its edge-free twin: {} vs {}",
@@ -102,7 +129,10 @@ fn citations_edges_and_stance_semantics_survive_replication() {
         score(&a["p"]),
         score(&a["p2"])
     );
-    assert_eq!(a["p"]["supports"], 2, "p: own evidence plus the incoming supports edge");
+    assert_eq!(
+        a["p"]["supports"], 2,
+        "p: own evidence plus the incoming supports edge"
+    );
     assert!(
         (score(&a["q"]) - score(&a["q2"])).abs() < 1e-6,
         "supports-edge author must be unaffected: {} vs {}",
@@ -113,13 +143,24 @@ fn citations_edges_and_stance_semantics_survive_replication() {
 
     // Exactly one citation per evidence item, with the right stance tallies.
     let cites = a["multi"]["citations"].as_array().unwrap();
-    let mut ids: Vec<&str> = cites.iter().map(|c| c["evidence_id"].as_str().unwrap()).collect();
+    let mut ids: Vec<&str> = cites
+        .iter()
+        .map(|c| c["evidence_id"].as_str().unwrap())
+        .collect();
     ids.sort();
-    assert_eq!(ids, ["m-e1", "m-e2", "m-e3", "m-e4"], "citations: {cites:?}");
+    assert_eq!(
+        ids,
+        ["m-e1", "m-e2", "m-e3", "m-e4"],
+        "citations: {cites:?}"
+    );
     assert_eq!(a["multi"]["supports"], 2);
     assert_eq!(a["multi"]["contradicts"], 1);
     for id in ["x", "y", "p", "q"] {
-        assert_eq!(a[id]["citations"].as_array().unwrap().len(), 1, "claim {id}");
+        assert_eq!(
+            a[id]["citations"].as_array().unwrap().len(),
+            1,
+            "claim {id}"
+        );
     }
 
     // Replicated edge is visible in the returned graph, direction preserved.
@@ -130,7 +171,9 @@ fn citations_edges_and_stance_semantics_survive_replication() {
     let g = r.json()["graph"].clone();
     let edges = g["edges"].as_array().unwrap();
     assert!(
-        edges.iter().any(|e| e["from_claim_id"] == "y" && e["to_claim_id"] == "x" && e["relation"] == "contradicts"),
+        edges.iter().any(|e| e["from_claim_id"] == "y"
+            && e["to_claim_id"] == "x"
+            && e["relation"] == "contradicts"),
         "graph edges: {edges:?}"
     );
 }
@@ -146,7 +189,11 @@ fn stance_mode_filters_contradicted_claims() {
         evidence("bad", "bad-e3", "supports"),
     ]);
     ingest_ok(&s, "tenant-a", &bad);
-    ingest_ok(&s, "tenant-a", &bundle("tenant-a", "good", "orbit stable", 2));
+    ingest_ok(
+        &s,
+        "tenant-a",
+        &bundle("tenant-a", "good", "orbit stable", 2),
+    );
     s.wait_caught_up(Duration::from_secs(20));
 
     let ask = |mode: &str| {
@@ -209,7 +256,11 @@ fn time_range_filters_by_event_time() {
         v
     };
     assert_eq!(window(Some(1_500_000), Some(2_500_000)), ["t2"]);
-    assert_eq!(window(Some(1_000_000), Some(2_000_000)), ["t1", "t2"], "bounds are inclusive");
+    assert_eq!(
+        window(Some(1_000_000), Some(2_000_000)),
+        ["t1", "t2"],
+        "bounds are inclusive"
+    );
     assert_eq!(window(Some(2_500_000), None), ["t3"]);
     assert_eq!(window(None, Some(1_500_000)), ["t1"]);
     assert!(window(Some(5_000_000), Some(6_000_000)).is_empty());
@@ -266,7 +317,12 @@ fn non_ascii_text_round_trips_through_post_and_get() {
             None,
         )
         .expect("raw UTF-8 in target");
-    assert!(r.status == 200 || r.status == 400, "raw UTF-8 query -> {} {}", r.status, r.body);
+    assert!(
+        r.status == 200 || r.status == 400,
+        "raw UTF-8 query -> {} {}",
+        r.status,
+        r.body
+    );
     // Retrieval stays healthy and the ingestion side agrees after a restart
     // replays the WAL.
     s.restart_ingest(false);

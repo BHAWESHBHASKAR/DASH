@@ -8,7 +8,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -37,7 +40,15 @@ struct Group {
 
 fn make_bundle(rng: &mut StdRng, claim: &str, edge_to: Option<&str>) -> (Value, Rec) {
     let n = rng.gen_range(1..=4);
-    let mut b = bundle(T, claim, &format!("crash test claim {claim} on turbine {}", rng.gen_range(0..50)), n);
+    let mut b = bundle(
+        T,
+        claim,
+        &format!(
+            "crash test claim {claim} on turbine {}",
+            rng.gen_range(0..50)
+        ),
+        n,
+    );
     if let Some(to) = edge_to {
         b["edges"] = json!([{
             "edge_id": format!("g-{claim}"), "from_claim_id": claim, "to_claim_id": to,
@@ -45,7 +56,12 @@ fn make_bundle(rng: &mut StdRng, claim: &str, edge_to: Option<&str>) -> (Value, 
         }]);
     }
     let evidence = (0..n).map(|i| format!("{claim}-e{i}")).collect();
-    let rec = Rec { claim: claim.to_string(), evidence, edge_to: edge_to.map(str::to_string), body: b.clone() };
+    let rec = Rec {
+        claim: claim.to_string(),
+        evidence,
+        edge_to: edge_to.map(str::to_string),
+        body: b.clone(),
+    };
     (b, rec)
 }
 
@@ -56,10 +72,20 @@ struct Outcome {
 }
 
 /// Send ingests until `stop` is set or the connection breaks.
-fn stream(s_addr: std::net::SocketAddr, key: String, prefix: String, seed: u64, batch_mode: bool, stop: Arc<AtomicBool>) -> Outcome {
+fn stream(
+    s_addr: std::net::SocketAddr,
+    key: String,
+    prefix: String,
+    seed: u64,
+    batch_mode: bool,
+    stop: Arc<AtomicBool>,
+) -> Outcome {
     let client = Client::new(s_addr);
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Outcome { acked: vec![], unknown: None };
+    let mut out = Outcome {
+        acked: vec![],
+        unknown: None,
+    };
     let mut prev: Option<String> = None;
     let mut i = 0usize;
     while !stop.load(Ordering::Relaxed) {
@@ -72,13 +98,28 @@ fn stream(s_addr: std::net::SocketAddr, key: String, prefix: String, seed: u64, 
                 items.push(b);
                 recs.push(r);
             }
-            ("/v1/ingest/batch", json!({"commit_id": format!("{prefix}-commit-{i}"), "items": items}), Group { recs, batch: true })
+            (
+                "/v1/ingest/batch",
+                json!({"commit_id": format!("{prefix}-commit-{i}"), "items": items}),
+                Group { recs, batch: true },
+            )
         } else {
             let claim = format!("{prefix}-{i}");
-            let edge_to = if rng.gen_bool(0.5) { prev.clone() } else { None };
+            let edge_to = if rng.gen_bool(0.5) {
+                prev.clone()
+            } else {
+                None
+            };
             let (b, r) = make_bundle(&mut rng, &claim, edge_to.as_deref());
             prev = Some(claim);
-            ("/v1/ingest", b, Group { recs: vec![r], batch: false })
+            (
+                "/v1/ingest",
+                b,
+                Group {
+                    recs: vec![r],
+                    batch: false,
+                },
+            )
         };
         match client.try_post_json(path, &[("x-api-key", key.as_str())], &body) {
             Ok(r) if r.status == 200 => out.acked.push(group),
@@ -116,10 +157,18 @@ fn run(cycles: usize, seed: u64) {
         let results: Arc<Mutex<Vec<Outcome>>> = Arc::new(Mutex::new(vec![]));
         let mut handles = vec![];
         for (idx, batch_mode) in [(0, false), (1, false), (2, true)] {
-            let (addr, key, stop, results) = (s.ingest_addr(), key.clone(), stop.clone(), results.clone());
+            let (addr, key, stop, results) =
+                (s.ingest_addr(), key.clone(), stop.clone(), results.clone());
             let wseed: u64 = rng.r#gen();
             handles.push(thread::spawn(move || {
-                let o = stream(addr, key, format!("c{cycle}w{idx}"), wseed, batch_mode, stop);
+                let o = stream(
+                    addr,
+                    key,
+                    format!("c{cycle}w{idx}"),
+                    wseed,
+                    batch_mode,
+                    stop,
+                );
                 results.lock().unwrap().push(o);
             }));
         }
@@ -152,7 +201,11 @@ fn run(cycles: usize, seed: u64) {
             }
             // Unacknowledged request: all or nothing.
             if let Some(g) = &o.unknown {
-                let present: Vec<&Rec> = g.recs.iter().filter(|r| leader.claims.contains_key(&r.claim)).collect();
+                let present: Vec<&Rec> = g
+                    .recs
+                    .iter()
+                    .filter(|r| leader.claims.contains_key(&r.claim))
+                    .collect();
                 if g.batch {
                     assert!(
                         present.is_empty() || present.len() == g.recs.len(),
@@ -171,10 +224,20 @@ fn run(cycles: usize, seed: u64) {
 
         // (c)/(d) Exactly the expected claims, each with its full evidence
         // list exactly once, and the acknowledged edges.
-        let unexpected: Vec<&String> = leader.claims.keys().filter(|c| !expected.contains_key(*c)).collect();
-        assert!(unexpected.is_empty(), "cycle {cycle}: claims present that were never sent: {unexpected:?}");
+        let unexpected: Vec<&String> = leader
+            .claims
+            .keys()
+            .filter(|c| !expected.contains_key(*c))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "cycle {cycle}: claims present that were never sent: {unexpected:?}"
+        );
         for (claim, rec) in &expected {
-            assert!(leader.claims.contains_key(claim), "cycle {cycle}: {claim} vanished");
+            assert!(
+                leader.claims.contains_key(claim),
+                "cycle {cycle}: {claim} vanished"
+            );
             for e in &rec.evidence {
                 assert_eq!(
                     leader.evidence.get(e).map(String::as_str),
@@ -190,25 +253,43 @@ fn run(cycles: usize, seed: u64) {
             }
             if let Some(to) = &rec.edge_to {
                 assert!(
-                    leader.edges.contains(&(claim.clone(), to.clone(), "supports".to_string())),
+                    leader
+                        .edges
+                        .contains(&(claim.clone(), to.clone(), "supports".to_string())),
                     "cycle {cycle}: edge {claim}->{to} lost"
                 );
             }
         }
-        let known_evidence: BTreeSet<&String> = expected.values().flat_map(|r| r.evidence.iter()).collect();
-        let stray: Vec<&String> = leader.evidence.keys().filter(|e| !known_evidence.contains(e)).collect();
-        assert!(stray.is_empty(), "cycle {cycle}: evidence with no expected claim: {stray:?}");
+        let known_evidence: BTreeSet<&String> =
+            expected.values().flat_map(|r| r.evidence.iter()).collect();
+        let stray: Vec<&String> = leader
+            .evidence
+            .keys()
+            .filter(|e| !known_evidence.contains(e))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "cycle {cycle}: evidence with no expected claim: {stray:?}"
+        );
 
         // The retrieval follower must converge to exactly the same picture,
         // with no duplicated citations.
         if cycle % 5 == 4 || cycle + 1 == cycles || cycle < 5 {
             s.wait_caught_up(Duration::from_secs(60));
             let api = s.claim_evidence_map(T, ALL, 100_000);
-            assert_eq!(api.len(), expected.len(), "cycle {cycle}: retrieval claim count differs from the leader");
+            assert_eq!(
+                api.len(),
+                expected.len(),
+                "cycle {cycle}: retrieval claim count differs from the leader"
+            );
             for (claim, rec) in &expected {
                 let mut want = rec.evidence.clone();
                 want.sort();
-                assert_eq!(api.get(claim), Some(&want), "cycle {cycle}: retrieval evidence for {claim} differs (duplicate or missing)");
+                assert_eq!(
+                    api.get(claim),
+                    Some(&want),
+                    "cycle {cycle}: retrieval evidence for {claim} differs (duplicate or missing)"
+                );
             }
         }
 
@@ -224,7 +305,11 @@ fn run(cycles: usize, seed: u64) {
         for r in sample {
             let before = s.leader_position();
             let resp = s.ingest_as(T, &r.body);
-            assert_eq!(resp.status, 200, "cycle {cycle}: replay of {} rejected: {}", r.claim, resp.body);
+            assert_eq!(
+                resp.status, 200,
+                "cycle {cycle}: replay of {} rejected: {}",
+                r.claim, resp.body
+            );
             assert_eq!(
                 s.leader_position(),
                 before,
@@ -235,20 +320,31 @@ fn run(cycles: usize, seed: u64) {
             );
         }
     }
-    println!("crash cycles={cycles} acknowledged_claims={total_acked} final_claims={}", expected.len());
-    assert!(total_acked > 0, "no ingest was ever acknowledged; the test did not exercise anything");
+    println!(
+        "crash cycles={cycles} acknowledged_claims={total_acked} final_claims={}",
+        expected.len()
+    );
+    assert!(
+        total_acked > 0,
+        "no ingest was ever acknowledged; the test did not exercise anything"
+    );
 }
 
 #[test]
 fn kill9_during_ingest_loses_nothing_and_duplicates_nothing() {
-    let cycles: usize = std::env::var("E2E_CRASH_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    let cycles: usize = std::env::var("E2E_CRASH_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
     let seed: u64 = std::env::var("E2E_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| rand::thread_rng().r#gen());
     println!("E2E_SEED={seed} E2E_CRASH_CYCLES={cycles}");
     if let Err(e) = catch_unwind(AssertUnwindSafe(|| run(cycles, seed))) {
-        eprintln!("crash-consistency FAILED; reproduce with E2E_SEED={seed} E2E_CRASH_CYCLES={cycles}");
+        eprintln!(
+            "crash-consistency FAILED; reproduce with E2E_SEED={seed} E2E_CRASH_CYCLES={cycles}"
+        );
         resume_unwind(e);
     }
 }

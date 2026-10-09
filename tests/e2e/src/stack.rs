@@ -54,7 +54,10 @@ impl Stack {
             .map(|t| (t.clone(), random_secret()))
             .collect();
         Stack {
-            dir: tempfile::Builder::new().prefix("dash-e2e-").tempdir().unwrap(),
+            dir: tempfile::Builder::new()
+                .prefix("dash-e2e-")
+                .tempdir()
+                .unwrap(),
             opts,
             ingest_port: free_port(),
             retrieval_port: free_port(),
@@ -70,7 +73,9 @@ impl Stack {
         format!("127.0.0.1:{}", self.ingest_port).parse().unwrap()
     }
     pub fn retrieval_addr(&self) -> SocketAddr {
-        format!("127.0.0.1:{}", self.retrieval_port).parse().unwrap()
+        format!("127.0.0.1:{}", self.retrieval_port)
+            .parse()
+            .unwrap()
     }
     pub fn ic(&self) -> Client {
         Client::new(self.ingest_addr())
@@ -91,8 +96,14 @@ impl Stack {
 
     pub fn ingest_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
-            ("DASH_INGEST_BIND".to_string(), self.ingest_addr().to_string()),
-            ("DASH_INGEST_WAL_PATH".into(), self.path("ingest.wal").display().to_string()),
+            (
+                "DASH_INGEST_BIND".to_string(),
+                self.ingest_addr().to_string(),
+            ),
+            (
+                "DASH_INGEST_WAL_PATH".into(),
+                self.path("ingest.wal").display().to_string(),
+            ),
             (
                 "DASH_INGEST_PERSISTENCE_PATH".into(),
                 self.path("ingest.redb").display().to_string(),
@@ -101,7 +112,10 @@ impl Stack {
                 "DASH_INGEST_API_KEY_SCOPES".into(),
                 Self::scopes(&self.ingest_keys, "ingest,read_only"),
             ),
-            ("DASH_INGEST_REPLICATION_TOKEN".into(), self.replication_token.clone()),
+            (
+                "DASH_INGEST_REPLICATION_TOKEN".into(),
+                self.replication_token.clone(),
+            ),
             // Lift the default per-tenant rate limit: only the rate-limit
             // scenario wants one.
             ("DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS".into(), "0".into()),
@@ -115,8 +129,14 @@ impl Stack {
 
     pub fn retrieval_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
-            ("DASH_RETRIEVAL_BIND".to_string(), self.retrieval_addr().to_string()),
-            ("DASH_RETRIEVAL_WAL_PATH".into(), self.path("retrieval.wal").display().to_string()),
+            (
+                "DASH_RETRIEVAL_BIND".to_string(),
+                self.retrieval_addr().to_string(),
+            ),
+            (
+                "DASH_RETRIEVAL_WAL_PATH".into(),
+                self.path("retrieval.wal").display().to_string(),
+            ),
             (
                 "DASH_RETRIEVAL_PERSISTENCE_PATH".into(),
                 self.path("retrieval.redb").display().to_string(),
@@ -129,13 +149,22 @@ impl Stack {
                 "DASH_RETRIEVAL_REPLICATION_SOURCE_URL".into(),
                 format!("http://{}", self.ingest_addr()),
             ),
-            ("DASH_RETRIEVAL_REPLICATION_TOKEN".into(), self.replication_token.clone()),
+            (
+                "DASH_RETRIEVAL_REPLICATION_TOKEN".into(),
+                self.replication_token.clone(),
+            ),
             (
                 "DASH_RETRIEVAL_REPLICATION_OFFSET_PATH".into(),
                 self.path("retrieval.offset").display().to_string(),
             ),
-            ("DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS".into(), "100".into()),
-            ("DASH_RETRIEVAL_RATE_LIMIT_PER_TENANT_RPS".into(), "0".into()),
+            (
+                "DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS".into(),
+                "100".into(),
+            ),
+            (
+                "DASH_RETRIEVAL_RATE_LIMIT_PER_TENANT_RPS".into(),
+                "0".into(),
+            ),
         ];
         env.extend(self.opts.extra_retrieval_env.clone());
         env
@@ -143,14 +172,26 @@ impl Stack {
 
     pub fn start_ingest(&mut self) {
         let env = self.ingest_env();
-        let mut p = Proc::spawn("ingestion", "ingestion", &[], &env, &self.path("ingestion.log"));
+        let mut p = Proc::spawn(
+            "ingestion",
+            "ingestion",
+            &[],
+            &env,
+            &self.path("ingestion.log"),
+        );
         p.wait_live(self.ingest_addr(), "/live", Duration::from_secs(30));
         self.ingest = Some(p);
     }
 
     pub fn start_retrieval(&mut self) {
         let env = self.retrieval_env();
-        let mut p = Proc::spawn("retrieval", "retrieval", &[], &env, &self.path("retrieval.log"));
+        let mut p = Proc::spawn(
+            "retrieval",
+            "retrieval",
+            &[],
+            &env,
+            &self.path("retrieval.log"),
+        );
         p.wait_live(self.retrieval_addr(), "/live", Duration::from_secs(30));
         self.retrieval = Some(p);
     }
@@ -212,13 +253,15 @@ impl Stack {
 
     pub fn try_ingest_as(&self, tenant: &str, body: &Value) -> std::io::Result<Resp> {
         let (k, v) = self.ik(tenant);
-        self.ic().try_post_json("/v1/ingest", &[(k, v.as_str())], body)
+        self.ic()
+            .try_post_json("/v1/ingest", &[(k, v.as_str())], body)
     }
 
     /// POST /v1/retrieve with the tenant's retrieve key.
     pub fn retrieve_as(&self, tenant: &str, body: &Value) -> Resp {
         let (k, v) = self.rk(tenant);
-        self.rc().post_json("/v1/retrieve", &[(k, v.as_str())], body)
+        self.rc()
+            .post_json("/v1/retrieve", &[(k, v.as_str())], body)
     }
 
     /// Basic retrieve of up to `top_k` results.
@@ -240,7 +283,11 @@ impl Stack {
             {
                 return;
             }
-            assert!(Instant::now() < end, "retrieval never became ready\n{}", self.retrieval_log());
+            assert!(
+                Instant::now() < end,
+                "retrieval never became ready\n{}",
+                self.retrieval_log()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -289,7 +336,10 @@ impl Stack {
                 .unwrap_or_else(|| panic!("frame lacks {name}: {}", r.body))
                 .to_string()
         };
-        (kv("generation").parse().unwrap(), kv("total_records").parse().unwrap())
+        (
+            kv("generation").parse().unwrap(),
+            kv("total_records").parse().unwrap(),
+        )
     }
 
     /// The leader's durable state as exported for followers (snapshot plus
@@ -304,7 +354,13 @@ impl Stack {
     }
 
     /// Poll retrieval until `claim_id` is visible for `tenant`.
-    pub fn wait_claim_visible(&self, tenant: &str, query: &str, claim_id: &str, timeout: Duration) -> Value {
+    pub fn wait_claim_visible(
+        &self,
+        tenant: &str,
+        query: &str,
+        claim_id: &str,
+        timeout: Duration,
+    ) -> Value {
         let end = Instant::now() + timeout;
         loop {
             let results = self.retrieve(tenant, query, 50);
@@ -329,7 +385,12 @@ impl Stack {
 
     /// claim_id -> sorted evidence ids, for every claim retrieval returns for
     /// `query` (callers pick a query that matches all of their claims).
-    pub fn claim_evidence_map(&self, tenant: &str, query: &str, top_k: usize) -> BTreeMap<String, Vec<String>> {
+    pub fn claim_evidence_map(
+        &self,
+        tenant: &str,
+        query: &str,
+        top_k: usize,
+    ) -> BTreeMap<String, Vec<String>> {
         self.retrieve(tenant, query, top_k)
             .into_iter()
             .map(|r| {

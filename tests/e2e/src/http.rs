@@ -213,8 +213,7 @@ fn parse_response(buf: &[u8]) -> std::io::Result<Resp> {
 
 fn dechunk(mut data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    loop {
-        let Some(p) = find(data, b"\r\n") else { break };
+    while let Some(p) = find(data, b"\r\n") {
         let size =
             usize::from_str_radix(String::from_utf8_lossy(&data[..p]).trim(), 16).unwrap_or(0);
         data = &data[p + 2..];

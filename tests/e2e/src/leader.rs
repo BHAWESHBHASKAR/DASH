@@ -66,6 +66,10 @@ impl LeaderState {
     }
 
     pub fn content(&self) -> Content {
-        (self.claims.clone(), self.evidence.clone(), self.edges.clone())
+        (
+            self.claims.clone(),
+            self.evidence.clone(),
+            self.edges.clone(),
+        )
     }
 }
