@@ -2,7 +2,7 @@
 
 Date: 2026-10-09
 Status: Open — tracked by [`2026-10-09-production-readiness-master-plan.md`](./2026-10-09-production-readiness-master-plan.md)
-Closure status (P0 phase): see [`2026-10-09-p0-status.md`](./2026-10-09-p0-status.md).
+Closure status (P0 phase, refreshed at `6988dd5`): 66 of 74 P0 rows CLOSED, 8 PARTIAL; 21 non-P0 rows closed early. See [`2026-10-09-p0-status.md`](./2026-10-09-p0-status.md).
 Source: full-repository review (all Rust crates, six SDKs, deploy, CI, docs).
 Baseline at review time: `cargo test --workspace` 416 passed / 0 failed, clippy clean;
 Go/Python/TypeScript SDK suites pass; Java SDK 4 failures + 14 errors.
