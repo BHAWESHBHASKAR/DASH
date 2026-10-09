@@ -290,7 +290,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build service binaries
-        run: cargo build -p ingestion -p retrieval -p control-plane
+        run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect
 
       - name: Run end-to-end suite
         # Launches the compiled binaries as child processes on loopback with
@@ -298,6 +298,44 @@ jobs:
         env:
           E2E_CRASH_CYCLES: "100"
         run: cargo test -p dash-e2e
+
+  crash-test:
+    name: Crash consistency (kill -9, short)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build ingestion, wal-inspect and crash-test
+        run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
+
+      - name: Run 25 randomized kill -9 cycles
+        # The seed is printed first; on failure the state directory is kept
+        # and the reproduce command is printed (docs/operations/testing-durability.md).
+        env:
+          DASH_E2E_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: target/debug/crash-test --cycles 25 --writers 4 --json-out crash-test.json
+
+      - name: Upload crash-test summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-test-pr
+          path: crash-test.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   doc-consistency:
     name: Doc consistency (deploy env, config docs, claims ledger)

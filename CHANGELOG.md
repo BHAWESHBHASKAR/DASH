@@ -6,6 +6,50 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (P2 crash-consistency, fault-injection and load harness)
+
+- **`tools/crash-test`**: randomized `kill -9` harness for the ingestion
+  service. Concurrent writers (single bundles with edges, atomic batches),
+  SIGKILL at a seeded random moment, `wal-inspect verify` before and after
+  recovery, restart-to-ready time, and an oracle of acknowledged writes (all
+  present with every evidence item and edge, nothing never sent, no evidence
+  stored twice, unacknowledged requests all-or-nothing). Seed printed, state
+  directory kept on failure, JSON summary. 25 cycles run on every PR (job
+  `crash-test`), 1000 nightly.
+- **Disk-full scenarios** (`tests/e2e/tests/s10_disk_full.rs`): the real
+  ingestion binary under `RLIMIT_FSIZE` (writes fail with `EFBIG`) with the WAL
+  alone, during checkpoints and with the redb mirror. The e2e harness gained
+  `SpawnOpts::file_size_limit`, `Proc::rss_kib` and readiness helpers, and now
+  also builds `wal-inspect`.
+- **`tools/loadgen`**: closed-loop ingest/retrieve load generator (concurrency,
+  duration, mix, vector dimension, batch size, bounded id space) against
+  spawned servers or a running deployment; throughput and p50/p95/p99/max
+  latency as text and JSON; soak mode with interval stats, server RSS sampling
+  and growth/error gates.
+- **Nightly workflow** `.github/workflows/durability-nightly.yml`: 1000-cycle
+  crash run, a checkpoint-pressure run, a harness self-check (it must detect
+  lost writes when WAL durability is disabled), the disk-full scenarios, the
+  e2e crash scenario with 500 cycles, a 30-minute soak and a load report,
+  uploaded as artifacts. How to run and what is guaranteed:
+  `docs/operations/testing-durability.md`.
+
+### Fixed (found by the harness)
+
+- **`/ready` ignored failed WAL writes.** With the redb mirror disabled or
+  still healthy, an ingestion node whose WAL volume was full answered every
+  write with 500 but kept reporting ready, so the load balancer kept sending
+  it writes. It now answers 503 `wal_write_failed` after a write could not be
+  persisted, until a 1 MiB probe file next to the WAL can be written and synced
+  (or a write succeeds). This covers failed appends (the group-commit path
+  included); a failed fsync still poisons the WAL and reports `wal_poisoned`
+  until a restart. New metrics `dash_ingest_wal_write_failure_total`,
+  `dash_ingest_wal_write_recovered_total`, `dash_ingest_wal_write_failing`.
+- **WAL rollback could leave the record count ahead of the file.** When the
+  truncation succeeded but writing the new generation file failed (possible on
+  a full disk), `FileWal::rollback_to` returned before resetting its counters,
+  so replication offsets and checkpoint decisions drifted from the file. The
+  counters are now reset right after the truncation.
+
 ### Security
 
 - **The metadata router no longer sends its control-plane token in clear
