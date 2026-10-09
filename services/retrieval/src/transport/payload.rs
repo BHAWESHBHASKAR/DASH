@@ -77,18 +77,20 @@ pub(super) fn build_retrieve_transport_request_from_query(
         return Err("time range is invalid: from_unix must be <= to_unix".to_string());
     }
 
+    let request = RetrieveApiRequest {
+        tenant_id,
+        query: request_query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    };
+    validate_retrieve_limits(&request)?;
     Ok(RetrieveTransportRequest {
-        request: RetrieveApiRequest {
-            tenant_id,
-            query: request_query,
-            query_embedding,
-            entity_filters,
-            embedding_id_filters,
-            top_k,
-            stance_mode,
-            return_graph,
-            time_range,
-        },
+        request,
         read_consistency,
     })
 }
@@ -185,18 +187,20 @@ pub(super) fn build_retrieve_transport_request_from_json(
         return Err("time range is invalid: from_unix must be <= to_unix".to_string());
     }
 
+    let request = RetrieveApiRequest {
+        tenant_id,
+        query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    };
+    validate_retrieve_limits(&request)?;
     Ok(RetrieveTransportRequest {
-        request: RetrieveApiRequest {
-            tenant_id,
-            query,
-            query_embedding,
-            entity_filters,
-            embedding_id_filters,
-            top_k,
-            stance_mode,
-            return_graph,
-            time_range,
-        },
+        request,
         read_consistency,
     })
 }
@@ -204,6 +208,50 @@ pub(super) fn build_retrieve_transport_request_from_json(
 #[cfg(test)]
 pub(super) fn build_retrieve_request_from_json(body: &str) -> Result<RetrieveApiRequest, String> {
     build_retrieve_transport_request_from_json(body).map(|value| value.request)
+}
+
+/// Default upper bound for `top_k` (override with `DASH_RETRIEVAL_MAX_TOP_K`).
+const DEFAULT_MAX_TOP_K: usize = 1000;
+const MAX_FILTER_VALUES: usize = 256;
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+const MAX_QUERY_VECTOR_LEN: usize = 8192;
+
+fn max_top_k() -> usize {
+    std::env::var("DASH_RETRIEVAL_MAX_TOP_K")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TOP_K)
+}
+
+/// Bounds on request size and fan-out, applied to both the GET and POST
+/// forms. Messages are short and name the offending field only.
+fn validate_retrieve_limits(req: &RetrieveApiRequest) -> Result<(), String> {
+    let max = max_top_k();
+    if req.top_k > max {
+        return Err(format!("top_k must be <= {max}"));
+    }
+    if req.query.len() > MAX_QUERY_BYTES {
+        return Err(format!("query must be <= {MAX_QUERY_BYTES} bytes"));
+    }
+    if req.entity_filters.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "entity_filters must contain <= {MAX_FILTER_VALUES} values"
+        ));
+    }
+    if req.embedding_id_filters.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "embedding_id_filters must contain <= {MAX_FILTER_VALUES} values"
+        ));
+    }
+    if let Some(vector) = &req.query_embedding
+        && vector.len() > MAX_QUERY_VECTOR_LEN
+    {
+        return Err(format!(
+            "query_embedding must have <= {MAX_QUERY_VECTOR_LEN} values"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_stance_mode(raw: &str) -> Result<StanceMode, String> {
@@ -671,5 +719,79 @@ mod tests {
         assert_eq!(escaped, "a\\u0000b\\u001fc\\u0008\\n");
         let wrapped = format!("\"{escaped}\"");
         assert!(serde_json::from_str::<String>(&wrapped).is_ok());
+    }
+
+    fn base_json(extra: &str) -> String {
+        format!(r#"{{"tenant_id":"t","query":"q"{extra}}}"#)
+    }
+
+    #[test]
+    fn retrieve_limits_are_enforced() {
+        let top_k_default = build_retrieve_request_from_json(&base_json(r#","top_k":1000"#));
+        assert!(top_k_default.is_ok());
+        let err = build_retrieve_request_from_json(&base_json(r#","top_k":1001"#)).unwrap_err();
+        assert!(err.contains("top_k must be <= 1000"), "{err}");
+
+        let filters = |n: usize| vec!["\"e\""; n].join(",");
+        assert!(
+            build_retrieve_request_from_json(&base_json(&format!(
+                r#","entity_filters":[{}]"#,
+                filters(256)
+            )))
+            .is_ok()
+        );
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","entity_filters":[{}]"#,
+            filters(257)
+        )))
+        .unwrap_err();
+        assert!(err.contains("entity_filters"), "{err}");
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","embedding_id_filters":[{}]"#,
+            filters(257)
+        )))
+        .unwrap_err();
+        assert!(err.contains("embedding_id_filters"), "{err}");
+
+        let long_query = format!(r#"{{"tenant_id":"t","query":"{}"}}"#, "a".repeat(8193));
+        let err = build_retrieve_request_from_json(&long_query).unwrap_err();
+        assert!(err.contains("query must be <="), "{err}");
+        let max_query = format!(r#"{{"tenant_id":"t","query":"{}"}}"#, "a".repeat(8192));
+        assert!(build_retrieve_request_from_json(&max_query).is_ok());
+
+        let vector = |n: usize| vec!["0.5"; n].join(",");
+        assert!(
+            build_retrieve_request_from_json(&base_json(&format!(
+                r#","query_embedding":[{}]"#,
+                vector(8192)
+            )))
+            .is_ok()
+        );
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","query_embedding":[{}]"#,
+            vector(8193)
+        )))
+        .unwrap_err();
+        assert!(err.contains("query_embedding must have <= 8192"), "{err}");
+    }
+
+    #[test]
+    fn get_form_enforces_the_same_limits() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".to_string(), "t".to_string());
+        params.insert("query".to_string(), "q".to_string());
+        params.insert("top_k".to_string(), "5000".to_string());
+        let err = build_retrieve_request_from_query(&params).unwrap_err();
+        assert!(err.contains("top_k must be <="), "{err}");
+        params.insert("top_k".to_string(), "5".to_string());
+        params.insert(
+            "entity_filters".to_string(),
+            (0..257)
+                .map(|i| format!("e{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let err = build_retrieve_request_from_query(&params).unwrap_err();
+        assert!(err.contains("entity_filters"), "{err}");
     }
 }

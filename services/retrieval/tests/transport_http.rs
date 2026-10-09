@@ -453,8 +453,8 @@ fn transport_openai_embeddings_array_input_returns_indexed_results() {
     assert!(response.contains("\"index\":0"));
     assert!(response.contains("\"index\":1"));
     assert!(response.contains("\"index\":2"));
-    // Word count tokenization: "alpha"=1, "beta"=1, "gamma"=1 => total 3
-    assert!(response.contains("\"total_tokens\":3"));
+    // Estimate is ceil(chars / 4) per input: alpha=2, beta=1, gamma=2 => 5
+    assert!(response.contains("\"total_tokens\":5"));
 }
 
 #[test]
