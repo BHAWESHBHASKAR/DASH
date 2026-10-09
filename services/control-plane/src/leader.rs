@@ -871,20 +871,26 @@ mod tests {
 
     #[test]
     fn epoch_strictly_increases_across_holders_and_ignores_placement_epoch() {
+        // Driven by an injected clock: acquiring writes and syncs several
+        // files, and on a slow disk that can take longer than a short lease,
+        // so asserting "still valid right after acquiring" must not depend on
+        // real elapsed time.
         let dir = temp_dir("lease-epoch");
         let path = dir.join("lease.txt");
-        let a = LeaderLease::new("node-a", &path, 300, 10);
-        let b = LeaderLease::new("node-b", &path, 300, 10);
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let a = LeaderLease::new("node-a", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
+        let b = LeaderLease::new("node-b", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
 
         // A huge placement epoch must not leak into the fencing token.
         assert!(a.try_acquire(9_999).unwrap());
         assert_eq!(a.fencing_token().unwrap(), Some(1));
 
-        std::thread::sleep(Duration::from_millis(350));
+        clock.store(base + 350, Ordering::SeqCst);
         assert!(b.try_acquire(0).unwrap());
         assert_eq!(b.fencing_token().unwrap(), Some(2));
 
-        std::thread::sleep(Duration::from_millis(350));
+        clock.store(base + 700, Ordering::SeqCst);
         assert!(a.try_acquire(0).unwrap());
         assert_eq!(a.fencing_token().unwrap(), Some(3));
     }
@@ -1048,16 +1054,21 @@ mod tests {
     fn epoch_never_restarts_after_the_lease_file_is_deleted_or_emptied() {
         let dir = temp_dir("lease-epoch-floor");
         let path = dir.join("lease.txt");
-        let a = LeaderLease::new("node-a", &path, 300, 10);
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let lease = |node: &str| {
+            LeaderLease::new(node, &path, 300, 10).with_test_wall_clock(Arc::clone(&clock))
+        };
+        let a = lease("node-a");
         assert!(a.try_acquire(0).unwrap());
         assert_eq!(a.fencing_token().unwrap(), Some(1));
-        std::thread::sleep(Duration::from_millis(350));
-        let b = LeaderLease::new("node-b", &path, 300, 10);
+        clock.store(base + 350, Ordering::SeqCst);
+        let b = lease("node-b");
         assert!(b.try_acquire(0).unwrap());
         assert_eq!(b.fencing_token().unwrap(), Some(2));
 
         fs::remove_file(&path).unwrap();
-        let c = LeaderLease::new("node-c", &path, 300, 10);
+        let c = lease("node-c");
         let acquired = c.acquire().unwrap().unwrap();
         assert!(
             acquired.record.epoch > 2,
@@ -1065,9 +1076,9 @@ mod tests {
             acquired.record.epoch
         );
 
-        std::thread::sleep(Duration::from_millis(350));
+        clock.store(base + 700, Ordering::SeqCst);
         fs::write(&path, "").unwrap();
-        let d = LeaderLease::new("node-d", &path, 300, 10);
+        let d = lease("node-d");
         let again = d.acquire().unwrap().unwrap();
         assert!(again.record.epoch > acquired.record.epoch);
         assert!(dir.join("lease.txt.epoch").exists());
