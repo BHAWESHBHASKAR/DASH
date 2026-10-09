@@ -61,6 +61,16 @@ const VEC_RERANK: &[Alias] = &[Alias {
     deprecated: false,
     eme: false,
 }];
+const VEC_PERSIST: &[Alias] = &[Alias {
+    name: "DASH_VECTOR_INDEX_PERSIST",
+    deprecated: false,
+    eme: false,
+}];
+const VEC_SAVE_INTERVAL: &[Alias] = &[Alias {
+    name: "DASH_VECTOR_INDEX_SAVE_INTERVAL_MS",
+    deprecated: false,
+    eme: false,
+}];
 const SEG_SIZE: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENT_SIZE")];
 const SEG_TIER: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENTS_PER_TIER")];
 const SEG_COMPACT: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS")];
@@ -612,6 +622,33 @@ pub static REGISTRY: &[Entry] = &[
         "HNSW candidates re-scored with exact `f32` cosine after the quantised (`i8`) search. `0` returns the quantised scores unchanged.",
     )
     .aliases(VEC_RERANK),
+    // ---- Persisted vector index (patterns, shared alias)
+    Entry::new(
+        "DASH_{SVC}_VECTOR_INDEX_PERSIST",
+        Common,
+        T_WAL,
+        Kind::BOOL,
+        "**on**",
+        "Save the vector indexes to `DASH_{SVC}_VECTOR_INDEX_PATH` and, at startup, load them instead of rebuilding every HNSW from the replayed vectors; only the vector records written after the save are re-applied. A file that is corrupt, of another format version, built with other ANN tuning or saved for another WAL generation (for example before a checkpoint) is discarded with a warning and the indexes are rebuilt from the WAL. Needs a WAL path. `0`, `false`, `no` or `off` turns it off.",
+    )
+    .aliases(VEC_PERSIST),
+    Entry::new(
+        "DASH_{SVC}_VECTOR_INDEX_PATH",
+        Common,
+        T_WAL,
+        Kind::Path,
+        "`<WAL path>.vindex`",
+        "File the vector indexes are saved to (written atomically through `<path>.tmp`). Keep it on the same volume as the WAL. Safe to delete while the service is stopped: the next start rebuilds and saves it again.",
+    ),
+    Entry::new(
+        "DASH_{SVC}_VECTOR_INDEX_SAVE_INTERVAL_MS",
+        Common,
+        T_WAL,
+        Kind::MILLIS,
+        "300000",
+        "How often a background thread saves the vector indexes when the WAL moved since the last save. `0` turns periodic saves off; the indexes are still saved after every WAL checkpoint (ingestion) and at a clean shutdown.",
+    )
+    .aliases(VEC_SAVE_INTERVAL),
     Entry::new(
         "DASH_VECTOR_BACKEND",
         Common,

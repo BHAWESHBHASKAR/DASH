@@ -11,6 +11,7 @@ pub(super) fn serve_http_with_workers(
     let queue_capacity = resolve_http_queue_capacity(worker_count);
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let segment_maintenance_interval = runtime.segment_maintenance_interval();
+    let vector_index_persistence = runtime.vector_index_persistence();
     let replication_pull = ReplicationPullConfig::from_env();
     let runtime = Arc::new(Mutex::new(runtime));
     if let Some(config) = replication_pull.as_ref()
@@ -26,7 +27,7 @@ pub(super) fn serve_http_with_workers(
     let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
     let (replication_shutdown_tx, replication_shutdown_rx) = mpsc::channel::<()>();
 
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         if let Some(async_interval) = wal_async_flush_interval {
             let runtime = Arc::clone(&runtime);
             scope.spawn(move || {
@@ -61,6 +62,17 @@ pub(super) fn serve_http_with_workers(
                 }
             });
         }
+        if let Some(persistence) = vector_index_persistence.clone() {
+            // The runtime lock is held only to take the (copy-on-write)
+            // snapshot; the file is written without it.
+            let runtime = Arc::clone(&runtime);
+            scope.spawn(move || {
+                persistence.run(
+                    || runtime.lock().ok()?.vector_index_snapshot(),
+                    log_vector_index_save,
+                );
+            });
+        }
         if let Some(replication_pull) = replication_pull.clone() {
             let runtime = Arc::clone(&runtime);
             scope.spawn(move || {
@@ -85,9 +97,12 @@ pub(super) fn serve_http_with_workers(
                 segment_shutdown_tx.clone(),
                 replication_shutdown_tx.clone(),
             ],
+            vector_index_persistence: vector_index_persistence.clone(),
         });
-        let handler: dash_http::Handler =
-            Arc::new(move |request| handle_request(&runtime, &HttpRequest::from(request)).into());
+        let handler_runtime = Arc::clone(&runtime);
+        let handler: dash_http::Handler = Arc::new(move |request| {
+            handle_request(&handler_runtime, &HttpRequest::from(request)).into()
+        });
         let result = dash_http::serve(
             listener,
             server_config(worker_count, queue_capacity),
@@ -100,8 +115,23 @@ pub(super) fn serve_http_with_workers(
         let _ = flush_shutdown_tx.send(());
         let _ = segment_shutdown_tx.send(());
         let _ = replication_shutdown_tx.send(());
+        if let Some(persistence) = vector_index_persistence.as_ref() {
+            persistence.stop();
+        }
         result
-    })
+    });
+    // Every worker and background thread has exited: save the final state
+    // so the next start loads it instead of rebuilding.
+    if let Some(persistence) = vector_index_persistence {
+        let snapshot = runtime
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.vector_index_snapshot());
+        if let Some(snapshot) = snapshot {
+            log_vector_index_save(persistence.save_if_changed(&snapshot));
+        }
+    }
+    result
 }
 
 /// Feeds the transport backpressure metrics and, when the accept loop stops,
@@ -109,6 +139,7 @@ pub(super) fn serve_http_with_workers(
 struct IngestionHooks {
     metrics: Arc<TransportBackpressureMetrics>,
     shutdown_txs: Vec<mpsc::Sender<()>>,
+    vector_index_persistence: Option<Arc<VectorIndexPersistence>>,
 }
 
 impl dash_http::ServerHooks for IngestionHooks {
@@ -131,6 +162,9 @@ impl dash_http::ServerHooks for IngestionHooks {
     fn on_shutdown(&self) {
         for tx in &self.shutdown_txs {
             let _ = tx.send(());
+        }
+        if let Some(persistence) = self.vector_index_persistence.as_ref() {
+            persistence.stop();
         }
     }
 }

@@ -395,8 +395,8 @@ C with 100k docs).
 
 The vector part of the recommendation is implemented in `pkg/store/src/vector_index.rs` and wired into
 `pkg/store/src/lib.rs`; `ann.rs` and the old graph code are deleted (follow-up 9 above, C31 now cites the new tests).
-Status of this ADR stays Proposed because segments, `tantivy`, the planner on roaring bitmaps, persisted/mmap'd
-indexes and WAL v2 are not built.
+Status of this ADR stays Proposed because segments, `tantivy`, the planner on roaring bitmaps, mmap'd indexes and
+WAL v2 are not built (the vector index is persisted since section 11).
 
 - **Layers.** `FlatIndex` (exact, contiguous normalised `f32`), `HnswIndex` (`usearch`, cosine, `i8`, connectivity 16,
   `ef_construction` 128, `ef_search` 256, exact `f32` rerank of 50 against the store's own `claim_vectors`, so no second
@@ -412,11 +412,68 @@ indexes and WAL v2 are not built.
 - **Concurrency.** usearch fails a search when all reserved thread contexts are in use, so `HnswIndex` gates searches with a
   semaphore sized to the reserved contexts (16 or the core count); a test runs 40 concurrent searchers against it. Clones of
   the store share the usearch index and copy it on the first write (staged batches carry no copy unless they write vectors).
-- **Cold start.** Not persisted: replay collects the vectors and builds each tenant once with several threads. Measured
-  numbers (100k x 384-d: 24 s total, 18.6 s index build; 20k: 4.3 s incremental) are in `docs/benchmarks/performance.md`.
-  Persisting with `save` and mapping with `view` (45 ms for 500k vectors in section 3.2) is the next step, together with a
-  version check on the usearch file format.
+- **Cold start.** At this step not persisted: replay collected the vectors and built each tenant once with several threads
+  (100k x 384-d: 24 s total, 18.6 s index build; 20k: 4.3 s incremental; `docs/benchmarks/performance.md`). Superseded by
+  section 11, which persists the index.
 - **Measured on the acceptance tests** (`pkg/store/tests/vector_recall.rs`, seeded 32-cluster 64-d mixture, recall@10 against
   brute force): the removed graph scored 0.48 at 2k and 0.34 at 5k vectors; the new index scores 1.000 and 1.000, and 0.998
   at 20k (HNSW). Filtered searches match exact search on allowed sets below the threshold and have recall@10 >= 0.95 above it
   (`pkg/store/tests/vector_filtered.rs`).
+
+## 11. Persisted vector index (P2 step 2, 2026-10-09)
+
+Section 10 left every restart rebuilding every tenant's HNSW from the replayed vectors (about 24 s at 100k x 384-d). The
+index is now saved next to the WAL and loaded at startup. Code: `pkg/store/src/vector_persist.rs` (format, load rules,
+save scheduling), `TenantVectorIndex::encode`/`decode` in `pkg/store/src/vector_index.rs`, the wiring in
+`services/ingestion/src/transport/server_runtime.rs`, `services/retrieval/src/vector_index.rs` and both `main.rs`.
+
+- **What is saved.** One file per service, default `<WAL path>.vindex` (`DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PATH`). A
+  section per tenant holds the claim-id key table (with a 64-bit fingerprint of each raw vector) and either the flat rows or
+  the usearch index in its own `save_to_buffer` format. `load_from_buffer` (a copy into RAM) is used, not `view`: a viewed
+  index is read-only and the store inserts into it after startup. A JSON manifest records the format version
+  (`VECTOR_INDEX_FORMAT_VERSION`, currently 1), the tuning (connectivity, both beam widths, flat threshold, rerank), the WAL
+  position the indexes reflect (WAL generation and record count), the vector count and, per tenant, dimension, backend,
+  vector count, section length and SHA-256. The header (magic, version, manifest) carries its own SHA-256. The usearch
+  file format is versioned by usearch itself; a usearch upgrade that cannot read an older file fails the load and rebuilds.
+- **Position.** The WAL generation already changes on every checkpoint, replication resync and rollback of flushed
+  records, so "generation + number of WAL lines" identifies exactly which records a saved index contains. Ingestion holds the
+  WAL and the store under one lock and stamps the snapshot with the WAL position after flushing it; retrieval records the
+  position in the store when it loads and whenever the replication follower commits a frame (under the store's write
+  lock), so the snapshot and its position always agree. redb is not consulted: the services load from the WAL, and redb
+  only mirrors it.
+- **Load rules.** The file is used only when magic, format version, header digest and every section digest verify; the
+  tuning equals the configured tuning; the generation equals the current WAL generation and the WAL holds at least the
+  saved number of lines; each tenant's dimension equals the tenant's stored dimension and each section decodes to a
+  self-consistent index (every key of the HNSW is in the key table and the counts agree). Then the WAL replay, which runs
+  anyway because the store keeps every claim and vector in memory, also collects the claim ids of the vector records after
+  the saved line, and only those claims are re-applied to the loaded index (catch-up, one insert each). Finally every
+  index must hold exactly its tenant's indexable stored vectors, each with the fingerprint of the stored vector. Any
+  failure logs a warning naming the reason and the indexes are built from the replayed vectors as before. The last check
+  makes the load safe even if the recorded position were wrong (a test saves an old index stamped with a newer position
+  and gets a rebuild).
+- **Saving.** `InMemoryStore::vector_index_snapshot` clones the tenant indexes (an HNSW clone shares the usearch index;
+  the live index copies it on its next write, once, through the existing copy-on-write path) so the caller's lock is held
+  for milliseconds; `VectorIndexSnapshot::save` serialises without any lock and replaces the file atomically (write
+  `<path>.tmp`, fsync, rename, fsync the directory; a test checks the order and that a crash at each step leaves the old or
+  the new file). `VectorIndexPersistence` runs saves every `DASH_*_VECTOR_INDEX_SAVE_INTERVAL_MS` (default 5 min) when
+  the WAL moved, on request (ingestion requests one after every checkpoint, since a checkpoint starts a new generation)
+  and once more after the server drained at shutdown; it never writes a position that is already on disk.
+- **Measured** with `tests/benchmarks/src/bin/cold_start.rs` (release build, one tenant, 64-cluster Gaussian mixture,
+  default tuning, 4 vCPUs on a shared VM, so run-to-run spread is large):
+
+  | N x dim | WAL | index file | replay floor (no HNSW) | full rebuild (before) | load saved index (after) | load + catch-up of 1000 | save |
+  |---|---|---|---|---|---|---|---|
+  | 50k x 384 | 215 MB | 28.2 MB | 4.0 s | 8.0 / 8.2 / 12.0 s | 3.9 / 3.7 / 3.9 s | 4.5 / 4.6 / 4.6 s | 0.16-0.23 s |
+  | 100k x 384 | 431 MB | 56.4 MB | 9.0 s | 23.1 / 27.5 s | 8.8 s | not measured (disk full) | 0.41 s |
+
+  Loading the saved index removes the HNSW build: a start with a current file costs what the WAL replay costs (the load
+  matches the replay floor within run-to-run noise), so cold start drops by about 2x at 50k and about 3x at 100k. The
+  catch-up costs about 0.7 ms per re-applied vector (single-threaded usearch inserts at 384-d). What remains is parsing
+  the text WAL and snapshot (about 9 s per 100k 384-d vectors here); a binary snapshot or loading the vectors from redb is
+  the next cold-start step.
+- **Limits.** One start after a checkpoint that happened after the last save (the generation changed) rebuilds; ingestion
+  narrows the window by saving right after each checkpoint. A crash loses at most the save interval of index work, never
+  data: the catch-up re-applies it. Results after catch-up equal a rebuild exactly only where the HNSW beam covers the
+  graph (the tests); at scale both are approximate with the same tuning (catch-up inserts one by one, a rebuild in bulk).
+  Loading needs RAM for the file plus the index while it is copied. Not done: `view`/mmap of a read-only base plus a
+  mutable delta, per-tenant salvage of an otherwise valid file (any problem rebuilds every tenant), and save metrics.

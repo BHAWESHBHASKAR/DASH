@@ -50,6 +50,9 @@ primary variables:
 | `DASH_INGEST_API_KEY` | none (same rule) | API key for ingestion |
 | `DASH_INGEST_WAL_PATH` | unset (ingestion is in-memory only) | WAL file for crash recovery |
 | `DASH_RETRIEVAL_WAL_PATH` | unset | optional retrieval-side WAL, mirrored from the replication leader when a follower is configured |
+| `DASH_*_VECTOR_INDEX_PERSIST` | on | save the vector indexes next to the WAL and load them at startup instead of rebuilding (needs a WAL path) |
+| `DASH_*_VECTOR_INDEX_PATH` | `<WAL path>.vindex` | saved vector index file |
+| `DASH_*_VECTOR_INDEX_SAVE_INTERVAL_MS` | `300000` | periodic save interval (`0` = only after checkpoints and at shutdown) |
 
 Most variables have a legacy `EME_*` alias for backward compat with
 deployments that predate the rename; the configuration reference marks
@@ -124,6 +127,18 @@ DASH_RETRIEVAL_PERSISTENCE_DISABLE=1 ./target/release/retrieval
 
 The services still maintain their in-memory state; the disk
 attachment is the only thing that's disabled.
+
+## State directory contents
+
+For a WAL at `<wal>` the state directory holds `<wal>`, `<wal>.snapshot`,
+`<wal>.gen` and, unless `DASH_*_VECTOR_INDEX_PERSIST=0`, the saved vector
+indexes `<wal>.vindex` (see [WAL recovery](wal-recovery.md#saved-vector-indexes)),
+plus the redb file at `DASH_*_PERSISTENCE_PATH`. The WAL, snapshot and
+generation file are the source of truth. The `.vindex` file is a cache that
+makes restarts fast: it is saved periodically, after checkpoints and at a
+clean shutdown, and a start that finds it missing, damaged or out of date logs
+a warning and rebuilds the indexes from the WAL. A clean stop (SIGTERM) leaves
+it current, so the next start skips the HNSW build.
 
 ## Metrics
 

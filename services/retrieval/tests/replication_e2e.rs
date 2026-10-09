@@ -1253,3 +1253,91 @@ fn ready_reports_an_oversized_leader_response_by_code_only() {
     );
     assert_eq!(value["replication"]["last_error"], "response_too_large");
 }
+
+fn ingest_with_vector(leader: &Leader, claim_id: &str, seed: usize) {
+    let vector: Vec<String> = (0..8)
+        .map(|d| format!("{}", ((seed * 13 + d * 7) % 19) as f32 / 4.0 + 0.25))
+        .collect();
+    leader.post_claim(
+        claim_id,
+        format!(
+            r#"{{"claim":{{"claim_id":"{claim_id}","tenant_id":"{TENANT}","canonical_text":"vector claim {claim_id}","confidence":0.9}},"evidence":[],"claim_embedding":[{}]}}"#,
+            vector.join(",")
+        ),
+    );
+}
+
+fn load_with_index(wal_path: &Path, index: &Path) -> (InMemoryStore, store::VectorIndexRestore) {
+    let wal = FileWal::open(wal_path).expect("open follower wal");
+    let (store, stats) = InMemoryStore::load_from_wal_with_vector_index(
+        &wal,
+        AnnTuningConfig::default(),
+        store::ReplayPolicy::Strict,
+        Some(index),
+    )
+    .expect("load follower wal");
+    (store, stats.vector_index)
+}
+
+#[test]
+fn durable_follower_saves_its_vector_index_at_the_replicated_wal_position() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(&dir.path().join("leader.wal"), None, no_checkpoint());
+    for i in 0..12 {
+        ingest_with_vector(&leader, &format!("v{i}"), i);
+    }
+    let follower_wal = dir.path().join("follower.wal");
+    let index = dir.path().join("follower.wal.vindex");
+    let persistence = store::VectorIndexPersistence::new(&index, None);
+
+    let mut node = start_durable(test_config(&leader.addr), &follower_wal);
+    let (_, total) = leader.frame();
+    wait_until("caught up", Duration::from_secs(10), || {
+        node.status().offset == total
+    });
+    node.stop();
+    // What the service does at shutdown: save at the store's WAL position,
+    // which the follower moves with every frame it applies.
+    retrieval::vector_index::save_on_shutdown(&node.store, &persistence, None);
+    let saved = persistence.last_saved_position().expect("saved");
+    drop(node);
+    let wal_position = FileWal::open(&follower_wal).unwrap().position();
+    assert_eq!(saved, wal_position, "saved at the replicated WAL position");
+
+    let (loaded, restore) = load_with_index(&follower_wal, &index);
+    assert_eq!(
+        restore,
+        store::VectorIndexRestore::Loaded {
+            tenants: 1,
+            vectors: 12,
+            caught_up: 0,
+            saved_position: wal_position,
+        }
+    );
+    assert_eq!(loaded.claims_len(), 12);
+
+    // Vectors replicated after the save are caught up from the WAL.
+    for i in 12..16 {
+        ingest_with_vector(&leader, &format!("v{i}"), i);
+    }
+    let mut node = start_durable(test_config(&leader.addr), &follower_wal);
+    let (_, total) = leader.frame();
+    wait_until("caught up again", Duration::from_secs(10), || {
+        node.status().offset == total
+    });
+    node.stop();
+    drop(node);
+    let (caught_up, restore) = load_with_index(&follower_wal, &index);
+    match restore {
+        store::VectorIndexRestore::Loaded {
+            vectors, caught_up, ..
+        } => assert_eq!((vectors, caught_up), (16, 4)),
+        other => panic!("expected a catch-up load, got {other:?}"),
+    }
+    let rebuilt = InMemoryStore::load_from_wal(&FileWal::open(&follower_wal).unwrap()).unwrap();
+    let query = [1.0f32, 0.5, 0.25, 2.0, 1.5, 0.75, 3.0, 0.5];
+    assert_eq!(
+        caught_up.ann_vector_top_candidates(TENANT, &query, 10),
+        rebuilt.ann_vector_top_candidates(TENANT, &query, 10)
+    );
+}

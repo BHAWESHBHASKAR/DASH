@@ -199,12 +199,31 @@ the index build): 24.0 s, of which 18.6 s is the HNSW build (a second run:
 26.4 s and 24.8 s total). The same inserts done one by one take 74.7 s, and raw
 `usearch` `i8` single-thread insertion of the same vectors takes 73.6 s, so the
 wrapper adds no measurable overhead; the per-vector cost is the library's on this
-data (the ADR's lower-dimensional clusters built about 3x faster). The index is
-not persisted, so every restart pays this; persisting or memory-mapping it is the
-follow-up that removes it. Memory: the `i8` HNSW holds `dim` bytes plus the graph
+data (the ADR's lower-dimensional clusters built about 3x faster). Since the
+index is persisted (next section) a restart with a current index file skips this
+build. Memory: the `i8` HNSW holds `dim` bytes plus the graph
 per vector and no `f32` copy (the full-precision vectors stay in `claim_vectors`);
 `StoreIndexStats::vector_index_bytes` reports it. Tenants at or below the flat
 threshold (default 8192) keep one extra normalised `f32` copy.
+
+### Cold start with the persisted vector index (2026-10-09)
+
+`cargo run --release -p benchmark-smoke --bin cold_start -- N 384 1000 RUNS`
+(`tests/benchmarks/src/bin/cold_start.rs`): one tenant, 64-cluster Gaussian
+mixture, default tuning, 4 vCPUs on a shared VM (other jobs were running, so
+the spread between runs is large; every run is listed).
+
+| N x dim | WAL | index file | replay floor (no HNSW) | full rebuild (before) | load saved index (after) | load + catch-up of 1000 vectors | save |
+|---|---|---|---|---|---|---|---|
+| 50k x 384 | 215 MB | 28.2 MB | 4.0 s | 8.0, 8.2, 12.0 s | 3.9, 3.7, 3.9 s | 4.5, 4.6, 4.6 s | 0.16 to 0.23 s |
+| 100k x 384 | 431 MB | 56.4 MB | 9.0 s | 23.1, 27.5 s | 8.8 s | not measured (the shared disk filled up) | 0.41 s |
+
+"Replay floor" loads the same WAL with the tenant kept on the flat index, so it
+is the WAL parsing and store rebuild that every start pays. With a current
+index file the load equals that floor within noise: the HNSW build is gone and
+cold start is now bounded by parsing the text WAL (about 2x faster at 50k,
+about 3x at 100k). Catch-up re-inserts the vectors written after the last save
+one by one, about 0.7 ms each at 384-d. ADR 0003 section 11 has the design.
 
 ## Known bottlenecks
 
@@ -248,10 +267,12 @@ retrieval engine today:
   (`docs/plans/2026-06-13-dash-modernization-roadmap.md`) covers the
   broader plan to retire `main.rs` in favor of composable per-path
   scenarios.
-- **Persist or memory-map the vector index.** The `usearch` backed index
-  landed in P2 (see "Vector index after P2"); it is still rebuilt at
-  startup, and `view` of a saved index took 45 ms for 500k vectors in the
-  ADR 0003 spike.
+- **Make WAL replay cheaper.** The vector index is persisted (see "Cold start
+  with the persisted vector index"); cold start is now the text WAL and
+  snapshot parse, about 9 s per 100k 384-d vectors. A binary snapshot, or
+  loading vectors from redb, is the next step. Memory-mapping the index
+  (`view` took 45 ms for 500k vectors in the ADR 0003 spike) would also save
+  the copy into RAM, but a viewed index is read-only.
 - **Add a WAL group-commit scenario** that compares
   `sync_every_records=1` against `sync_every_records=32,128,512` so
   the durability/throughput tradeoff is quantified, not guessed.

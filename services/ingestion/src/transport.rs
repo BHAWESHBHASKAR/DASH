@@ -63,8 +63,8 @@ use request::{parse_query_usize, query_encoding_is_invalid, split_target};
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationExport,
-    WalReplicationFrame,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, VectorIndexPersistence,
+    VectorIndexSaveStats, VectorIndexSnapshot, WalReplicationExport, WalReplicationFrame,
 };
 
 use crate::{
@@ -139,6 +139,9 @@ pub struct IngestionRuntime {
     replication_commit_status: commit_status::CommitStatusTable,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
+    /// Saves the vector indexes (persistent mode only); see
+    /// `with_vector_index_persistence`.
+    vector_index_persistence: Option<Arc<VectorIndexPersistence>>,
 }
 
 #[derive(Debug, Default)]
@@ -252,6 +255,7 @@ impl IngestionRuntime {
             replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
+            vector_index_persistence: None,
         }
     }
 
@@ -315,6 +319,7 @@ impl IngestionRuntime {
             replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
+            vector_index_persistence: None,
         }
     }
 
@@ -646,7 +651,14 @@ impl IngestionRuntime {
         match should_checkpoint_now(&self.checkpoint_policy, wal) {
             Ok(false) => (None, false),
             Ok(true) => match self.store.checkpoint_and_compact(wal) {
-                Ok(stats) => (Some(stats), false),
+                Ok(stats) => {
+                    // The checkpoint started a new WAL generation, which the
+                    // saved vector index no longer matches: save it again.
+                    if let Some(persistence) = self.vector_index_persistence.as_ref() {
+                        persistence.request_save();
+                    }
+                    (Some(stats), false)
+                }
                 Err(err) => {
                     eprintln!("ingestion {label} checkpoint failed after commit: {err:?}");
                     (None, true)
@@ -869,6 +881,36 @@ impl IngestionRuntime {
 
     pub(crate) fn wal_async_flush_interval(&self) -> Option<Duration> {
         self.wal_async_flush_interval
+    }
+
+    /// Save the vector indexes through `persistence`: periodically, after
+    /// every WAL checkpoint and once more at a clean shutdown (see
+    /// `serve_http_with_workers`). Ignored without a WAL.
+    pub fn with_vector_index_persistence(
+        mut self,
+        persistence: Arc<VectorIndexPersistence>,
+    ) -> Self {
+        if self.wal.is_some() {
+            self.vector_index_persistence = Some(persistence);
+        }
+        self
+    }
+
+    pub(crate) fn vector_index_persistence(&self) -> Option<Arc<VectorIndexPersistence>> {
+        self.vector_index_persistence.clone()
+    }
+
+    /// A copy of the vector indexes stamped with the WAL position they
+    /// reflect. The WAL is flushed first so that position is durable; on a
+    /// flush failure there is nothing safe to save and `None` is returned.
+    /// Cheap (copy-on-write); the caller saves it after releasing the lock.
+    pub fn vector_index_snapshot(&mut self) -> Option<VectorIndexSnapshot> {
+        let wal = self.wal.as_mut()?;
+        if let Err(err) = wal.flush_pending_sync() {
+            tracing::warn!("ingestion vector index save skipped: WAL flush failed: {err:?}");
+            return None;
+        }
+        Some(self.store.vector_index_snapshot(wal.position()))
     }
 
     fn observe_wal_flush_success(&mut self, synced_records: u64, latency: Duration) {
@@ -1286,6 +1328,22 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
 pub fn serve_http(runtime: IngestionRuntime, bind_addr: &str) -> std::io::Result<()> {
     let shutdown = dash_common::ShutdownSignal::install();
     serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
+}
+
+pub(crate) fn log_vector_index_save(outcome: Result<Option<VectorIndexSaveStats>, StoreError>) {
+    match outcome {
+        Ok(Some(stats)) => tracing::info!(
+            "ingestion vector index saved: vectors={}, tenants={}, bytes={}, wal_generation={:016x}, wal_records={}, elapsed_ms={}",
+            stats.vectors,
+            stats.tenants,
+            stats.bytes,
+            stats.position.generation,
+            stats.position.records,
+            stats.elapsed.as_millis()
+        ),
+        Ok(None) => {}
+        Err(err) => tracing::warn!("ingestion vector index save failed: {err:?}"),
+    }
 }
 
 pub fn serve_http_with_workers(
