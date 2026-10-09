@@ -39,9 +39,9 @@ mod authz_matrix_tests;
 mod debug_render;
 mod http;
 mod payload;
-use audit::{AuditEvent, append_audit_record, audit_gate};
 #[cfg(test)]
 use audit::is_sha256_hex;
+use audit::{AuditEvent, append_audit_record, audit_gate};
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
     AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,

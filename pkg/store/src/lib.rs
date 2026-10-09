@@ -40,6 +40,10 @@ pub use wal::{
     WalReplayStats, WalReplicationDelta, WalReplicationExport, WalReplicationFrame,
     WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
+pub use wal::{
+    GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
+    complete_group_prefix_len, is_group_marker_commit_id,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
@@ -48,6 +52,16 @@ pub struct BatchCommitMetadata {
     pub ts_unix_ms: u64,
     pub claim_ids: Vec<String>,
     pub payload_fingerprint: String,
+}
+
+/// Result of [`InMemoryStore::ingest_atomic_persistent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicIngestOutcome {
+    /// `false` when the bundle was already fully applied (idempotent retry).
+    pub applied: bool,
+    /// Set when redb rejected the mirrored write after the WAL commit. The
+    /// write itself is durable (WAL) and visible; redb was detached.
+    pub disk_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,19 +281,25 @@ impl InMemoryStore {
     /// store is always returned (the caller's in-memory state is
     /// preserved).
     pub fn with_disk(self, path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        Ok(self.attach_disk(path))
+    }
+
+    /// Infallible form of [`InMemoryStore::with_disk`]: on open failure the
+    /// in-memory state is kept and [`InMemoryStore::disk_status`] reports
+    /// `Unavailable { reason }`, so callers inspect the status instead of a
+    /// `Result` that can never be `Err`.
+    pub fn attach_disk(self, path: impl AsRef<std::path::Path>) -> Self {
         match disk::DiskBackedStore::new(path) {
-            Ok(disk) => Ok(Self {
+            Ok(disk) => Self {
                 disk: Some(Arc::new(disk)),
                 disk_status: disk::DiskStatus::Available,
                 ..self
-            }),
-            Err(reason) => Ok(Self {
+            },
+            Err(reason) => Self {
                 disk: None,
-                disk_status: disk::DiskStatus::Unavailable {
-                    reason: reason.clone(),
-                },
+                disk_status: disk::DiskStatus::Unavailable { reason },
                 ..self
-            }),
+            },
         }
     }
 
@@ -652,6 +672,169 @@ impl InMemoryStore {
         }
 
         self.apply_bundle(claim, evidence, edges)
+    }
+
+    /// `true` when applying this exact bundle (and vector) would not change
+    /// the store: the claim, every evidence row, every edge and the vector
+    /// are already present and identical. Used to make retries of an
+    /// ambiguous request a no-op (DATA-10, DATA-12).
+    pub fn bundle_already_applied(
+        &self,
+        claim: &Claim,
+        evidence: &[Evidence],
+        edges: &[ClaimEdge],
+        vector: Option<&[f32]>,
+    ) -> bool {
+        if self.claims.get(&claim.claim_id) != Some(claim) {
+            return false;
+        }
+        let stored_evidence = self.evidence_by_claim.get(&claim.claim_id);
+        for evd in evidence {
+            let found = stored_evidence.is_some_and(|list| {
+                list.iter()
+                    .any(|e| e.evidence_id == evd.evidence_id && e == evd)
+            });
+            if !found {
+                return false;
+            }
+        }
+        let stored_edges = self.edges_by_claim.get(&claim.claim_id);
+        for edge in edges {
+            let found = stored_edges.is_some_and(|list| {
+                list.iter().any(|e| {
+                    e.to_claim_id == edge.to_claim_id && e.relation == edge.relation && e == edge
+                })
+            });
+            if !found {
+                return false;
+            }
+        }
+        match vector {
+            Some(values) => self
+                .claim_vectors
+                .get(&claim.claim_id)
+                .is_some_and(|stored| stored.as_slice() == values),
+            None => true,
+        }
+    }
+
+    /// Validate a vector for a claim that may not exist yet: non-empty,
+    /// finite and matching the tenant's established dimension.
+    fn validate_vector_for_tenant(
+        &self,
+        tenant_id: &str,
+        vector: &[f32],
+    ) -> Result<(), StoreError> {
+        validate_vector(vector)?;
+        if let Some(existing_dim) = self.tenant_vector_dims.get(tenant_id)
+            && *existing_dim != vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "vector dimension mismatch for tenant '{tenant_id}': expected {existing_dim}, got {}",
+                vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Run `apply` against the in-memory state with disk writes deferred,
+    /// then replay them onto redb. A disk failure drops the handle and
+    /// marks the disk `Unavailable` (the WAL is the source of truth) and is
+    /// reported as `Ok(Some(reason))`.
+    fn apply_with_deferred_disk<F>(&mut self, apply: F) -> Result<Option<String>, StoreError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), StoreError>,
+    {
+        let disk = self.disk.take();
+        let previous_staging = self.staged_disk_ops.replace(Vec::new());
+        let result = apply(self);
+        let ops = self.staged_disk_ops.take().unwrap_or_default();
+        self.staged_disk_ops = previous_staging;
+        self.disk = disk;
+        let mut disk_failure = None;
+        if let Some(disk) = self.disk.clone() {
+            for op in &ops {
+                if let Err(reason) = write_disk_op(&disk, op) {
+                    self.disk = None;
+                    self.disk_status = disk::DiskStatus::Unavailable {
+                        reason: reason.clone(),
+                    };
+                    disk_failure = Some(reason);
+                    break;
+                }
+            }
+        }
+        result.map(|()| disk_failure)
+    }
+
+    /// Atomically ingest one bundle (claim, evidence, edges and optional
+    /// vector) as a single WAL commit group (DATA-10).
+    ///
+    /// Everything is validated first; the WAL group (`begin` marker, the
+    /// records, closing commit marker) is appended next and rolled back on
+    /// failure; only then is the in-memory state (and redb) updated. A
+    /// crash inside the group leaves a torn group that replay discards, so
+    /// a partial bundle can never be observed. Nothing is written when the
+    /// bundle is already fully applied (an idempotent retry).
+    pub fn ingest_atomic_persistent(
+        &mut self,
+        wal: &mut FileWal,
+        claim: Claim,
+        evidence: Vec<Evidence>,
+        edges: Vec<ClaimEdge>,
+        vector: Option<Vec<f32>>,
+        ts_unix_ms: u64,
+    ) -> Result<AtomicIngestOutcome, StoreError> {
+        self.validate_bundle(&claim, &evidence, &edges)?;
+        if let Some(values) = vector.as_deref() {
+            self.validate_vector_for_tenant(&claim.tenant_id, values)?;
+        }
+        if self.bundle_already_applied(&claim, &evidence, &edges, vector.as_deref()) {
+            return Ok(AtomicIngestOutcome {
+                applied: false,
+                disk_error: None,
+            });
+        }
+
+        let claim_id = claim.claim_id.clone();
+        let rollback_point = wal.begin_rollback_point()?;
+        let appended = (|| {
+            wal.begin_group(&claim_id, ts_unix_ms)?;
+            wal.append_claim(&claim)?;
+            for evd in &evidence {
+                wal.append_evidence(evd)?;
+            }
+            for edge in &edges {
+                wal.append_edge(edge)?;
+            }
+            if let Some(values) = vector.as_deref() {
+                wal.append_claim_vector(&claim_id, values)?;
+            }
+            wal.append_batch_commit(
+                &format!("{SINGLE_TX_PREFIX}{claim_id}"),
+                1,
+                ts_unix_ms,
+                std::slice::from_ref(&claim_id),
+            )
+        })();
+        if let Err(err) = appended {
+            if let Err(rollback_err) = wal.rollback_to(rollback_point) {
+                eprintln!("ingest rollback failed after WAL append error: {rollback_err:?}");
+            }
+            return Err(err);
+        }
+
+        let disk_error = self.apply_with_deferred_disk(|store| {
+            store.apply_bundle(claim, evidence, edges)?;
+            if let Some(values) = vector {
+                store.apply_claim_vector(&claim_id, values)?;
+            }
+            Ok(())
+        })?;
+        Ok(AtomicIngestOutcome {
+            applied: true,
+            disk_error,
+        })
     }
 
     pub fn ingest_bundle_persistent_with_policy(
@@ -2020,6 +2203,10 @@ impl InMemoryStore {
     }
 
     fn apply_batch_commit_record(&mut self, record: BatchCommitRecord) -> Result<(), StoreError> {
+        // Group delimiters carry no batch metadata of their own.
+        if is_group_marker_commit_id(&record.commit_id) {
+            return Ok(());
+        }
         // Compute the metadata the same way the inner function will,
         // so we can mirror to disk before mutating in-memory state.
         let payload_fingerprint =

@@ -55,7 +55,7 @@ use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
     PlacementRoutingState, WriteRouteError, WriteRouteResolution, map_write_route_error,
-    write_entity_key_for_claim,
+    refresh_placement, write_entity_key_for_claim,
 };
 use replication::{
     ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
@@ -67,8 +67,8 @@ use request::{
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationFrame,
-    WalReplicationExport, batch_commit_payload_fingerprint,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationExport,
+    WalReplicationFrame,
 };
 
 use crate::{
@@ -78,7 +78,7 @@ use crate::{
         IngestDocumentApiResponse, IngestRawApiResponse, WriteConsistencyPolicy,
     },
     extraction::{build_ingest_batch_from_document_request, build_ingest_raw_output_from_request},
-    ingest_document, ingest_document_persistent_with_policy,
+    ingest_document,
 };
 
 #[cfg(test)]
@@ -373,13 +373,14 @@ impl IngestionRuntime {
                 total_replicas: 1,
             });
         };
-        routing_state.maybe_refresh();
+        routing_state.check_fresh()?;
         let routing = routing_state.runtime();
         let entity_key = write_entity_key_for_claim(claim);
+        let tenant_router_config = routing.router_config_for_tenant(&claim.tenant_id);
         let routed = route_write_with_placement(
             &claim.tenant_id,
             entity_key,
-            &routing.router_config,
+            &tenant_router_config,
             &routing.placements,
         )
         .map_err(WriteRouteError::Placement)?;
@@ -441,10 +442,14 @@ impl IngestionRuntime {
             evidence: request.evidence,
             edges: request.edges,
         };
-        let checkpoint_stats = self.ingest_input_internal(input)?;
+        let (checkpoint_stats, checkpoint_deferred, applied) = self.ingest_input_internal(input)?;
 
         self.successful_ingests += 1;
-        self.publish_segments_for_tenant(&tenant_id);
+        // A retry that changed nothing must not re-scan the tenant's claims
+        // to rebuild segments.
+        if applied {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
         Ok(IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
@@ -457,6 +462,7 @@ impl IngestionRuntime {
             checkpoint_truncated_wal_records: checkpoint_stats
                 .as_ref()
                 .map(|s| s.truncated_wal_records),
+            checkpoint_deferred,
         })
     }
 
@@ -482,22 +488,27 @@ impl IngestionRuntime {
             ingested_claim_ids.push(claim_id);
         }
 
-        if let Some(existing) = self.store.batch_commit_metadata(&commit_id) {
-            let incoming_fingerprint =
-                batch_commit_payload_fingerprint(ingested_claim_ids.len(), &ingested_claim_ids);
-            if existing.payload_fingerprint != incoming_fingerprint {
-                return Err(StoreError::Conflict(format!(
-                    "batch commit_id '{}' already exists with different payload (existing_fingerprint={}, incoming_fingerprint={})",
-                    commit_id, existing.payload_fingerprint, incoming_fingerprint
-                )));
-            }
-
+        // Idempotency is decided on CONTENT, not on claim ids (DATA-12): a
+        // known commit id whose every bundle is already stored verbatim is a
+        // replay; a known commit id with different content is an update that
+        // upserts over the previous version.
+        let existing = self.store.batch_commit_metadata(&commit_id).cloned();
+        let content_unchanged = inputs.iter().all(|input| {
+            self.store.bundle_already_applied(
+                &input.claim,
+                &input.evidence,
+                &input.edges,
+                input.claim_embedding.as_deref(),
+            )
+        });
+        if existing.is_some() && content_unchanged {
             self.batch_success_total = self.batch_success_total.saturating_add(1);
             self.batch_last_size = ingested_claim_ids.len();
             self.batch_idempotent_hit_total = self.batch_idempotent_hit_total.saturating_add(1);
             return Ok(IngestBatchApiResponse {
                 commit_id,
                 idempotent_replay: true,
+                updated: false,
                 batch_size: ingested_claim_ids.len(),
                 ingested_claim_ids,
                 claims_total: self.store.claims_len(),
@@ -508,23 +519,47 @@ impl IngestionRuntime {
                 checkpoint_triggered: false,
                 checkpoint_snapshot_records: None,
                 checkpoint_truncated_wal_records: None,
+                checkpoint_deferred: false,
             });
         }
+        let updated = existing.is_some();
+        // The commit metadata is keyed by claim-id set; an update that
+        // changes the set is recorded under a versioned id so the original
+        // record is never rewritten (and replay never sees a conflict).
+        let wal_commit_id = match existing.as_ref() {
+            Some(meta) if meta.claim_ids != ingested_claim_ids => format!(
+                "{commit_id}@{}",
+                store::batch_commit_payload_fingerprint(
+                    ingested_claim_ids.len(),
+                    &ingested_claim_ids
+                )
+            ),
+            _ => commit_id.clone(),
+        };
 
-        let mut staged_store = self.store.clone();
+        // Stage on a detached clone: nothing reaches redb until the WAL
+        // append succeeded (DATA-09).
+        let commit_ts_unix_ms = unix_timestamp_millis();
+        let mut staged_store = self.store.clone_detached();
         for input in &inputs {
             ingest_document(&mut staged_store, input.clone())?;
         }
+        staged_store.observe_batch_commit(
+            &wal_commit_id,
+            ingested_claim_ids.len(),
+            commit_ts_unix_ms,
+            &ingested_claim_ids,
+        )?;
 
-        let commit_ts_unix_ms = unix_timestamp_millis();
         if let Some(wal) = self.wal.as_mut() {
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
+                wal.begin_group(&wal_commit_id, commit_ts_unix_ms)?;
                 for input in &inputs {
                     append_input_to_wal(wal, input)?;
                 }
                 wal.append_batch_commit(
-                    &commit_id,
+                    &wal_commit_id,
                     ingested_claim_ids.len(),
                     commit_ts_unix_ms,
                     &ingested_claim_ids,
@@ -540,28 +575,16 @@ impl IngestionRuntime {
             self.batch_commit_total = self.batch_commit_total.saturating_add(1);
         }
 
-        self.store = staged_store;
+        // The WAL is durable: the commit stands even if redb mirroring
+        // fails (the store detaches redb and reports `Unavailable`).
+        if let Err(err) = self.store.commit_staged(staged_store) {
+            eprintln!("ingestion batch commit: redb mirror failed after WAL commit: {err:?}");
+        }
         self.successful_ingests = self
             .successful_ingests
             .saturating_add(ingested_claim_ids.len() as u64);
 
-        let mut checkpoint_stats = None;
-        self.store.observe_batch_commit(
-            &commit_id,
-            ingested_claim_ids.len(),
-            commit_ts_unix_ms,
-            &ingested_claim_ids,
-        )?;
-        if let Some(wal) = self.wal.as_mut()
-            && should_checkpoint_now(&self.checkpoint_policy, wal)?
-        {
-            match self.store.checkpoint_and_compact(wal) {
-                Ok(stats) => checkpoint_stats = Some(stats),
-                Err(err) => {
-                    eprintln!("ingestion batch checkpoint failed after commit: {err:?}");
-                }
-            }
-        }
+        let (checkpoint_stats, checkpoint_deferred) = self.checkpoint_after_commit("batch");
 
         for tenant_id in touched_tenants {
             self.publish_segments_for_tenant(&tenant_id);
@@ -572,6 +595,7 @@ impl IngestionRuntime {
         Ok(IngestBatchApiResponse {
             commit_id,
             idempotent_replay: false,
+            updated,
             batch_size: ingested_claim_ids.len(),
             ingested_claim_ids,
             claims_total: self.store.claims_len(),
@@ -584,25 +608,57 @@ impl IngestionRuntime {
             checkpoint_truncated_wal_records: checkpoint_stats
                 .as_ref()
                 .map(|s| s.truncated_wal_records),
+            checkpoint_deferred,
         })
+    }
+
+    /// Checkpoint after a committed write. A failure never invalidates the
+    /// commit: the write is durable in the WAL, so the caller is told the
+    /// checkpoint was deferred and a later write retries it (DATA-10).
+    fn checkpoint_after_commit(
+        &mut self,
+        label: &str,
+    ) -> (Option<store::WalCheckpointStats>, bool) {
+        let Some(wal) = self.wal.as_mut() else {
+            return (None, false);
+        };
+        match should_checkpoint_now(&self.checkpoint_policy, wal) {
+            Ok(false) => (None, false),
+            Ok(true) => match self.store.checkpoint_and_compact(wal) {
+                Ok(stats) => (Some(stats), false),
+                Err(err) => {
+                    eprintln!("ingestion {label} checkpoint failed after commit: {err:?}");
+                    (None, true)
+                }
+            },
+            Err(err) => {
+                eprintln!("ingestion {label} checkpoint check failed after commit: {err:?}");
+                (None, true)
+            }
+        }
     }
 
     fn ingest_input_internal(
         &mut self,
         input: IngestInput,
-    ) -> Result<Option<store::WalCheckpointStats>, StoreError> {
-        let checkpoint_stats = if let Some(wal) = self.wal.as_mut() {
-            ingest_document_persistent_with_policy(
-                &mut self.store,
-                wal,
-                &self.checkpoint_policy,
-                input,
-            )?
-        } else {
+    ) -> Result<(Option<store::WalCheckpointStats>, bool, bool), StoreError> {
+        let Some(wal) = self.wal.as_mut() else {
             ingest_document(&mut self.store, input)?;
-            None
+            return Ok((None, false, true));
         };
-        Ok(checkpoint_stats)
+        let outcome = self.store.ingest_atomic_persistent(
+            wal,
+            input.claim,
+            input.evidence,
+            input.edges,
+            input.claim_embedding,
+            unix_timestamp_millis(),
+        )?;
+        if let Some(reason) = outcome.disk_error {
+            eprintln!("ingestion redb mirror failed after WAL commit: {reason}");
+        }
+        let (stats, deferred) = self.checkpoint_after_commit("ingest");
+        Ok((stats, deferred, outcome.applied))
     }
 
     fn publish_segments_for_tenant(&mut self, tenant_id: &str) {
@@ -832,9 +888,19 @@ impl IngestionRuntime {
         self.transport_backpressure = Some(metrics);
     }
 
-    pub(crate) fn refresh_placement_if_due(&mut self) {
+    fn begin_placement_refresh(&mut self) -> Option<placement_routing::PlacementRefreshJob> {
+        match self.placement_routing.as_mut() {
+            Ok(Some(state)) => state.begin_refresh(),
+            _ => None,
+        }
+    }
+
+    fn finish_placement_refresh(
+        &mut self,
+        result: Result<placement_routing::PlacementRoutingRuntime, String>,
+    ) {
         if let Ok(Some(state)) = self.placement_routing.as_mut() {
-            state.maybe_refresh();
+            state.finish_refresh(result);
         }
     }
 

@@ -654,6 +654,14 @@ impl Follower {
         if frame.next_offset > frame.total_records {
             return Err("replication frame next_offset exceeds total_records".to_string());
         }
+        // Apply only whole commit groups; an unterminated trailing group is
+        // held back and re-fetched from its first line on the next poll.
+        let mut frame = frame;
+        let keep = store::complete_group_prefix_len(&frame.wal_lines);
+        if keep < frame.wal_lines.len() {
+            frame.wal_lines.truncate(keep);
+            frame.next_offset = frame.from_offset + keep;
+        }
         if !frame.wal_lines.is_empty() {
             self.apply_delta(&frame.wal_lines)?;
         }
@@ -963,7 +971,11 @@ fn parse_delta_frame(body: &str, max_records: usize) -> Result<DeltaFrame, Strin
     let records = parse_kv_usize(&mut lines, "records")?;
     // Reject absurd counts before touching them: the leader never returns
     // more than it was asked for.
-    if records > max_records.max(1) || records > body.len() {
+    // Frames may run past `max_records` to end on a commit-group boundary.
+    let limit = max_records
+        .max(1)
+        .saturating_add(store::REPLICATION_GROUP_EXTENSION_MAX);
+    if records > limit || records > body.len() {
         return Err(format!(
             "replication delta advertises {records} records (limit {max_records})"
         ));

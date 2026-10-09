@@ -359,7 +359,11 @@ pub(crate) fn parse_replication_delta_frame(
     let next_offset = parse_kv_usize(&mut lines, "next_offset")?;
     let total_records = parse_kv_usize(&mut lines, "total_records")?;
     let records = parse_kv_usize(&mut lines, "records")?;
-    if records > max_records.max(1) || records > body.len() {
+    // Frames may run past `max_records` to end on a commit-group boundary.
+    let limit = max_records
+        .max(1)
+        .saturating_add(store::REPLICATION_GROUP_EXTENSION_MAX);
+    if records > limit || records > body.len() {
         return Err(format!(
             "replication delta advertises {records} records (limit {max_records})"
         ));
@@ -854,6 +858,14 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
     }
     if delta_frame.next_offset > delta_frame.total_records {
         return Err("replication frame next_offset exceeds total_records".to_string());
+    }
+    // Apply only whole commit groups: an unterminated group at the end of
+    // the frame is held back and re-fetched from its first line next poll.
+    let mut delta_frame = delta_frame;
+    let keep = store::complete_group_prefix_len(&delta_frame.wal_lines);
+    if keep < delta_frame.wal_lines.len() {
+        delta_frame.wal_lines.truncate(keep);
+        delta_frame.next_offset = delta_frame.from_offset + keep;
     }
     let commit_ids = extract_batch_commit_ids_from_wal_lines(&delta_frame.wal_lines)?;
     runtime

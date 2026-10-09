@@ -291,25 +291,16 @@ where
 }
 
 fn attach_disk(store: InMemoryStore, disk_path: &str) -> InMemoryStore {
-    match store.with_disk(disk_path) {
-        Ok(updated) => {
-            match updated.disk_status() {
-                store::DiskStatus::Unavailable { reason } => {
-                    tracing::error!(
-                        "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                    );
-                }
-                _ => {
-                    tracing::info!("retrieval persistence: disk={disk_path}");
-                }
-            }
-            updated
-        }
-        Err(err) => {
+    let updated = store.attach_disk(disk_path);
+    match updated.disk_status() {
+        store::DiskStatus::Unavailable { reason } => {
             tracing::error!(
-                "retrieval redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+                "retrieval redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
             );
-            unreachable!("with_disk always returns Ok")
+        }
+        _ => {
+            tracing::info!("retrieval persistence: disk={disk_path}");
         }
     }
+    updated
 }

@@ -363,7 +363,7 @@ fn transport_post_ingest_batch_replays_idempotently_for_same_commit_id() {
 }
 
 #[test]
-fn transport_post_ingest_batch_rejects_commit_id_reuse_with_different_payload() {
+fn transport_post_ingest_batch_commit_id_reuse_with_changed_content_is_an_update() {
     let _guard = env_lock().lock().expect("env lock should be available");
     let runtime = sample_runtime();
     let first_body = r#"{
@@ -411,12 +411,11 @@ fn transport_post_ingest_batch_rejects_commit_id_reuse_with_different_payload() 
         .expect("second request should parse and return response");
     let second_response = String::from_utf8(second_response).expect("response should be UTF-8");
     assert!(
-        second_response.starts_with("HTTP/1.1 409"),
+        second_response.starts_with("HTTP/1.1 200"),
         "response was: {second_response}"
     );
-    assert!(second_response.contains("state conflict"));
-    assert!(second_response.contains("existing_fingerprint="));
-    assert!(second_response.contains("incoming_fingerprint="));
+    assert!(second_response.contains("\"updated\":true"));
+    assert!(second_response.contains("\"idempotent_replay\":false"));
 }
 
 #[test]
@@ -1076,6 +1075,18 @@ fn transport_ingest_authorizes_before_calling_the_embedding_provider() {
             &runtime,
             &ingest_request(&format!("X-API-Key: {STRONG_API_KEY}\r\n"))
         ),
-        "400"
+        // An unreachable provider is a retryable 503 with a short code and
+        // no provider detail (endpoint, error text).
+        "503"
     );
+    let detail = String::from_utf8(
+        handle_http_request_bytes(
+            &runtime,
+            ingest_request(&format!("X-API-Key: {STRONG_API_KEY}\r\n")).as_bytes(),
+        )
+        .expect("request should parse"),
+    )
+    .expect("response should be UTF-8");
+    assert!(detail.contains("embedding_unavailable"), "{detail}");
+    assert!(!detail.contains("127.0.0.1"), "{detail}");
 }

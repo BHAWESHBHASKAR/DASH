@@ -448,6 +448,8 @@ fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
     leader.restart(no_checkpoint());
     leader.ingest("d", Some("anchor"));
     leader.ingest("e", Some("anchor"));
+    leader.ingest("f", Some("anchor"));
+    leader.ingest("g", Some("anchor"));
     let (_, total_after) = leader.frame();
     assert!(
         total_after >= follower_offset,
@@ -456,10 +458,10 @@ fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
 
     node.handle().resume();
     wait_until("follower converges", Duration::from_secs(10), || {
-        node.claim_ids().len() == 5
+        node.claim_ids().len() == 7
     });
-    assert_eq!(node.claim_ids(), vec!["a", "b", "c", "d", "e"]);
-    for id in ["a", "b", "c", "d", "e"] {
+    assert_eq!(node.claim_ids(), vec!["a", "b", "c", "d", "e", "f", "g"]);
+    for id in ["a", "b", "c", "d", "e", "f", "g"] {
         assert_eq!(supports_for(&node.store, id), 1, "evidence for {id}");
     }
     wait_until("resync counted", Duration::from_secs(10), || {
@@ -940,4 +942,248 @@ fn bad_leader_responses_never_partially_apply_or_kill_the_follower() {
     wait_until("recovers", Duration::from_secs(10), || {
         node.store.read().unwrap().claims_len() == 1
     });
+}
+
+// ---------------------------------------------------------------------
+// Commit groups (single ingests and batches) on the replication stream
+// ---------------------------------------------------------------------
+
+impl Leader {
+    fn post_batch(&self, commit_id: &str, claim_ids: &[&str]) {
+        let items: Vec<String> = claim_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    r#"{{"claim":{{"claim_id":"{id}","tenant_id":"{TENANT}","canonical_text":"replicated statement {id}","confidence":0.9}},"evidence":[{{"evidence_id":"ev-{id}","claim_id":"{id}","source_id":"source://{id}","stance":"supports","source_quality":0.9}}]}}"#
+                )
+            })
+            .collect();
+        let body = format!(
+            r#"{{"commit_id":"{commit_id}","items":[{}]}}"#,
+            items.join(",")
+        );
+        let (status, text) = http_post_json(&self.addr, "/v1/ingest/batch", &body);
+        assert_eq!(status, 200, "batch {commit_id} failed: {text}");
+    }
+
+    /// One replication frame as `(next_offset, total_records, lines)`.
+    fn frame_from(&self, from: usize, max_records: usize) -> (usize, usize, Vec<String>) {
+        let (status, body) = http(
+            &self.addr,
+            "GET",
+            &format!(
+                "/internal/replication/wal?from_offset={from}&max_records={max_records}&from_generation={}",
+                self.frame().0
+            ),
+            &[("x-replication-token", TOKEN)],
+        );
+        assert_eq!(status, 200, "{body}");
+        let mut lines = body.lines();
+        let mut next = 0;
+        let mut total = 0;
+        for line in lines.by_ref() {
+            if let Some(v) = line.strip_prefix("next_offset=") {
+                next = v.parse().unwrap();
+            } else if let Some(v) = line.strip_prefix("total_records=") {
+                total = v.parse().unwrap();
+            } else if line.starts_with("records=") {
+                break;
+            }
+        }
+        (next, total, lines.map(str::to_string).collect())
+    }
+}
+
+#[test]
+fn leader_frames_never_end_inside_a_commit_group() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(&dir.path().join("leader.wal"), None, no_checkpoint());
+    leader.ingest("g1", None);
+    leader.post_batch("batch-1", &["b1", "b2", "b3"]);
+    leader.ingest("g2", None);
+
+    let (_, total, all) = leader.frame_from(0, 10_000);
+    assert_eq!(all.len(), total);
+    let boundaries: Vec<usize> = (0..=total)
+        .filter(|b| store::complete_group_prefix_len(&all[..*b]) == *b)
+        .collect();
+    assert!(boundaries.len() > 3, "expected several group boundaries");
+    for &from in &boundaries {
+        if from == total {
+            continue;
+        }
+        for max in 1..=6 {
+            let (next, _, lines) = leader.frame_from(from, max);
+            assert_eq!(
+                from + lines.len(),
+                next,
+                "from={from} max={max} lines={lines:?}"
+            );
+            assert!(next > from);
+            assert_eq!(
+                store::complete_group_prefix_len(&lines),
+                lines.len(),
+                "frame from={from} max={max} ends inside a group"
+            );
+        }
+    }
+}
+
+#[test]
+fn follower_converges_over_groups_with_tiny_frames_and_restart_mid_stream() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(&dir.path().join("leader.wal"), None, no_checkpoint());
+    leader.ingest("s1", Some("anchor"));
+    leader.post_batch("batch-a", &["a1", "a2", "a3"]);
+    leader.ingest("s2", Some("anchor"));
+
+    let follower_wal = dir.path().join("follower.wal");
+    let mut config = test_config(&leader.addr);
+    config.max_records = 1;
+    let mut node = start_durable(config.clone(), &follower_wal);
+    wait_until("first claims", Duration::from_secs(10), || {
+        !node.claim_ids().is_empty()
+    });
+    // Restart mid-stream, with more groups arriving meanwhile.
+    node.stop();
+    leader.post_batch("batch-b", &["x1", "x2"]);
+    leader.ingest("s3", Some("anchor"));
+    let node = start_durable(config, &follower_wal);
+
+    let expected = ["a1", "a2", "a3", "s1", "s2", "s3", "x1", "x2"];
+    wait_until("converged", Duration::from_secs(15), || {
+        node.claim_ids() == expected
+    });
+    let (_, total) = leader.frame();
+    wait_until("offset", Duration::from_secs(10), || {
+        node.status().offset == total
+    });
+    assert_eq!(node.status().resyncs_total, 0);
+    assert_eq!(
+        node.store.read().unwrap().edges_for_claim("s1").len(),
+        1,
+        "no duplicate edges"
+    );
+    assert_eq!(supports_for(&node.store, "a1"), 1, "no duplicate evidence");
+    drop(node);
+    let wal = FileWal::open(&follower_wal).expect("reopen");
+    assert_eq!(
+        wal.wal_record_count().unwrap(),
+        total,
+        "each leader line (markers included) exactly once"
+    );
+    let replayed = InMemoryStore::load_from_wal(&wal).expect("replay");
+    assert_eq!(replayed.claim_count_for_tenant(TENANT), expected.len() + 1);
+}
+
+#[test]
+fn follower_holds_back_an_unterminated_group_and_refetches_from_its_start() {
+    // A scripted leader serves a frame that ends inside a group.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src_wal = dir.path().join("src.wal");
+    {
+        let mut wal = FileWal::open(&src_wal).unwrap();
+        let mut s = InMemoryStore::new();
+        for id in ["h1", "h2"] {
+            s.ingest_atomic_persistent(
+                &mut wal,
+                schema::Claim {
+                    claim_id: id.to_string(),
+                    tenant_id: TENANT.to_string(),
+                    canonical_text: format!("replicated statement {id}"),
+                    confidence: 0.9,
+                    event_time_unix: None,
+                    entities: vec![],
+                    embedding_ids: vec![],
+                    claim_type: None,
+                    valid_from: None,
+                    valid_to: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+                vec![],
+                vec![],
+                None,
+                1,
+            )
+            .unwrap();
+        }
+    }
+    let lines: Vec<String> = std::fs::read_to_string(&src_wal)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines.len(), 6);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let requested = Arc::new(Mutex::new(Vec::<usize>::new()));
+    {
+        let requested = Arc::clone(&requested);
+        let lines = lines.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let from: usize = head
+                    .split("from_offset=")
+                    .nth(1)
+                    .and_then(|r| r.split(['&', ' ']).next())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let first_poll = {
+                    let mut guard = requested.lock().unwrap();
+                    guard.push(from);
+                    guard.len() == 1
+                };
+                // First poll: cut inside the second group (5 of 6 lines).
+                let end = if first_poll { 5 } else { 6 };
+                let slice = &lines[from..end];
+                let body = format!(
+                    "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset={from}\nnext_offset={end}\ntotal_records=6\nrecords={}\n{}\n",
+                    slice.len(),
+                    slice.join("\n")
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+    }
+    let node = start_durable(test_config(&addr), &dir.path().join("follower.wal"));
+    wait_until("both groups applied", Duration::from_secs(10), || {
+        node.claim_ids() == ["h1", "h2"]
+    });
+    let polls = requested.lock().unwrap().clone();
+    assert_eq!(
+        &polls[..2],
+        &[0, 3],
+        "second poll restarts at the held-back group"
+    );
+    wait_until("offset at end", Duration::from_secs(5), || {
+        node.status().offset == 6
+    });
+}
+
+#[test]
+fn leader_checkpoint_between_groups_forces_resync_and_converges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(
+        &dir.path().join("leader.wal"),
+        None,
+        checkpoint_every_record(),
+    );
+    leader.ingest("k1", None);
+    let node = start_durable(test_config(&leader.addr), &dir.path().join("follower.wal"));
+    wait_until("k1", Duration::from_secs(10), || node.claim_ids() == ["k1"]);
+    leader.post_batch("batch-k", &["k2", "k3"]);
+    leader.ingest("k4", None);
+    wait_until("converged", Duration::from_secs(15), || {
+        node.claim_ids() == ["k1", "k2", "k3", "k4"]
+    });
+    assert_eq!(supports_for(&node.store, "k2"), 1, "no duplicate evidence");
 }

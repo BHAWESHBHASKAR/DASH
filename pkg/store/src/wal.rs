@@ -155,6 +155,141 @@ pub struct WalReplicationExport {
     pub wal_lines: Vec<String>,
 }
 
+/// Prefix of the batch-commit record that opens a commit group. A group is
+/// `B2(~grp:<id>) <records...> B2(<id>)`; on replay a group whose closing
+/// `B2(<id>)` is missing was torn by a crash and is discarded as a whole,
+/// so a bundle is never partially applied (DATA-10).
+pub const GROUP_BEGIN_PREFIX: &str = "~grp:";
+
+/// Prefix of the commit id used by single `/v1/ingest` transactions. These
+/// markers only delimit the WAL group; they are never registered as batch
+/// commits in the store.
+pub const SINGLE_TX_PREFIX: &str = "~tx:";
+
+/// `true` for commit ids that only delimit WAL groups and carry no batch
+/// metadata of their own.
+/// Upper bound on how far a replication frame may be extended past
+/// `max_records` to end on a commit-group boundary. Followers accept frames
+/// of `max_records + REPLICATION_GROUP_EXTENSION_MAX` lines.
+pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 100_000;
+
+enum GroupEvent {
+    Begin(String),
+    End(String),
+}
+
+fn group_event(line: &str) -> Option<GroupEvent> {
+    if !line.starts_with("B2	") {
+        return None;
+    }
+    let Ok(PersistedRecord::BatchCommit(commit)) = line_to_record(line) else {
+        return None;
+    };
+    if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+        return Some(GroupEvent::Begin(id.to_string()));
+    }
+    Some(GroupEvent::End(commit.commit_id))
+}
+
+fn closes_group(open_id: &str, end_id: &str) -> bool {
+    end_id == open_id || end_id.strip_prefix(SINGLE_TX_PREFIX) == Some(open_id)
+}
+
+/// Number of leading `lines` that form complete commit groups (plus
+/// ungrouped legacy records). A trailing unterminated group is excluded, so
+/// a replication follower applies only whole groups and re-fetches from the
+/// group's first line.
+pub fn complete_group_prefix_len(lines: &[String]) -> usize {
+    let mut open: Option<(usize, String)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        match group_event(line) {
+            Some(GroupEvent::Begin(id)) => open = Some((idx, id)),
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    open.map_or(lines.len(), |(start, _)| start)
+}
+
+/// Moves `next` forward so a frame `[from, next)` does not end inside a
+/// commit group, when the group closes within the extension bound.
+fn extend_to_group_end(lines: &[String], from: usize, next: usize) -> usize {
+    let mut open: Option<String> = None;
+    for line in &lines[from..next] {
+        match group_event(line) {
+            Some(GroupEvent::Begin(id)) => open = Some(id),
+            Some(GroupEvent::End(id)) if open.as_ref().is_some_and(|o| closes_group(o, &id)) => {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    let Some(id) = open else {
+        return next;
+    };
+    let bound = lines
+        .len()
+        .min(next.saturating_add(REPLICATION_GROUP_EXTENSION_MAX));
+    for (offset, line) in lines[next..bound].iter().enumerate() {
+        if let Some(GroupEvent::End(end)) = group_event(line)
+            && closes_group(&id, &end)
+        {
+            return next + offset + 1;
+        }
+    }
+    next
+}
+
+pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
+    commit_id.starts_with(GROUP_BEGIN_PREFIX) || commit_id.starts_with(SINGLE_TX_PREFIX)
+}
+
+/// Drops records of commit groups that were never closed. Records outside
+/// any group (legacy appends) pass through untouched. Returns the kept
+/// records and the number of discarded records.
+pub(crate) fn resolve_commit_groups<T>(
+    records: Vec<T>,
+    record_of: impl Fn(&T) -> &PersistedRecord,
+) -> (Vec<T>, usize) {
+    let mut out = Vec::with_capacity(records.len());
+    let mut open: Option<(String, Vec<T>)> = None;
+    let mut discarded = 0usize;
+    for item in records {
+        if let PersistedRecord::BatchCommit(commit) = record_of(&item) {
+            if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+                if let Some((_, buffered)) = open.take() {
+                    discarded += buffered.len() + 1;
+                }
+                open = Some((id.to_string(), Vec::new()));
+                continue;
+            }
+            let closes = open.as_ref().is_some_and(|(id, _)| {
+                commit.commit_id == *id
+                    || commit.commit_id.strip_prefix(SINGLE_TX_PREFIX) == Some(id.as_str())
+            });
+            if closes {
+                if let Some((_, buffered)) = open.take() {
+                    out.extend(buffered);
+                }
+                out.push(item);
+                continue;
+            }
+        }
+        match open.as_mut() {
+            Some((_, buffered)) => buffered.push(item),
+            None => out.push(item),
+        }
+    }
+    if let Some((_, buffered)) = open {
+        discarded += buffered.len() + 1;
+    }
+    (out, discarded)
+}
+
 pub struct FileWal {
     path: PathBuf,
     wal_records: usize,
@@ -227,7 +362,7 @@ impl FileWal {
         if !existed {
             sync_parent_dir(&path)?;
         }
-        let torn_tail_dropped = repair_torn_tail(&path)?;
+        let torn_tail_dropped = repair_torn_tail(&path)? + truncate_unterminated_group(&path)?;
         let wal_records = count_non_empty_lines(&path)?;
         let generation = load_or_create_generation(&generation_path_for(&path))?;
         Ok(Self {
@@ -340,6 +475,19 @@ impl FileWal {
             batch_size,
             ts_unix_ms,
             claim_ids: claim_ids.to_vec(),
+        }))
+    }
+
+    /// Opens a commit group. Every record appended afterwards belongs to
+    /// the group until `append_batch_commit` is called with the same
+    /// `commit_id` (single ingests use `SINGLE_TX_PREFIX + claim_id` for
+    /// the closing record and pass the bare `claim_id`-based id here).
+    pub fn begin_group(&mut self, group_id: &str, ts_unix_ms: u64) -> Result<(), StoreError> {
+        self.append_record(&PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{GROUP_BEGIN_PREFIX}{group_id}"),
+            batch_size: 0,
+            ts_unix_ms,
+            claim_ids: Vec::new(),
         }))
     }
 
@@ -463,6 +611,8 @@ impl FileWal {
         }
         let limit = max_records.max(1);
         let next_offset = from_offset.saturating_add(limit).min(total_records);
+        // Never cut a frame inside a commit group when it can be avoided.
+        let next_offset = extend_to_group_end(&wal_lines, from_offset, next_offset);
         Ok(WalReplicationFrame {
             generation: self.generation,
             from_offset,
@@ -605,23 +755,30 @@ impl FileWal {
             n
         };
         let scan = scan_wal(&self.path)?;
-        let mut wal_count = 0usize;
+        let mut wal_items = Vec::new();
         for (line_no, line) in scan.lines {
             let origin = format!("wal line {line_no}");
             if let Some(item) = parser.parse(line, origin, &mut sink)? {
-                items.push(item);
-                wal_count += 1;
+                wal_items.push(item);
             }
         }
         for line in &self.append_buffer {
-            items.push(ReplayItem {
+            wal_items.push(ReplayItem {
                 record: line_to_record(line)?,
                 legacy: false,
                 raw: None,
                 origin: "unflushed wal buffer".to_string(),
             });
-            wal_count += 1;
         }
+        // Commit groups that were never closed are torn writes: drop them
+        // whole (quarantined lines were already removed, so a group with a
+        // quarantined member still closes normally).
+        let (wal_items, discarded) = resolve_commit_groups(wal_items, |item| &item.record);
+        if discarded > 0 {
+            eprintln!("warning: discarded {discarded} records of an unterminated WAL commit group");
+        }
+        let wal_count = wal_items.len();
+        items.extend(wal_items);
         let stats = WalReplayStats {
             snapshot_records: snapshot_count,
             wal_records: wal_count,
@@ -1165,6 +1322,54 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(0)
+}
+
+/// Physically truncates an unterminated commit group at the end of the log
+/// (see [`GROUP_BEGIN_PREFIX`]) so later appends cannot be mistaken for
+/// members of the torn group. Returns the number of dropped lines.
+fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
+    let scan = scan_wal(path)?;
+    let mut open: Option<(usize, String)> = None;
+    for (line_no, line) in &scan.lines {
+        if !line.starts_with("B2\t") {
+            continue;
+        }
+        let Ok(PersistedRecord::BatchCommit(commit)) = line_to_record(line) else {
+            continue;
+        };
+        if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+            open = Some((*line_no, id.to_string()));
+        } else if open.as_ref().is_some_and(|(_, id)| {
+            commit.commit_id == *id
+                || commit.commit_id.strip_prefix(SINGLE_TX_PREFIX) == Some(id.as_str())
+        }) {
+            open = None;
+        }
+    }
+    let Some((begin_line, _)) = open else {
+        return Ok(0);
+    };
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .read_to_end(&mut bytes)?;
+    let mut offset = 0usize;
+    for (idx, chunk) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+        if idx + 1 == begin_line {
+            break;
+        }
+        offset += chunk.len();
+    }
+    let dropped = scan.lines.iter().filter(|(n, _)| *n >= begin_line).count();
+    eprintln!(
+        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records)",
+        path.display()
+    );
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(offset as u64)?;
+    file.sync_all()?;
+    Ok(dropped)
 }
 
 pub(crate) fn record_to_line(record: &PersistedRecord) -> String {

@@ -81,10 +81,10 @@ pub(super) fn handle_get_request(
             {
                 return denied;
             }
+            refresh_placement(runtime);
             let body = match runtime.lock() {
                 Ok(mut rt) => {
                     rt.flush_wal_if_due();
-                    rt.refresh_placement_if_due();
                     let mut text = rt.metrics_text();
                     text.push_str(&rt.replication_follower_metrics_text());
                     text
@@ -93,11 +93,8 @@ pub(super) fn handle_get_request(
             };
             HttpResponse::ok_text(body)
         }
-        "/debug/placement" => match runtime.lock() {
-            Ok(mut rt) => {
-                rt.refresh_placement_if_due();
-                HttpResponse::ok_json(render_placement_debug_json(&rt, query))
-            }
+        "/debug/placement" => match locked_after_placement_refresh(runtime) {
+            Ok(rt) => HttpResponse::ok_json(render_placement_debug_json(&rt, query)),
             Err(_) => {
                 HttpResponse::internal_server_error("failed to acquire ingestion runtime lock")
             }
@@ -289,4 +286,14 @@ fn escape_json(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+fn locked_after_placement_refresh(
+    runtime: &SharedRuntime,
+) -> Result<
+    std::sync::MutexGuard<'_, IngestionRuntime>,
+    std::sync::PoisonError<std::sync::MutexGuard<'_, IngestionRuntime>>,
+> {
+    refresh_placement(runtime);
+    runtime.lock()
 }

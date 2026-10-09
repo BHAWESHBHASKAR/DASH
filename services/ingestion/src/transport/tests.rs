@@ -2,6 +2,7 @@ use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
 
 mod authz_matrix;
+mod write_path;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
 use metadata_router::{ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader};
 use std::io::Read;
@@ -733,7 +734,7 @@ fn handle_request_post_batch_replays_idempotently_for_same_commit_id() {
 }
 
 #[test]
-fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
+fn handle_request_post_batch_commit_id_reuse_with_changed_content_is_an_update() {
     let runtime = sample_runtime();
     let first_request = HttpRequest {
         method: "POST".to_string(),
@@ -778,10 +779,14 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
         .to_vec(),
     };
     let second = handle_request(&runtime, &second_request);
-    assert_eq!(second.status, 409);
-    assert!(second.body.contains("state conflict"));
-    assert!(second.body.contains("existing_fingerprint="));
-    assert!(second.body.contains("incoming_fingerprint="));
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert!(second.body.contains("\"idempotent_replay\":false"));
+    assert!(second.body.contains("\"updated\":true"));
+    // The identical request afterwards is a plain replay.
+    let third = handle_request(&runtime, &second_request);
+    assert_eq!(third.status, 200);
+    assert!(third.body.contains("\"idempotent_replay\":true"));
+    assert!(!third.body.contains("\"updated\""));
 
     let metrics_request = HttpRequest {
         method: "GET".to_string(),
@@ -794,12 +799,12 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
     assert!(
         metrics_response
             .body
-            .contains("dash_ingest_batch_failed_total 1")
+            .contains("dash_ingest_batch_failed_total 0")
     );
     assert!(
         metrics_response
             .body
-            .contains("dash_ingest_batch_idempotent_hit_total 0")
+            .contains("dash_ingest_batch_idempotent_hit_total 1")
     );
 }
 
@@ -849,12 +854,12 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
         target: "/v1/ingest/batch".to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{
-                "commit_id": "commit-audit-conflict-1",
+                "commit_id": "commit-audit-conflict-2",
                 "items": [
                     {
                         "claim": {
-                            "claim_id": "c-audit-conflict-2",
-                            "tenant_id": "tenant-a",
+                            "claim_id": "c-audit-conflict-1",
+                            "tenant_id": "tenant-b",
                             "canonical_text": "Commit conflict two",
                             "confidence": 0.89
                         }
@@ -882,7 +887,7 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
     assert!(matches!(last_obj.get("status"), Some(JsonValue::Number(raw)) if raw == "409"));
     assert!(matches!(last_obj.get("outcome"), Some(JsonValue::String(raw)) if raw == "denied"));
     assert!(
-        matches!(last_obj.get("reason"), Some(JsonValue::String(raw)) if raw.contains("existing_fingerprint="))
+        matches!(last_obj.get("reason"), Some(JsonValue::String(raw)) if raw.contains("claim_id already exists"))
     );
 
     restore_env_var_for_tests("DASH_INGEST_AUDIT_LOG_PATH", previous_audit_path.as_deref());
@@ -891,6 +896,7 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
 
 #[test]
 fn handle_request_post_batch_is_atomic_on_validation_failure() {
+    ensure_dev_mode_env();
     let wal_path = temp_wal_path();
     let wal = FileWal::open(&wal_path).expect("wal should open");
     let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
@@ -982,8 +988,9 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
     let pull_response = handle_request(&runtime, &pull_request);
     assert_eq!(pull_response.status, 200);
     assert!(pull_response.body.contains("status=ok"));
-    assert!(pull_response.body.contains("records=2"));
-    assert!(pull_response.body.contains("next_offset=2"));
+    // begin marker + claim + vector + commit marker
+    assert!(pull_response.body.contains("records=4"));
+    assert!(pull_response.body.contains("next_offset=4"));
 
     let guard = runtime.lock().expect("runtime lock should be available");
     let _ = std::fs::remove_file(
@@ -1419,14 +1426,14 @@ fn background_only_mode_skips_request_thread_interval_flush() {
     std::thread::sleep(Duration::from_millis(2));
     runtime.flush_wal_if_due();
     let metrics = runtime.metrics_text();
-    assert!(metrics.contains("dash_ingest_wal_unsynced_records 1"));
+    assert!(metrics.contains("dash_ingest_wal_unsynced_records 3"));
     assert!(metrics.contains("dash_ingest_wal_background_flush_only 1"));
 
     runtime.flush_wal_for_async_tick();
     let flushed = runtime.metrics_text();
     assert!(flushed.contains("dash_ingest_wal_unsynced_records 0"));
-    assert!(flushed.contains("dash_ingest_wal_flush_synced_records_total 1"));
-    assert!(flushed.contains("dash_ingest_wal_flush_last_synced_records 1"));
+    assert!(flushed.contains("dash_ingest_wal_flush_synced_records_total 3"));
+    assert!(flushed.contains("dash_ingest_wal_flush_last_synced_records 3"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);
@@ -1456,16 +1463,16 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
         .expect("request should parse");
     runtime.ingest(request).expect("ingest should succeed");
     let before = runtime.metrics_text();
-    assert!(before.contains("dash_ingest_wal_unsynced_records 1"));
-    assert!(before.contains("dash_ingest_wal_buffered_records 1"));
+    assert!(before.contains("dash_ingest_wal_unsynced_records 3"));
+    assert!(before.contains("dash_ingest_wal_buffered_records 3"));
 
     runtime.flush_wal_for_async_tick();
     let after = runtime.metrics_text();
     assert!(after.contains("dash_ingest_wal_unsynced_records 0"));
     assert!(after.contains("dash_ingest_wal_buffered_records 0"));
     assert!(after.contains("dash_ingest_wal_async_flush_tick_total 1"));
-    assert!(after.contains("dash_ingest_wal_flush_synced_records_total 1"));
-    assert!(after.contains("dash_ingest_wal_flush_last_synced_records 1"));
+    assert!(after.contains("dash_ingest_wal_flush_synced_records_total 3"));
+    assert!(after.contains("dash_ingest_wal_flush_last_synced_records 3"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);
@@ -1476,6 +1483,7 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
 
 #[test]
 fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1547,6 +1555,7 @@ fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
 
 #[test]
 fn handle_request_write_route_reresolves_after_leader_promotion() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1640,6 +1649,7 @@ fn handle_request_write_route_reresolves_after_leader_promotion() {
 
 #[test]
 fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1730,6 +1740,7 @@ fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack(
 
 #[test]
 fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insufficient() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1781,6 +1792,7 @@ fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insuff
 
 #[test]
 fn debug_placement_endpoint_returns_structured_route_probe() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1926,6 +1938,7 @@ fn debug_document_parser_endpoint_reports_adapter_configuration() {
 
 #[test]
 fn segment_publish_writes_manifest_and_metrics() {
+    ensure_dev_mode_env();
     let mut root_dir = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

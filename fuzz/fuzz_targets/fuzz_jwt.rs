@@ -4,7 +4,7 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 
 use arbitrary::Arbitrary;
-use auth::{verify_hs256_token_for_tenant, JwtValidationConfig};
+use auth::{JwtValidationConfig, verify_hs256_token_for_tenant};
 
 #[derive(Arbitrary, Debug)]
 struct FuzzInput {

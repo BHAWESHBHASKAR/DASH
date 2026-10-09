@@ -36,19 +36,84 @@ pub struct IngestApiRequest {
     pub edges: Vec<ClaimEdge>,
 }
 
+/// Failure to compute a claim embedding. Carries only a short machine code
+/// and the HTTP status to answer with; provider details (URLs, response
+/// bodies, key material) go to the server log, never to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedFailure {
+    pub status: u16,
+    pub code: &'static str,
+}
+
+impl EmbedFailure {
+    fn from_error(error: &embeddings::EmbeddingError) -> Self {
+        use embeddings::EmbeddingError as E;
+        match error {
+            E::Io(_) | E::Timeout(_) | E::CircuitOpen { .. } | E::InvalidConfig(_) => Self {
+                status: 503,
+                code: "embedding_unavailable",
+            },
+            E::Http { status, .. } if *status == 429 || *status >= 500 => Self {
+                status: 503,
+                code: "embedding_unavailable",
+            },
+            _ => Self {
+                status: 502,
+                code: "embedding_upstream_error",
+            },
+        }
+    }
+}
+
+type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
+
+/// Embedding provider shared by requests. It is rebuilt only when the
+/// provider-related environment changes, instead of on every request.
+fn shared_embedding_provider() -> SharedEmbeddingProvider {
+    use std::hash::{Hash, Hasher};
+    static CACHE: std::sync::Mutex<Option<(u64, SharedEmbeddingProvider)>> =
+        std::sync::Mutex::new(None);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for name in [
+        "DASH_EMBEDDING_PROVIDER",
+        "DASH_OLLAMA_ENDPOINT",
+        "DASH_OLLAMA_BASE_URL",
+        "DASH_OLLAMA_MODEL",
+        "DASH_OPENAI_API_KEY",
+        "DASH_OPENAI_MODEL",
+        "DASH_EMBEDDING_ALLOW_INSECURE_HTTP",
+    ] {
+        std::env::var(name).ok().hash(&mut hasher);
+    }
+    let signature = hasher.finish();
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((cached, provider)) = cache.as_ref()
+        && *cached == signature
+    {
+        return std::sync::Arc::clone(provider);
+    }
+    let provider: SharedEmbeddingProvider =
+        std::sync::Arc::from(embeddings::select_embedding_provider_from_env());
+    *cache = Some((signature, std::sync::Arc::clone(&provider)));
+    provider
+}
+
 impl IngestApiRequest {
     /// Compute a claim embedding using the configured `DASH_EMBEDDING_PROVIDER`
     /// when the caller did not supply one. This lets clients ingest raw claim
     /// text and still get semantic retrieval without calling `/v1/embeddings`
     /// first.
-    pub fn embed_claim_if_missing(&mut self) -> Result<(), String> {
+    pub fn embed_claim_if_missing(&mut self) -> Result<(), EmbedFailure> {
         if self.claim_embedding.is_some() {
             return Ok(());
         }
-        let provider = embeddings::select_embedding_provider_from_env();
+        let provider = shared_embedding_provider();
         let vectors = provider
             .embed(std::slice::from_ref(&self.claim.canonical_text))
-            .map_err(|e| format!("embedding failed: {e}"))?;
+            .map_err(|error| {
+                eprintln!("ingestion embedding provider failed: {error}");
+                EmbedFailure::from_error(&error)
+            })?;
         if let Some(vector) = vectors.into_iter().next() {
             self.claim_embedding = Some(vector);
         }
@@ -138,6 +203,9 @@ impl IngestBatchApiRequestWire {
             .commit_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        if commit_id.as_deref().is_some_and(|id| id.starts_with('~')) {
+            return Err("commit_id must not start with '~' (reserved)".to_string());
+        }
 
         let mut items = Vec::with_capacity(self.items.len());
         let mut expected_tenant: Option<String> = None;
@@ -401,6 +469,10 @@ pub struct IngestApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +480,10 @@ pub struct IngestApiResponse {
 pub struct IngestBatchApiResponse {
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub ingested_claim_ids: Vec<String>,
     pub batch_size: usize,
     pub claims_total: usize,
@@ -421,6 +497,10 @@ pub struct IngestBatchApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +509,10 @@ pub struct IngestRawApiResponse {
     pub document_id: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -446,6 +530,10 @@ pub struct IngestRawApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +544,10 @@ pub struct IngestDocumentApiResponse {
     pub parser_provider: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -473,6 +565,10 @@ pub struct IngestDocumentApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[cfg(test)]
@@ -534,6 +630,7 @@ mod tests {
             checkpoint_triggered: true,
             checkpoint_snapshot_records: Some(10),
             checkpoint_truncated_wal_records: Some(5),
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: IngestApiResponse = serde_json::from_str(&json).unwrap();
@@ -552,6 +649,7 @@ mod tests {
             checkpoint_triggered: false,
             checkpoint_snapshot_records: None,
             checkpoint_truncated_wal_records: None,
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("commit_epoch"));
