@@ -555,11 +555,8 @@ fn parse_ann_tuning_config() -> AnnTuningConfig {
         ])
         .filter(|value| *value > 0)
         .unwrap_or(defaults.flat_threshold),
-        rerank: parse_env_first::<usize>(&[
-            "DASH_INGEST_VECTOR_RERANK",
-            "DASH_VECTOR_RERANK",
-        ])
-        .unwrap_or(defaults.rerank),
+        rerank: parse_env_first::<usize>(&["DASH_INGEST_VECTOR_RERANK", "DASH_VECTOR_RERANK"])
+            .unwrap_or(defaults.rerank),
     }
 }
 

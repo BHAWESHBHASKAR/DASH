@@ -390,3 +390,33 @@ engine-spike wal secs=3                      # results/E_wal.jsonl
 (`engine-spike` = `$CARGO_TARGET_DIR/release/engine-spike`, `SPIKE_SCRATCH` holds temporary index files.) The A, B, D, deletes, C and E result files were
 produced with exactly these arguments except that `run.sh B` and `run.sh C` default to larger parameters than the committed runs (B was run with kind=i8 and nq=300 only,
 C with 100k docs).
+
+## 10. Outcome of the first implementation step (P2 step 1, 2026-10-09)
+
+The vector part of the recommendation is implemented in `pkg/store/src/vector_index.rs` and wired into
+`pkg/store/src/lib.rs`; `ann.rs` and the old graph code are deleted (follow-up 9 above, C31 now cites the new tests).
+Status of this ADR stays Proposed because segments, `tantivy`, the planner on roaring bitmaps, persisted/mmap'd
+indexes and WAL v2 are not built.
+
+- **Layers.** `FlatIndex` (exact, contiguous normalised `f32`), `HnswIndex` (`usearch`, cosine, `i8`, connectivity 16,
+  `ef_construction` 128, `ef_search` 128, exact `f32` rerank of 50 against the store's own `claim_vectors`, so no second
+  full-precision copy), `TenantVectorIndex` (flat until 8192 vectors, then HNSW; claim id to `u64` key interning with key
+  reuse). Non-normalised input is normalised for the index; final scores in retrieval are still computed by the store's
+  `f64` cosine, so they are unchanged.
+- **Filtering.** Time-range and allowed-claim-id filters become predicates. In an HNSW tenant, an allowed set of at most
+  the flat threshold is scanned exactly, otherwise `filtered_search` runs with the predicate (the section 3.3 rule with the
+  threshold set to 8192). A time-only filter on an HNSW tenant scans the tenant's claims to size the allowed set (stopping
+  at the threshold); a roaring prefilter would remove that scan (follow-up 3).
+- **Deletes.** `remove` is a soft delete whose slot is reused by the next insert; replace is remove plus add. Memory does
+  not shrink (section 3.1 deletes); compaction is still a follow-up (8).
+- **Concurrency.** usearch fails a search when all reserved thread contexts are in use, so `HnswIndex` gates searches with a
+  semaphore sized to the reserved contexts (16 or the core count); a test runs 40 concurrent searchers against it. Clones of
+  the store share the usearch index and copy it on the first write (staged batches carry no copy unless they write vectors).
+- **Cold start.** Not persisted: replay collects the vectors and builds each tenant once with several threads. Measured
+  numbers (100k x 384-d: 24 s total, 18.6 s index build; 20k: 4.3 s incremental) are in `docs/benchmarks/performance.md`.
+  Persisting with `save` and mapping with `view` (45 ms for 500k vectors in section 3.2) is the next step, together with a
+  version check on the usearch file format.
+- **Measured on the acceptance tests** (`pkg/store/tests/vector_recall.rs`, seeded 32-cluster 64-d mixture, recall@10 against
+  brute force): the removed graph scored 0.48 at 2k and 0.34 at 5k vectors; the new index scores 1.000 and 1.000, and 0.998
+  at 20k (HNSW). Filtered searches match exact search on allowed sets below the threshold and have recall@10 >= 0.95 above it
+  (`pkg/store/tests/vector_filtered.rs`).

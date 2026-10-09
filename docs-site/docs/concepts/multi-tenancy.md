@@ -9,7 +9,7 @@ DASH is multi-tenant by design: every `Claim` carries a `tenant_id`, evidence an
 
 1. **Retrieval is tenant-filtered.** `POST /v1/retrieve` requires `tenant_id`; candidate generation (lexical, entity, temporal and ANN) and the final claim filter compare against it. Evidence for each result comes from the claim's own record.
 2. **Credentials are tenant-scoped.** A scoped API key (`DASH_*_API_KEY_SCOPES`, entries `key:tenantA,tenantB[:roles]`) or a JWT tenant claim limits which tenants a caller may act on; a mismatch returns 403. A service-wide allowlist (`DASH_*_ALLOWED_TENANTS`) applies on top. Tests: `transport_denies_cross_tenant_retrieval_for_scoped_key` (retrieval) and `transport_denies_cross_tenant_ingest_for_scoped_key` (ingestion).
-3. **ANN graphs are per tenant.** The in-memory store keeps one HNSW-style graph per tenant (`TenantAnnGraph`), with the vector dimension pinned at that tenant's first vector. The index is in-repo code, not `usearch`.
+3. **Vector indexes are per tenant.** The in-memory store keeps one vector index per tenant (`TenantVectorIndex`: flat, then `usearch` HNSW), with the vector dimension pinned at that tenant's first vector. A query only ever searches its own tenant's index, including filtered and exact scans (test: `tenant_isolation_with_identical_vectors` in `pkg/store/tests/vector_recall.rs`).
 4. **Claim ids are validated across tenants on write.** Reusing a `claim_id` that belongs to another tenant is rejected by the store (unit tests exercise this in `pkg/store`).
 
 ## Where the tenant comes from

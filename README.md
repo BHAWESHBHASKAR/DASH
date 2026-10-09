@@ -108,7 +108,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - SHA-256 hash-chained audit log (`DASH_*_AUDIT_LOG_PATH`) with one canonical record encoding, file locking, torn-tail recovery and the `tools/audit-verify` verifier (`scripts/verify_audit_chain.sh` wraps it). The chain is **unkeyed**, so it detects accidental edits but not an attacker who can rewrite the file; there is no HMAC. Details: [`docs/operations/audit-chain.md`](docs/operations/audit-chain.md).
 - OIDC/JWKS validation: asymmetric algorithms only, `iss`/`aud`/`exp` required, HTTPS JWKS, a hardened JWKS cache. Tests use RS256 keys against an in-process stub IdP; there is no test against a real identity provider, and the ES256/EdDSA/PS* algorithms are accepted but untested.
 - Segment build, manifest, compaction and maintenance daemon (`services/indexer`), with collision-free tenant directories. Retrieval's use of segments is partial.
-- ANN: an in-repo, multi-level HNSW-style graph in `pkg/store/src/ann.rs`. It is **not** `usearch`: the `usearch` crate is declared in `Cargo.toml` but no source file uses it. Tuning via `DASH_*_ANN_*`. Recall at scale has not been measured in a reproducible CI job.
+- Vector search: a per-tenant index in `pkg/store/src/vector_index.rs`. A tenant is searched exactly (flat scan) up to `DASH_*_VECTOR_FLAT_THRESHOLD` vectors (default 8192) and through a [`usearch`](https://github.com/unum-cloud/usearch) HNSW (cosine, `i8` quantization, exact `f32` rerank of 50 candidates) above it. Time-range, entity and claim-id filters are applied as predicates, and allowed sets no larger than the threshold are scanned exactly. Recall@10 against brute force is at least 0.95 on seeded clustered data (`pkg/store/tests/vector_recall.rs`, `vector_filtered.rs`). The index is **not persisted**: it is rebuilt from the stored vectors at startup, which costs about 24 s for 100,000 x 384-d vectors on 4 vCPUs (three quarters of it the multi-threaded HNSW build) and grows with the vector count; persisting the index is planned. Tuning via `DASH_*_ANN_*` and `DASH_*_VECTOR_*`.
 - Ranking: support and contradiction contributions saturate (support bonus capped at 0.4, contradiction penalty at 0.5), and an edge `from supports to` credits the target claim.
 - Benchmark and drill scripts. Numbers in `docs/benchmarks/` are drill output, not a published performance claim.
 
@@ -128,7 +128,7 @@ DASH is a Rust workspace (edition 2024).
 | Crate | Role |
 |---|---|
 | `pkg/schema` | Claim, Evidence, ClaimEdge types and validation |
-| `pkg/store` | In-memory store, WAL (checksummed records, commit groups, generations), redb disk layer, in-repo HNSW-style ANN, GPU placeholder |
+| `pkg/store` | In-memory store, WAL (checksummed records, commit groups, generations), redb disk layer, per-tenant vector index (flat scan plus `usearch` HNSW), GPU placeholder |
 | `pkg/ranking` | Scoring (confidence, stance, source quality, contradiction penalty) |
 | `pkg/graph` | Claim graph expansion and support/contradiction path reasoning |
 | `pkg/auth` | HS256 JWT, OIDC/JWKS, roles, SHA-256 helper |
@@ -167,7 +167,7 @@ Counts are static (computed 2026-10-09: the Rust figure with `cargo test --works
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1149 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1178 |
 | Python SDK | 69 |
 | Go SDK | 92 |
 | TypeScript SDK | 71 |

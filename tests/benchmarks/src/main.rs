@@ -751,7 +751,10 @@ where
     let mut scorecard_out = None;
     let defaults = AnnTuningConfig::default();
     let mut ann_tuning = AnnTuningConfig {
-        connectivity: env_or_default_usize("DASH_BENCH_ANN_MAX_NEIGHBORS_BASE", defaults.connectivity),
+        connectivity: env_or_default_usize(
+            "DASH_BENCH_ANN_MAX_NEIGHBORS_BASE",
+            defaults.connectivity,
+        ),
         expansion_add: env_or_default_usize("DASH_BENCH_ANN_EXPANSION_ADD", defaults.expansion_add),
         expansion_search: env_or_default_usize(
             "DASH_BENCH_ANN_SEARCH_EXPANSION_MIN",

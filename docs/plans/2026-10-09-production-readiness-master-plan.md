@@ -273,6 +273,7 @@ A thin `Engine` trait lets P2 run the v1 store and v2 engine side by side (shado
 *Alternatives evaluated in the P2 spike:* Lance (columnar + vector + object storage) as the
 segment format. Recommendation stands unless the spike shows Lance meets latency targets
 with less code; decision recorded either way.
+*Status (P2 step 1, 2026-10-09):* the vector half is implemented in `pkg/store/src/vector_index.rs` (flat memtable-style index that converts to `usearch` HNSW with `i8` quantization, exact rerank and predicate filtering; `ann.rs` is retired); see ADR 0003 section 10 for the measured outcome. Segments, `tantivy`, the `Engine` trait and the persisted/mmap'd index are still open.
 
 **ADR-05 Raft for replication and metadata (D5).** `openraft` shard groups: the Raft log *is*
 the WAL v2 (Raft index = LSN), so commit = majority fsync = true quorum (fixes REP-07).

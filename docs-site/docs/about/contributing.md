@@ -165,7 +165,7 @@ Looking for a place to start? Check issues labeled [`good-first-issue`](https://
 
 ### High complexity (but high impact!)
 
-- Replace the in-repo ANN graph with a maintained HNSW library (evaluate `usearch` or `hora`; see register IDX-01)
+- Persist or memory-map the per-tenant vector index so a restart does not rebuild it (the HNSW is `usearch` since P2; see ADR 0003)
 - Build pluggable embedding model API
 - Implement multi-hop graph traversal
 - Design segment storage with object store backend (S3)

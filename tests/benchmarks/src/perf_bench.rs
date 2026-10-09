@@ -531,9 +531,10 @@ fn scenario_ann_search_throughput_at_scale(
     warmup: usize,
 ) -> Result<Vec<BenchResult>, String> {
     eprintln!(
-        "  (pre-loading {ANN_VECTORS} vectors at {ANN_DIM} dim — this is the O(N^2) ANN graph build and may take ~30s)"
+        "  (pre-loading {ANN_VECTORS} vectors at {ANN_DIM} dim into the per-tenant vector index)"
     );
     let mut store = InMemoryStore::new();
+    let build_start = Instant::now();
     for i in 0..ANN_VECTORS {
         let id = format!("claim-ann-{i}");
         let claim = make_claim(&id, ANN_TENANT, &format!("ann fixture text {i}"), 0.9);
@@ -544,6 +545,7 @@ fn scenario_ann_search_throughput_at_scale(
             .upsert_claim_vector(&id, fixture_vector(i + 17, ANN_DIM))
             .map_err(|e| format!("ann vector upsert at {i}: {e:?}"))?;
     }
+    let build_ms = build_start.elapsed().as_millis();
 
     let warmup_queries: Vec<Vec<f32>> = (0..warmup)
         .map(|i| fixture_vector(2_000_000 + i, ANN_DIM))
@@ -567,9 +569,14 @@ fn scenario_ann_search_throughput_at_scale(
             .with_extra("fixture_size", ANN_VECTORS.to_string())
             .with_extra("vector_dim", ANN_DIM.to_string())
             .with_extra("top_n", ANN_TOP_N.to_string())
+            .with_extra("build_ms", build_ms.to_string())
+            .with_extra(
+                "vector_index_bytes",
+                store.index_stats().vector_index_bytes.to_string(),
+            )
             .with_extra(
                 "note",
-                "ANN graph build is O(N^2); scale reduced from 100k spec for build feasibility",
+                "build_ms covers claim ingest plus incremental vector index inserts (HNSW above the flat threshold)",
             ),
     ])
 }

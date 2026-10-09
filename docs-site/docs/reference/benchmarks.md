@@ -12,7 +12,7 @@ The benchmark suite measures the six hot paths in the DASH retrieval pipeline:
 | `ingest_throughput_sequential.persistent_wal` | `ingest_bundle_persistent` + `FileWal::append_*` + `sync_data` | empty → 110    |        100 |
 | `retrieve_throughput_lexical`        | `InMemoryStore::retrieve` (no query vector)                            | 10 000 claims  |      1 000 |
 | `retrieve_throughput_semantic`        | `InMemoryStore::retrieve_semantic` (with 768-dim query vector)         | 10 000 + vec   |      1 000 |
-| `ann_search_throughput_at_scale`      | `InMemoryStore::ann_vector_top_candidates` (top-10)                    | 10 000 × 384-d |        500 |
+| `ann_search_throughput_at_scale`      | `InMemoryStore::ann_vector_top_candidates` (top-10; flat/`usearch` HNSW index, reports `build_ms`) | 10 000 × 384-d |        500 |
 | `wal_replay_throughput`               | `FileWal::open` + `load_from_wal_with_stats_and_ann_tuning`            | 1 000 claims   |        100 |
 
 All scenarios are timed with `std::time::Instant` per iteration. The distribution is summarized as p50 / p95 / p99 / min / max / mean microseconds, plus an aggregate throughput in operations per second.

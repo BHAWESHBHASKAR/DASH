@@ -165,7 +165,7 @@ Looking for a place to start? Check out issues labeled `good-first-issue`:
 - Write tutorial: \"Ingest and retrieve your first claims\"
 
 ### High Complexity (but high impact!)
-- Integrate ANN vector index (HNSW via `usearch` or `hora`)
+- Persist or memory-map the vector index (HNSW via `usearch` is integrated; it is rebuilt at startup today)
 - Build pluggable embedding model API
 - Implement multi-hop graph traversal
 - Design segment storage with object store backend (S3)

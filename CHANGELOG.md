@@ -6,6 +6,54 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
+
+- **Semantic retrieval now finds the true nearest neighbours.** The in-repo
+  HNSW-style graph (`pkg/store/src/ann.rs` and the graph code in `lib.rs`) is
+  removed. Its build was O(N^2) (20k vectors took 321 s in the ADR 0003 spike)
+  and on clustered data its recall@10 was about 0.15 beyond 5k vectors,
+  because the greedy search never left the entry cluster. Vector search is now
+  a per-tenant `TenantVectorIndex` (`pkg/store/src/vector_index.rs`): an exact
+  flat scan up to `DASH_*_VECTOR_FLAT_THRESHOLD` vectors (default 8192), then
+  a `usearch` HNSW (cosine, `i8` scalar quantisation, connectivity 16,
+  `ef_construction` 128, `ef_search` 128) whose best 50 candidates
+  (`DASH_*_VECTOR_RERANK`) are re-scored with exact `f32` cosine against the
+  stored vectors. The index holds about a third of the memory of an `f32` HNSW.
+  Recall@10 against brute force on seeded clustered data (`pkg/store/tests/vector_recall.rs`):
+  1.000 at 2k and 5k vectors, 0.998 at 20k (the removed graph: 0.48 at 2k, 0.34
+  at 5k on the same data). Measured build, query and startup numbers are in
+  `docs/benchmarks/performance.md`.
+- **Filters are applied inside the vector search.** Time-range, entity and
+  claim-id filters used to be applied after taking the global top-N, so a
+  selective filter could leave nothing. They are now predicates of the search
+  (new `InMemoryStore::ann_vector_top_candidates_filtered`), and an allowed set
+  no larger than the flat threshold is scanned exactly (ADR 0003 selection
+  rule). The old "empty ANN result, scan every vector" fallback is gone; an
+  invalid or wrong-dimension query vector still returns nothing and never
+  touches another tenant.
+- **Startup builds the vector index once.** WAL replay and the redb bulk load
+  collect vectors first and build each tenant's index at the end (multi-threaded
+  for large tenants). The index is still not persisted, so cold start grows
+  with the vector count (about 24 s for 100,000 x 384-d vectors on 4 vCPUs); persisting or memory-mapping it is a
+  follow-up. `set_ann_tuning` rebuilds existing indexes.
+- **Tuning settings changed.** Removed (they described the old graph; if still
+  set they are ignored): `DASH_{INGEST,RETRIEVAL}_ANN_MAX_NEIGHBORS_UPPER`,
+  `..._ANN_SEARCH_EXPANSION_FACTOR`, `..._ANN_SEARCH_EXPANSION_MAX`, their shared
+  `DASH_ANN_*` spellings and the `DASH_BENCH_ANN_*` equivalents; the benchmark
+  flags `--ann-max-neighbors-upper`, `--ann-search-expansion-factor` and
+  `--ann-search-expansion-max` are gone too. `..._ANN_MAX_NEIGHBORS_BASE` now sets
+  the HNSW connectivity (default 16, was 12) and `..._ANN_SEARCH_EXPANSION_MIN`
+  the `ef_search` floor (default 128, was 64). New: `..._ANN_EXPANSION_ADD`
+  (128), `..._VECTOR_FLAT_THRESHOLD` (8192) and `..._VECTOR_RERANK` (50), plus
+  `DASH_BENCH_*` twins.
+- **API.** `store::AnnTuningConfig` now has the fields `connectivity`,
+  `expansion_add`, `expansion_search`, `flat_threshold` and `rerank`;
+  `StoreIndexStats` gains `vector_index_bytes` (`ann_vector_buckets` counts
+  indexed vectors); new public module `store::vector_index` (`VectorIndex`,
+  `FlatIndex`, `HnswIndex`, `TenantVectorIndex`).
+- `store` now uses `usearch` (it was declared but unused), which needs a C++
+  toolchain at build time. The GPU backend remains a placeholder.
+
 ### Changed (internal)
 
 - Retrieval, ingestion and the control plane now share one HTTP/1.1 server and
