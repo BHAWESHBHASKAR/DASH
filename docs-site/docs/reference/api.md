@@ -35,14 +35,14 @@ Authorization is per tenant. The tenant is taken from the **request** (`claim.te
 | `admin` | every route |
 | `ingest` | `/v1/ingest*` |
 | `retrieve` | `/v1/retrieve`, `/v1/embeddings` |
-| `read_only` | everything `retrieve` allows, plus `/metrics` and `/debug/*` |
+| `read_only` | everything `retrieve` allows, plus `/metrics` and `/debug/*` (which additionally need `admin` or an unscoped credential, see below) |
 
 `ingest` and `retrieve` are independent; neither implies `read_only`. Legacy unscoped API keys get `DASH_*_API_KEY_DEFAULT_ROLES` (default: `ingest` on ingestion, `retrieve` on retrieval). A JWT **without** a roles claim gets no roles (403 on every role-checked route) unless `DASH_*_JWT_DEFAULT_ROLES` is set. `/metrics` can be exempted from authentication with `DASH_METRICS_PUBLIC=1`.
 
 | Route | Required role |
 |---|---|
 | retrieval `POST`/`GET /v1/retrieve`, `POST /v1/embeddings` | `retrieve` |
-| retrieval `/metrics`, `/debug/*`; ingestion `/metrics`, `/debug/*` | `read_only` |
+| retrieval `/metrics`, `/debug/*`; ingestion `/metrics`, `/debug/*` | `read_only` and (`admin` or an unscoped credential); tenant-scoped keys get 403 |
 | ingestion `POST /v1/ingest`, `/v1/ingest/raw`, `/v1/ingest/document`, `/v1/ingest/batch` | `ingest` |
 | ingestion `/internal/replication/*` | not a role: `x-replication-token` header |
 | control plane `/v1/control-plane/*` except health and ready | not a role: `Authorization: Bearer <control-plane token>` |
@@ -267,7 +267,7 @@ Requires role `ingest`. Like `/raw` but takes `mime_type` and either `text` or `
 
 ### Health, metrics, debug (ingestion)
 
-Same health, readiness and liveness routes as retrieval (`/ready` also reports ingestion-to-ingestion follower state and a disk problem), plus `GET /metrics` (Prometheus text), `GET /debug/placement` and `GET /debug/document-parser` (parser/extraction provider config). `/metrics` and `/debug/*` need a credential with the `read_only` (or `admin`) role; `/metrics` can be made public with `DASH_METRICS_PUBLIC=1`.
+Same health, readiness and liveness routes as retrieval (`/ready` also reports ingestion-to-ingestion follower state and a disk problem), plus `GET /metrics` (Prometheus text), `GET /debug/placement` and `GET /debug/document-parser` (parser/extraction provider config). `/metrics` and `/debug/*` need a credential with the `read_only` (or `admin`) role that is also `admin` or unscoped (tenant-scoped keys get 403, see `docs/operations/auth.md`); `/metrics` can be made public with `DASH_METRICS_PUBLIC=1`.
 
 ### Replication endpoints (internal)
 

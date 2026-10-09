@@ -209,7 +209,7 @@ public class DashClientTests
     }
 
     // -----------------------------------------------------------------
-    // Ingest / Retrieve / Delete / Health
+    // Ingest / Retrieve / Health
     // -----------------------------------------------------------------
 
     private static IngestRequest SampleIngestRequest() => new()

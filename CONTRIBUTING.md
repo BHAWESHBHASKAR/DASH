@@ -115,6 +115,7 @@ In practice:
 - Changes to security, storage format or replication need a second reviewer and an update to `docs/threat-model.md` (or an ADR line) when behavior changes.
 - Configuration and API reference pages must list only what the code reads and serves. When you add an environment variable or a route, update `docs-site/docs/reference/configuration.md` or `api.md` in the same PR.
 - `scripts/check_config_docs.sh` fails if an environment variable read by the Rust code (`DASH_*` or `EME_*` string literals in `services/*/src`, `pkg/*/src`, `tools/*/src`, plus the per-service auth and audit names built at runtime) is not mentioned in `docs-site/docs/reference/configuration.md`. Run it whenever you add or rename an environment variable.
+- `scripts/check_sdk_surface.sh` fails if the Java, Kotlin or C# SDK exposes a `delete` client method, a `/v1/delete` route or `Delete*` types (the server has no such route; "removed" notes in CHANGELOGs and READMEs are allowed), or if any `sdks/*/README.md` names an endpoint that is not in the route tables of `docs-site/docs/reference/api.md`. Run it after changing an SDK or its README; `--self-test` plants violations in a temporary copy and checks that each is caught. CI runs both in the `surface-check` job of `.github/workflows/sdks.yml`.
 
 ---
 

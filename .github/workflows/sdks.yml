@@ -181,3 +181,18 @@ jobs:
 
       - name: dotnet test
         run: dotnet test tests/Dash.Tests --configuration Release --no-build
+
+  surface-check:
+    name: SDK surface check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Removed delete API stays removed; READMEs match the server routes
+        run: scripts/check_sdk_surface.sh
+
+      - name: Surface check catches planted violations
+        run: scripts/check_sdk_surface.sh --self-test

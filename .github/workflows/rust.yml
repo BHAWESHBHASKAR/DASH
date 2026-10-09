@@ -269,3 +269,28 @@ jobs:
         env:
           E2E_CRASH_CYCLES: "100"
         run: cargo test -p dash-e2e
+
+  doc-consistency:
+    name: Doc consistency (deploy env, config docs, claims ledger)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check deploy env vars against the code
+        run: scripts/check_deploy_env.sh
+
+      - name: Check configuration reference against the code
+        run: scripts/check_config_docs.sh
+
+      - name: Check claims ledger (also compares the README test count via cargo test --list)
+        run: scripts/check_claims_ledger.sh
