@@ -1,6 +1,6 @@
 # Observability
 
-DASH exposes a Prometheus `/metrics` endpoint, emits structured JSON logs, and is being wired for OpenTelemetry tracing. This page describes the metrics surface, the scrape config, the log format, and the tracing roadmap.
+DASH exposes a Prometheus `/metrics` endpoint, writes logs through `tracing` (text, or JSON lines on request), and has no tracing export yet. This page describes the metrics surface, the scrape config, the log format, and the tracing roadmap.
 
 ## `/metrics` endpoint
 
@@ -10,43 +10,22 @@ The retrieval service exposes a Prometheus-format metrics endpoint on the same p
 GET /metrics
 ```
 
-A sample of the metrics surface:
+The ingestion service serves `GET /metrics` too. Metrics are unlabelled Prometheus text lines (counters and gauges) with a service prefix: `dash_ingest_*` on ingestion, `dash_retrieve_*` and `dash_transport_*` on retrieval. There are no histograms and no `tenant_id` or `outcome` labels; latency is exported as precomputed percentiles. Representative names (not exhaustive):
 
-```text
-# HELP dash_retrieve_requests_total Total number of retrieve requests.
-# TYPE dash_retrieve_requests_total counter
-dash_retrieve_requests_total{tenant_id="t1",outcome="ok"} 1283
+| Area | Metrics |
+|---|---|
+| Retrieval requests | `dash_retrieve_requests_total`, `dash_retrieve_success_total`, `dash_retrieve_client_error_total`, `dash_retrieve_server_error_total`, `dash_retrieve_latency_ms_p50` / `_p95` / `_p99`, `dash_retrieve_last_result_count` |
+| Retrieval transport | `dash_retrieve_transport_queue_depth`, `dash_retrieve_transport_queue_capacity`, `dash_retrieve_transport_queue_full_reject_total`, `dash_transport_uptime_seconds` |
+| Auth and audit (retrieval) | `dash_transport_auth_success_total`, `dash_transport_auth_failure_total`, `dash_transport_authz_denied_total`, `dash_transport_audit_events_total`, `dash_transport_audit_write_error_total` |
+| Storage visibility | `dash_retrieve_storage_divergence_warn_total`, `dash_retrieve_storage_last_divergence_ratio`, `dash_retrieve_segment_cache_hits_total`, `dash_retrieve_segment_refresh_*`, `dash_ingest_to_visible_lag_ms_p50` / `_p95` |
+| Disk | `dash_disk_unavailable`, `dash_disk_recovering` |
+| Placement | `dash_retrieve_placement_*`, `dash_ingest_placement_*` |
+| Ingest | `dash_ingest_claims_total`, `dash_ingest_success_total`, `dash_ingest_failed_total`, `dash_ingest_batch_*`, `dash_ingest_auth_*`, `dash_ingest_audit_*` |
+| WAL | `dash_ingest_wal_buffered_records`, `dash_ingest_wal_unsynced_records`, `dash_ingest_wal_flush_*`, `dash_ingest_wal_async_flush_*` |
+| Replication | `dash_ingest_replication_last_offset`, `dash_ingest_replication_pull_success_total`, `dash_ingest_replication_pull_failure_total`, `dash_ingest_replication_resync_total` |
+| Segments | `dash_ingest_segment_publish_*`, `dash_ingest_segment_maintenance_*` |
 
-# HELP dash_retrieve_latency_seconds Latency of retrieve requests.
-# TYPE dash_retrieve_latency_seconds histogram
-dash_retrieve_latency_seconds_bucket{le="0.001"} 920
-dash_retrieve_latency_seconds_bucket{le="0.005"} 1180
-dash_retrieve_latency_seconds_bucket{le="0.01"}  1250
-dash_retrieve_latency_seconds_bucket{le="+Inf"}  1283
-dash_retrieve_latency_seconds_sum   2.41
-dash_retrieve_latency_seconds_count 1283
-
-# HELP dash_ann_search_latency_seconds Latency of the ANN search.
-# TYPE dash_ann_search_latency_seconds histogram
-dash_ann_search_latency_seconds_bucket{le="0.0005"} 1100
-dash_ann_search_latency_seconds_bucket{le="+Inf"}   1283
-dash_ann_search_latency_seconds_sum   0.61
-dash_ann_search_latency_seconds_count 1283
-
-# HELP dash_embeddings_requests_total Total embeddings requests, by provider.
-# TYPE dash_embeddings_requests_total counter
-dash_embeddings_requests_total{provider="hash",outcome="ok"} 640
-
-# HELP dash_redb_disk_bytes redb file size, in bytes.
-# TYPE dash_redb_disk_bytes gauge
-dash_redb_disk_bytes{service="retrieval"} 482344960
-
-# HELP dash_audit_chain_head_seq The sequence number of the head of the audit chain.
-# TYPE dash_audit_chain_head_seq gauge
-dash_audit_chain_head_seq{tenant_id="t1"} 17842
-```
-
-The full list of metrics is generated at build time and lives in `services/*/src/metrics.rs`.
+An earlier version of this page listed metrics that do not exist (`dash_retrieve_latency_seconds` histograms, `dash_ann_search_latency_seconds`, `dash_embeddings_requests_total`, `dash_redb_disk_bytes`, `dash_audit_chain_head_seq`). The metric names are rendered in `services/retrieval/src/transport.rs` (`render_prometheus`) and `services/ingestion/src/transport.rs`; there is no `metrics.rs` per service and no generated metric list yet. In v0.2.x `/metrics` needs no credentials; v0.3.0 requires authentication, so add the credential to your scrape config (Prometheus supports an `authorization` block and, in recent versions, `http_headers`).
 
 ## Prometheus scrape config
 
@@ -75,61 +54,17 @@ scrape_configs:
 
 ### Recommended alert rules
 
-```yaml
-groups:
-  - name: dash
-    rules:
-      - alert: DashHighRetrieveLatency
-        expr: histogram_quantile(0.99, sum(rate(dash_retrieve_latency_seconds_bucket[5m])) by (le)) > 0.05
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "DASH p99 retrieve latency is above 50ms for 10m"
+The repository ships alert rules in `deploy/container/monitoring/prometheus-alert-rules.yml`: `DashDiskUnavailable`, `DashIngestToVisibleLagHigh`, `DashStorageDivergenceWarn`, `DashRetrieveServerErrorRate` and `DashReadyProbeFailing`. They are not validated by any automated test. Earlier examples on this page referenced histogram, audit-chain and redb-size metrics that DASH does not export.
 
-      - alert: DashAuditChainStalled
-        expr: rate(dash_audit_chain_head_seq[5m]) == 0
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "DASH audit chain has not advanced for 5m"
+## Logs
 
-      - alert: DashRedbDiskHigh
-        expr: dash_redb_disk_bytes > 1e12
-        for: 30m
-        labels:
-          severity: warning
-        annotations:
-          summary: "DASH redb file is above 1 TB; consider snapshot + archive"
-```
+Services log through `tracing`. The default output is compact text on stderr/stdout; set `DASH_LOG_FORMAT=json` for JSON lines. Verbosity is controlled by the standard `RUST_LOG` variable (default `info`); `DASH_LOG_LEVEL` does not exist. Some startup diagnostics are still written with `eprintln!`, outside the `tracing` pipeline. There is no stable log schema: no `request_id`, `actor` or per-request completion line is emitted today, and log field names may change. Do not build parsers or alerts on them yet.
 
-## Structured logs
-
-DASH emits logs as one JSON object per line on stdout. The fields:
-
-```json
-{
-  "ts": "2026-06-15T12:34:56.789Z",
-  "level": "info",
-  "service": "retrieval",
-  "tenant_id": "t1",
-  "request_id": "01HMRX...",
-  "actor": "jwt:sub=alice",
-  "msg": "retrieve complete",
-  "took_us": 1240,
-  "top_k": 5,
-  "result_count": 3
-}
-```
-
-The filter is controlled by the standard `RUST_LOG` variable (default `info`; `DASH_LOG_LEVEL` does not exist). The format is compact text by default; set `DASH_LOG_FORMAT=json` for JSON lines. The field names in the sample above are illustrative, not a stable schema.
-
-In Kubernetes, the logs are picked up by the standard `kubectl logs` path. A `Fluent Bit` or `Vector` sidecar forwards them to the log backend. The JSON shape is stable; downstream parsers should key on `ts`, `level`, `service`, `tenant_id`, and `msg`.
+In Kubernetes, `kubectl logs` and a log-forwarding sidecar work as usual.
 
 ## OpenTelemetry tracing (future)
 
-OpenTelemetry tracing is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Aotel) but **not** in the current release. The plan is to instrument the request handlers with `tracing` spans, export via OTLP, and propagate the W3C `traceparent` header across the SDK → ingestion → retrieval path.
+OpenTelemetry tracing is on the roadmap but **not** in the current release. The plan is to instrument the request handlers with `tracing` spans, export via OTLP, and propagate the W3C `traceparent` header across the SDK → ingestion → retrieval path.
 
 When it ships, the trace shape will be:
 
@@ -142,4 +77,4 @@ HTTP server span (POST /v1/retrieve)
   └── Response build span
 ```
 
-The migration will be additive — no breaking changes to the response shape or the log fields. Follow the [issue tracker](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Aotel) for the rollout.
+The migration will be additive — no breaking changes to the response shape or the log fields. 

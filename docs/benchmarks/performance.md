@@ -1,5 +1,12 @@
 # DASH Performance Benchmark Suite
 
+> **Status note (2026-10-09).** The numbers in this document come from a single local run on an unspecified
+> "Apple M-series" machine on 2026-06-15. They were not produced by CI, are not tied to a commit, and have not
+> been repeated, so treat them as illustrative only. They must not be quoted as DASH performance. The suite's
+> methodology (scenarios, fixtures, percentile math) is accurate to the code in `tests/benchmarks`. The
+> "Security posture" section below is a 2026-06-15 snapshot and is out of date; run `cargo audit` for current
+> results. Reproducible, CI-produced numbers are planned (see `docs/benchmarks/history/README.md`).
+
 This document describes the `perf_bench` micro-benchmark binary that
 ships in `tests/benchmarks/src/perf_bench.rs`. It measures the latency
 and throughput of the six hot paths in the DASH retrieval pipeline:
