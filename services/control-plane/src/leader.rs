@@ -1,5 +1,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +24,11 @@ pub struct LeaseRecord {
     pub node_id: String,
     pub epoch: u64,
     pub expires_at_ms: u64,
+    /// Random per-process id of the holder. The holder identity is
+    /// `node_id` plus `instance_id`, so two processes that were started with
+    /// the same node id are never both leader. Empty for records written by
+    /// older versions (which no live process matches).
+    pub instance_id: String,
 }
 
 impl LeaseRecord {
@@ -57,6 +64,10 @@ pub struct Acquisition {
 #[derive(Debug)]
 pub struct LeaderLease {
     node_id: String,
+    instance_id: String,
+    /// Set by `DASH_CONTROL_PLANE_LEASE_RESET=1`: discard one implausible
+    /// (forged or corrupt) lease record instead of refusing to run.
+    reset_requested: std::sync::atomic::AtomicBool,
     lease_path: PathBuf,
     lease_duration_ms: u64,
     renewal_interval_ms: u64,
@@ -76,6 +87,8 @@ impl LeaderLease {
     ) -> Self {
         Self {
             node_id: node_id.into(),
+            instance_id: dash_common::random_hex(8),
+            reset_requested: std::sync::atomic::AtomicBool::new(false),
             lease_path: lease_path.into(),
             lease_duration_ms,
             renewal_interval_ms,
@@ -104,6 +117,64 @@ impl LeaderLease {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Random id of this process' lease handle (see [`LeaseRecord::instance_id`]).
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Override the instance id (tests that model a process restart).
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = instance_id.into();
+        self
+    }
+
+    /// Allow discarding one implausible lease record (expiry far in the
+    /// future or an absurd epoch), the documented admin recovery from a
+    /// forged or corrupted lease (`DASH_CONTROL_PLANE_LEASE_RESET=1`).
+    pub fn with_lease_reset(self, reset: bool) -> Self {
+        self.reset_requested
+            .store(reset, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    fn holds(&self, record: &LeaseRecord) -> bool {
+        record.node_id == self.node_id && record.instance_id == self.instance_id
+    }
+
+    /// True when `record` could not have been written by a healthy cluster:
+    /// it expires further ahead than one lease plus the safety margin and a
+    /// clock-skew allowance, or carries an absurd fencing token.
+    fn is_implausible(&self, record: &LeaseRecord, now: u64) -> bool {
+        let horizon = now
+            .saturating_add(self.lease_duration_ms)
+            .saturating_add(self.safety_margin_ms)
+            .saturating_add(LEASE_HORIZON_SLACK_MS);
+        record.expires_at_ms > horizon || record.epoch > MAX_PLAUSIBLE_EPOCH
+    }
+
+    fn implausible_error(&self, record: &LeaseRecord) -> String {
+        format!(
+            "lease file '{}' holds an implausible record (node '{}', epoch {}, expires_at_ms {}); \
+             it may be forged or corrupt. Inspect it and restart with \
+             DASH_CONTROL_PLANE_LEASE_RESET=1 to discard it",
+            self.lease_path.display(),
+            record.node_id,
+            record.epoch,
+            record.expires_at_ms
+        )
+    }
+
+    /// Read the lease for a read-only check, refusing implausible records.
+    fn read_trusted(&self, now: u64) -> Result<Option<LeaseRecord>, String> {
+        let record = read_lease(&self.lease_path)?;
+        if let Some(record) = &record
+            && self.is_implausible(record, now)
+        {
+            return Err(self.implausible_error(record));
+        }
+        Ok(record)
     }
 
     pub fn lease_duration_ms(&self) -> u64 {
@@ -140,10 +211,38 @@ impl LeaderLease {
     /// in-process guard and the cross-process file lock (this is what
     /// `renew` previously got wrong by re-entering the non-reentrant mutex).
     fn try_acquire_locked(&self, now: u64) -> Result<Option<Acquisition>, String> {
-        let existing = read_lease(&self.lease_path)?;
+        let mut existing = read_lease(&self.lease_path)?;
+        if let Some(record) = &existing
+            && self.is_implausible(record, now)
+        {
+            if !self
+                .reset_requested
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(self.implausible_error(record));
+            }
+            eprintln!(
+                "control-plane: DASH_CONTROL_PLANE_LEASE_RESET=1: discarding implausible lease record \
+                 (node '{}', epoch {}, expires_at_ms {})",
+                record.node_id, record.epoch, record.expires_at_ms
+            );
+            // Treat it as an expired record of nobody; keep a plausible epoch
+            // so the fencing token never moves backwards needlessly.
+            let epoch = if record.epoch > MAX_PLAUSIBLE_EPOCH {
+                0
+            } else {
+                record.epoch
+            };
+            existing = Some(LeaseRecord {
+                node_id: String::new(),
+                epoch,
+                expires_at_ms: 0,
+                instance_id: String::new(),
+            });
+        }
         let (epoch, newly_acquired) = match &existing {
             None => (1, true),
-            Some(record) if record.node_id == self.node_id => {
+            Some(record) if self.holds(record) => {
                 if now < record.expires_at_ms.saturating_add(self.safety_margin_ms) {
                     // Still ours and nobody may take it yet: extend in place.
                     (record.epoch, false)
@@ -163,6 +262,7 @@ impl LeaderLease {
             node_id: self.node_id.clone(),
             epoch,
             expires_at_ms: now.saturating_add(self.lease_duration_ms),
+            instance_id: self.instance_id.clone(),
         };
         write_lease(&self.lease_path, &record)?;
         Ok(Some(Acquisition {
@@ -187,7 +287,7 @@ impl LeaderLease {
         let _file_lock = self.lock_file()?;
         let now = self.now_ms()?;
         match read_lease(&self.lease_path)? {
-            Some(record) if record.node_id == self.node_id => {
+            Some(record) if self.holds(&record) => {
                 // Both the extend and the lapsed-re-acquire cases are handled
                 // by the locked helper; no second lock is taken.
                 self.try_acquire_locked(now)
@@ -200,8 +300,8 @@ impl LeaderLease {
     /// holder stops reporting leadership `safety_margin_ms` before expiry.
     pub fn is_leader(&self) -> Result<bool, String> {
         let now = self.now_ms()?;
-        match read_lease(&self.lease_path)? {
-            Some(record) => Ok(record.node_id == self.node_id
+        match self.read_trusted(now)? {
+            Some(record) => Ok(self.holds(&record)
                 && now.saturating_add(self.safety_margin_ms) < record.expires_at_ms),
             None => Ok(false),
         }
@@ -210,9 +310,9 @@ impl LeaderLease {
     /// The fencing token of the lease this node currently holds, if any.
     pub fn fencing_token(&self) -> Result<Option<u64>, String> {
         let now = self.now_ms()?;
-        match read_lease(&self.lease_path)? {
+        match self.read_trusted(now)? {
             Some(record)
-                if record.node_id == self.node_id
+                if self.holds(&record)
                     && now.saturating_add(self.safety_margin_ms) < record.expires_at_ms =>
             {
                 Ok(Some(record.epoch))
@@ -225,7 +325,7 @@ impl LeaderLease {
     /// valid lease.
     pub fn current_leader(&self) -> Result<Option<LeaseRecord>, String> {
         let now = self.now_ms()?;
-        match read_lease(&self.lease_path)? {
+        match self.read_trusted(now)? {
             Some(record) if !record.is_expired_at(now) => Ok(Some(record)),
             _ => Ok(None),
         }
@@ -301,6 +401,20 @@ fn ms_since_epoch(time: SystemTime) -> Result<u64, String> {
         .map_err(|_| "system clock is set before the UNIX epoch".to_string())
 }
 
+/// Temp file next to `lease_path` with a random suffix.
+fn tmp_path_for(lease_path: &Path) -> PathBuf {
+    let mut name = lease_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "lease".into());
+    name.push(format!(
+        ".lease-tmp-{}-{}",
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        dash_common::random_hex(8)
+    ));
+    lease_path.with_file_name(name)
+}
+
 fn lock_path_for(lease_path: &Path) -> PathBuf {
     let mut name = lease_path
         .file_name()
@@ -320,17 +434,12 @@ impl FileLockGuard {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            fs::create_dir_all(parent).map_err(|err| {
-                format!(
-                    "failed creating lease parent dir '{}': {err}",
-                    parent.display()
-                )
-            })?;
+            ensure_private_dir(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        harden_open_options(&mut options);
+        let file = options
             .open(path)
             .map_err(|err| format!("failed opening lease lock '{}': {err}", path.display()))?;
         let deadline = Instant::now() + FILE_LOCK_TIMEOUT;
@@ -364,6 +473,12 @@ impl Drop for FileLockGuard {
 }
 
 fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "lease file '{}' is a symbolic link; refusing to follow it",
+            path.display()
+        ));
+    }
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -377,7 +492,8 @@ fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    // The lease file is a single line: node_id,epoch,expires_at_ms
+    // The lease file is a single line: node_id,epoch,expires_at_ms[,instance_id]
+    // (the instance id is absent in files written by older versions).
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("lease file '{}' is not valid UTF-8", path.display()))?;
     let line = text.lines().next().unwrap_or("").trim();
@@ -385,7 +501,7 @@ fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
         return Ok(None);
     }
     let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() != 3 {
+    if !(3..=4).contains(&parts.len()) {
         return Err(format!(
             "lease file '{}' has invalid format (expected node_id,epoch,expires_at_ms)",
             path.display()
@@ -405,7 +521,75 @@ fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
         node_id,
         epoch,
         expires_at_ms,
+        instance_id: parts.get(3).map(|id| id.to_string()).unwrap_or_default(),
     }))
+}
+
+/// Allowance for clock skew and differing lease durations when judging
+/// whether a lease record expires implausibly far ahead.
+const LEASE_HORIZON_SLACK_MS: u64 = 60_000;
+/// Fencing tokens above this are treated as forged (a real one increments by
+/// one per leadership change).
+const MAX_PLAUSIBLE_EPOCH: u64 = 1 << 53;
+
+/// Owner-only creation mode and no symlink following for files we create.
+fn harden_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = options;
+    }
+}
+
+/// Create `dir` (and missing parents) with mode 0700; for an existing
+/// directory only verify the mode and warn once when it is group or world
+/// writable.
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).map_err(|err| {
+        format!(
+            "failed creating lease parent dir '{}': {err}",
+            dir.display()
+        )
+    })?;
+    if let Some(warning) = dir_permission_warning(dir) {
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+        let first_time = WARNED
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .map(|mut warned| warned.insert(dir.to_path_buf()))
+            .unwrap_or(false);
+        if first_time {
+            eprintln!("WARNING: {warning}");
+        }
+    }
+    Ok(())
+}
+
+/// A warning when `dir` is writable by group or others (anyone who can write
+/// there can replace the lease or plant files next to it).
+fn dir_permission_warning(dir: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(dir).ok()?.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Some(format!(
+                "lease directory '{}' is group/world writable (mode {:o}); restrict it to the \
+                 control-plane user (chmod 0700)",
+                dir.display(),
+                mode & 0o7777
+            ));
+        }
+    }
+    let _ = dir;
+    None
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -417,23 +601,19 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    fs::create_dir_all(&parent).map_err(|err| {
-        format!(
-            "failed creating lease parent dir '{}': {err}",
-            parent.display()
-        )
-    })?;
+    ensure_private_dir(&parent)?;
     let line = format!(
-        "{},{},{}\n",
-        record.node_id, record.epoch, record.expires_at_ms
+        "{},{},{},{}\n",
+        record.node_id, record.epoch, record.expires_at_ms, record.instance_id
     );
-    let tmp_path = path.with_extension(format!(
-        "lease-tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    // Unguessable name, created exclusively (never reusing or following an
+    // existing path) with owner-only permissions.
+    let tmp_path = tmp_path_for(path);
     let write_result = (|| -> Result<(), String> {
-        let mut file = File::create(&tmp_path).map_err(|err| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        harden_open_options(&mut options);
+        let mut file = options.open(&tmp_path).map_err(|err| {
             format!(
                 "failed creating lease temp file '{}': {err}",
                 tmp_path.display()
@@ -472,6 +652,9 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
             )
         })
 }
+
+#[cfg(test)]
+mod hardening_tests;
 
 #[cfg(test)]
 mod tests {
