@@ -6,6 +6,18 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (internal)
+
+- Retrieval, ingestion and the control plane now share one HTTP/1.1 server and
+  request parser, the new `pkg/http` crate (`dash-http`), instead of three
+  hand-written copies (MNT-01). Routing, status codes, error messages, env var
+  names and metric names are unchanged. A handler panic is now answered with
+  500 instead of taking down a worker. The control plane gains the strict
+  parser (HTTP version check, 501 for `Transfer-Encoding`, bounded header
+  count, accept-error backoff) and escapes all JSON control characters. The
+  shared crate has socket-level and seeded property tests and a
+  `fuzz_http_request` fuzz target.
+
 The 0.3.0 release has not been tagged yet; its content is below.
 
 ## 0.3.0 (unreleased) - P0 production-readiness hardening

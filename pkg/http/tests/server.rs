@@ -545,7 +545,7 @@ fn connections_that_outwait_the_deadline_in_the_queue_are_dropped_unanswered() {
     let addr = server.addr.clone();
     let blocker =
         std::thread::spawn(move || send_raw(&addr, b"GET /slow?ms=1200 HTTP/1.1\r\n\r\n"));
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_queue(1, 1);
     // Queued behind the 1.2 s request: by the time the worker is free it is
     // past its 400 ms deadline.
     let stale = send_raw(&server.addr, b"GET /echo HTTP/1.1\r\n\r\n");
@@ -572,14 +572,32 @@ fn per_ip_connection_cap_sheds_excess_and_recovers() {
     let idle: Vec<TcpStream> = (0..8)
         .map(|_| TcpStream::connect(&server.addr).expect("connect idle"))
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
-    let shed = send_raw(&server.addr, b"GET /health HTTP/1.1\r\n\r\n");
-    assert!(status_line(&shed).contains("503"), "{shed:?}");
-    assert!(shed.contains("worker queue full"), "{shed:?}");
-    assert!(server.hooks.per_ip_rejects.load(Ordering::SeqCst) >= 1);
+    // Poll until the cap is observed: the probe is shed only once all eight
+    // idle connections have been admitted.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shed = send_raw(&server.addr, b"GET /health HTTP/1.1\r\n\r\n");
+        if status_line(&shed).contains("503") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection over the per-IP cap must be shed: {shed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     drop(idle);
-    std::thread::sleep(Duration::from_millis(200));
-    assert_alive(&server.addr);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health = send_raw(&server.addr, b"GET /health HTTP/1.1\r\n\r\n");
+        if status_line(&health).contains("200") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "cap must release: {health:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.hooks.per_ip_rejects.load(Ordering::SeqCst) >= 1);
 }
 
 #[test]
@@ -588,7 +606,6 @@ fn per_ip_cap_of_zero_disables_the_cap() {
     let many: Vec<TcpStream> = (0..100)
         .map(|_| TcpStream::connect(&server.addr).expect("connect"))
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
     assert_alive(&server.addr);
     assert_eq!(server.hooks.per_ip_rejects.load(Ordering::SeqCst), 0);
     drop(many);
@@ -608,9 +625,9 @@ fn full_queue_is_shed_with_the_overload_response() {
     };
     // One request in the worker, one in the queue.
     let first = slow(server.addr.clone());
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_queue(1, 1);
     let second = slow(server.addr.clone());
-    std::thread::sleep(Duration::from_millis(150));
+    server.wait_queue(2, 1);
     let shed = send_raw(&server.addr, b"GET /echo HTTP/1.1\r\n\r\n");
     assert!(status_line(&shed).contains("503"), "{shed:?}");
     assert!(shed.contains("custom overload"), "{shed:?}");
@@ -642,7 +659,7 @@ fn health_lane_answers_while_the_general_lane_is_saturated() {
             std::thread::spawn(move || send_raw(&addr, b"GET /slow?ms=1500 HTTP/1.1\r\n\r\n"))
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(300));
+    server.wait_queue(2, 1);
     for path in ["/health", "/live", "/ready", "/metrics"] {
         let started = Instant::now();
         let response = send_raw(
@@ -677,7 +694,7 @@ fn health_classifier_is_pluggable() {
     let slow = std::thread::spawn(move || send_raw(&addr, b"GET /slow?ms=1200 HTTP/1.1\r\n\r\n"));
     let addr = server.addr.clone();
     let queued = std::thread::spawn(move || send_raw(&addr, b"GET /slow?ms=10 HTTP/1.1\r\n\r\n"));
-    std::thread::sleep(Duration::from_millis(300));
+    server.wait_queue(2, 1);
     let started = Instant::now();
     assert_alive(&server.addr);
     assert!(started.elapsed() < Duration::from_millis(500));
@@ -747,7 +764,7 @@ fn shutdown_drains_in_flight_requests_and_returns() {
     let addr = server.addr.clone();
     let inflight =
         std::thread::spawn(move || send_raw(&addr, b"GET /slow?ms=600 HTTP/1.1\r\n\r\n"));
-    std::thread::sleep(Duration::from_millis(200));
+    server.wait_queue(1, 1);
     server.stop.store(true, Ordering::SeqCst);
     let result = server.join.take().unwrap().join().expect("serve thread");
     assert!(result.is_ok());

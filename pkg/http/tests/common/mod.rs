@@ -212,3 +212,26 @@ pub fn connect(addr: &str) -> TcpStream {
         .expect("read timeout");
     stream
 }
+
+/// Poll `cond` (10 ms steps) until it holds; panics after 5 s.
+pub fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl Harness {
+    /// Wait until `n` connections were queued and `taken` were picked up by
+    /// workers.
+    pub fn wait_queue(&self, n: usize, taken: usize) {
+        wait_for("queue state", || {
+            self.hooks.enqueued.load(Ordering::SeqCst) >= n
+                && self.hooks.dequeued.load(Ordering::SeqCst) >= taken
+        });
+    }
+}

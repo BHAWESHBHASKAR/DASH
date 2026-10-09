@@ -235,14 +235,29 @@ fn per_ip_connection_cap_sheds_excess_and_recovers() {
     let idle: Vec<TcpStream> = (0..8)
         .map(|_| TcpStream::connect(&addr).expect("connect idle"))
         .collect();
-    std::thread::sleep(Duration::from_millis(100));
-    let shed = send_raw(&addr, b"GET /health HTTP/1.1\r\n\r\n");
-    assert!(
-        status_line(&shed).contains("503"),
-        "connection over the per-IP cap must be shed: {shed:?}"
-    );
+    // Poll until the cap is observed: the probe is shed only once all eight
+    // idle connections have been admitted.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shed = send_raw(&addr, b"GET /health HTTP/1.1\r\n\r\n");
+        if status_line(&shed).contains("503") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "connection over the per-IP cap must be shed: {shed:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     drop(idle);
-    std::thread::sleep(Duration::from_millis(200));
-    let health = send_raw(&addr, b"GET /health HTTP/1.1\r\n\r\n");
-    assert!(status_line(&health).contains("200"), "{health:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health = send_raw(&addr, b"GET /health HTTP/1.1\r\n\r\n");
+        if status_line(&health).contains("200") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "cap must release: {health:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
