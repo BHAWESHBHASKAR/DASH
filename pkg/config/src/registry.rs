@@ -1059,6 +1059,22 @@ pub static REGISTRY: &[Entry] = &[
     .readers(INGEST)
     .eme(),
     Entry::new(
+        "DASH_INGEST_REPLICATION_COMMIT_STATUS_MAX",
+        Ingestion,
+        T_REPLICATION,
+        Kind::POSITIVE,
+        "100000",
+        "Leader-side cap on tracked per-commit replication status entries. Past the cap the oldest completed entries are evicted first; entries still pending quorum are never evicted. Exposed as `dash_ingest_replication_commit_status_entries` and `dash_ingest_replication_commit_status_evicted_total`.",
+    ),
+    Entry::new(
+        "DASH_INGEST_REPLICATION_COMMIT_STATUS_TTL_SECS",
+        Ingestion,
+        T_REPLICATION,
+        Kind::POSITIVE,
+        "3600",
+        "Seconds a completed (quorum met) commit status entry is kept before it expires. Pending entries do not expire. A late ack for an expired commit gets 404 and the follower ignores it.",
+    ),
+    Entry::new(
         "DASH_INGEST_REPLICATION_POLL_INTERVAL_MS",
         Ingestion,
         T_REPLICATION,

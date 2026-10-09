@@ -248,3 +248,65 @@ fn dev_mode_does_not_open_replication_when_auth_is_configured() {
     let response = handle_request_with_policy(&runtime, &get(routes[0]), &open);
     assert_ne!(response.status, 403, "{}", response.body);
 }
+
+/// PERF-05: the leader's commit-status table is bounded and exposes its size
+/// and evictions through `/metrics`; a late ack for an evicted commit is a
+/// plain 404 that never recreates the entry.
+#[test]
+fn commit_status_table_is_bounded_and_reported_through_metrics() {
+    let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _max = ScopedEnv::set("DASH_INGEST_REPLICATION_COMMIT_STATUS_MAX", "2");
+    let open = policy_from_raw(RawAuthConfig {
+        insecure_dev: true,
+        ..Default::default()
+    })
+    .expect("policy");
+    let runtime = std::sync::Arc::new(std::sync::Mutex::new(IngestionRuntime::in_memory(
+        InMemoryStore::new(),
+    )));
+    {
+        let mut rt = runtime.lock().expect("lock");
+        for i in 0..5 {
+            rt.record_commit_status(&format!("commit-{i}"), None, 1, 1);
+        }
+        rt.record_commit_status("commit-pending", None, 1, 2);
+    }
+    let status = |id: &str| {
+        handle_request_with_policy(
+            &runtime,
+            &get(&format!(
+                "/internal/replication/commit-status?commit_id={id}"
+            )),
+            &open,
+        )
+        .status
+    };
+    assert_eq!(
+        status("commit-0"),
+        404,
+        "oldest completed commit is evicted"
+    );
+    assert_eq!(status("commit-4"), 200);
+    assert_eq!(status("commit-pending"), 200, "pending commit is kept");
+
+    let metrics = handle_request_with_policy(&runtime, &get("/metrics"), &open).body;
+    assert!(
+        metrics.contains("dash_ingest_replication_commit_status_entries 2\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("dash_ingest_replication_commit_status_evicted_total 4\n"),
+        "{metrics}"
+    );
+
+    let late_ack = post(
+        "/internal/replication/ack?commit_id=commit-0&replica_id=r1",
+        "",
+        &[],
+    );
+    assert_eq!(
+        handle_request_with_policy(&runtime, &late_ack, &open).status,
+        404
+    );
+    assert_eq!(status("commit-0"), 404, "late ack must not resurrect it");
+}

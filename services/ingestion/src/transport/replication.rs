@@ -853,6 +853,20 @@ dash_ingest_replication_blocked_group_too_large {}\n",
         )
     }
 
+    /// Size and eviction counters of the leader's commit-status table.
+    pub(super) fn replication_commit_status_metrics_text(&mut self) -> String {
+        self.replication_commit_status
+            .expire(std::time::Instant::now());
+        format!(
+            "# TYPE dash_ingest_replication_commit_status_entries gauge\n\
+dash_ingest_replication_commit_status_entries {}\n\
+# TYPE dash_ingest_replication_commit_status_evicted_total counter\n\
+dash_ingest_replication_commit_status_evicted_total {}\n",
+            self.replication_commit_status.len(),
+            self.replication_commit_status.evicted_total(),
+        )
+    }
+
     /// Leader-side replication metrics (served from the WAL).
     pub(super) fn replication_leader_metrics_text(&self) -> String {
         let Some(wal) = self.wal.as_ref() else {
@@ -1071,6 +1085,12 @@ fn acknowledge_replication_commits(
             continue;
         };
         let response = request_replication_ack(&url, config.token.as_deref())?;
+        // 404: the leader no longer tracks this commit (evicted by its
+        // retention policy or restarted). The data is already applied, so a
+        // forgotten commit must not fail the pull.
+        if response.status == 404 {
+            continue;
+        }
         if response.status != 200 {
             return Err(format!(
                 "replication ack failed for commit_id '{}' with status {}",
@@ -1345,6 +1365,18 @@ mod tests {
         delta_response_body: String,
         expected_requests: usize,
     ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        spawn_mock_replication_source_with_ack(
+            delta_response_body,
+            expected_requests,
+            "HTTP/1.1 200 OK",
+        )
+    }
+
+    fn spawn_mock_replication_source_with_ack(
+        delta_response_body: String,
+        expected_requests: usize,
+        ack_status_line: &'static str,
+    ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("mock replication source should bind a random local port");
         let address = listener
@@ -1364,7 +1396,7 @@ mod tests {
                 let response = if request_line.starts_with("GET /internal/replication/wal?") {
                     render_http_response("HTTP/1.1 200 OK", &delta_response_body)
                 } else if request_line.starts_with("POST /internal/replication/ack?") {
-                    render_http_response("HTTP/1.1 200 OK", "status=ok\n")
+                    render_http_response(ack_status_line, "status=ok\n")
                 } else {
                     render_http_response("HTTP/1.1 404 Not Found", "status=not_found\n")
                 };
@@ -1506,6 +1538,31 @@ mod tests {
         assert_eq!(guard.replication_last_offset, 2);
         assert_eq!(guard.replication_pull_success_total, 1);
         assert_eq!(guard.replication_pull_failure_total, 0);
+    }
+
+    #[test]
+    fn ack_for_a_commit_the_leader_forgot_does_not_fail_the_pull() {
+        let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
+            store::InMemoryStore::new(),
+        )));
+        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-1\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-1\t1\t1700000000000\t7:claim-1\n".to_string();
+        let (source_base_url, requests, source_handle) =
+            spawn_mock_replication_source_with_ack(delta_body, 2, "HTTP/1.1 404 Not Found");
+        let config = ReplicationPullConfig {
+            source_base_url,
+            local_replica_id: Some("node-b".to_string()),
+            ..ReplicationPullConfig::new("http://127.0.0.1:1")
+        };
+
+        run_replication_pull_tick(&runtime, &config);
+
+        let _pull = requests.recv_timeout(Duration::from_secs(2)).expect("pull");
+        let ack = requests.recv_timeout(Duration::from_secs(2)).expect("ack");
+        assert!(ack.starts_with("POST /internal/replication/ack?"), "{ack}");
+        source_handle.join().expect("mock source joins");
+        let guard = runtime.lock().expect("lock");
+        assert_eq!(guard.replication_pull_failure_total, 0);
+        assert_eq!(guard.replication_pull_success_total, 1);
     }
 
     #[test]

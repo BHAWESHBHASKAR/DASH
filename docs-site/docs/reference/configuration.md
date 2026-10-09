@@ -252,6 +252,8 @@ An ingestion node can itself follow another ingestion node; it then pulls WAL fr
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_INGEST_REPLICATION_SOURCE_URL` | unset (off) | URL | An ingestion node can itself follow another ingestion node. Requires `DASH_INGEST_REPLICATION_TOKEN`. |  |
+| `DASH_INGEST_REPLICATION_COMMIT_STATUS_MAX` | `100000` | integer >= 1 | Leader-side cap on tracked per-commit replication status entries. Past the cap the oldest completed entries are evicted first; entries still pending quorum are never evicted. Exposed as `dash_ingest_replication_commit_status_entries` and `dash_ingest_replication_commit_status_evicted_total`. | DASH only. |
+| `DASH_INGEST_REPLICATION_COMMIT_STATUS_TTL_SECS` | `3600` | integer >= 1 | Seconds a completed (quorum met) commit status entry is kept before it expires. Pending entries do not expire. A late ack for an expired commit gets 404 and the follower ignores it. | DASH only. |
 | `DASH_INGEST_REPLICATION_POLL_INTERVAL_MS` | `500` | milliseconds >= 1 | Poll interval for ingestion-to-ingestion pulls. |  |
 | `DASH_INGEST_REPLICATION_MAX_RECORDS` | `512` | integer >= 1 | Records per pull. |  |
 | `DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES` | 67108864 (64 MiB) | integer >= 1 | Upper bound for one response body. |  |

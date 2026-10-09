@@ -11,6 +11,7 @@ use std::{
 
 mod audit;
 mod authz;
+mod commit_status;
 mod config;
 mod document_parser_debug;
 mod http;
@@ -135,7 +136,7 @@ pub struct IngestionRuntime {
     replication_last_offset: usize,
     replication_last_error: Option<String>,
     replication_follower: replication::ReplicationFollowerState,
-    replication_commit_status: HashMap<String, ReplicationCommitStatus>,
+    replication_commit_status: commit_status::CommitStatusTable,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
 }
@@ -148,15 +149,6 @@ pub(crate) struct TransportBackpressureMetrics {
     /// Requests that failed while being read (408/413/431/400/...), by status class.
     pub(crate) read_error_4xx_total: AtomicU64,
     pub(crate) read_error_5xx_total: AtomicU64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReplicationCommitStatus {
-    commit_epoch: Option<u64>,
-    ack_count: usize,
-    required_acks: usize,
-    commit_status: String,
-    acknowledged_replicas: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +249,7 @@ impl IngestionRuntime {
             replication_last_offset: 0,
             replication_last_error: None,
             replication_follower: replication::ReplicationFollowerState::default(),
-            replication_commit_status: HashMap::new(),
+            replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -320,7 +312,7 @@ impl IngestionRuntime {
             replication_last_offset: 0,
             replication_last_error: None,
             replication_follower: replication::ReplicationFollowerState::default(),
-            replication_commit_status: HashMap::new(),
+            replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
         }
@@ -726,20 +718,15 @@ impl IngestionRuntime {
         if let Some(local_replica_id) = self.local_replica_ack_seed() {
             acknowledged_replicas.insert(local_replica_id);
         }
-        let commit_status = if ack_count >= required_acks {
-            "replication_quorum_met"
-        } else {
-            "replication_pending"
-        };
         self.replication_commit_status.insert(
             commit_id.to_string(),
-            ReplicationCommitStatus {
+            commit_status::ReplicationCommitStatus::new(
                 commit_epoch,
                 ack_count,
                 required_acks,
-                commit_status: commit_status.to_string(),
                 acknowledged_replicas,
-            },
+            ),
+            Instant::now(),
         );
     }
 
@@ -774,22 +761,8 @@ impl IngestionRuntime {
     ) -> Result<ReplicationCommitStatusSnapshot, String> {
         let status = self
             .replication_commit_status
-            .get_mut(commit_id)
+            .ack(commit_id, replica_id, ack_epoch, Instant::now())
             .ok_or_else(|| format!("unknown commit_id '{}'", commit_id))?;
-        if status
-            .acknowledged_replicas
-            .insert(replica_id.trim().to_string())
-        {
-            status.ack_count = status.ack_count.saturating_add(1);
-        }
-        if let Some(epoch) = ack_epoch {
-            status.commit_epoch = Some(status.commit_epoch.unwrap_or(epoch).max(epoch));
-        }
-        if status.ack_count >= status.required_acks {
-            status.commit_status = "replication_quorum_met".to_string();
-        } else {
-            status.commit_status = "replication_pending".to_string();
-        }
         Ok(ReplicationCommitStatusSnapshot {
             commit_id: commit_id.to_string(),
             commit_epoch: status.commit_epoch,
