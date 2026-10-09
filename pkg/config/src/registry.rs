@@ -466,6 +466,24 @@ pub static REGISTRY: &[Entry] = &[
     )
     .eme(),
     Entry::new(
+        "DASH_REPLICATION_ALLOW_INSECURE_HTTP",
+        Common,
+        T_REPL_AUTH,
+        Kind::Bool(Honors::One),
+        "off",
+        "Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Use an `https://` source URL behind a TLS-terminating sidecar or ingress instead; see `docs/operations/replication-security.md`.",
+    )
+    .readers(DATA),
+    Entry::new(
+        "DASH_REPLICATION_CA_FILE",
+        Common,
+        T_REPL_AUTH,
+        Kind::Path,
+        "",
+        "PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted.",
+    )
+    .readers(DATA),
+    Entry::new(
         "DASH_CONTROL_PLANE_TOKEN",
         ControlPlane,
         T_REPL_AUTH,

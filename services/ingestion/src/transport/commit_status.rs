@@ -53,6 +53,7 @@ impl ReplicationCommitStatus {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_completed(&self) -> bool {
         self.completed.is_some()
     }

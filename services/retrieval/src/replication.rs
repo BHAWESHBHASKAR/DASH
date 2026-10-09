@@ -31,8 +31,7 @@
 
 use std::{
     collections::HashMap,
-    io::{Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
@@ -50,10 +49,6 @@ const DEFAULT_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_MAX_LAG_RECORDS: usize = 100_000;
 const DEFAULT_MAX_STALENESS_MS: u64 = 300_000;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const IO_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
-const HEADER_SLACK_BYTES: usize = 16 * 1024;
 const PREALLOC_CAP: usize = 4096;
 
 /// Configuration for the retrieval follower that pulls WAL records from
@@ -508,6 +503,26 @@ pub fn spawn_replication_follower(
     Some(start_follower(store, config, wal))
 }
 
+/// Startup findings about the replication transport: a plaintext http://
+/// source on another host, and a token that would be refused over it.
+pub(crate) fn source_transport_findings(
+    config: &ReplicationFollowerConfig,
+    allow_insecure_http: bool,
+) -> Vec<String> {
+    use dash_common::replication_client as client;
+    let mut out = Vec::new();
+    if let Some(message) = client::plaintext_source_warning(&config.source_base_url) {
+        out.push(message);
+    }
+    if let Ok(url) = client::parse_source_url(&config.source_base_url)
+        && let Err(message) =
+            client::check_token_transport(&url, config.token.is_some(), allow_insecure_http)
+    {
+        out.push(format!("every replication poll will fail: {message}"));
+    }
+    out
+}
+
 pub fn start_follower(
     store: Arc<RwLock<InMemoryStore>>,
     config: ReplicationFollowerConfig,
@@ -519,6 +534,12 @@ pub fn start_follower(
         config.poll_interval.as_millis(),
         wal.is_some()
     );
+    for message in source_transport_findings(
+        &config,
+        dash_common::replication_client::insecure_http_allowed_from_env(),
+    ) {
+        tracing::warn!("{message}");
+    }
     let status = Arc::new(FollowerStatus::new(&config));
     let registry_key = Arc::as_ptr(&store) as usize;
     if let Ok(mut guard) = registry().lock() {
@@ -898,117 +919,17 @@ fn http_get(
     token: Option<&str>,
     max_body_bytes: usize,
 ) -> Result<ReplicationSourceResponse, String> {
-    let (authority, path) = parse_http_url(url)?;
-    let addrs = authority
-        .to_socket_addrs()
-        .map_err(|err| format!("failed resolving replication source '{authority}': {err}"))?;
-    let mut stream = None;
-    let mut last_err = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(s) => {
-                stream = Some(s);
-                break;
-            }
-            Err(err) => last_err = Some(err),
-        }
-    }
-    let mut stream = stream.ok_or_else(|| {
-        format!(
-            "failed connecting replication source '{authority}': {}",
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no addresses".to_string())
-        )
-    })?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-        .map_err(|err| format!("failed setting socket timeouts: {err}"))?;
-
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Length: 0\r\n"
-    );
-    if let Some(token) = token {
-        request.push_str(&format!("x-replication-token: {token}\r\n"));
-    }
-    request.push_str("\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|()| stream.flush())
-        .map_err(|err| format!("failed sending replication request: {err}"))?;
-
-    let limit = max_body_bytes.saturating_add(HEADER_SLACK_BYTES);
-    let deadline = Instant::now() + REQUEST_DEADLINE;
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        if Instant::now() > deadline {
-            return Err("replication response timed out".to_string());
-        }
-        let n = stream
-            .read(&mut chunk)
-            .map_err(|err| format!("failed reading replication response: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        if bytes.len() + n > limit {
-            return Err(format!(
-                "replication response exceeds {max_body_bytes} byte limit"
-            ));
-        }
-        bytes.extend_from_slice(&chunk[..n]);
-    }
-    parse_http_response(&bytes, max_body_bytes)
-}
-
-fn parse_http_response(
-    bytes: &[u8],
-    max_body_bytes: usize,
-) -> Result<ReplicationSourceResponse, String> {
-    let split = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "replication response missing HTTP header terminator".to_string())?;
-    let header_block = std::str::from_utf8(&bytes[..split])
-        .map_err(|_| "replication response headers are not valid UTF-8".to_string())?;
-    let body_bytes = &bytes[split + 4..];
-    let mut header_lines = header_block.lines();
-    let status_line = header_lines
-        .next()
-        .ok_or_else(|| "replication response missing status line".to_string())?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "replication response status line missing code".to_string())?
-        .parse::<u16>()
-        .map_err(|_| "replication response has invalid status code".to_string())?;
-    for line in header_lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            let declared = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "replication response has invalid Content-Length".to_string())?;
-            if declared > max_body_bytes {
-                return Err(format!(
-                    "replication response exceeds {max_body_bytes} byte limit"
-                ));
-            }
-            if declared != body_bytes.len() {
-                return Err("replication response body is truncated".to_string());
-            }
-        }
-    }
-    if body_bytes.len() > max_body_bytes {
-        return Err(format!(
-            "replication response exceeds {max_body_bytes} byte limit"
-        ));
-    }
-    let body = String::from_utf8(body_bytes.to_vec())
-        .map_err(|_| "replication response is not valid UTF-8".to_string())?;
-    Ok(ReplicationSourceResponse { status, body })
+    let response = dash_common::replication_client::request(
+        "GET",
+        url,
+        token,
+        max_body_bytes,
+        &dash_common::replication_client::ClientOptions::from_env(),
+    )?;
+    Ok(ReplicationSourceResponse {
+        status: response.status,
+        body: response.body,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1132,20 +1053,6 @@ where
         }
         _ => Ok(None),
     }
-}
-
-fn parse_http_url(url: &str) -> Result<(String, String), String> {
-    let without_scheme = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "replication source URL must start with http://".to_string())?;
-    let (authority, path_and_query) = match without_scheme.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{}", suffix)),
-        None => (without_scheme, "/".to_string()),
-    };
-    if authority.trim().is_empty() {
-        return Err("replication source URL missing host:port authority".to_string());
-    }
-    Ok((authority.to_string(), path_and_query))
 }
 
 fn parse_kv_usize<'a, I>(lines: &mut I, key: &str) -> Result<usize, String>
@@ -1375,14 +1282,63 @@ mod tests {
         assert_eq!(parse_state("garbage"), None);
     }
 
+    /// Serve one canned raw HTTP response and return the base URL.
+    fn serve_raw_once(raw: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(raw);
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn http_response_enforces_declared_and_actual_size() {
-        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        assert_eq!(parse_http_response(ok, 10).expect("ok").body, "hi");
-        let too_big = b"HTTP/1.1 200 OK\r\nContent-Length: 99999\r\n\r\nhi";
-        assert!(parse_http_response(too_big, 10).is_err());
-        let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi";
-        assert!(parse_http_response(truncated, 10).is_err());
+        let base =
+            serve_raw_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        assert_eq!(
+            http_get(&format!("{base}/x"), None, 10).expect("ok").body,
+            "hi"
+        );
+        let base = serve_raw_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 99999\r\nConnection: close\r\n\r\nhi",
+        );
+        let err = http_get(&format!("{base}/x"), None, 10).unwrap_err();
+        assert!(err.contains("exceeds 10 byte limit"), "{err}");
+        let base =
+            serve_raw_once(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhi");
+        assert!(http_get(&format!("{base}/x"), None, 10).is_err());
+    }
+
+    #[test]
+    fn startup_findings_cover_remote_plaintext_sources_and_refused_tokens() {
+        let remote = ReplicationFollowerConfig {
+            token: Some("a-long-enough-replication-token".to_string()),
+            ..ReplicationFollowerConfig::new("http://ingestion:8081")
+        };
+        let findings = source_transport_findings(&remote, false);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings[0].contains("plain http://"), "{findings:?}");
+        assert!(findings[1].contains("will fail"), "{findings:?}");
+        // Acknowledged: still warned about, no longer refused.
+        let findings = source_transport_findings(&remote, true);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+
+        let loopback = ReplicationFollowerConfig {
+            token: Some("a-long-enough-replication-token".to_string()),
+            ..ReplicationFollowerConfig::new("http://127.0.0.1:8081")
+        };
+        assert!(source_transport_findings(&loopback, false).is_empty());
+        let tls = ReplicationFollowerConfig {
+            token: Some("a-long-enough-replication-token".to_string()),
+            ..ReplicationFollowerConfig::new("https://ingestion:8443")
+        };
+        assert!(source_transport_findings(&tls, false).is_empty());
     }
 
     #[test]

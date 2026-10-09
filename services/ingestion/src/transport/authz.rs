@@ -48,6 +48,18 @@ fn validate_replication_config() -> Result<(), String> {
     )
     .is_some_and(|value| !value.trim().is_empty());
     let dev = dash_common::insecure_dev_mode_enabled();
+    if follower {
+        let source = dash_common::env_with_fallback(
+            "DASH_INGEST_REPLICATION_SOURCE_URL",
+            "EME_INGEST_REPLICATION_SOURCE_URL",
+        )
+        .unwrap_or_default();
+        check_follower_token_transport(
+            &source,
+            token.is_some(),
+            dash_common::replication_client::insecure_http_allowed_from_env(),
+        )?;
+    }
     match token {
         Some(token) => {
             if dash_common::strict_secrets_enabled() {
@@ -72,6 +84,57 @@ fn validate_replication_config() -> Result<(), String> {
         ),
     }
     Ok(())
+}
+
+/// A follower must not send the replication token over plain http to a
+/// non-loopback host unless the operator acknowledged it.
+fn check_follower_token_transport(
+    source_url: &str,
+    token_present: bool,
+    allow_insecure_http: bool,
+) -> Result<(), String> {
+    let url = dash_common::replication_client::parse_source_url(source_url)?;
+    dash_common::replication_client::check_token_transport(&url, token_present, allow_insecure_http)
+}
+
+/// Startup warnings about how replication traffic crosses the network.
+/// `source_url` is the follower source (when this node follows another one),
+/// `bind_addr` the listener address.
+pub(crate) fn replication_transport_warnings(
+    token_set: bool,
+    source_url: Option<&str>,
+    bind_addr: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(source) = source_url
+        && let Some(message) = dash_common::replication_client::plaintext_source_warning(source)
+    {
+        out.push(message);
+    }
+    if let Some(message) =
+        dash_common::replication_client::leader_exposure_warning(bind_addr, token_set)
+    {
+        out.push(message);
+    }
+    out
+}
+
+/// Log [`replication_transport_warnings`] for this process. Call once at
+/// startup with the resolved listener address.
+pub fn warn_replication_transport(bind_addr: &str) {
+    let token_set = dash_common::env_with_fallback(
+        "DASH_INGEST_REPLICATION_TOKEN",
+        "EME_INGEST_REPLICATION_TOKEN",
+    )
+    .is_some_and(|value| !value.trim().is_empty());
+    let source = dash_common::env_with_fallback(
+        "DASH_INGEST_REPLICATION_SOURCE_URL",
+        "EME_INGEST_REPLICATION_SOURCE_URL",
+    )
+    .filter(|value| !value.trim().is_empty());
+    for message in replication_transport_warnings(token_set, source.as_deref(), bind_addr) {
+        tracing::warn!("{message}");
+    }
 }
 
 /// The policy used by request handling: the pinned startup policy, or (when
@@ -124,4 +187,52 @@ pub(crate) fn policy_from_parts(
 #[cfg(test)]
 pub(crate) fn policy_from_raw(raw: dash_common::RawAuthConfig) -> Result<AuthPolicy, String> {
     AuthPolicy::build(raw, &SERVICE_AUTH)
+}
+
+#[cfg(test)]
+mod replication_transport_tests {
+    use super::*;
+
+    #[test]
+    fn follower_with_a_token_over_remote_plain_http_is_refused_unless_acknowledged() {
+        let err =
+            check_follower_token_transport("http://leader.internal:8081", true, false).unwrap_err();
+        assert!(
+            err.contains("DASH_REPLICATION_ALLOW_INSECURE_HTTP"),
+            "{err}"
+        );
+        assert!(check_follower_token_transport("http://leader.internal:8081", true, true).is_ok());
+        assert!(
+            check_follower_token_transport("https://leader.internal:8443", true, false).is_ok()
+        );
+        assert!(check_follower_token_transport("http://127.0.0.1:8081", true, false).is_ok());
+    }
+
+    #[test]
+    fn startup_warns_for_remote_plaintext_source_and_exposed_leader() {
+        // Follower side.
+        let warnings = replication_transport_warnings(
+            true,
+            Some("http://leader.internal:8081"),
+            "127.0.0.1:8081",
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("plain http://"), "{warnings:?}");
+        assert!(warnings[0].contains("replication-security.md"));
+        // Leader side.
+        let warnings = replication_transport_warnings(true, None, "0.0.0.0:8081");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not loopback"), "{warnings:?}");
+        // Quiet cases.
+        assert!(replication_transport_warnings(true, None, "127.0.0.1:8081").is_empty());
+        assert!(replication_transport_warnings(false, None, "0.0.0.0:8081").is_empty());
+        assert!(
+            replication_transport_warnings(
+                true,
+                Some("https://leader.internal:8443"),
+                "127.0.0.1:8081"
+            )
+            .is_empty()
+        );
+    }
 }

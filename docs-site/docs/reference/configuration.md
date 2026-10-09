@@ -104,6 +104,8 @@ HS256 tokens carry tenants in `tenant_id` (string) or `tenants` / `tenant_ids` (
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_METRICS_PUBLIC` | `off` | bool | Expose `/metrics` without credentials. Without it `/metrics` and `/debug/*` need a credential holding `read_only` or `admin`. | DASH only. |
+| `DASH_REPLICATION_ALLOW_INSECURE_HTTP` | `off` | bool | Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Use an `https://` source URL behind a TLS-terminating sidecar or ingress instead; see `docs/operations/replication-security.md`. | DASH only. Enabled by only the literal `1`. |
+| `DASH_REPLICATION_CA_FILE` | unset | path | PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_TOKEN` | falls back to `DASH_CONTROL_PLANE_TOKEN` | secret | Token the router client sends to the control plane. | DASH only. |
 
 ### Audit log

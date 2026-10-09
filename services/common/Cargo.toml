@@ -11,6 +11,11 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 signal-hook = { workspace = true }
 tracing-subscriber = { workspace = true }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }

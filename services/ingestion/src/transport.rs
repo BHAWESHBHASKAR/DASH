@@ -29,10 +29,10 @@ mod segment_runtime;
 mod server_runtime;
 
 use audit::{AuditEvent, emit_audit_event};
-pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
     AuthDecision, Role, authorize_request_for_tenant, authorize_request_ops, shared_auth_policy,
 };
+pub use authz::{initialize_auth_policy, warn_replication_transport};
 use config::{
     env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,

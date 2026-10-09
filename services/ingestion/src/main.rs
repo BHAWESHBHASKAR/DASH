@@ -97,6 +97,9 @@ fn main() {
         tracing::error!("ingestion startup refused: {reason}");
         std::process::exit(2);
     }
+    if serve_mode {
+        ingestion::transport::warn_replication_transport(&bind_addr);
+    }
 
     let input = IngestInput {
         claim: Claim {
