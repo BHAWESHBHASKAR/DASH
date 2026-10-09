@@ -36,7 +36,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -208,8 +208,41 @@ pub struct FollowerStatus {
     applied_total: AtomicU64,
     synced_once: AtomicBool,
     last_error: Mutex<Option<String>>,
+    /// Replicated lines skipped because lenient replay would quarantine them.
+    skipped_total: AtomicU64,
+    /// `BLOCKED_*` code: a failure retrying cannot fix.
+    blocked: AtomicU8,
     max_lag_records: usize,
     max_staleness_ms: u64,
+}
+
+const BLOCKED_NONE: u8 = 0;
+const BLOCKED_RESPONSE_TOO_LARGE: u8 = 1;
+const BLOCKED_GROUP_TOO_LARGE: u8 = 2;
+
+fn blocked_reason_name(code: u8) -> Option<&'static str> {
+    match code {
+        BLOCKED_RESPONSE_TOO_LARGE => Some("replication_response_too_large"),
+        BLOCKED_GROUP_TOO_LARGE => Some("replication_group_too_large"),
+        _ => None,
+    }
+}
+
+/// Failures that retrying cannot fix: the leader's answer is permanently
+/// larger than this follower accepts, or a commit group cannot be shipped.
+fn classify_blocking_error(error: &str) -> u8 {
+    if error.contains("replication_group_too_large") {
+        BLOCKED_GROUP_TOO_LARGE
+    } else if error.contains("byte limit") {
+        BLOCKED_RESPONSE_TOO_LARGE
+    } else {
+        BLOCKED_NONE
+    }
+}
+
+/// First bytes of a non-200 response body, for the error message.
+fn body_excerpt(body: &str) -> String {
+    body.chars().take(200).collect()
 }
 
 /// Point-in-time copy of [`FollowerStatus`].
@@ -244,6 +277,8 @@ impl FollowerStatus {
             applied_total: AtomicU64::new(0),
             synced_once: AtomicBool::new(false),
             last_error: Mutex::new(None),
+            skipped_total: AtomicU64::new(0),
+            blocked: AtomicU8::new(BLOCKED_NONE),
             max_lag_records: config.max_lag_records,
             max_staleness_ms: config.max_staleness_ms,
         }
@@ -278,6 +313,9 @@ impl FollowerStatus {
 
     /// `Err(reason)` when the follower is not healthy enough to serve.
     pub fn readiness(&self) -> Result<(), &'static str> {
+        if let Some(reason) = blocked_reason_name(self.blocked.load(Ordering::Relaxed)) {
+            return Err(reason);
+        }
         let snap = self.snapshot();
         if !snap.synced_once {
             return Err("replication_initial_sync_pending");
@@ -302,14 +340,19 @@ impl FollowerStatus {
             Some(err) => format!("\"{}\"", json_escape(err)),
             None => "null".to_string(),
         };
+        let blocked = match blocked_reason_name(self.blocked.load(Ordering::Relaxed)) {
+            Some(reason) => format!("\"{reason}\""),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"last_error\":{last_error}}}",
+            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"skipped_records_total\":{},\"blocked_reason\":{blocked},\"last_error\":{last_error}}}",
             snap.offset,
             snap.leader_total_records,
             snap.lag_records,
             snap.last_success_age_ms,
             snap.consecutive_failures,
             snap.resyncs_total,
+            self.skipped_total.load(Ordering::Relaxed),
         )
     }
 
@@ -336,7 +379,13 @@ dash_retrieval_replication_resyncs_total {}\n\
 # TYPE dash_retrieval_replication_applied_records_total counter\n\
 dash_retrieval_replication_applied_records_total {}\n\
 # TYPE dash_retrieval_replication_generation gauge\n\
-dash_retrieval_replication_generation {}\n",
+dash_retrieval_replication_generation {}\n\
+# TYPE dash_retrieval_replication_skipped_records_total counter\n\
+dash_retrieval_replication_skipped_records_total {}\n\
+# TYPE dash_retrieval_replication_blocked_response_too_large gauge\n\
+dash_retrieval_replication_blocked_response_too_large {}\n\
+# TYPE dash_retrieval_replication_blocked_group_too_large gauge\n\
+dash_retrieval_replication_blocked_group_too_large {}\n",
             snap.lag_records,
             snap.offset,
             snap.last_success_age_ms,
@@ -345,6 +394,9 @@ dash_retrieval_replication_generation {}\n",
             snap.resyncs_total,
             snap.applied_records_total,
             snap.generation.unwrap_or(0),
+            self.skipped_total.load(Ordering::Relaxed),
+            (self.blocked.load(Ordering::Relaxed) == BLOCKED_RESPONSE_TOO_LARGE) as u8,
+            (self.blocked.load(Ordering::Relaxed) == BLOCKED_GROUP_TOO_LARGE) as u8,
         )
     }
 
@@ -364,12 +416,15 @@ dash_retrieval_replication_generation {}\n",
             .store(now_ms().max(1), Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.synced_once.store(true, Ordering::Relaxed);
+        self.blocked.store(BLOCKED_NONE, Ordering::Relaxed);
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = None;
         }
     }
 
     fn record_failure(&self, error: String) {
+        self.blocked
+            .store(classify_blocking_error(&error), Ordering::Relaxed);
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
         self.failures_total.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut guard) = self.last_error.lock() {
@@ -630,8 +685,9 @@ impl Follower {
         )?;
         if response.status != 200 {
             return Err(format!(
-                "replication source returned status {}",
-                response.status
+                "replication source returned status {} ({})",
+                response.status,
+                body_excerpt(&response.body)
             ));
         }
         let frame = parse_delta_frame(&response.body, self.config.max_records)?;
@@ -688,10 +744,14 @@ impl Follower {
             let guard = self.store.read().unwrap_or_else(|p| p.into_inner());
             guard.clone_detached()
         };
+        let mut skipped = 0u64;
         for line in lines {
-            staged
-                .apply_persisted_record_line(line)
+            let applied = staged
+                .apply_persisted_record_line_lenient(line)
                 .map_err(|err| format!("failed to apply replicated record: {err:?}"))?;
+            if !applied {
+                skipped += 1;
+            }
         }
         staged.clear_wal_events();
         if let Some(wal) = self.wal.as_mut() {
@@ -717,6 +777,7 @@ impl Follower {
         if let Err(err) = guard.commit_staged(staged) {
             eprintln!("retrieval replication: disk mirror degraded after commit: {err:?}");
         }
+        self.status.skipped_total.fetch_add(skipped, Ordering::Relaxed);
         Ok(())
     }
 
@@ -729,8 +790,9 @@ impl Follower {
         )?;
         if response.status != 200 {
             return Err(format!(
-                "replication source export returned status {}",
-                response.status
+                "replication source export returned status {} ({})",
+                response.status,
+                body_excerpt(&response.body)
             ));
         }
         let export = parse_export_frame(&response.body)?;
@@ -739,16 +801,21 @@ impl Follower {
             guard.ann_tuning().clone()
         };
         let mut fresh = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        let mut skipped = 0u64;
         for line in export
             .export
             .snapshot_lines
             .iter()
             .chain(export.export.wal_lines.iter())
         {
-            fresh
-                .apply_persisted_record_line(line)
+            let applied = fresh
+                .apply_persisted_record_line_lenient(line)
                 .map_err(|err| format!("failed to apply exported record: {err:?}"))?;
+            if !applied {
+                skipped += 1;
+            }
         }
+        self.status.skipped_total.fetch_add(skipped, Ordering::Relaxed);
         fresh.clear_wal_events();
         if let Some(wal) = self.wal.as_mut() {
             wal.replace_with_replication_export(&export.export)
@@ -1312,6 +1379,112 @@ mod tests {
         assert!(parse_http_response(too_big, 10).is_err());
         let truncated = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhi";
         assert!(parse_http_response(truncated, 10).is_err());
+    }
+
+    #[test]
+    fn unfixable_failures_block_readiness_with_a_reason() {
+        let config = ReplicationFollowerConfig::new("http://127.0.0.1:1");
+        let status = FollowerStatus::new(&config);
+        status.record_success();
+        assert_eq!(status.readiness(), Ok(()));
+
+        status.record_failure("replication response exceeds 10 byte limit".to_string());
+        assert_eq!(status.readiness(), Err("replication_response_too_large"));
+        assert!(
+            status
+                .to_json()
+                .contains("\"blocked_reason\":\"replication_response_too_large\"")
+        );
+        assert!(
+            status
+                .render_prometheus()
+                .contains("dash_retrieval_replication_blocked_response_too_large 1")
+        );
+
+        status.record_success();
+        assert_eq!(status.readiness(), Ok(()));
+
+        status.record_failure(
+            "replication source WAL returned status 500 (replication_group_too_large: ...)"
+                .to_string(),
+        );
+        assert_eq!(status.readiness(), Err("replication_group_too_large"));
+
+        status.record_failure("connection refused".to_string());
+        assert_eq!(status.readiness(), Ok(()), "transient errors do not block");
+    }
+
+    #[test]
+    fn follower_applies_poisoned_legacy_lines_leniently_and_counts_them() {
+        let tail = "null\tnull\tnull\tnull\tnull";
+        let lines: Vec<String> = vec![
+            format!("C\tr-ok\ttenant-r\ttext\t0.9\tnull\t3:foo\t\t{tail}"),
+            format!("C\tr\\tbad\ttenant-r\ttext\t0.9\tnull\t\t\t{tail}"),
+            format!("C\tr-ent\ttenant-r\ttext\t0.9\tnull\t5:a\tb c\t\t{tail}"),
+            "E\tre-dep\tr\\tbad\tsrc\tsupports\t0.8".to_string(),
+            "E\tre-ok\tr-ok\tsrc\tsupports\t0.8".to_string(),
+        ];
+        let store = Arc::new(RwLock::new(InMemoryStore::new()));
+        let config = ReplicationFollowerConfig::new("http://127.0.0.1:1");
+        let status = Arc::new(FollowerStatus::new(&config));
+        let mut follower = Follower::new(Arc::clone(&store), config, None, Arc::clone(&status));
+        follower
+            .apply_delta(&lines)
+            .expect("poisoned legacy lines must not wedge the follower");
+        assert_eq!(store.read().expect("read").claims_len(), 1);
+        assert_eq!(status.skipped_total.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn mutated_frames_never_panic_the_frame_parsers() {
+        let delta = "status=ok\ngeneration=7\nneeds_resync=0\nfrom_offset=2\nnext_offset=4\ntotal_records=9\nrecords=2\nline-a\nline-b\n";
+        let export =
+            "status=ok\ngeneration=3\nsnapshot_records=1\nwal_records=1\nSNAPSHOT\na\nWAL\nb\n";
+        let huge = [
+            "18446744073709551615",
+            "18446744073709551614",
+            "9223372036854775808",
+            "-1",
+            "",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for iteration in 0..20_000usize {
+            let seed = if iteration % 2 == 0 { delta } else { export };
+            let mut bytes = seed.as_bytes().to_vec();
+            for _ in 0..=(next() % 3) {
+                match next() % 3 {
+                    0 if !bytes.is_empty() => {
+                        let i = (next() % bytes.len() as u64) as usize;
+                        bytes[i] = (next() & 0x7f) as u8;
+                    }
+                    1 if !bytes.is_empty() => {
+                        let i = (next() % bytes.len() as u64) as usize;
+                        bytes.remove(i);
+                    }
+                    _ => {
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let pick = huge[(next() % huge.len() as u64) as usize];
+                        bytes = text
+                            .replacen(|c: char| c.is_ascii_digit(), pick, 1)
+                            .into_bytes();
+                    }
+                }
+            }
+            let Ok(body) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = parse_delta_frame(&body, 512);
+                let _ = parse_export_frame(&body);
+            }));
+            assert!(outcome.is_ok(), "frame parser panicked on {body:?}");
+        }
     }
 
     #[test]
