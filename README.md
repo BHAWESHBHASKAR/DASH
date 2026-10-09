@@ -2,60 +2,36 @@
 
 > Evidence-first vector database for citation-grade RAG.
 
-DASH stores atomic claims with provenance, retrieves them with citation-grade rankings, and ships an OpenAI-compatible embeddings endpoint so any client can adopt it without changing call sites.
+DASH stores atomic claims with provenance, retrieves them with citation-bearing rankings, and exposes an OpenAI-compatible embeddings endpoint so existing clients can call it without code changes.
 
-```bash
-# Drop-in OpenAI-compatible embeddings
-curl -X POST http://localhost:8080/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"input": "Company X acquired Company Y", "model": "text-embedding-3-small"}'
-```
-
-```python
-import openai
-client = openai.OpenAI(base_url="http://localhost:8080/v1", api_key="not_needed")
-resp = client.embeddings.create(input="hello world", model="text-embedding-3-small")
-print(resp.data[0].embedding[:5])
-```
-
-## Current state (2026-06-13)
-
-**Production-ready in this release:**
-- OpenAI-compatible `/v1/embeddings` endpoint (wire-byte compatible with the OpenAI spec)
-- Semantic-first retrieval (`InMemoryStore::retrieve_semantic`) with dense-similarity as the primary ranking signal
-- Env-driven real embedding providers: `DASH_EMBEDDING_PROVIDER=hash|ollama|openai`
-- `redb` persistence (PR 1, additive, default off; enable with `DASH_*_PERSISTENCE_PATH`)
-- SDKs: Python (`dash-py`), Go (`dash-go`), TypeScript (`dash-ts`) — all OpenAI-drop-in compatible
-- `cargo-fuzz` harnesses for JWT, OpenAI parser, ranking, and WAL parser
-- Performance benchmark suite (`perf_bench`): ingest, retrieve-lexical, retrieve-semantic, ANN-at-scale, WAL-replay
-- Docker + docker-compose (multi-arch, non-root, healthcheck)
-- Hash-chained audit log, per-tenant rate limiting, JWT auth + scoped API keys, OpenAI drop-in
-
-**Test counts:** 379 Rust unit/integration tests passing, plus 86 Go + 65 TypeScript + 59 Python = **589 tests total** across the workspace. `cargo clippy --workspace --all-targets` is clean. `cargo build --workspace` is clean.
-
-See [`CHANGELOG.md`](./CHANGELOG.md) for the full deltas and [`docs/quickstart.md`](./docs/quickstart.md) for the 5-minute path.
-
-## Why DASH
-
-Naive RAG ranks documents by vector similarity and returns the top *k* chunks. That works for "summarize this article" but fails in three common enterprise cases: (1) two sources say opposite things and you have no way to demote the contradicted one, (2) a fact has a temporal window and the version you retrieved is stale, (3) your auditor asks "why did the model say that" and the answer is "because a 768-dimensional number was close to a query." DASH treats the **claim** — an atomic, source-bound assertion — as the primary data primitive, with **evidence** and **citation** as first-class fields on every result.
-
-Concretely, every retrieval response in DASH is `{ claim, score, supports, contradicts, citations[] }`. Each `citation` carries its `source_id`, `stance` (supports/contradicts/neutral), `source_quality`, and an optional `chunk_id` plus `span_start`/`span_end` for character-level traceability. The retrieval API exposes `stance_mode: support_only` to filter out claims that have been contradicted, and `time_range: {from_unix, to_unix}` to constrain results to a validity window. This makes DASH a different kind of vector database: not the fastest pure vector index, but the most defensible one for RAG that has to ship to legal, medical, financial, and enterprise knowledge workflows.
+**Status: pre-1.0, not yet production-ready.** The current line is v0.2.x; v0.3.0 is the security and correctness hardening release described in [`docs/plans/2026-10-09-production-readiness-master-plan.md`](docs/plans/2026-10-09-production-readiness-master-plan.md). Read the [Status](#status) section before deploying anything that holds real data. Every capability claim in this file is tracked in [`docs/claims-ledger.md`](docs/claims-ledger.md) with the test or document that backs it.
 
 ## Quickstart
 
-The five-minute path from clone to retrieval query. Requires Docker.
+Requires Docker with Compose v2, `git`, and `curl`. This builds the images from source (no release images have been published yet), so the first run takes several minutes.
 
 ```bash
-git clone https://github.com/anomalyco/dash.git
-cd dash
-docker compose -f deploy/container/docker-compose.yml up -d
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+
+# 1. Generate strong random credentials into deploy/container/.env (git-ignored).
+./scripts/generate-secrets.sh
+set -a; source deploy/container/.env; set +a
+
+# 2. Build and start ingestion (:8081), retrieval (:8080), control-plane (:8090).
+docker compose -f deploy/container/docker-compose.yml up -d --build
+curl -fsS http://localhost:8081/health
+curl -fsS http://localhost:8080/health
 ```
 
-Ingest a claim with its supporting evidence:
+The services refuse to be left open: v0.3.0 will not start without credentials unless `DASH_INSECURE_DEV_MODE=1` is set (dev mode binds localhost only). The compose file requires the keys generated above. Send them in the `x-api-key` header (or as `Authorization: Bearer <key>`). Ingestion and retrieval use separate keys.
+
+Ingest a claim with supporting evidence:
 
 ```bash
-curl -X POST http://localhost:8081/v1/ingest \
+curl -fsS -X POST http://localhost:8081/v1/ingest \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -d '{
     "claim": {
       "claim_id": "c1",
@@ -74,11 +50,13 @@ curl -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
-Retrieve with citations, dropping any claim that has been contradicted:
+The retrieval service is a read replica that follows the ingestion WAL by polling (250 ms in the compose file), so wait a moment, then retrieve with citations, dropping claims that have more contradicting than supporting evidence:
 
 ```bash
-curl -X POST http://localhost:8080/v1/retrieve \
+sleep 2
+curl -fsS -X POST http://localhost:8080/v1/retrieve \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -d '{
     "tenant_id": "t1",
     "query": "Company X acquired Company Y",
@@ -87,69 +65,130 @@ curl -X POST http://localhost:8080/v1/retrieve \
   }'
 ```
 
-Use the OpenAI-compatible `/v1/embeddings` endpoint from any OpenAI SDK — `langchain`, `llama-index`, the `openai` CLI — by setting `OPENAI_API_BASE=http://localhost:8080/v1`. See [`docs/quickstart.md`](docs/quickstart.md) for the full path including building from source, Python examples, and the contradiction-handling walkthrough.
+The OpenAI-compatible embeddings endpoint is on the retrieval service. It is authenticated as of v0.3.0 (before that it was open, which was a defect). The default provider is a deterministic hash embedder with no network access; it is for development and tests, not semantic quality. Use `DASH_EMBEDDING_PROVIDER=ollama` for real vectors (see [Configuration](docs-site/docs/reference/configuration.md)).
 
-## What's production-ready
+```bash
+curl -fsS -X POST http://localhost:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
+  -d '{"input": "Company X acquired Company Y", "model": "text-embedding-3-small"}'
+```
 
-- **Claim + Evidence + Edge data model** with first-class citation provenance (`source_id`, `stance`, `source_quality`, `chunk_id`, `span_start`, `span_end`, `doc_id`, `extraction_model`).
-- **Contradiction handling**: `Stance::Contradicts` on evidence and `ClaimEdge { relation: Contradicts }` demote results; `stance_mode: support_only` filters them out.
-- **Temporal validity windows**: `event_time_unix`, `valid_from`, `valid_to` on every claim, with `time_range` filtering on the retrieval API.
-- **OpenAI-compatible `/v1/embeddings`**: byte-compatible request/response with the OpenAI v1 embeddings API. Default provider is `HashEmbeddingProvider` (deterministic, no network); swap for Ollama, OpenAI, or any custom backend by implementing the `EmbeddingProvider` trait.
-- **HNSW ANN** via `usearch` for vector candidate generation, with `DASH_*_ANN_*` tuning knobs and a graph-backed recall layer on top.
-- **Durable WAL** with replay, checkpoints, and compaction in `pkg/store`. WAL durability guardrails reject unsafe flush policies by default; an explicit `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true` override is required for stress testing.
-- **Hash-chained audit log**: every authenticated state change is recorded as a SHA-256-chained JSON line; verify with `scripts/verify_audit_chain.sh`.
-- **Per-tenant rate limits, scoped API keys, and key revocation** with `DASH_*_RATE_LIMIT_*`, `DASH_*_SCOPED_API_KEYS`, and `DASH_*_REVOKED_API_KEYS`. Multi-tenant tenant allowlist enforced in the authz layer.
-- **JWT auth (HS256)** with key rotation by `kid`, optional `iss`/`aud` checks, fallback secrets list, and per-tenant claim enforcement.
-- **Open source** — see the `LICENSE` file (the intended license is Apache-2.0, pending confirmation before the first tagged release). Fully auditable core, no vendor lock-in, no telemetry.
-- **Operational scripts**: backup, restore, recovery drill, failover drill, SLO guard, release-candidate gate, audit chain verifier — see `scripts/`.
-- **Benchmark suite** with `smoke`, `hybrid`, and `large` profiles and a CI-enforced regression guard against prior scorecards.
+```python
+import openai
+client = openai.OpenAI(base_url="http://localhost:8080/v1", api_key=RETRIEVAL_API_KEY)
+resp = client.embeddings.create(input="hello world", model="text-embedding-3-small")
+```
 
-## Comparison
+To run from source instead of Docker, see [`docs/quickstart.md`](docs/quickstart.md). To stop and wipe the stack: `docker compose -f deploy/container/docker-compose.yml down -v`.
 
-DASH vs other vector databases on the dimensions that matter to RAG users. See [`docs/comparison.md`](docs/comparison.md) for the full table and "when to use / when not to use" guidance.
+## Why DASH
 
-| Dimension | DASH | Pinecone | Weaviate | Milvus | Qdrant | Chroma |
-|---|---|---|---|---|---|---|
-| Open source | yes | no | yes (BSD-3) | yes (Apache-2.0) | yes (Apache-2.0) | yes (Apache-2.0) |
-| Claim + Evidence model | first-class | no | no | no | no | no |
-| Contradiction handling | first-class | no | manual | no | no | no |
-| Temporal validity windows | first-class | metadata | manual | manual | manual | manual |
-| OpenAI-compatible `/v1/embeddings` | yes | limited | yes | proxy | proxy | yes |
-| Hash-chained audit log | yes | no | no | no | no | no |
-| Tenant rate limits | yes | yes | yes | yes | partial | no |
-| JWT + scoped API keys + revocation | yes | JWT only | OIDC | yes | partial | no |
-| RAG-specific primitives | yes | no | modules | no | no | no |
+Naive RAG ranks documents by vector similarity and returns the top *k* chunks. That fails in three common enterprise cases: (1) two sources say opposite things and nothing demotes the contradicted one, (2) a fact has a temporal window and the retrieved version is stale, (3) an auditor asks "why did the model say that" and the answer is "a vector was close." DASH treats the **claim**, an atomic source-bound assertion, as the primary data primitive, with **evidence** and **citation** as first-class fields on every result.
+
+A retrieval result carries the claim text, a score, `supports` / `contradicts` counts, and a `citations[]` array. Each citation has `evidence_id`, `source_id`, `stance` (supports / contradicts / neutral), `source_quality`, and optional `chunk_id`, `span_start`, `span_end`, `doc_id`, `extraction_model`. The retrieval API accepts `stance_mode: support_only` to drop claims with more contradictions than supports, and `time_range: {from_unix, to_unix}` to constrain results to a validity window. DASH does not aim to be the fastest pure vector index; the goal is defensible retrieval.
+
+## Status
+
+This is the honest state as of 2026-10-09. The authoritative plan, with owners, phases and exit criteria, is [`docs/plans/2026-10-09-production-readiness-master-plan.md`](docs/plans/2026-10-09-production-readiness-master-plan.md); the defect list is [`docs/plans/2026-10-09-issue-register.md`](docs/plans/2026-10-09-issue-register.md).
+
+**Stable (behavior covered by tests, unlikely to change shape):**
+- Claim, Evidence and Edge schema and validation (`pkg/schema`).
+- Retrieval semantics: `balanced` and `support_only` stance modes, contradiction demotion, temporal `time_range` filtering, optional graph payload.
+- WAL write, replay, checkpoint and snapshot compaction in a single process (`pkg/store`).
+- HS256 JWT validation (kid rotation, `iss`/`aud`, tenant claims), scoped API keys, key revocation lists, role checks (`admin`, `ingest`, `retrieve`, `read_only`).
+
+**Beta (works, with known defects listed in the register; v0.3.0 addresses the P0 items):**
+- HTTP services on a hand-written thread-per-connection transport (ingestion, retrieval, control-plane). v0.3.0: services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1`; strict secret validation (>= 32 chars, placeholders rejected) is on by default; `/v1/embeddings`, `/debug/*` and `/metrics` require auth; replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`.
+- Per-tenant rate limiting. Configurable today, but the limiter state is rebuilt per request and rejections surface as 401, so it does not throttle. v0.3.0 enforces it with HTTP 429.
+- Evidence and edge writes are not idempotent today: evidence is duplicated on restart, retry and replication re-apply (register DATA-01), which inflates citation counts and ranking. v0.3.0 makes them idempotent upserts.
+- WAL recovery: v0.3.0 truncates a torn tail on recovery and adds WAL generation ids so followers resync after compaction.
+- Single-writer ingestion plus polling read replicas, a file-lease control plane and CSV placement files. This is not consensus replication.
+- `redb` on-disk persistence is **on by default** when a WAL path is configured (default `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`; opt out with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`). If the file cannot be opened the service logs an error and continues in memory.
+- Embedding providers: `hash` (default, dev only), `ollama`, `openai`. The OpenAI provider currently speaks plain HTTP only and cannot reach `api.openai.com`; v0.3.0 adds TLS. The Ollama endpoint variable is `DASH_OLLAMA_ENDPOINT`.
+- SHA-256 hash-chained audit log (`DASH_*_AUDIT_LOG_PATH`, verifier `scripts/verify_audit_chain.sh`). The chain is unkeyed, so it detects accidental edits but not an attacker who can rewrite the file; there is no HMAC.
+- OIDC/JWKS validation and RBAC roles (library and transport wiring exist; no end-to-end IdP test in CI).
+- Segment build, manifest, compaction and maintenance daemon (`services/indexer`). Retrieval's use of segments is partial.
+- ANN: an in-repo, multi-level HNSW-style graph in `pkg/store/src/ann.rs`. It is **not** `usearch`: the `usearch` crate is declared in `Cargo.toml` but no source file uses it. Tuning via `DASH_*_ANN_*`. Recall at scale has not been measured in a reproducible CI job.
+- Benchmark and drill scripts. Numbers in `docs/benchmarks/` are drill output, not a published performance claim.
+
+**Planned (do not rely on):**
+- Encryption at rest / CMEK. `pkg/encryption` is a standalone AES-256-GCM library with an env-key provider; no storage code calls it, so nothing on disk is encrypted by DASH.
+- GPU vector backend. `pkg/store/src/gpu.rs` is a stub that always returns "no GPU"; scoring runs on CPU.
+- Consensus replication, automatic failover, sharded cluster mode.
+- Delete, tenant management and reindex APIs (`/v1/delete`, `/v1/tenants`, `/v1/admin/reindex` do not exist; see [Planned API](docs-site/docs/reference/planned-api.md)).
+- Generated config/API reference, signed release images, published release artifacts.
 
 ## Architecture
 
-DASH is a Rust workspace organized into library crates (`pkg/schema`, `pkg/store`, `pkg/ranking`, `pkg/graph`, `pkg/auth`, `pkg/embeddings`) and four service binaries (`services/ingestion`, `services/retrieval`, `services/indexer`, `services/control-plane`). Ingested claims are durably written to a write-ahead log, replayed into an in-memory `Claim + Evidence + Edge` store, and indexed for HNSW ANN candidate generation. The retrieval path runs a planner that combines ANN candidates with metadata filters, time-range filters, stance demotion/filtering, and optional graph expansion, then projects results into a citation-bearing response. JWT and scoped-API-key authz is enforced in the transport layer; per-tenant rate limits and a hash-chained audit log are emitted alongside every state change. The full design — including the data model, WAL/snapshot protocol, retrieval planner, and operational model — lives in [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md).
+DASH is a Rust workspace (edition 2024).
+
+| Crate | Role |
+|---|---|
+| `pkg/schema` | Claim, Evidence, ClaimEdge types and validation |
+| `pkg/store` | In-memory store, WAL, redb disk layer, in-repo HNSW-style ANN, GPU stub |
+| `pkg/ranking` | Scoring (confidence, stance, source quality, contradiction penalty) |
+| `pkg/graph` | Claim graph expansion and support/contradiction path reasoning |
+| `pkg/auth` | HS256 JWT, OIDC/JWKS, roles, SHA-256 helper |
+| `pkg/embeddings` | `EmbeddingProvider` trait; hash, Ollama, OpenAI providers; circuit breaker |
+| `pkg/encryption` | AES-256-GCM envelope library with env-key provider (not wired into storage) |
+| `services/ingestion` | Write API (`/v1/ingest*`), WAL owner, replication source |
+| `services/retrieval` | Read API (`/v1/retrieve`, `/v1/embeddings`), WAL/replication follower |
+| `services/control-plane` | Placement state, file-lease leader election, failover promotion |
+| `services/metadata-router` | Shard placement and read/write routing library used by the services |
+| `services/indexer` | Segment builder, compaction planner, `segment-maintenance-daemon` |
+| `services/common` | Shutdown signaling, secret validation, logging |
+| `tests/benchmarks` | Benchmark and load-test binaries |
+
+Ingested claims are written to a WAL, replayed into an in-memory Claim + Evidence + Edge store, and indexed for ANN candidate generation. The retrieval path combines ANN and lexical candidates with tenant, time-range and stance filters and optional graph expansion, then projects citation-bearing results. Design detail: [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) (the design document predates several renames; where it disagrees with the code, the code and this README win).
+
+## SDKs
+
+Six client SDKs live in `sdks/`. The Python, Go, TypeScript, Java and C# SDKs send the API key as `Authorization: Bearer <api_key>`, which the servers accept (the Kotlin SDK was not checked). Test counts are static counts of test declarations and include live-integration tests that are skipped without a running server.
+
+| SDK | Path | Version | Coverage | Tests |
+|---|---|---|---|---|
+| Python (`dash-py`) | `sdks/python` | 0.1.0 | embeddings, retrieve; sync and async; OpenAI-compat helper. Ingest types only, no ingest method. | 64 |
+| Go | `sdks/go` | untagged | embeddings, retrieve, OpenAI-compat. No ingest method. | 89 |
+| TypeScript (`dash-ts`) | `sdks/typescript` | 0.1.0 | embeddings, retrieve, OpenAI-compat. No ingest method. | 69 |
+| Java | `sdks/java` | 0.2.0 | embeddings, ingest, retrieve. | 21 |
+| Kotlin | `sdks/kotlin` | 0.2.0 | embeddings, ingest, retrieve (suspend API). | 12 |
+| C# | `sdks/csharp` | 0.2.0 | embeddings, ingest, retrieve. | 41 |
+
+The Java, Kotlin and C# SDKs also expose a `delete` call for `POST /v1/delete`, which the server does not implement. Do not use it. v0.3.0 fixes the three JVM/.NET SDKs and unifies them at 0.2.0. See [`sdks/LIVE_INTEGRATION_TESTS.md`](sdks/LIVE_INTEGRATION_TESTS.md) for running SDK tests against a live stack.
+
+## Tests
+
+Counts are static (computed 2026-10-09 with `grep -rE '#\[(tokio::)?test\]' --include=*.rs . | wc -l`); they are not a pass/fail report. CI is the source of truth for what passes.
+
+| Suite | Declared tests |
+|---|---|
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 420 |
+| Python SDK | 64 |
+| Go SDK | 89 |
+| TypeScript SDK | 69 |
+| Java SDK | 21 |
+| Kotlin SDK | 12 |
+| C# SDK | 41 |
+
+There are also four `cargo-fuzz` targets in `fuzz/` (JWT, OpenAI embeddings parser, ranking, WAL parser) and a benchmark suite in `tests/benchmarks`.
+
+## Comparison
+
+See [`docs/comparison.md`](docs/comparison.md) for a feature comparison with other vector databases and guidance on when not to use DASH. DASH's differentiators are the claim/evidence/contradiction/temporal data model and per-result citations. It does not match mature vector databases on scale, operational tooling, or ANN performance, and none of those comparisons are backed by head-to-head benchmarks yet.
 
 ## Roadmap
 
-Done (in this tree):
-- Claim + Evidence + Edge schema, validation, and serde round-trips
-- WAL with replay, checkpoints, compaction, and durability guardrails
-- HNSW ANN via `usearch` with `DASH_*_ANN_*` tuning
-- Retrieval API with `Balanced` and `SupportOnly` stance modes, time-range filtering, optional graph payload
-- OpenAI-compatible `/v1/embeddings`
-- Per-tenant authz, scoped keys, revocation, rate limits
-- Hash-chained audit log with chain verifier
-- HS256 JWT with kid rotation, `iss`/`aud`, fallback secrets
-- Benchmark suite with CI regression guard
-- Docker Compose and systemd unit files
+Shipped in this tree: claim/evidence/edge model, WAL with checkpoints, retrieval with stance and time filters, scoped keys and JWT auth, OIDC/JWKS and RBAC, OpenAI-compatible embeddings endpoint, hash-chained audit log, segment indexer and maintenance daemon, control-plane with file-lease leadership, redb persistence layer, six SDKs, Docker/Helm/systemd packaging, benchmark suite.
 
-Next (active development):
-- Larger-scale ANN recall/quality tuning and benchmarking at 10M+ claim corpora
-- Full segment lifecycle integration in the retrieval hot path
-- Distributed shard + replication protocol (placement router is wired; production-ready replication path is not)
-- Auth federation (OIDC), broader key-rotation story
-- Pluggable embedding backends (Ollama, OpenAI passthrough) as a first-class `EmbeddingProvider` example set
-- JavaScript/TypeScript and Go SDKs
+Next (P0, release v0.3.0): the hardening items listed under [Status](#status), tracked in the issue register.
+
+After that, in plan order: container/Helm/CI hardening (P1), storage engine and index rework (P2), consensus replication (P3), encryption at rest and tenant lifecycle (P4), retrieval quality evaluation (P5), API and SDK regeneration (P6), GA hardening (P7). See the master plan for scope and exit criteria.
 
 ## Contributing
 
-Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the workflow, code standards (clippy enforced at `-D warnings`, fmt enforced in CI), RFC process, and "good first issue" list. All new code must pass `cargo test --workspace` and `./scripts/ci.sh`.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). New code must pass `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. An issue is closed only when the fix is merged with a regression test that fails on the old code; plan status lines must link to evidence.
 
 ## License
 
-DASH is source-available software. The intended release license is Apache-2.0, pending confirmation before the first tagged release. Until a `LICENSE` file is added at the repository root, the actual terms are those stated in the repository's `README.md` and `CONTRIBUTING.md`.
+Apache License 2.0. See [`LICENSE`](LICENSE).

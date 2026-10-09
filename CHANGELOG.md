@@ -6,6 +6,77 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+This section is the planned content of **0.3.0**. Nothing below has shipped
+yet; items move to a dated release section only when the fix is merged with
+a regression test that fails on the old code (see `CONTRIBUTING.md`). The
+authoritative scope, owners and exit criteria are in
+[`docs/plans/2026-10-09-production-readiness-master-plan.md`](docs/plans/2026-10-09-production-readiness-master-plan.md)
+and the defect IDs below refer to
+[`docs/plans/2026-10-09-issue-register.md`](docs/plans/2026-10-09-issue-register.md).
+
+## 0.3.0 (planned) - P0 production-readiness hardening
+
+### Security
+- Services refuse to start without credentials unless
+  `DASH_INSECURE_DEV_MODE=1`; dev mode binds localhost only (SEC-01).
+- Strict secret validation is on by default: at least 32 characters,
+  placeholders rejected (SEC-04, SEC-05).
+- `/v1/embeddings`, `/debug/*` and `/metrics` require authentication;
+  authentication runs before any embedding provider call (SEC-09,
+  SEC-10).
+- Replication endpoints require `DASH_INGEST_REPLICATION_TOKEN` (SEC-08).
+- The control plane requires `DASH_CONTROL_PLANE_TOKEN` (SEC-07).
+- Per-tenant rate limiting is enforced and rejects with HTTP 429
+  (SEC-06).
+- The OpenAI embedding provider speaks TLS (SEC-23).
+- The Ollama endpoint variable is `DASH_OLLAMA_ENDPOINT`.
+
+### Data integrity and recovery
+- Evidence and edges are idempotent upserts instead of appends (DATA-01).
+- A torn WAL tail is truncated on recovery instead of failing startup.
+- WAL generation ids force follower resync after compaction.
+
+### SDKs
+- Java, Kotlin and C# SDKs are fixed and unified at version 0.2.0.
+
+### Documentation
+- README, configuration reference, HTTP API reference, deploy guide,
+  threat model and SOC 2 readiness mapping rewritten to describe only
+  what the code does (DOC-01 to DOC-07). Every README capability claim is
+  tracked in `docs/claims-ledger.md` and checked by
+  `scripts/check_claims_ledger.sh`.
+
+## M11 - Enterprise identity, RBAC, encryption library, SOC 2 package (in tree, untagged; 2026-08-10)
+
+Delivered in commits `c55e8cb` (M11a/M11b) and `e38cd0b` (M11c/M11d). What
+exists and what does not:
+
+### Added
+- **OIDC/JWKS token validation** (`pkg/auth/src/oidc.rs`): JWKS fetch with
+  a refresh interval, issuer/audience/expiry checks, tenant claim
+  extraction. Enabled per service with `DASH_*_JWT_PROVIDER=oidc`. Unit
+  tests use a symmetric (`oct`/HS256) JWK; there is no end-to-end test
+  against an identity provider and no RSA/EC key test.
+- **Role-based access control**: roles `admin`, `ingest`, `retrieve`,
+  `read_only` parsed from JWT claims and scoped API keys
+  (`key:tenants:roles`) and checked per route in ingestion and retrieval.
+  Known gaps: roles have no hierarchy, a JWT without a roles claim gets
+  all roles, unscoped keys skip role checks (SEC-11). The planned
+  control-plane `admin` enforcement was not implemented (SEC-07).
+- **`pkg/encryption`**: an AES-256-GCM `EncryptionProvider` trait with an
+  environment master-key provider. This is a library only: no storage
+  code calls it, so no data is encrypted at rest by DASH (SEC-16).
+- **SOC 2 readiness package**: `docs/compliance/soc2-readiness.md`,
+  policy templates, and `scripts/soc2_evidence_collector.sh`. These
+  describe a target state; see the "Current status" column added in the
+  2026-10-09 documentation correction.
+
+## 0.2.x line - 2026-06-13 modernization (in tree, untagged)
+
+Everything below this heading was previously listed under `[Unreleased]`.
+Corrections made on 2026-10-09 are marked *Correction*.
+
+
 ### Added
 - **OpenAI-compatible `/v1/embeddings` endpoint** on the retrieval
   service. Any OpenAI client (langchain, llama-index, semantic-kernel,
@@ -40,7 +111,7 @@ to [Semantic Versioning](https://semver.org/).
   in `[-1, 1]`, mapped to `[0, 1]`); the lexical/BM25 score becomes a
   small tie-breaker. 3 new integration tests cover the semantic-first
   guarantee.
-- **redb persistence (PR 1, additive, default off)** — `DiskBackedStore`
+- **redb persistence (PR 1, additive)** (*Correction:* PR 1 shipped default-off, but commit `6a242d8` (PR 2) made persistence default-on when a WAL path is set; disable with `DASH_*_PERSISTENCE_DISABLE=1`. The text below describes PR 1.) — `DiskBackedStore`
   struct in `pkg/store/src/disk.rs` provides on-disk durability for
   claims, evidence, edges, vectors, and the tenant→claim set. Enabled
   via `DASH_INGEST_PERSISTENCE_PATH` / `DASH_RETRIEVAL_PERSISTENCE_PATH`
@@ -77,10 +148,13 @@ to [Semantic Versioning](https://semver.org/).
   `jsonwebtoken`, `serde_json`, `base64`, `sha2`, and `hex`. Public
   API preserved. 16 tests pass (was 7 in the hand-rolled impl —
   added 9 new edge-case tests including a FIPS SHA-256 known vector).
-- **Hand-rolled HNSW in pkg/store** — replaced the 4-level O(N²)-per-insert
-  HNSW scaffolding with the `usearch` crate. Per-tenant ANN graphs
-  are still isolated and dimension-pinned; the new index is
-  substantially faster on the benchmark suite.
+- **Hand-rolled HNSW in pkg/store** — *Correction (2026-10-09):* this
+  entry originally claimed the in-repo HNSW scaffolding was replaced by
+  the `usearch` crate and was "substantially faster". That did not
+  happen. `usearch` is declared in `Cargo.toml` but no source file uses
+  it; the ANN index is the in-repo HNSW-style graph in
+  `pkg/store/src/ann.rs` (register IDX-01). No benchmark in the
+  repository supports a speedup claim.
 - **Schema types** in `pkg/schema` — added `Serialize`/`Deserialize`
   derives to all public domain types with `#[serde(default)]` on
   optional fields.
@@ -101,6 +175,12 @@ to [Semantic Versioning](https://semver.org/).
   `ingest_bundle`; fixed by merging into a single evidence vec).
 
 ### Test counts
+*Correction (2026-10-09):* the counts below are the figures recorded on
+2026-06-13 and were not re-verified. On 2026-10-09 the repository
+contains 420 Rust `#[test]`/`#[tokio::test]` declarations (static
+count). SDK test declarations: Python 64, Go 89, TypeScript 69, Java 21,
+Kotlin 12, C# 41. Pass/fail status is the CI result, not these numbers.
+
 - **Rust unit + integration tests:** 379 passing (was 333 at the start
   of this modernization campaign; +46 new tests across schema,
   auth, store (unit), store (integration_retrieval), retrieval,
@@ -111,13 +191,9 @@ to [Semantic Versioning](https://semver.org/).
 - **Total across all stacks:** **589 tests passing.**
 
 ### Known limitations
-- The `InMemoryStore::Clone` derive was replaced with a manual impl
-  that drops the disk handle on clone. This is a known limitation of
-  the redb PR 1 design; the next PR will switch to `Arc<DiskBackedStore>`
-  to share the handle cheaply. Cloned stores used for batched ingest
-  staging will lose their disk attachment — this affects
-  `IngestionRuntime::ingest_batch` which does `self.store.clone()`
-  internally.
+- *Superseded:* the `InMemoryStore::Clone` limitation (disk handle dropped
+  on clone) was addressed by redb PR 2 (`Arc<DiskBackedStore>`, commit
+  `6a242d8`).
 - The `embeddings_for_claim` returns the full evidence vec; for tenants
   with thousands of evidence per claim, this is unbounded. A future
   PR will add pagination.
@@ -129,6 +205,9 @@ to [Semantic Versioning](https://semver.org/).
 ## Earlier releases
 
 ### Pre-modernization
+(Note: the architecture document referred to here is
+`docs/architecture/eme-architecture.md`; the root `EME_ARCHITECTURE.md`
+is now a pointer to it.)
 The original EME/DASH architecture is documented in
 `docs/architecture/eme-architecture.md` (the "Evidence Memory Engine"
 phase 0 design). The 11-phase production rollout plan lives in

@@ -1,128 +1,43 @@
 # Backup
 
-DASH state lives in two places: the `redb` snapshot files and the WAL. A complete backup procedure copies both, verifies the copies, and ships them off-host. This page describes the recommended procedure for each layer, the cross-region replication pattern, and the restore procedure.
+DASH's recoverable state is the **WAL** (plus its `.snapshot` file after a checkpoint), the optional **segment directory**, and the **placement file** when placement routing is used. The `redb` file is a mirror that the service can run without, and is not included in the backup bundle. This page describes the scripts that exist and how to use them. It replaces an earlier version that referenced `dash-admin`, `redb-checksum`, `dash-wal-replay`, a `tests/backup/` suite and RPO/RTO figures; none of those exist and no recovery-time numbers have been measured.
 
-## redb snapshots
-
-The `redb` file is a single, self-contained, page-aligned file. A filesystem-level snapshot is the recommended backup primitive.
-
-### Procedure
-
-1. **Trigger a checkpoint** on the live service. The service exposes a checkpoint on `SIGHUP`; the `dash` CLI exposes it as `dash-admin checkpoint` (a thin wrapper over `kill -HUP $(pidof dash-ingestion)`).
-
-2. **Copy the file** with a method that guarantees a consistent read:
-   - On a filesystem that supports it (LVM, ZFS, EBS), take a snapshot first and copy from the snapshot.
-   - On a plain filesystem, stop the service, copy, and start it back up. The downtime is sub-second because the service restart is bounded by the WAL replay time.
-
-3. **Verify the copy** with the bundled `redb-checksum` tool:
-
-   ```bash
-   redb-checksum /var/backups/dash/ingest.redb
-   # [OK] redb file verifies, 17842 keys across 4 tables
-   ```
-
-4. **Ship off-host** to object storage, a second disk, or a second region.
-
-### Script
+## Create a bundle
 
 ```bash
-#!/usr/bin/env bash
-# /usr/local/bin/dash-backup.sh — run from cron or systemd timer.
-set -euo pipefail
-
-DATA=/var/lib/dash
-BACKUP=/var/backups/dash/$(date -u +%Y%m%dT%H%M%SZ)
-S3=s3://my-bucket/dash-backups
-mkdir -p "$BACKUP"
-
-# 1. Checkpoint
-systemctl reload dash-ingestion
-systemctl reload dash-retrieval
-sleep 1
-
-# 2. Snapshot (LVM example; adapt to your filesystem)
-lvcreate -L 10G -s -n dash-snap /dev/vg0/dash
-mount -o ro /dev/vg0/dash-snap /mnt/snap
-
-# 3. Copy
-install -m 0644 /mnt/snap/ingest.redb    "$BACKUP/ingest.redb"
-install -m 0644 /mnt/snap/retrieval.redb "$BACKUP/retrieval.redb"
-
-# 4. Verify
-redb-checksum "$BACKUP/ingest.redb"
-redb-checksum "$BACKUP/retrieval.redb"
-
-# 5. Cleanup snapshot
-umount /mnt/snap
-lvremove -f /dev/vg0/dash-snap
-
-# 6. Ship off-host
-aws s3 cp --recursive "$BACKUP" "$S3/$(basename "$BACKUP")/"
-
-# 7. Local retention
-find /var/backups/dash -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
+scripts/backup_state_bundle.sh \
+  --wal-path /var/lib/dash/wal/ingestion.wal \
+  --segment-dir /var/lib/dash/segments/ingestion \
+  --output-dir /var/backups/dash
 ```
 
-## WAL archiving
+Options (from `--help`): `--wal-path` (default `DASH_INGEST_WAL_PATH` or `DASH_RETRIEVAL_WAL_PATH`), `--segment-dir`, `--placement-file`, `--output-dir` (default `dist/backups`), `--bundle-label`, and `--s3-uri` to upload the bundle. The output is `dash-backup-<label>.tar.gz` containing the WAL, its snapshot file, the optional directories, and a `CHECKSUMS.sha256` file.
 
-The WAL is the **first** thing written on every mutation. A backup that misses the WAL head has a gap between the snapshot and the most recent state. The recommended pattern is to **archive the WAL continuously** with a sidecar.
+The script reads the files while the service may be running. To get a quiesced copy, stop ingestion (or snapshot the volume with your filesystem or cloud tooling) before running it.
+
+## Restore
 
 ```bash
-#!/usr/bin/env bash
-# Tail the WAL and ship every closed segment to object storage.
-# Run as a systemd service or a Kubernetes sidecar.
-set -euo pipefail
+# Verify checksums only, no writes:
+scripts/restore_state_bundle.sh --bundle dist/backups/dash-backup-<label>.tar.gz --verify-only true
 
-WAL=/var/lib/dash/ingest.wal
-ARCHIVE=s3://my-bucket/dash-wal
-LAST_SEG=0
-
-while true; do
-    CUR_SEG=$(stat -c %Y "$WAL")
-    if [ "$CUR_SEG" != "$LAST_SEG" ]; then
-        SEG_NAME="ingest-$(date -u +%Y%m%dT%H%M%SZ).wal"
-        aws s3 cp "$WAL" "$ARCHIVE/$SEG_NAME" --no-progress
-        LAST_SEG="$CUR_SEG"
-    fi
-    sleep 5
-done
+# Restore (stop the services first):
+scripts/restore_state_bundle.sh \
+  --bundle dist/backups/dash-backup-<label>.tar.gz \
+  --wal-path /var/lib/dash/wal/ingestion.wal \
+  --segment-dir /var/lib/dash/segments/ingestion \
+  --force true
 ```
 
-The archive is a series of immutable segments. On restore, the segments are replayed in order after the redb snapshot is loaded.
+`--bundle` also accepts an `s3://` URI. The script refuses to overwrite existing targets unless `--force true`. After restoring, start ingestion: it replays the snapshot and WAL into memory. If a stale `redb` file exists from before the restore, remove it (or leave `DASH_INGEST_PERSISTENCE_DISABLE=1` for the first start) so it cannot disagree with the restored WAL. Retrieval followers resync from ingestion by replication; reset their offset file (`DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) if the restored WAL is shorter than what they had applied.
 
-## Cross-region replication
+## Drill
 
-For cross-region durability, the recommended pattern is **continuous WAL archive + periodic snapshot replication**:
+`scripts/backup_restore_drill.sh` runs ingest, backup, state destruction, restore and a retrieval comparison through Docker Compose. It is wired into the "Backup/Restore Drill" job in `.github/workflows/rust.yml`; check that workflow's latest run for the current result. The drill uses `DASH_INGEST_API_KEY` when it is set.
 
-1. Ship every WAL segment to a second region as it is rotated (above script, with `DEST_REGION=us-west-2`).
-2. Once an hour, copy the most recent `redb` snapshot to the second region (`aws s3 cp --recursive ... --region us-west-2`).
-3. The recovery-point objective (RPO) is the WAL rotation interval (default 5 minutes).
-4. The recovery-time objective (RTO) is `redb load time + WAL replay time`. For 1 M claims, that is ~10 seconds. For 100 M claims, ~2 minutes.
+## Cadence and gaps
 
-A second region can be promoted to read-write by running a new ingestion replica against the replicated `redb` file; the WAL tail is paused on the original region, and the new region takes over as the leader.
-
-## Restore procedure
-
-To restore from a backup:
-
-1. **Stop** both services.
-2. **Copy** the `redb` files from the backup to the data directory.
-3. **Replay** the WAL segments in order:
-
-   ```bash
-   ls -1 /var/backups/dash/wal/ingest-*.wal | sort | \
-     xargs -I {} dash-wal-replay /var/lib/dash/ingest.redb {}
-   ```
-
-   The `dash-wal-replay` tool (in `tools/`) is idempotent — it skips records whose `(tenant_id, idempotency_key)` is already in the redb file.
-
-4. **Start** the services. The services will pick up the restored state on boot.
-
-### Test the backup
-
-A backup that has never been restored is a backup that will fail when it matters. The recommended cadence:
-
-- **Weekly**: restore the latest backup to a staging cluster, run the test suite, and tear down.
-- **Monthly**: full DR drill — take a fresh backup, restore it to a clean cluster in a second region, fail over the load balancer, run the production read traffic for an hour, and fail back.
-
-Automate both in CI. The `tests/backup/` directory has a script that orchestrates a restore against a kind cluster.
+- There is no built-in continuous WAL archiving, point-in-time recovery tooling or cross-region replication. Archiving WAL files with a generic tool (rsync, object-storage sync) is possible but untested here.
+- Backups are not encrypted by DASH. Encrypt the destination.
+- Restore drills should be run on a schedule that you own; none is automated beyond the CI job above.
+- State-bundle consistency while the service is writing is not guaranteed (see register DATA-10 on non-atomic multi-record writes).

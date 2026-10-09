@@ -85,12 +85,11 @@ git checkout -b feature/add-hnsw-index
 Use clear, imperative commit messages:
 
 ```text
-Add HNSW vector index integration
+Add tenant allowlist check to the retrieval path
 
-- Integrate usearch crate for ANN search
-- Add IndexBuilder trait for pluggable indexes
-- Implement IndexedStore with vector retrieval path
-- Add benchmark comparing linear scan vs HNSW
+- Reject tenants outside the configured allowlist before embedding
+- Return 403 with a stable error message
+- Add a regression test that fails without the check
 ```
 
 ### 4. Push and open a PR
@@ -166,7 +165,7 @@ Looking for a place to start? Check issues labeled [`good-first-issue`](https://
 
 ### High complexity (but high impact!)
 
-- Integrate ANN vector index (HNSW via `usearch` or `hora`)
+- Replace the in-repo ANN graph with a maintained HNSW library (evaluate `usearch` or `hora`; see register IDX-01)
 - Build pluggable embedding model API
 - Implement multi-hop graph traversal
 - Design segment storage with object store backend (S3)
@@ -321,8 +320,12 @@ Contributors are recognized in:
 ## Questions?
 
 - Check the [Concepts](../concepts/index.md) section of the docs for system design.
-- Check [`EME_ARCHITECTURE.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/EME_ARCHITECTURE.md) for the original EME architecture doc.
+- Check [`docs/architecture/eme-architecture.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/architecture/eme-architecture.md) for the original EME architecture doc.
 - Open a [GitHub Discussion](https://github.com/BHAWESHBHASKAR/DASH/discussions) for questions.
 - Tag maintainers in issues if blocked.
 
 **Thank you for contributing to DASH!**
+
+## Closing issues and status claims
+
+An issue is closed only when the fix is merged with a regression test that fails on the old code; plan status lines must link to evidence. Capability claims in the README are tracked in `docs/claims-ledger.md` and checked by `scripts/check_claims_ledger.sh`. See `CONTRIBUTING.md` in the repository root for the full rule.

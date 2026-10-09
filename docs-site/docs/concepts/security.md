@@ -1,106 +1,53 @@
 # Security
 
-DASH is built to be deployed in environments that are subject to audit — legal-tech, med-tech, fintech, enterprise. The security model is small, explicit, and conservative. This page describes the auth model, the API-key scoping, the hash-chained audit log, and the threat model.
+This page describes the security controls that exist in DASH today, the ones that change in v0.3.0, and the ones that are only planned. DASH is pre-1.0; read the [threat model](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/threat-model.md) and the [issue register](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/plans/2026-10-09-issue-register.md) before exposing a deployment to untrusted networks.
 
-## JWT auth model
+## Authentication
 
-DASH uses **JWT bearer tokens** for all authenticated endpoints. The token is verified against an **asymmetric public key** (`RS256` or `EdDSA`); the private key never lives in the DASH process.
+Each service (ingestion, retrieval) authenticates requests independently. Accepted credentials:
 
-```text
-Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
-```
+1. **API keys**: `x-api-key: <key>` or `Authorization: Bearer <key>`. Configured with `DASH_INGEST_API_KEY(S)` / `DASH_RETRIEVAL_API_KEY(S)`. Keys are compared as plain strings (no hashing at rest).
+2. **Scoped API keys**: `DASH_*_API_KEY_SCOPES`, entries `key:tenantA,tenantB[:role,...]` separated by `;`. A scoped key is limited to the listed tenants and roles.
+3. **HS256 JWTs**: validated with `DASH_*_JWT_HS256_SECRET` (plus rotation secrets and a `kid` to secret map). Optional `iss`, `aud`, leeway and required `exp`. The tenant list is read from `tenant_id`, `tenants` or `tenant_ids`; roles from `dash_roles`.
+4. **OIDC / JWKS** (`DASH_*_JWT_PROVIDER=oidc`): validates tokens against an issuer's JWKS, using the algorithm named in the token header and the matching JWK (via the `jsonwebtoken` crate). The unit tests only exercise a symmetric (`oct`/HS256) JWK; RSA/EC JWKs are not covered by tests in this repository. There is no PEM public-key configuration (`DASH_*_JWT_PUBLIC_KEY` does not exist) and no required scope names such as `claims:read`.
 
-The JWT is verified by the `pkg/auth` crate (which uses `jsonwebtoken`). The required claims are:
+Authorization checks, in order: credential validity, revocation, tenant scope (credential and the `DASH_*_ALLOWED_TENANTS` allowlist), and role (`admin`, `ingest`, `retrieve`, `read_only`). Roles do not imply each other.
 
-| Claim      | Required | Type             | Meaning                                          |
-| ---------- | -------- | ---------------- | ------------------------------------------------ |
-| `sub`      | yes      | string           | The principal (a user ID, service-account ID).   |
-| `tenants`  | yes      | array of strings | The tenants the principal is authorized for.     |
-| `scopes`   | yes      | array of strings | The capabilities (see below).                    |
-| `exp`      | yes      | integer (unix)   | Expiration.                                      |
-| `iat`      | yes      | integer (unix)   | Issued-at.                                       |
-| `aud`      | yes      | string           | Must equal `dash`.                               |
+Revoke an API key with `DASH_*_REVOKED_API_KEYS` or by adding it to the file at `DASH_*_REVOKED_KEYS_PATH` (one key per line; re-read on each request). There is no key expiry and no overlap/rotation setting; rotate by adding the new key to `DASH_*_API_KEYS`, moving clients, then removing the old one.
 
-The signing key is configured by `DASH_INGEST_JWT_PUBLIC_KEY` / `DASH_RETRIEVAL_JWT_PUBLIC_KEY` (PEM, env var) or by a path (`DASH_*_JWT_PUBLIC_KEY_PATH`). A token with an unknown `kid` is rejected.
+### Known gaps (v0.2.x), fixed or changing in v0.3.0
 
-### Scopes
+| Gap | Register | v0.3.0 |
+|---|---|---|
+| Auth is fail-open when no credentials are configured | SEC-01 | Services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1` (localhost only). |
+| With only a JWT secret set, a request with no `Authorization` header is accepted | SEC-02 | P0 fix. |
+| `/v1/embeddings`, `/metrics`, `/debug/*` unauthenticated | SEC-09, SEC-10 | Require auth. |
+| Embeddings are computed before authentication on retrieve/ingest | SEC-09 | P0 fix. |
+| Replication endpoints open unless a token is set | SEC-08 | `DASH_INGEST_REPLICATION_TOKEN` required. |
+| Control plane has no authentication | SEC-07 | `DASH_CONTROL_PLANE_TOKEN` required. |
+| Rate limiter never throttles | SEC-06 | Enforced; HTTP 429. |
+| Secret validation is opt-in, minimum 16 characters | SEC-04/05 | On by default, minimum 32 characters, placeholders rejected. |
+| JWT without a roles claim gets all roles; roles have no hierarchy | SEC-11 | P1. |
+| OpenAI embedding provider has no TLS | SEC-23 | TLS added. |
 
-| Scope             | Grants                                              |
-| ----------------- | --------------------------------------------------- |
-| `claims:read`     | `POST /v1/retrieve`, `POST /v1/embeddings`          |
-| `claims:write`    | `POST /v1/ingest`                                   |
-| `audit:read`      | The audit-log read endpoint (if enabled).           |
-| `admin:tenants`   | Tenant create / delete in the control plane.        |
+## Audit log
 
-A token without `claims:write` cannot call `POST /v1/ingest`. A token without `claims:read` cannot call `POST /v1/retrieve`. The check is in the route handler; a scope mismatch returns HTTP 403.
+When `DASH_INGEST_AUDIT_LOG_PATH` / `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set, each service appends a JSON line per audited request with a SHA-256 hash chain (`seq`, `prev_hash`, `hash`). The format is in the [data model](data-model.md#audit-record). Limits to understand:
 
-### Token lifetime
+- The chain is unkeyed. It catches accidental damage, not a deliberate rewrite by someone with write access to the file. There is no HMAC and no external anchoring.
+- Records carry the tenant, action, status and reason, but no principal, JWT `jti`, or request/response hashes.
+- Ingestion's chain does not verify with `scripts/verify_audit_chain.sh` today (SEC-17).
+- Audit is off by default and is not enabled in any shipped deployment manifest.
+- There is no retention setting, compaction or per-tenant chain; one chain per service log file.
 
-DASH does not enforce a maximum token lifetime — the issuer is responsible. Recommended ceiling: **1 hour** for user tokens, **15 minutes** for service-account tokens. A refresh-token flow is the issuer's responsibility (DASH does not issue tokens).
+## Encryption
 
-## Scoped API keys
+DASH does not encrypt data at rest and does not terminate TLS. Use an encrypted volume and a TLS-terminating proxy. `pkg/encryption` is an AES-256-GCM library with an environment-key provider; no service calls it, so `DASH_ENCRYPTION_*` settings have no effect (SEC-16, planned P4). The OpenAI embedding provider needs v0.3.0 for TLS.
 
-For service-to-service callers that cannot easily mint JWTs (legacy backends, cron jobs, embedded agents), DASH supports **scoped API keys**. A scoped API key is a 256-bit random value, base64url-encoded, with a record in redb:
+## What was documented before and is not true
 
-```json
-{
-  "key_id": "ak_01HMRX...",
-  "tenant_id": "t1",
-  "scopes": ["claims:read", "claims:write"],
-  "created_at_unix": 1718300000,
-  "expires_at_unix": 1720976000,
-  "last_used_at_unix": 1718300050
-}
-```
+Earlier versions of this page described RS256/EdDSA-only JWTs, `claims:read` / `claims:write` scopes, `DashKey` API keys stored in redb with expiry, constant-time comparison, `DASH_API_KEY_OVERLAP_SECONDS`, per-tenant audit chains, and `DASH_AUDIT_RETENTION_DAYS` compaction. None of these exist. See [Planned API](../reference/planned-api.md).
 
-The caller passes the key in the `Authorization` header with a `DashKey` scheme:
+## Reporting a vulnerability
 
-```text
-Authorization: DashKey ak_01HMRX...
-```
-
-The lookup is constant-time on the key prefix; the full key is compared with a `subtle::ConstantTimeEq`. A key with `expires_at_unix` in the past returns HTTP 401.
-
-API keys are **tenant-scoped**: a key for `t1` cannot be used to read or write claims in `t2`. The check is in the same code path as the JWT tenant check.
-
-### Rotation
-
-A new key can be issued with the same `key_id` and a new secret. The old key remains valid for the duration of `DASH_API_KEY_OVERLAP_SECONDS` (default: 60 seconds) so that callers can roll without downtime.
-
-## Hash-chained audit log
-
-Every authenticated state change is recorded in a **hash-chained audit log**. The format is described in [Data model → AuditEvent](data-model.md#auditevent). The chain is verified by `scripts/verify_audit_chain.sh`:
-
-```bash
-./scripts/verify_audit_chain.sh /var/lib/dash/audit.log
-# [OK] chain verifies, 17842 events
-```
-
-A modified event invalidates every subsequent `hash`. The chain is the **primary tamper-evidence mechanism** in DASH — it is the artifact the auditor inspects when a question of the form "did anyone modify the data?" comes up.
-
-The chain is **per-tenant**. A break in tenant `t1`'s chain does not affect tenant `t2`'s chain.
-
-### Retention
-
-`DASH_AUDIT_RETENTION_DAYS` (default: 2555 — seven years) controls how long audit events are retained. Events older than the retention window are compacted into a daily summary record (event count, hash of the day's chain) and the individual records are deleted.
-
-## Threat model
-
-The full threat model is in [Security → Threat model](../about/security.md#threat-model). The short version:
-
-| Threat                                            | Mitigation                                            |
-| ------------------------------------------------- | ----------------------------------------------------- |
-| Stolen JWT                                         | Short token lifetime; audience claim; `aud = dash`.   |
-| Stolen API key                                     | Per-tenant scoping; rotation overlap; constant-time compare. |
-| Cross-tenant data leak                             | Hard isolation in the store + the API layer.           |
-| Tampering with audit log                           | SHA-256 hash chain; verify script in CI.               |
-| Replay of ingest                                   | Idempotency keys; redb dedup.                          |
-| DoS via large payload                              | `Content-Length` cap; per-tenant rate limit.           |
-| Slow-loris DoS                                     | TCP read timeout in the transport.                     |
-| SQL injection                                      | N/A — DASH is not SQL.                                 |
-| Dependency CVE                                     | `cargo audit` in CI; `trivy` on the image.             |
-| Compromised redb file                              | `redb` is ACID; replay from WAL reconstructs.          |
-| Compromised process memory                        | JWT public-key only; private key never enters DASH.   |
-| Compromised operator workstation                  | Out of scope; see the operator-host-hardening guide.   |
-
-For the full threat model, including the residual risks, see [Security policy](../about/security.md).
+See [`SECURITY.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/SECURITY.md) and [About → Security](../about/security.md).

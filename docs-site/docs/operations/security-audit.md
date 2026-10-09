@@ -1,72 +1,34 @@
-# Security & audit
+# Security and audit
 
-DASH is built to be deployed in audit-subjected environments. The security story is layered: a small attack surface, a tight set of dependencies, a hash-chained audit log, and a CI pipeline that catches regressions before they ship. This page describes the audit tools, the CI checks, and the threat model.
+This page describes the security checks and audit tooling that exist in the repository, and says what they do and do not prove. It replaces an earlier version that reported "0 open advisories" and "0 HIGH, 0 CRITICAL" without a source; no such result is recorded in this repository, so none is claimed here.
 
-## `cargo audit`
+## CI checks (`.github/workflows/security.yml`)
 
-`cargo audit` checks the Rust dependency tree against the [RustSec Advisory Database](https://rustsec.org/). The check is in CI on every PR:
+| Job | What it runs | Notes |
+|---|---|---|
+| `cargo-audit` | `cargo install cargo-audit --locked` then `cargo audit` | Checks `Cargo.lock` against the RustSec database. It uses default behavior, not `--deny warnings`. There is no `deny.toml` in the repository. |
+| Trivy filesystem scan | `trivy fs` with `ignore-unfixed`, severity HIGH/CRITICAL, SARIF upload | A scan of the source tree, not of a built container image. The action is referenced as `@master` (register SEC-21). |
+| CodeQL | `github/codeql-action` with `security-and-quality`, per language matrix | Findings appear in the repository's code-scanning tab. |
+| Gitleaks | `gitleaks/gitleaks-action@v2` | Secret scanning on the repository. |
 
-```bash
-cargo install --locked cargo-audit
-cargo audit --deny warnings
-```
+Run the dependency audit locally with `scripts/cargo-audit.sh` and the secret scan with `scripts/secret-scan.sh`. To see current results, open the latest workflow runs in GitHub Actions; do not rely on any number written in documentation.
 
-A high-severity advisory against a dependency **fails the build**. The `deny.toml` in the repo pins the policy: any advisory with a `[[advisory]]` entry under `[advisories]` is treated as a hard error regardless of severity. To ignore a specific advisory (e.g. for a transitive that the team has reviewed and accepted), add an entry to `deny.toml` with a `reason`.
+## Release pipeline (`.github/workflows/release.yml`)
 
-The current advisory count is **0** open advisories.
+On a `v*` tag it cross-compiles binaries, builds and pushes images to `ghcr.io/<owner>/dash-<service>`, and generates an SBOM with `anchore/sbom-action`. Images are not signed and there is no provenance attestation (register SEC-21, planned P7). No release has been tagged yet, so no published images or SBOMs exist.
 
-## `trivy`
+## Audit log tooling
 
-`trivy` scans the container image for OS-level CVEs and misconfigurations. The check is in CI on every image push:
+`scripts/verify_audit_chain.sh --path <file> [--service ingestion|retrieval]` checks `seq`, `prev_hash` linkage and the SHA-256 of each record. Limitations, in short: the chain is unkeyed (rewritable), ingestion-written logs fail verification today (SEC-17), and auditing is off unless `DASH_INGEST_AUDIT_LOG_PATH` / `DASH_RETRIEVAL_AUDIT_LOG_PATH` is set. See [Security](../concepts/security.md#audit-log) and the [data model](../concepts/data-model.md#audit-record).
 
-```bash
-trivy image --severity HIGH,CRITICAL \
-  --exit-code 1 \
-  ghcr.io/bhaweshbhaskar/dash:0.1.0
-```
+## Release sign-off scripts
 
-The image is built on `debian:bookworm-slim`, pinned at build time. The `Dockerfile` runs `apt-get update && apt-get install -y --no-install-recommends ...` and then `rm -rf /var/lib/apt/lists/*` to keep the layer small. A multi-stage build discards the build-time dependencies from the final image.
-
-The current `trivy` result is **0 HIGH, 0 CRITICAL**.
-
-## `codeql`
-
-`codeql` does semantic analysis of the Rust source for security-relevant patterns. The check is in CI on every PR, against the `security-and-quality` query pack:
-
-```yaml
-- name: Initialize CodeQL
-  uses: github/codeql-action/init@v3
-  with:
-    languages: rust
-    queries: security-and-quality
-
-- name: Perform CodeQL Analysis
-  uses: github/codeql-action/analyze@v3
-  with:
-    category: "/language:rust"
-```
-
-A new finding of `security` or higher severity **fails the PR check**. The findings dashboard is on the [GitHub Security tab](https://github.com/BHAWESHBHASKAR/DASH/security/code-scanning).
+`scripts/security_signoff_gate.sh`, `scripts/auth_revocation_drill.sh` and `scripts/release_candidate_gate.sh` automate parts of a release check. They are drills run by a person; their output is not published anywhere and nothing here states that they have passed.
 
 ## Threat model
 
-The full threat model is at [Security → Threat model](../about/security.md#threat-model). The condensed view:
+The repository threat model is [`docs/threat-model.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/threat-model.md). It lists, per threat, what is mitigated today, what is not, and which release or phase addresses it.
 
-| Threat                                            | Mitigation                                                          | Residual risk                                                                 |
-| ------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Stolen JWT                                         | Short lifetime, `aud = dash`, scope checks, per-tenant rate limit. | A stolen JWT is valid until `exp`. Use short lifetimes; rotate keys.          |
-| Stolen API key                                     | Per-tenant scoping, rotation overlap, constant-time compare.        | A stolen key is valid until `expires_at_unix`. Use short expiry; rotate.     |
-| Cross-tenant data leak                             | Hard isolation in the store + the API layer.                        | A bug in the isolation boundary. Mitigated by per-tenant integration tests.    |
-| Tampering with audit log                           | SHA-256 hash chain; verify script in CI.                            | A motivated insider with write access to the log file.                         |
-| Replay of ingest                                   | Idempotency keys; redb dedup.                                        | None observed.                                                                |
-| DoS via large payload                              | `Content-Length` cap; per-tenant rate limit.                         | A flood from many distinct tenants. Mitigated by upstream WAF.                |
-| Slow-loris DoS                                     | TCP read timeout in the transport.                                   | None observed.                                                                |
-| SQL injection                                      | N/A — DASH is not SQL.                                              | N/A.                                                                          |
-| Dependency CVE                                     | `cargo audit` in CI; `trivy` on the image.                          | A zero-day. Mitigated by rapid patch policy.                                  |
-| Compromised redb file                              | `redb` is ACID; replay from WAL reconstructs.                        | A maliciously crafted redb file could exploit a redb parser bug.              |
-| Compromised process memory                        | JWT public-key only; private key never enters DASH.                 | A memory-disclosure vulnerability in a transitive dep.                       |
-| Compromised operator workstation                  | Out of scope.                                                       | See the operator-host-hardening guide (forthcoming).                          |
+## How to report a vulnerability
 
-### How to report a vulnerability
-
-See [Security → Reporting](../about/security.md#reporting). The PGP fingerprint and the supported-versions table are also in the security policy.
+See [About → Security](../about/security.md).

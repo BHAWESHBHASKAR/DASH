@@ -4,6 +4,14 @@
 > 2026-10-09 deep review. See [`2026-10-09-production-readiness-master-plan.md`](./2026-10-09-production-readiness-master-plan.md)
 > and [`2026-10-09-issue-register.md`](./2026-10-09-issue-register.md) for the current status.
 
+> **Correction note (2026-10-09, register item DOC-07).** The test counts in this document (354 tests passing,
+> and the per-module counts below) are the figures recorded on 2026-06-13. They were not tied to a CI run or a
+> linked test report, and they disagree with other documents of the same date (the README and CHANGELOG then said
+> 379). On 2026-10-09 the repository contains 420 Rust `#[test]` / `#[tokio::test]` declarations (static count;
+> not a pass/fail result). "Production hardening complete" was not accurate: the 2026-10 review found open S0
+> items (fail-open auth, open replication endpoints, a rate limiter that does not throttle, duplicated evidence).
+> The original text is left unchanged below as a historical record.
+
 Date: 2026-06-13
 Status: **Production hardening complete.** 354 tests passing, 0 build errors, 0 clippy warnings, comprehensive integration tests in place. Transport axum migration and redb persistent indexes remain as future work.
 
