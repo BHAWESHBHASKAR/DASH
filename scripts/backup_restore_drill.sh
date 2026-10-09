@@ -127,6 +127,9 @@ wait_ready "${RETRIEVE_URL}"
 # service, which mounts that same volume.
 RESTORE_DIR="$(mktemp -d /tmp/dash-drill-restore-XXXXXX)"
 tar -xzf "${BUNDLE}" -C "${RESTORE_DIR}"
+# The one-off container runs as the unprivileged service user, and mktemp
+# creates the directory 0700 for the host user, so open it up for reading.
+chmod -R a+rX "${RESTORE_DIR}"
 docker compose stop ingestion
 docker compose run --rm --no-deps -T \
   -v "${RESTORE_DIR}:/restore:ro" \
