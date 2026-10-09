@@ -171,7 +171,7 @@ pub const SINGLE_TX_PREFIX: &str = "~tx:";
 /// Upper bound on how far a replication frame may be extended past
 /// `max_records` to end on a commit-group boundary. Followers accept frames
 /// of `max_records + REPLICATION_GROUP_EXTENSION_MAX` lines.
-pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 100_000;
+pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 1_000_000;
 
 enum GroupEvent {
     Begin(String),
@@ -215,33 +215,75 @@ pub fn complete_group_prefix_len(lines: &[String]) -> usize {
     open.map_or(lines.len(), |(start, _)| start)
 }
 
+/// Why a frame cannot be extended to the end of its commit group.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupTooLarge {
+    start: usize,
+    cap: usize,
+}
+
 /// Moves `next` forward so a frame `[from, next)` does not end inside a
-/// commit group, when the group closes within the extension bound.
-fn extend_to_group_end(lines: &[String], from: usize, next: usize) -> usize {
-    let mut open: Option<String> = None;
-    for line in &lines[from..next] {
+/// commit group. A group that closes within `cap` records of its first line
+/// is shipped whole. A larger group that starts after `from` is left for the
+/// next frame (the frame ends just before it); one that starts at `from`
+/// can never be shipped, which is an error rather than a frame the follower
+/// would hold back forever. A group still open at the end of the log is a
+/// write in progress and is left as is.
+fn extend_to_group_end(
+    lines: &[String],
+    from: usize,
+    next: usize,
+    cap: usize,
+) -> Result<usize, GroupTooLarge> {
+    let mut open: Option<(usize, String)> = None;
+    for (offset, line) in lines[from..next].iter().enumerate() {
         match group_event(line) {
-            Some(GroupEvent::Begin(id)) => open = Some(id),
-            Some(GroupEvent::End(id)) if open.as_ref().is_some_and(|o| closes_group(o, &id)) => {
+            Some(GroupEvent::Begin(id)) => open = Some((from + offset, id)),
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
                 open = None;
             }
             _ => {}
         }
     }
-    let Some(id) = open else {
-        return next;
+    let Some((start, id)) = open else {
+        return Ok(next);
     };
-    let bound = lines
-        .len()
-        .min(next.saturating_add(REPLICATION_GROUP_EXTENSION_MAX));
+    let bound = lines.len().min(start.saturating_add(cap));
     for (offset, line) in lines[next..bound].iter().enumerate() {
         if let Some(GroupEvent::End(end)) = group_event(line)
             && closes_group(&id, &end)
         {
-            return next + offset + 1;
+            return Ok(next + offset + 1);
         }
     }
-    next
+    let closes_beyond_cap = lines[bound..].iter().any(
+        |line| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end)),
+    );
+    if !closes_beyond_cap {
+        return Ok(next);
+    }
+    if start > from {
+        Ok(start)
+    } else {
+        Err(GroupTooLarge { start, cap })
+    }
+}
+
+/// The commit id carried by a batch-commit WAL line (legacy `B` or checksummed
+/// `B2`), or `None` for any other line, an unreadable line, or a commit-group
+/// begin/end marker (markers are framing, not client-visible batch commits).
+pub fn batch_commit_id_from_wal_line(line: &str) -> Option<String> {
+    if !(line.starts_with("B\t") || line.starts_with("B2\t")) {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::BatchCommit(commit) if !is_group_marker_commit_id(&commit.commit_id) => {
+            Some(commit.commit_id)
+        }
+        _ => None,
+    }
 }
 
 pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
@@ -302,6 +344,13 @@ pub struct FileWal {
     last_sync_at: Instant,
     generation: u64,
     torn_tail_dropped: usize,
+    /// Lines left out of the most recent replication view because lenient
+    /// replay would quarantine them.
+    replication_skipped: usize,
+    /// Largest commit group (in records) a replication frame may be
+    /// extended to cover.
+    replication_group_cap: usize,
+    replication_group_too_large_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +426,9 @@ impl FileWal {
             last_sync_at: Instant::now(),
             generation,
             torn_tail_dropped,
+            replication_skipped: 0,
+            replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
+            replication_group_too_large_total: 0,
         })
     }
 
@@ -385,6 +437,26 @@ impl FileWal {
     /// export, or rolled back over already-flushed records.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Number of WAL/snapshot lines the most recent replication frame or
+    /// export left out because lenient replay quarantines them (unparseable
+    /// legacy lines and their dependents). They are never served to
+    /// followers; offsets index the served (filtered) view.
+    pub fn replication_skipped_lines(&self) -> usize {
+        self.replication_skipped
+    }
+
+    /// Overrides the largest commit group (in records) a replication frame
+    /// may be extended to cover (default [`REPLICATION_GROUP_EXTENSION_MAX`]).
+    pub fn set_replication_group_cap(&mut self, cap: usize) {
+        self.replication_group_cap = cap.max(1);
+    }
+
+    /// Frame requests refused because a commit group exceeded the cap
+    /// (`replication_group_too_large`).
+    pub fn replication_group_too_large_total(&self) -> u64 {
+        self.replication_group_too_large_total
     }
 
     /// Torn tail lines discarded since this handle was opened.
@@ -547,7 +619,7 @@ impl FileWal {
                 "raw WAL record line must not be empty".to_string(),
             ));
         }
-        let _ = line_to_record(line)?;
+        check_replicated_line(line)?;
         self.append_raw_record_line_unchecked(line.to_string())
     }
 
@@ -592,7 +664,8 @@ impl FileWal {
         check_generation: bool,
     ) -> Result<WalReplicationFrame, StoreError> {
         self.flush_pending_sync()?;
-        let wal_lines = self.replay_wal_lines_raw()?;
+        let (wal_lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.note_replication_skipped(skipped);
         let total_records = wal_lines.len();
         let generation_ok = !check_generation
             || match from_generation {
@@ -612,7 +685,22 @@ impl FileWal {
         let limit = max_records.max(1);
         let next_offset = from_offset.saturating_add(limit).min(total_records);
         // Never cut a frame inside a commit group when it can be avoided.
-        let next_offset = extend_to_group_end(&wal_lines, from_offset, next_offset);
+        let next_offset = match extend_to_group_end(
+            &wal_lines,
+            from_offset,
+            next_offset,
+            self.replication_group_cap,
+        ) {
+            Ok(next) => next,
+            Err(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                return Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )));
+            }
+        };
         Ok(WalReplicationFrame {
             generation: self.generation,
             from_offset,
@@ -625,10 +713,24 @@ impl FileWal {
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
         self.flush_pending_sync()?;
+        let (snapshot_lines, skipped_snapshot) =
+            filter_replication_lines(self.replay_snapshot_lines_raw()?);
+        let (wal_lines, skipped_wal) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.note_replication_skipped(skipped_snapshot + skipped_wal);
         Ok(WalReplicationExport {
-            snapshot_lines: self.replay_snapshot_lines_raw()?,
-            wal_lines: self.replay_wal_lines_raw()?,
+            snapshot_lines,
+            wal_lines,
         })
+    }
+
+    fn note_replication_skipped(&mut self, skipped: usize) {
+        if skipped != self.replication_skipped {
+            eprintln!(
+                "warning: replication view of {} leaves out {skipped} line(s) that lenient replay quarantines",
+                self.path.display()
+            );
+        }
+        self.replication_skipped = skipped;
     }
 
     pub fn replace_with_replication_export(
@@ -636,11 +738,8 @@ impl FileWal {
         export: &WalReplicationExport,
     ) -> Result<(), StoreError> {
         self.flush_pending_sync()?;
-        for line in &export.snapshot_lines {
-            let _ = line_to_record(line)?;
-        }
-        for line in &export.wal_lines {
-            let _ = line_to_record(line)?;
+        for line in export.snapshot_lines.iter().chain(&export.wal_lines) {
+            check_replicated_line(line)?;
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
@@ -1212,6 +1311,15 @@ impl QuarantineSink {
         })
     }
 
+    /// A sink that is never flushed to disk.
+    fn detached() -> Self {
+        Self {
+            path: PathBuf::new(),
+            seen: HashSet::new(),
+            pending: Vec::new(),
+        }
+    }
+
     pub(crate) fn push(&mut self, raw: &str) {
         if self.seen.insert(raw.to_string()) {
             self.pending.push(raw.to_string());
@@ -1248,6 +1356,9 @@ struct ReplayParser {
     /// an unrecognisable line directly after it is the remainder of the same
     /// record (a legacy field containing a raw newline).
     prev_failed: bool,
+    /// Suppress the per-line warning (replication views re-run the parser on
+    /// every poll).
+    quiet: bool,
 }
 
 impl ReplayParser {
@@ -1257,6 +1368,7 @@ impl ReplayParser {
             quarantined: 0,
             quarantined_claim_ids: HashSet::new(),
             prev_failed: false,
+            quiet: false,
         }
     }
 
@@ -1284,7 +1396,11 @@ impl ReplayParser {
                 if self.policy == ReplayPolicy::Strict || !(legacy || continuation) {
                     return Err(with_context(err, &origin));
                 }
-                eprintln!("warning: quarantining unreadable legacy record at {origin}: {err:?}");
+                if !self.quiet {
+                    eprintln!(
+                        "warning: quarantining unreadable legacy record at {origin}: {err:?}"
+                    );
+                }
                 if kind == "C"
                     && let Some(id) = line.split('\t').nth(1).and_then(|f| unescape_field(f).ok())
                 {
@@ -1299,6 +1415,58 @@ impl ReplayParser {
     }
 }
 
+/// A replicated line must parse, except legacy-format lines, which a
+/// follower mirrors verbatim (its own lenient replay quarantines them just
+/// like the leader's).
+fn check_replicated_line(line: &str) -> Result<(), StoreError> {
+    match line_to_record(line) {
+        Ok(_) => Ok(()),
+        Err(_) if is_legacy_kind(record_kind(line)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Drops the lines lenient replay would quarantine (unparseable legacy
+/// lines, continuation fragments and records depending on a quarantined
+/// legacy claim) from a replication view, using the replay parser itself so
+/// the decision cannot drift. Lines that only fail validation against the
+/// store state (control characters in ids, poisoned vectors) are still
+/// served; followers skip those (see
+/// `InMemoryStore::apply_persisted_record_line_lenient`). Returns the kept
+/// lines and the number dropped.
+fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
+    let mut parser = ReplayParser::new(ReplayPolicy::Lenient);
+    parser.quiet = true;
+    let mut sink = QuarantineSink::detached();
+    let mut bad_claims: HashSet<String> = HashSet::new();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut skipped = 0usize;
+    for line in lines {
+        // Fast path: only legacy lines (and fragments following a failed
+        // one) can be quarantined at parse level.
+        if !parser.prev_failed && bad_claims.is_empty() && !is_legacy_kind(record_kind(&line)) {
+            kept.push(line);
+            continue;
+        }
+        match parser.parse(line.clone(), String::new(), &mut sink) {
+            Ok(Some(item)) => {
+                if !bad_claims.is_empty() && item.depends_on(&bad_claims) {
+                    skipped += 1;
+                } else {
+                    kept.push(line);
+                }
+            }
+            Ok(None) => {
+                skipped += 1;
+                bad_claims.extend(parser.quarantined_claim_ids.iter().cloned());
+            }
+            // Not quarantinable: serve it unchanged, the receiver rejects it.
+            Err(_) => kept.push(line),
+        }
+    }
+    (kept, skipped)
+}
+
 /// Truncates a torn final WAL line (and terminates an otherwise valid
 /// unterminated one). Returns the number of dropped lines (0 or 1).
 fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
@@ -1308,10 +1476,12 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
     }
     let file = OpenOptions::new().write(true).open(path)?;
     if scan.torn_tail {
+        let saved = save_truncated_tail(path, scan.valid_len)?;
         eprintln!(
-            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes)",
+            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes; removed bytes saved to {})",
             path.display(),
-            scan.valid_len
+            scan.valid_len,
+            saved.display()
         );
         file.set_len(scan.valid_len)?;
         file.sync_all()?;
@@ -1324,9 +1494,55 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
     Ok(0)
 }
 
+/// Copies the bytes of `path` from `from` to EOF into a fresh, fsynced
+/// `<path>.truncated-<unix-ms>` sidecar so a truncation never destroys data
+/// irrecoverably. Returns the sidecar path.
+fn save_truncated_tail(path: &Path, from: u64) -> Result<PathBuf, StoreError> {
+    use std::io::{Seek, SeekFrom};
+    let mut src = OpenOptions::new().read(true).open(path)?;
+    src.seek(SeekFrom::Start(from))?;
+    let mut tail = Vec::new();
+    src.read_to_end(&mut tail)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut attempt = 0u32;
+    loop {
+        let mut name = path.to_path_buf().into_os_string();
+        if attempt == 0 {
+            name.push(format!(".truncated-{ts}"));
+        } else {
+            name.push(format!(".truncated-{ts}-{attempt}"));
+        }
+        let sidecar = PathBuf::from(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+        {
+            Ok(mut out) => {
+                out.write_all(&tail)?;
+                out.sync_all()?;
+                sync_parent_dir(&sidecar)?;
+                return Ok(sidecar);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 /// Physically truncates an unterminated commit group at the end of the log
 /// (see [`GROUP_BEGIN_PREFIX`]) so later appends cannot be mistaken for
 /// members of the torn group. Returns the number of dropped lines.
+///
+/// Interior corruption is never "repaired" by truncation: a `B2` line that
+/// fails to parse or verify, or any unreadable line inside the apparently
+/// open group, is a hard error naming the line (an unterminated group can
+/// only be a crash artifact, so every line in it must be intact). The
+/// removed bytes of a genuine torn group are first saved to a
+/// `<wal>.truncated-<ts>` sidecar.
 fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
     let scan = scan_wal(path)?;
     let mut open: Option<(usize, String)> = None;
@@ -1334,8 +1550,10 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         if !line.starts_with("B2\t") {
             continue;
         }
-        let Ok(PersistedRecord::BatchCommit(commit)) = line_to_record(line) else {
-            continue;
+        let commit = match line_to_record(line) {
+            Ok(PersistedRecord::BatchCommit(commit)) => commit,
+            Ok(_) => continue,
+            Err(err) => return Err(with_context(err, &format!("wal line {line_no}"))),
         };
         if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
             open = Some((*line_no, id.to_string()));
@@ -1349,6 +1567,18 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
     let Some((begin_line, _)) = open else {
         return Ok(0);
     };
+    for (line_no, line) in scan.lines.iter().filter(|(n, _)| *n > begin_line) {
+        if let Err(err) = line_to_record(line)
+            && !is_legacy_kind(record_kind(line))
+        {
+            return Err(with_context(
+                err,
+                &format!(
+                    "wal line {line_no} (inside the open commit group starting at line {begin_line})"
+                ),
+            ));
+        }
+    }
     let mut bytes = Vec::new();
     OpenOptions::new()
         .read(true)
@@ -1362,9 +1592,11 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         offset += chunk.len();
     }
     let dropped = scan.lines.iter().filter(|(n, _)| *n >= begin_line).count();
+    let saved = save_truncated_tail(path, offset as u64)?;
     eprintln!(
-        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records)",
-        path.display()
+        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records; removed bytes saved to {})",
+        path.display(),
+        saved.display()
     );
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(offset as u64)?;
@@ -1810,15 +2042,16 @@ fn unpack_string_list(raw: &str) -> Result<Vec<String>, StoreError> {
             .parse::<usize>()
             .map_err(|_| StoreError::Parse("invalid packed list length in wal".to_string()))?;
         offset += 1;
-        if offset + len > bytes.len() {
-            return Err(StoreError::Parse(
-                "packed list length exceeds wal field size".to_string(),
-            ));
-        }
-        let value = std::str::from_utf8(&bytes[offset..offset + len])
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                StoreError::Parse("packed list length exceeds wal field size".to_string())
+            })?;
+        let value = std::str::from_utf8(&bytes[offset..end])
             .map_err(|_| StoreError::Parse("invalid UTF-8 in packed list field".to_string()))?;
         out.push(value.to_string());
-        offset += len;
+        offset = end;
     }
     Ok(out)
 }
@@ -1885,7 +2118,7 @@ fn parse_optional_claim_type_field(raw: &str) -> Result<Option<ClaimType>, Store
     Ok(Some(str_to_claim_type(raw)?))
 }
 
-fn unescape_field(value: &str) -> Result<String, StoreError> {
+pub(crate) fn unescape_field(value: &str) -> Result<String, StoreError> {
     let mut output = String::with_capacity(value.len());
     let mut escaped = false;
     for ch in value.chars() {

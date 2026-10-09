@@ -671,3 +671,154 @@ fn leader_checkpoint_between_groups_forces_resync_and_converges() {
         vec!["k1", "k2", "k3", "k4"]
     );
 }
+
+#[test]
+fn follower_acks_batch_commits_so_the_leader_ack_count_advances() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(&dir.path().join("leader.wal"), None, no_checkpoint(), None);
+    leader.batch("batch-ack-1", &["a1", "a2"]);
+    let status_path = "/internal/replication/commit-status?commit_id=batch-ack-1";
+    let (code, body) = request(
+        &leader.addr,
+        "GET",
+        status_path,
+        "",
+        &[("x-replication-token", TOKEN)],
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("\"ack_count\":1"), "{body}");
+
+    set_env("DASH_NODE_ID", "follower-ack-node");
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    unset_env("DASH_NODE_ID");
+    wait_until(
+        "leader sees the follower ack for the batch commit",
+        Duration::from_secs(15),
+        || {
+            request(
+                &leader.addr,
+                "GET",
+                status_path,
+                "",
+                &[("x-replication-token", TOKEN)],
+            )
+            .1
+            .contains("\"ack_count\":2")
+        },
+    );
+    follower.stop();
+}
+
+#[test]
+fn follower_with_truncated_wal_and_stale_cursor_forces_a_full_resync() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(&dir.path().join("leader.wal"), None, no_checkpoint(), None);
+    for id in ["s1", "s2", "s3"] {
+        leader.ingest(id);
+    }
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    let (_, total) = leader.frame();
+    wait_until("follower catches up", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    follower.stop();
+
+    // A restored/truncated WAL next to a newer `.replication` cursor: the
+    // last commit group is gone locally but the cursor still claims it.
+    let text = std::fs::read_to_string(&follower_wal).expect("read follower wal");
+    let mut lines: Vec<&str> = text.lines().collect();
+    let keep = lines.len() - 4;
+    lines.truncate(keep);
+    std::fs::write(&follower_wal, lines.join("\n") + "\n").expect("truncate follower wal");
+    assert!(dir.path().join("follower.wal.replication").exists());
+
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    wait_until(
+        "stale cursor forces a full resync",
+        Duration::from_secs(10),
+        || follower.metric("dash_ingest_replication_resync_total") == Some(1),
+    );
+    wait_until("follower converges", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    follower.stop();
+    assert_eq!(claim_ids_in_wal(&follower_wal), vec!["s1", "s2", "s3"]);
+}
+
+#[test]
+fn follower_reports_an_oversized_leader_response_loudly_in_ready_and_metrics() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(&dir.path().join("leader.wal"), None, no_checkpoint(), None);
+    for i in 0..8 {
+        leader.ingest(&format!("big{i}"));
+    }
+    set_env("DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES", "1500");
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    unset_env("DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES");
+    wait_until(
+        "follower reports the oversized response",
+        Duration::from_secs(15),
+        || {
+            let (status, body) = request(&follower.addr, "GET", "/ready", "", &[]);
+            status == 503 && body.contains("replication_response_too_large")
+        },
+    );
+    assert_eq!(
+        follower.metric("dash_ingest_replication_blocked_response_too_large"),
+        Some(1)
+    );
+    follower.stop();
+}
+
+#[test]
+fn follower_converges_over_a_leader_wal_with_poisoned_legacy_lines() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tail = "null\tnull\tnull\tnull\tnull";
+    let claim = |id: &str, entities: &str| {
+        format!("C\t{id}\t{TENANT}\ttext of {id}\t0.9\tnull\t{entities}\t\t{tail}")
+    };
+    let lines = [
+        claim("p-ok", "3:foo"),
+        claim("p\\tbad", ""),
+        claim("p-ok2", "3:bar"),
+        claim("p-ent", "5:a\tb c"),
+        "E\tpe-ok\tp-ok\tsource-1\tsupports\t0.8".to_string(),
+        "E\tpe-dep\tp\\tbad\tsource-1\tsupports\t0.8".to_string(),
+        "E\tpe-dep2\tp-ent\tsource-1\tsupports\t0.8".to_string(),
+        "G\tpg-dep\tp-ok\tp\\tbad\tsupports\t0.5".to_string(),
+        "G\tpg-ok\tp-ok\tp-ok2\tsupports\t0.5".to_string(),
+        "V\tp-ok\t1,2,3".to_string(),
+        "V\tp-ok2\t1,2".to_string(),
+        "B\tpcommit\t2\t1700000000000\t4:p-ok5:p-ok2".to_string(),
+    ];
+    let leader_wal = dir.path().join("leader.wal");
+    std::fs::write(&leader_wal, lines.join("\n") + "\n").expect("write poisoned wal");
+    let leader = Server::start(&leader_wal, None, no_checkpoint(), None);
+    assert_eq!(leader.metric("dash_ingest_claims_total"), Some(2));
+
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    let (_, total) = leader.frame();
+    wait_until("follower converges", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    assert_eq!(follower.metric("dash_ingest_claims_total"), Some(2));
+    assert_eq!(
+        follower.metric("dash_ingest_replication_consecutive_failures"),
+        Some(0)
+    );
+    assert!(
+        follower
+            .metric("dash_ingest_replication_skipped_records_total")
+            .is_some_and(|n| n > 0),
+        "validation-level poison is skipped and counted on the follower"
+    );
+    follower.stop();
+}

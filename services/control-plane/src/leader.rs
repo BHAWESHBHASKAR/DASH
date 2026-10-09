@@ -9,6 +9,60 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// giving up with an error (rather than blocking forever on a wedged peer).
 const FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Largest disagreement between the wall clock and this process's monotonic
+/// elapsed time that is treated as ordinary slew and followed.
+const CLOCK_RESYNC_BOUND_MS: u64 = 5_000;
+
+/// How long a larger disagreement must persist before it is adopted as a
+/// real clock correction rather than ignored as a transient spike.
+const CLOCK_STEP_PERSIST: Duration = Duration::from_secs(60);
+
+/// Clock used for lease arithmetic: wall-clock based (the lease is shared
+/// between hosts) but never backwards, and not latched by transient spikes.
+///
+/// Readings follow the wall clock while it agrees with the monotonic clock
+/// to within [`CLOCK_RESYNC_BOUND_MS`]. A bigger jump is ignored (time keeps
+/// advancing with the monotonic clock) until it has persisted for
+/// [`CLOCK_STEP_PERSIST`], at which point it is adopted. A backwards step is
+/// never followed (readings hold or advance monotonically), so after a
+/// permanent backwards correction readings run ahead of the wall clock.
+#[derive(Debug, Default)]
+struct LeaseClock {
+    last_ms: u64,
+    base_wall_ms: u64,
+    base_mono: Option<Instant>,
+    out_of_bound_since: Option<Instant>,
+}
+
+impl LeaseClock {
+    fn observe(&mut self, wall_ms: u64, mono: Instant) -> u64 {
+        let Some(base_mono) = self.base_mono else {
+            self.base_wall_ms = wall_ms;
+            self.base_mono = Some(mono);
+            self.last_ms = wall_ms;
+            return wall_ms;
+        };
+        let elapsed = mono.saturating_duration_since(base_mono).as_millis() as u64;
+        let computed = self.base_wall_ms.saturating_add(elapsed);
+        let adopt = if wall_ms.abs_diff(computed) <= CLOCK_RESYNC_BOUND_MS {
+            self.out_of_bound_since = None;
+            true
+        } else {
+            let since = *self.out_of_bound_since.get_or_insert(mono);
+            mono.saturating_duration_since(since) >= CLOCK_STEP_PERSIST
+        };
+        let candidate = if adopt { wall_ms } else { computed };
+        let reading = candidate.max(self.last_ms);
+        if adopt {
+            self.base_wall_ms = reading;
+            self.base_mono = Some(mono);
+            self.out_of_bound_since = None;
+        }
+        self.last_ms = reading;
+        reading
+    }
+}
+
 /// On-disk lease record used for simple leader election across
 /// control-plane replicas. The process whose `node_id` matches the
 /// non-expired lease is the leader.
@@ -64,7 +118,7 @@ pub struct LeaderLease {
     // Serializes in-process callers; cross-process safety comes from the
     // advisory file lock taken inside this guard.
     lock: Mutex<()>,
-    last_now_ms: AtomicU64,
+    clock: Mutex<LeaseClock>,
 }
 
 impl LeaderLease {
@@ -81,7 +135,7 @@ impl LeaderLease {
             renewal_interval_ms,
             safety_margin_ms: 0,
             lock: Mutex::new(()),
-            last_now_ms: AtomicU64::new(0),
+            clock: Mutex::new(LeaseClock::default()),
         }
     }
 
@@ -141,22 +195,27 @@ impl LeaderLease {
     /// `renew` previously got wrong by re-entering the non-reentrant mutex).
     fn try_acquire_locked(&self, now: u64) -> Result<Option<Acquisition>, String> {
         let existing = read_lease(&self.lease_path)?;
+        // Highest fencing token ever issued from this lease path. It survives
+        // deletion or truncation of the lease file, so tokens never go back.
+        let floor = read_epoch_floor(&self.epoch_floor_path())?;
         let (epoch, newly_acquired) = match &existing {
-            None => (1, true),
+            None => (next_epoch(floor)?, true),
             Some(record) if record.node_id == self.node_id => {
-                if now < record.expires_at_ms.saturating_add(self.safety_margin_ms) {
+                if record.epoch >= floor
+                    && now < record.expires_at_ms.saturating_add(self.safety_margin_ms)
+                {
                     // Still ours and nobody may take it yet: extend in place.
                     (record.epoch, false)
                 } else {
                     // We let it lapse; treat as a fresh acquisition.
-                    (next_epoch(record.epoch)?, true)
+                    (next_epoch(record.epoch.max(floor))?, true)
                 }
             }
             Some(record) => {
                 if now < record.expires_at_ms.saturating_add(self.safety_margin_ms) {
                     return Ok(None);
                 }
-                (next_epoch(record.epoch)?, true)
+                (next_epoch(record.epoch.max(floor))?, true)
             }
         };
         let record = LeaseRecord {
@@ -164,6 +223,11 @@ impl LeaderLease {
             epoch,
             expires_at_ms: now.saturating_add(self.lease_duration_ms),
         };
+        // Floor first: a crash between the two writes can only leave the
+        // floor ahead of the lease, never behind it.
+        if epoch > floor {
+            write_file_atomic(&self.epoch_floor_path(), &format!("{epoch}\n"))?;
+        }
         write_lease(&self.lease_path, &record)?;
         Ok(Some(Acquisition {
             record,
@@ -251,11 +315,25 @@ impl LeaderLease {
         FileLockGuard::acquire(&lock_path_for(&self.lease_path))
     }
 
-    /// Wall-clock milliseconds, never decreasing within this process.
+    /// Wall-clock milliseconds, never decreasing within this process and not
+    /// latched by transient forward spikes (see [`LeaseClock`]).
     fn now_ms(&self) -> Result<u64, String> {
-        let observed = ms_since_epoch(SystemTime::now())?;
-        let previous = self.last_now_ms.fetch_max(observed, Ordering::SeqCst);
-        Ok(observed.max(previous))
+        let wall = ms_since_epoch(SystemTime::now())?;
+        Ok(self.now_ms_from(wall, Instant::now()))
+    }
+
+    /// [`now_ms`](Self::now_ms) with the clock readings injected.
+    fn now_ms_from(&self, wall_ms: u64, mono: Instant) -> u64 {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(wall_ms, mono)
+    }
+
+    fn epoch_floor_path(&self) -> PathBuf {
+        let mut name = self.lease_path.clone().into_os_string();
+        name.push(".epoch");
+        PathBuf::from(name)
     }
 }
 
@@ -413,6 +491,34 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Durably replace the lease: write a temp file, fsync it, rename over the
 /// lease, then fsync the directory so the rename survives a crash.
 fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
+    write_file_atomic(
+        path,
+        &format!(
+            "{},{},{}\n",
+            record.node_id, record.epoch, record.expires_at_ms
+        ),
+    )
+}
+
+/// Reads the epoch floor sidecar (`0` when it does not exist yet).
+fn read_epoch_floor(path: &Path) -> Result<u64, String> {
+    match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Ok(0),
+        Ok(text) => text.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "lease epoch floor '{}' is not a valid number",
+                path.display()
+            )
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(format!(
+            "failed reading lease epoch floor '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+fn write_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -423,10 +529,7 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
             parent.display()
         )
     })?;
-    let line = format!(
-        "{},{},{}\n",
-        record.node_id, record.epoch, record.expires_at_ms
-    );
+    let line = contents;
     let tmp_path = path.with_extension(format!(
         "lease-tmp-{}-{}",
         std::process::id(),
@@ -663,11 +766,74 @@ mod tests {
     }
 
     #[test]
-    fn now_ms_never_goes_backwards() {
-        let dir = temp_dir("lease-clock");
+    fn forward_clock_spike_is_not_latched() {
+        let dir = temp_dir("lease-spike");
         let lease = LeaderLease::new("node-a", dir.join("lease.txt"), 1_000, 100);
-        lease.last_now_ms.store(u64::MAX / 2, Ordering::SeqCst);
-        assert_eq!(lease.now_ms().unwrap(), u64::MAX / 2);
+        let t0 = Instant::now();
+        let wall0 = 1_700_000_000_000u64;
+        assert_eq!(lease.now_ms_from(wall0, t0), wall0);
+        // A wall-clock spike of ten hours is ignored: time keeps advancing
+        // with the monotonic clock only.
+        let spiked = lease.now_ms_from(wall0 + 36_000_000, t0 + Duration::from_secs(1));
+        assert_eq!(spiked, wall0 + 1_000);
+        // Once the wall clock is sane again the reading follows it, not the
+        // spike (the old latch would still report wall0 + 10h here).
+        let back = lease.now_ms_from(wall0 + 2_000, t0 + Duration::from_secs(2));
+        assert_eq!(back, wall0 + 2_000);
+    }
+
+    #[test]
+    fn persistent_clock_step_is_adopted_and_never_goes_backwards() {
+        let dir = temp_dir("lease-step");
+        let lease = LeaderLease::new("node-a", dir.join("lease.txt"), 1_000, 100);
+        let t0 = Instant::now();
+        let wall0 = 1_700_000_000_000u64;
+        lease.now_ms_from(wall0, t0);
+        let step = 3_600_000u64; // the clock was corrected forward an hour
+        let mut last = wall0;
+        let mut adopted_at = None;
+        for secs in 1..=120u64 {
+            let value =
+                lease.now_ms_from(wall0 + step + secs * 1_000, t0 + Duration::from_secs(secs));
+            assert!(value >= last, "went backwards at {secs}s");
+            last = value;
+            if value >= wall0 + step && adopted_at.is_none() {
+                adopted_at = Some(secs);
+            }
+        }
+        assert!(adopted_at.is_some(), "a persistent step must be adopted");
+        // A small backwards wobble never moves the reading backwards.
+        let wobble = lease.now_ms_from(last - 500, t0 + Duration::from_secs(121));
+        assert!(wobble >= last);
+    }
+
+    #[test]
+    fn epoch_never_restarts_after_the_lease_file_is_deleted_or_emptied() {
+        let dir = temp_dir("lease-epoch-floor");
+        let path = dir.join("lease.txt");
+        let a = LeaderLease::new("node-a", &path, 300, 10);
+        assert!(a.try_acquire(0).unwrap());
+        assert_eq!(a.fencing_token().unwrap(), Some(1));
+        std::thread::sleep(Duration::from_millis(350));
+        let b = LeaderLease::new("node-b", &path, 300, 10);
+        assert!(b.try_acquire(0).unwrap());
+        assert_eq!(b.fencing_token().unwrap(), Some(2));
+
+        fs::remove_file(&path).unwrap();
+        let c = LeaderLease::new("node-c", &path, 300, 10);
+        let acquired = c.acquire().unwrap().unwrap();
+        assert!(
+            acquired.record.epoch > 2,
+            "fencing token went backwards to {}",
+            acquired.record.epoch
+        );
+
+        std::thread::sleep(Duration::from_millis(350));
+        fs::write(&path, "").unwrap();
+        let d = LeaderLease::new("node-d", &path, 300, 10);
+        let again = d.acquire().unwrap().unwrap();
+        assert!(again.record.epoch > acquired.record.epoch);
+        assert!(dir.join("lease.txt.epoch").exists());
     }
 
     #[test]
