@@ -33,7 +33,8 @@ pub(crate) struct Bm25Context {
 pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
 pub use wal::{
     CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
-    WalReplicationDelta, WalReplicationExport, WalRollbackPoint, WalWritePolicy,
+    WalReplicationDelta, WalReplicationExport, WalReplicationFrame, WalRollbackPoint,
+    WalWritePolicy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
