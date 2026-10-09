@@ -130,6 +130,10 @@ pub struct LeaderLease {
     // advisory file lock taken inside this guard.
     lock: Mutex<()>,
     clock: Mutex<LeaseClock>,
+    /// Test-only wall clock shared between lease instances, so tests move
+    /// time explicitly instead of sleeping.
+    #[cfg(test)]
+    test_wall_ms: Option<std::sync::Arc<AtomicU64>>,
 }
 
 impl LeaderLease {
@@ -149,6 +153,8 @@ impl LeaderLease {
             safety_margin_ms: 0,
             lock: Mutex::new(()),
             clock: Mutex::new(LeaseClock::default()),
+            #[cfg(test)]
+            test_wall_ms: None,
         }
     }
 
@@ -166,6 +172,14 @@ impl LeaderLease {
     /// duration so a lease can never be shorter than its own margin).
     pub fn with_safety_margin_ms(mut self, margin_ms: u64) -> Self {
         self.safety_margin_ms = margin_ms.min(self.lease_duration_ms / 2);
+        self
+    }
+
+    /// Read wall-clock time from `clock` (milliseconds since the epoch)
+    /// instead of the system clock. Tests only.
+    #[cfg(test)]
+    fn with_test_wall_clock(mut self, clock: std::sync::Arc<AtomicU64>) -> Self {
+        self.test_wall_ms = Some(clock);
         self
     }
 
@@ -433,6 +447,10 @@ impl LeaderLease {
     /// Wall-clock milliseconds, never decreasing within this process and not
     /// latched by transient forward spikes (see [`LeaseClock`]).
     fn now_ms(&self) -> Result<u64, String> {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_wall_ms {
+            return Ok(self.now_ms_from(clock.load(Ordering::SeqCst), Instant::now()));
+        }
         let wall = ms_since_epoch(SystemTime::now())?;
         Ok(self.now_ms_from(wall, Instant::now()))
     }
@@ -915,20 +933,34 @@ mod tests {
 
     #[test]
     fn safety_margin_delays_takeover_and_early_stops_holder() {
+        // Time is moved explicitly (no sleeps), so the result cannot depend
+        // on how slowly a loaded runner schedules threads.
         let dir = temp_dir("lease-margin");
         let path = dir.join("lease.txt");
-        let a = LeaderLease::new("node-a", &path, 400, 50).with_safety_margin_ms(150);
-        let b = LeaderLease::new("node-b", &path, 400, 50).with_safety_margin_ms(150);
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let a = LeaderLease::new("node-a", &path, 400, 50)
+            .with_safety_margin_ms(150)
+            .with_test_wall_clock(Arc::clone(&clock));
+        let b = LeaderLease::new("node-b", &path, 400, 50)
+            .with_safety_margin_ms(150)
+            .with_test_wall_clock(Arc::clone(&clock));
         assert!(a.try_acquire(0).unwrap());
         assert!(a.is_leader().unwrap());
 
-        // Past expiry - margin: the holder already considers itself deposed...
-        std::thread::sleep(Duration::from_millis(300));
+        // Lease expires at base + 400. The holder stops 150 ms early
+        // (base + 250), so at +300 it already considers itself deposed...
+        clock.store(base + 300, Ordering::SeqCst);
         assert!(!a.is_leader().unwrap());
-        // ...but the challenger must still wait out expiry + margin.
-        std::thread::sleep(Duration::from_millis(150));
+        // ...but a challenger must wait out expiry + margin (base + 550).
+        clock.store(base + 450, Ordering::SeqCst);
         assert!(!b.try_acquire(0).unwrap(), "takeover inside the margin");
-        std::thread::sleep(Duration::from_millis(150));
+        clock.store(base + 549, Ordering::SeqCst);
+        assert!(
+            !b.try_acquire(0).unwrap(),
+            "takeover just before the margin ends"
+        );
+        clock.store(base + 600, Ordering::SeqCst);
         assert!(b.try_acquire(0).unwrap());
     }
 
