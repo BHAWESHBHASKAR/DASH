@@ -316,3 +316,159 @@ fn https_source_with_an_untrusted_certificate_is_refused() {
         "{seen}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Mutual TLS against the shared server
+// ---------------------------------------------------------------------
+
+struct MtlsLeader {
+    base: String,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    pki: dash_tls_fixtures::TestPki,
+}
+
+impl Drop for MtlsLeader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The shared `dash-http` server with TLS and required client certificates,
+/// answering with the verified client fingerprint and the token it saw.
+fn mtls_leader() -> MtlsLeader {
+    let pki = dash_tls_fixtures::TestPki::new();
+    let mut config = dash_http::ServerConfig::new("mtls-leader", 2, 8);
+    config.tls = Some(
+        dash_http::TlsAcceptor::new(dash_http::TlsSettings {
+            cert_file: pki.server_cert.clone(),
+            key_file: pki.server_key.clone(),
+            client_ca_file: Some(pki.client_ca.clone()),
+            require_client_cert: true,
+        })
+        .unwrap(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler: dash_http::Handler = Arc::new(|request: dash_http::Request| {
+        let client = request
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.client_cert_sha256.clone())
+            .unwrap_or_default();
+        let token = request
+            .header("x-replication-token")
+            .unwrap_or("")
+            .to_string();
+        dash_http::Response::new(
+            200,
+            "text/plain",
+            format!("client={client}\ntoken={token}\n"),
+        )
+    });
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            dash_http::serve(
+                listener,
+                config,
+                handler,
+                dash_http::default_health_classifier,
+                &|| stop.load(std::sync::atomic::Ordering::SeqCst),
+                Arc::new(dash_http::NoHooks),
+            )
+        });
+    }
+    MtlsLeader {
+        base: format!("https://127.0.0.1:{port}"),
+        stop,
+        pki,
+    }
+}
+
+#[test]
+fn mtls_source_is_fetched_with_a_client_certificate() {
+    let leader = mtls_leader();
+    let options = ClientOptions {
+        ca_file: Some(leader.pki.server_ca.clone()),
+        client_cert_file: Some(leader.pki.client_cert.clone()),
+        client_key_file: Some(leader.pki.client_key.clone()),
+        ..ClientOptions::default()
+    };
+    options.validate().unwrap();
+    let response = request(
+        "GET",
+        &format!("{}/internal/replication/wal", leader.base),
+        Some("tok-mtls"),
+        1024,
+        &options,
+    )
+    .expect("mTLS request should succeed");
+    assert_eq!(response.status, 200);
+    let fingerprint = dash_http::sha256_hex(&leader.pki.client_der);
+    assert_eq!(
+        response.body,
+        format!("client={fingerprint}\ntoken=tok-mtls\n")
+    );
+}
+
+#[test]
+fn mtls_source_refuses_a_follower_without_a_trusted_client_certificate() {
+    let leader = mtls_leader();
+    let url = format!("{}/internal/replication/wal", leader.base);
+    let anonymous = ClientOptions {
+        ca_file: Some(leader.pki.server_ca.clone()),
+        ..ClientOptions::default()
+    };
+    let err = request("GET", &url, Some("tok-mtls"), 1024, &anonymous).unwrap_err();
+    assert!(
+        err.contains("failed requesting replication source"),
+        "{err}"
+    );
+
+    let rogue = ClientOptions {
+        ca_file: Some(leader.pki.server_ca.clone()),
+        client_cert_file: Some(leader.pki.rogue_cert.clone()),
+        client_key_file: Some(leader.pki.rogue_key.clone()),
+        ..ClientOptions::default()
+    };
+    assert!(request("GET", &url, Some("tok-mtls"), 1024, &rogue).is_err());
+}
+
+#[test]
+fn https_source_is_verified_against_the_web_roots_without_a_ca_bundle() {
+    // The follower trusts only the public roots; the private server CA is
+    // not among them, so verification fails (it is never turned off).
+    let leader = mtls_leader();
+    let options = ClientOptions {
+        client_cert_file: Some(leader.pki.client_cert.clone()),
+        client_key_file: Some(leader.pki.client_key.clone()),
+        ..ClientOptions::default()
+    };
+    let err = request("GET", &format!("{}/x", leader.base), None, 1024, &options).unwrap_err();
+    assert!(
+        err.contains("failed requesting replication source"),
+        "{err}"
+    );
+}
+
+#[test]
+fn half_configured_client_identity_is_rejected_up_front() {
+    let pki = dash_tls_fixtures::TestPki::new();
+    let options = ClientOptions {
+        client_cert_file: Some(pki.client_cert.clone()),
+        ..ClientOptions::default()
+    };
+    let err = options.validate().unwrap_err();
+    assert!(err.contains("DASH_REPLICATION_CLIENT_KEY_FILE"), "{err}");
+    let err = request("GET", "https://127.0.0.1:1/x", None, 1024, &options).unwrap_err();
+    assert!(err.contains("DASH_REPLICATION_CLIENT_KEY_FILE"), "{err}");
+
+    let options = ClientOptions {
+        ca_file: Some(pki.dir.path().join("missing.pem")),
+        ..ClientOptions::default()
+    };
+    let err = options.validate().unwrap_err();
+    assert!(err.contains("DASH_REPLICATION_CA_FILE"), "{err}");
+    assert!(err.contains("missing.pem"), "{err}");
+}

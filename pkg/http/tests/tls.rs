@@ -6,7 +6,7 @@ mod common;
 use std::{
     io::{Read, Write},
     net::TcpStream,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
@@ -16,94 +16,14 @@ use dash_http::{
     Handler, Request, Response, ServerConfig, TlsAcceptor, TlsSettings, default_health_classifier,
     rustls, sha256_hex,
 };
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
-};
+use dash_tls_fixtures::{TestPki as Pki, leaf, new_ca};
 
-// ---------------------------------------------------------------------------
-// Test PKI
-// ---------------------------------------------------------------------------
-
-fn new_ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.distinguished_name.push(DnType::CommonName, name);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
-}
-
-/// (certificate PEM, key PEM, certificate DER) of a leaf signed by `ca`.
-fn leaf(
-    ca: &CertifiedIssuer<'static, KeyPair>,
-    name: &str,
-    client: bool,
-) -> (String, String, Vec<u8>) {
-    let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
-    params.distinguished_name.push(DnType::CommonName, name);
-    params.extended_key_usages = vec![if client {
-        ExtendedKeyUsagePurpose::ClientAuth
-    } else {
-        ExtendedKeyUsagePurpose::ServerAuth
-    }];
-    let key = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&key, ca).unwrap();
-    (cert.pem(), key.serialize_pem(), cert.der().to_vec())
-}
-
-struct Pki {
-    dir: tempfile::TempDir,
-    server_ca: PathBuf,
-    server_cert: PathBuf,
-    server_key: PathBuf,
-    client_ca: PathBuf,
-    client_cert: PathBuf,
-    client_key: PathBuf,
-    client_der: Vec<u8>,
-    /// A client certificate from a CA the server does not trust.
-    rogue_cert: PathBuf,
-    rogue_key: PathBuf,
-}
-
-impl Pki {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, content: &str| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, content).unwrap();
-            path
-        };
-        let server_ca = new_ca("test server CA");
-        let client_ca = new_ca("test client CA");
-        let rogue_ca = new_ca("rogue CA");
-        let (server_cert, server_key, _) = leaf(&server_ca, "localhost", false);
-        let (client_cert, client_key, client_der) = leaf(&client_ca, "replica-1", true);
-        let (rogue_cert, rogue_key, _) = leaf(&rogue_ca, "replica-x", true);
-        Pki {
-            server_ca: write("server-ca.pem", &server_ca.pem()),
-            server_cert: write("server.pem", &server_cert),
-            server_key: write("server.key", &server_key),
-            client_ca: write("client-ca.pem", &client_ca.pem()),
-            client_cert: write("client.pem", &client_cert),
-            client_key: write("client.key", &client_key),
-            client_der,
-            rogue_cert: write("rogue.pem", &rogue_cert),
-            rogue_key: write("rogue.key", &rogue_key),
-            dir,
-        }
-    }
-
-    fn settings(&self, client_ca: bool, require: bool) -> TlsSettings {
-        TlsSettings {
-            cert_file: self.server_cert.clone(),
-            key_file: self.server_key.clone(),
-            client_ca_file: client_ca.then(|| self.client_ca.clone()),
-            require_client_cert: require,
-        }
+fn settings(pki: &Pki, client_ca: bool, require: bool) -> TlsSettings {
+    TlsSettings {
+        cert_file: pki.server_cert.clone(),
+        key_file: pki.server_key.clone(),
+        client_ca_file: client_ca.then(|| pki.client_ca.clone()),
+        require_client_cert: require,
     }
 }
 
@@ -188,7 +108,7 @@ fn start_tls(config: ServerConfig) -> Harness {
 #[test]
 fn https_request_round_trip_negotiates_http11_and_tls12_or_newer() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(false, false)));
+    let server = start_tls(tls_config(settings(&pki, false, false)));
     let client = client_config(&pki.server_ca, None);
 
     let response = https(&server.addr, Arc::clone(&client), GET_WHO).unwrap();
@@ -229,7 +149,7 @@ fn https_request_round_trip_negotiates_http11_and_tls12_or_newer() {
 #[test]
 fn tls12_only_client_is_served() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(false, false)));
+    let server = start_tls(tls_config(settings(&pki, false, false)));
     let mut roots = rustls::RootCertStore::empty();
     let pem = std::fs::read(&pki.server_ca).unwrap();
     use rustls::pki_types::pem::PemObject;
@@ -255,7 +175,7 @@ fn tls12_only_client_is_served() {
 #[test]
 fn untrusted_server_certificate_is_refused_by_the_client() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(false, false)));
+    let server = start_tls(tls_config(settings(&pki, false, false)));
     // Trusting only the client CA: the server chain does not verify.
     let client = client_config(&pki.client_ca, None);
     let err = https(&server.addr, client, GET_WHO)
@@ -280,7 +200,7 @@ fn assert_alive_tls(addr: &str, pki: &Pki) {
 #[test]
 fn plaintext_client_on_a_tls_port_gets_a_clean_400() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(false, false)));
+    let server = start_tls(tls_config(settings(&pki, false, false)));
     let response = send_raw(
         &server.addr,
         b"GET /who HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -294,7 +214,7 @@ fn plaintext_client_on_a_tls_port_gets_a_clean_400() {
 #[test]
 fn mtls_required_accepts_a_trusted_client_and_exposes_its_fingerprint() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(true, true)));
+    let server = start_tls(tls_config(settings(&pki, true, true)));
     let client = client_config(
         &pki.server_ca,
         Some((pki.client_cert.as_path(), pki.client_key.as_path())),
@@ -318,7 +238,7 @@ fn mtls_required_accepts_a_trusted_client_and_exposes_its_fingerprint() {
 #[test]
 fn mtls_required_rejects_missing_and_untrusted_client_certificates() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(true, true)));
+    let server = start_tls(tls_config(settings(&pki, true, true)));
 
     let anonymous = https(&server.addr, client_config(&pki.server_ca, None), GET_WHO);
     assert!(
@@ -360,7 +280,7 @@ fn mtls_required_rejects_missing_and_untrusted_client_certificates() {
 #[test]
 fn optional_client_certs_allow_anonymous_clients_but_still_verify_presented_ones() {
     let pki = Pki::new();
-    let server = start_tls(tls_config(pki.settings(true, false)));
+    let server = start_tls(tls_config(settings(&pki, true, false)));
 
     let anonymous = https(&server.addr, client_config(&pki.server_ca, None), GET_WHO).unwrap();
     assert!(
@@ -398,7 +318,7 @@ fn optional_client_certs_allow_anonymous_clients_but_still_verify_presented_ones
 #[test]
 fn stalled_handshakes_never_reach_a_worker_and_are_closed_at_the_first_byte_timeout() {
     let pki = Pki::new();
-    let mut config = tls_config(pki.settings(false, false));
+    let mut config = tls_config(settings(&pki, false, false));
     config.workers = 1;
     config.health_workers = 0;
     config.first_byte_timeout = Duration::from_millis(300);
@@ -428,7 +348,7 @@ fn stalled_handshakes_never_reach_a_worker_and_are_closed_at_the_first_byte_time
 #[test]
 fn per_ip_cap_applies_before_the_handshake() {
     let pki = Pki::new();
-    let mut config = tls_config(pki.settings(false, false));
+    let mut config = tls_config(settings(&pki, false, false));
     config.max_conns_per_ip = 1;
     config.first_byte_timeout = Duration::from_secs(5);
     let server = start_tls(config);
@@ -451,7 +371,7 @@ fn per_ip_cap_applies_before_the_handshake() {
 #[test]
 fn certificate_rotation_is_picked_up_without_a_restart() {
     let pki = Pki::new();
-    let acceptor = TlsAcceptor::new(pki.settings(false, false)).unwrap();
+    let acceptor = TlsAcceptor::new(settings(&pki, false, false)).unwrap();
     let mut config = config();
     config.tls = Some(acceptor.clone());
     let server = start_tls(config);
@@ -460,11 +380,10 @@ fn certificate_rotation_is_picked_up_without_a_restart() {
     // Rotate to a certificate from a new CA (key written first, then the
     // certificate, as a renewal job would).
     let new_ca = new_ca("rotated CA");
-    let (cert, key, _) = leaf(&new_ca, "localhost", false);
-    let new_ca_file = pki.dir.path().join("rotated-ca.pem");
-    std::fs::write(&new_ca_file, new_ca.pem()).unwrap();
-    std::fs::write(&pki.server_key, key).unwrap();
-    std::fs::write(&pki.server_cert, cert).unwrap();
+    let rotated_leaf = leaf(&new_ca, &dash_tls_fixtures::SERVER_NAMES, false);
+    let new_ca_file = pki.write("rotated-ca.pem", &new_ca.pem());
+    std::fs::write(&pki.server_key, rotated_leaf.key_pem).unwrap();
+    std::fs::write(&pki.server_cert, rotated_leaf.cert_pem).unwrap();
 
     let rotated = client_config(&new_ca_file, None);
     wait_for("rotated certificate served", || {
@@ -480,7 +399,7 @@ fn certificate_rotation_is_picked_up_without_a_restart() {
 #[test]
 fn broken_rotation_keeps_serving_the_previous_certificate() {
     let pki = Pki::new();
-    let acceptor = TlsAcceptor::new(pki.settings(false, false)).unwrap();
+    let acceptor = TlsAcceptor::new(settings(&pki, false, false)).unwrap();
     let mut config = config();
     config.tls = Some(acceptor.clone());
     let server = start_tls(config);
@@ -498,23 +417,21 @@ fn broken_rotation_keeps_serving_the_previous_certificate() {
 #[test]
 fn mismatched_key_and_bad_ca_are_refused_at_load() {
     let pki = Pki::new();
-    let mut settings = pki.settings(false, false);
-    settings.key_file = pki.client_key.clone();
-    let err = TlsAcceptor::new(settings).unwrap_err();
+    let mut mismatched = settings(&pki, false, false);
+    mismatched.key_file = pki.client_key.clone();
+    let err = TlsAcceptor::new(mismatched).unwrap_err();
     assert!(err.contains("unusable"), "{err}");
 
-    let mut settings = pki.settings(true, true);
-    let empty = pki.dir.path().join("empty.pem");
-    std::fs::write(&empty, "").unwrap();
-    settings.client_ca_file = Some(empty);
-    let err = TlsAcceptor::new(settings).unwrap_err();
+    let mut empty_ca = settings(&pki, true, true);
+    empty_ca.client_ca_file = Some(pki.write("empty.pem", ""));
+    let err = TlsAcceptor::new(empty_ca).unwrap_err();
     assert!(err.contains("no certificates"), "{err}");
 }
 
 #[test]
 fn serve_once_speaks_tls_too() {
     let pki = Pki::new();
-    let config = tls_config(pki.settings(true, true));
+    let config = tls_config(settings(&pki, true, true));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let handle = std::thread::spawn(move || {

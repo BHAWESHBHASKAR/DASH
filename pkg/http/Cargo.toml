@@ -12,5 +12,4 @@ sha2 = { workspace = true }
 webpki-roots = "0.26"
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
-tempfile = "3"
+dash-tls-fixtures = { path = "../../tests/tls-fixtures" }

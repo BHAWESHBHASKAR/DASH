@@ -867,9 +867,12 @@ pub fn serve_listener(
         let peer = request.peer.map(|addr| addr.ip());
         handle_request(&state, request, peer).into()
     });
+    let mut http = config.to_http();
+    http.tls = dash_common::tls::listener_tls_from_env(&dash_common::tls::CONTROL_PLANE_TLS_ENV)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
     dash_http::serve(
         listener,
-        config.to_http(),
+        http,
         handler,
         |_, _| false,
         &dash_http::NeverShutdown,

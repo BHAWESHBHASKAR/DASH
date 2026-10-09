@@ -28,6 +28,11 @@ fn main() {
     for warning in &security.warnings {
         eprintln!("WARNING: {warning}");
     }
+    if let Err(err) = dash_common::tls::check_listener_tls(&dash_common::tls::CONTROL_PLANE_TLS_ENV)
+    {
+        eprintln!("control-plane refusing to start: {err}");
+        std::process::exit(2);
+    }
     let bind_addr = security.bind_addr.clone();
     let node_id = resolve_node_id(
         env_with_fallback("DASH_CONTROL_PLANE_NODE_ID", "EME_CONTROL_PLANE_NODE_ID").as_deref(),

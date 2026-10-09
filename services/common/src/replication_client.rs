@@ -4,8 +4,11 @@
 //! identical.
 //!
 //! * `http://` and `https://` source URLs are accepted. TLS is `rustls` via
-//!   `ureq`; the public web roots are trusted, plus an optional PEM bundle in
-//!   `DASH_REPLICATION_CA_FILE` for a private or mesh CA.
+//!   `ureq`; the server certificate is always verified, against the public
+//!   web roots plus an optional PEM bundle in `DASH_REPLICATION_CA_FILE` for
+//!   a private or mesh CA. `DASH_REPLICATION_CLIENT_CERT_FILE` and
+//!   `DASH_REPLICATION_CLIENT_KEY_FILE` present a client certificate (mutual
+//!   TLS against a leader with `DASH_INGEST_TLS_CLIENT_CA_FILE`).
 //! * Redirects are never followed, so the replication token cannot be
 //!   forwarded to another host.
 //! * Response bodies are read through a hard cap.
@@ -14,8 +17,8 @@
 //!   `DASH_REPLICATION_ALLOW_INSECURE_HTTP=1` acknowledges the exposure
 //!   (the same rule the embeddings client applies to API keys).
 //!
-//! The leader itself speaks plain HTTP only; see
-//! `docs/operations/replication-security.md` for how to put TLS in front of it.
+//! The leader serves HTTPS itself when `DASH_INGEST_TLS_CERT_FILE` and
+//! `DASH_INGEST_TLS_KEY_FILE` are set; see `docs/operations/tls.md`.
 
 use std::io::Read;
 use std::net::IpAddr;
@@ -30,6 +33,10 @@ use url::{Host, Url};
 pub const ALLOW_INSECURE_HTTP_ENV: &str = "DASH_REPLICATION_ALLOW_INSECURE_HTTP";
 /// PEM bundle of extra trusted CA certificates for `https://` sources.
 pub const CA_FILE_ENV: &str = "DASH_REPLICATION_CA_FILE";
+/// PEM client certificate chain presented to an `https://` source.
+pub const CLIENT_CERT_FILE_ENV: &str = "DASH_REPLICATION_CLIENT_CERT_FILE";
+/// PEM private key of [`CLIENT_CERT_FILE_ENV`].
+pub const CLIENT_KEY_FILE_ENV: &str = "DASH_REPLICATION_CLIENT_KEY_FILE";
 /// Operator documentation referenced by the startup warnings.
 pub const SECURITY_DOC: &str = "docs/operations/replication-security.md";
 
@@ -43,6 +50,9 @@ pub struct SourceResponse {
 pub struct ClientOptions {
     pub allow_insecure_http: bool,
     pub ca_file: Option<PathBuf>,
+    /// Client certificate chain for mutual TLS (with `client_key_file`).
+    pub client_cert_file: Option<PathBuf>,
+    pub client_key_file: Option<PathBuf>,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
     pub request_deadline: Duration,
@@ -53,6 +63,8 @@ impl Default for ClientOptions {
         Self {
             allow_insecure_http: false,
             ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
             connect_timeout: Duration::from_secs(5),
             io_timeout: Duration::from_secs(10),
             request_deadline: Duration::from_secs(60),
@@ -60,17 +72,63 @@ impl Default for ClientOptions {
     }
 }
 
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 impl ClientOptions {
     pub fn from_env() -> Self {
         Self {
             allow_insecure_http: insecure_http_allowed_from_env(),
-            ca_file: std::env::var(CA_FILE_ENV)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            ca_file: env_path(CA_FILE_ENV),
+            client_cert_file: env_path(CLIENT_CERT_FILE_ENV),
+            client_key_file: env_path(CLIENT_KEY_FILE_ENV),
             ..Self::default()
         }
+    }
+
+    /// The verified TLS configuration for an `https://` source. Errors name
+    /// the variable and the file, never key material.
+    pub fn tls_config(&self) -> Result<Arc<dash_http::rustls::ClientConfig>, String> {
+        let identity = match (
+            self.client_cert_file.as_deref(),
+            self.client_key_file.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (Some(_), None) => {
+                return Err(format!(
+                    "{CLIENT_CERT_FILE_ENV} is set but {CLIENT_KEY_FILE_ENV} is not"
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{CLIENT_KEY_FILE_ENV} is set but {CLIENT_CERT_FILE_ENV} is not"
+                ));
+            }
+        };
+        dash_http::client_config(self.ca_file.as_deref(), identity).map_err(|err| {
+            format!(
+                "replication TLS configuration rejected ({CA_FILE_ENV}, \
+                 {CLIENT_CERT_FILE_ENV}, {CLIENT_KEY_FILE_ENV}): {err}"
+            )
+        })
+    }
+
+    /// Check the TLS files at startup so a typo fails fast instead of on
+    /// every poll.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ca_file.is_none()
+            && self.client_cert_file.is_none()
+            && self.client_key_file.is_none()
+        {
+            return Ok(());
+        }
+        self.tls_config().map(|_| ())
     }
 }
 
@@ -183,23 +241,24 @@ pub fn plaintext_source_warning(source_url: &str) -> Option<String> {
     Some(format!(
         "replication source '{}' uses plain http:// to a non-loopback host: the WAL stream \
          (all tenants' data) and the replication token cross the network unencrypted. \
-         Terminate TLS in front of the leader and use https://, or restrict the path with a \
-         mesh/NetworkPolicy; see {SECURITY_DOC}",
+         Enable TLS on the leader (DASH_INGEST_TLS_CERT_FILE) and use an https:// source URL, \
+         or restrict the path with a mesh/NetworkPolicy; see {SECURITY_DOC}",
         redact_url(&url)
     ))
 }
 
 /// Leader-side startup warning: replication token configured while the
-/// listener is reachable from other machines.
-pub fn leader_exposure_warning(bind_addr: &str, token_set: bool) -> Option<String> {
-    if !token_set || bind_is_loopback(bind_addr) {
+/// listener is reachable from other machines over plain HTTP.
+pub fn leader_exposure_warning(bind_addr: &str, token_set: bool, tls: bool) -> Option<String> {
+    if !token_set || tls || bind_is_loopback(bind_addr) {
         return None;
     }
     Some(format!(
-        "replication is enabled (token set) and the listener {bind_addr} is not loopback: \
-         /internal/replication/* serves every tenant's data over plain HTTP, and the std server \
-         does not terminate TLS. Put a TLS-terminating sidecar/ingress or a mesh with mTLS in \
-         front of it and restrict who can reach the port; see {SECURITY_DOC}"
+        "replication is enabled (token set) and the listener {bind_addr} is not loopback and \
+         serves plain HTTP: /internal/replication/* sends every tenant's data and accepts the \
+         token unencrypted. Set DASH_INGEST_TLS_CERT_FILE and DASH_INGEST_TLS_KEY_FILE (and \
+         DASH_INGEST_TLS_CLIENT_CA_FILE for mutual TLS), or use a mesh with mTLS, and restrict \
+         who can reach the port; see {SECURITY_DOC}"
     ))
 }
 
@@ -224,32 +283,6 @@ fn redact_url(url: &Url) -> String {
     }
 }
 
-fn tls_config(ca_file: &std::path::Path) -> Result<Arc<rustls::ClientConfig>, String> {
-    use rustls::pki_types::pem::PemObject;
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let pem = std::fs::read(ca_file)
-        .map_err(|err| format!("cannot read {CA_FILE_ENV} '{}': {err}", ca_file.display()))?;
-    let mut added = 0usize;
-    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
-        let cert = cert.map_err(|err| format!("invalid certificate in {CA_FILE_ENV}: {err}"))?;
-        roots
-            .add(cert)
-            .map_err(|err| format!("invalid certificate in {CA_FILE_ENV}: {err}"))?;
-        added += 1;
-    }
-    if added == 0 {
-        return Err(format!("{CA_FILE_ENV} contains no certificates"));
-    }
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|err| format!("tls configuration failed: {err}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(Arc::new(config))
-}
-
 /// Perform one request. `max_body_bytes` bounds the response body; errors use
 /// stable phrases (`exceeds N byte limit`) the followers classify on.
 pub fn request(
@@ -268,10 +301,8 @@ pub fn request(
         .timeout_read(options.io_timeout)
         .timeout_write(options.io_timeout)
         .timeout(options.request_deadline);
-    if parsed.scheme() == "https"
-        && let Some(ca_file) = options.ca_file.as_deref()
-    {
-        builder = builder.tls_config(tls_config(ca_file)?);
+    if parsed.scheme() == "https" {
+        builder = builder.tls_config(options.tls_config()?);
     }
     let agent = builder.build();
 
@@ -410,13 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn leader_warning_needs_a_token_and_a_non_loopback_bind() {
-        assert!(leader_exposure_warning("0.0.0.0:8081", true).is_some());
-        assert!(leader_exposure_warning("10.1.2.3:8081", true).is_some());
-        assert!(leader_exposure_warning("[::]:8081", true).is_some());
-        assert!(leader_exposure_warning("0.0.0.0:8081", false).is_none());
-        assert!(leader_exposure_warning("127.0.0.1:8081", true).is_none());
-        assert!(leader_exposure_warning("localhost:8081", true).is_none());
-        assert!(leader_exposure_warning("[::1]:8081", true).is_none());
+    fn leader_warning_needs_a_token_a_non_loopback_bind_and_plain_http() {
+        assert!(leader_exposure_warning("0.0.0.0:8081", true, false).is_some());
+        assert!(leader_exposure_warning("10.1.2.3:8081", true, false).is_some());
+        assert!(leader_exposure_warning("[::]:8081", true, false).is_some());
+        assert!(leader_exposure_warning("0.0.0.0:8081", false, false).is_none());
+        assert!(leader_exposure_warning("127.0.0.1:8081", true, false).is_none());
+        assert!(leader_exposure_warning("localhost:8081", true, false).is_none());
+        assert!(leader_exposure_warning("[::1]:8081", true, false).is_none());
+        // A TLS listener is not a plaintext exposure.
+        assert!(leader_exposure_warning("0.0.0.0:8081", true, true).is_none());
     }
 }

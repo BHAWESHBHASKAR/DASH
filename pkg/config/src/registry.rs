@@ -493,7 +493,7 @@ pub static REGISTRY: &[Entry] = &[
         T_REPL_AUTH,
         Kind::Bool(Honors::One),
         "off",
-        "Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Use an `https://` source URL behind a TLS-terminating sidecar or ingress instead; see `docs/operations/replication-security.md`.",
+        "Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Enable TLS on the leader (`DASH_INGEST_TLS_CERT_FILE`) and use an `https://` source URL instead; see `docs/operations/tls.md`.",
     )
     .readers(DATA),
     Entry::new(
@@ -502,9 +502,43 @@ pub static REGISTRY: &[Entry] = &[
         T_REPL_AUTH,
         Kind::Path,
         "",
-        "PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted.",
+        "PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted. Server certificates are always verified; there is no switch to turn verification off.",
     )
     .readers(DATA),
+    Entry::new(
+        "DASH_REPLICATION_CLIENT_CERT_FILE",
+        Common,
+        T_REPL_AUTH,
+        Kind::Path,
+        "",
+        "PEM client certificate chain a replication follower presents to an `https://` source (mutual TLS, for a leader with `DASH_INGEST_TLS_CLIENT_CA_FILE`). Needs `DASH_REPLICATION_CLIENT_KEY_FILE`; one without the other refuses to start an ingestion follower and fails every retrieval poll. Re-read on every poll, so rotation needs no restart.",
+    )
+    .readers(DATA),
+    Entry::new(
+        "DASH_REPLICATION_CLIENT_KEY_FILE",
+        Common,
+        T_REPL_AUTH,
+        Kind::Path,
+        "",
+        "PEM private key of `DASH_REPLICATION_CLIENT_CERT_FILE`.",
+    )
+    .readers(DATA),
+    Entry::new(
+        "DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT",
+        Ingestion,
+        T_REPL_AUTH,
+        Kind::BOOL,
+        "off",
+        "Require, on top of the replication token, a client certificate verified against `DASH_INGEST_TLS_CLIENT_CA_FILE` on `/internal/replication/*` (403 otherwise). Other routes are unaffected. Startup is refused when the listener does not verify client certificates.",
+    ),
+    Entry::new(
+        "DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS",
+        Ingestion,
+        T_REPL_AUTH,
+        Kind::List { sep: ',', u32_items: false },
+        "",
+        "Comma-separated SHA-256 fingerprints (64 hex digits, colons allowed) of the follower certificates allowed on `/internal/replication/*`; implies `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT`. Gives each follower its own identity: remove a fingerprint to cut one follower off. Compute one with `openssl x509 -in follower.pem -outform der | sha256sum`. A malformed entry refuses startup.",
+    ),
     Entry::new(
         "DASH_CONTROL_PLANE_TOKEN",
         ControlPlane,
@@ -677,7 +711,7 @@ pub static REGISTRY: &[Entry] = &[
         T_PLACEMENT,
         Kind::Url,
         "",
-        "Fetch placement from the control plane. If it is configured and unreachable, the placement file is **not** used as a fallback unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT` is set.",
+        "Fetch placement from the control plane (`http://` or `https://`). If it is configured and unreachable, the placement file is **not** used as a fallback unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT` is set.",
     )
     .eme(),
     Entry::new(
@@ -725,6 +759,30 @@ pub static REGISTRY: &[Entry] = &[
         "Write timeout of the control-plane client.",
     )
     .blank_ok(),
+    Entry::new(
+        "DASH_ROUTER_CONTROL_PLANE_CA_FILE",
+        Common,
+        T_PLACEMENT,
+        Kind::Path,
+        "",
+        "PEM bundle of extra CAs trusted for an `https://` `DASH_ROUTER_CONTROL_PLANE_URL` (the public web roots are always trusted; verification is never off).",
+    ),
+    Entry::new(
+        "DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE",
+        Common,
+        T_PLACEMENT,
+        Kind::Path,
+        "",
+        "PEM client certificate chain presented to an `https://` control plane that verifies client certificates. Needs `DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE`.",
+    ),
+    Entry::new(
+        "DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE",
+        Common,
+        T_PLACEMENT,
+        Kind::Path,
+        "",
+        "PEM private key of `DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE`.",
+    ),
     Entry::new(
         "DASH_ROUTER_LOCAL_NODE_ID",
         Common,
@@ -1007,6 +1065,38 @@ pub static REGISTRY: &[Entry] = &[
         "Bounded accept queue. When full, the service answers 503.",
     )
     .eme(),
+    Entry::new(
+        "DASH_INGEST_TLS_CERT_FILE",
+        Ingestion,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset (plain HTTP)",
+        "PEM certificate chain (leaf first) for the ingestion listener. With `DASH_INGEST_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`.",
+    ),
+    Entry::new(
+        "DASH_INGEST_TLS_KEY_FILE",
+        Ingestion,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset",
+        "PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_INGEST_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate.",
+    ),
+    Entry::new(
+        "DASH_INGEST_TLS_CLIENT_CA_FILE",
+        Ingestion,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset (no client certificates)",
+        "PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_INGEST_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes. To require a client certificate only on `/internal/replication/*`, leave the next setting off and set `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT` or `DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS`.",
+    ),
+    Entry::new(
+        "DASH_INGEST_TLS_REQUIRE_CLIENT_CERT",
+        Ingestion,
+        T_TRANSPORT,
+        Kind::BOOL,
+        "off",
+        "Refuse every client that presents no certificate chaining to `DASH_INGEST_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead.",
+    ),
     Entry::new(
         "DASH_INGEST_WAL_PATH",
         Ingestion,
@@ -1397,6 +1487,38 @@ pub static REGISTRY: &[Entry] = &[
     )
     .eme(),
     Entry::new(
+        "DASH_RETRIEVAL_TLS_CERT_FILE",
+        Retrieval,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset (plain HTTP)",
+        "PEM certificate chain (leaf first) for the retrieval listener. With `DASH_RETRIEVAL_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`.",
+    ),
+    Entry::new(
+        "DASH_RETRIEVAL_TLS_KEY_FILE",
+        Retrieval,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset",
+        "PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_RETRIEVAL_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate.",
+    ),
+    Entry::new(
+        "DASH_RETRIEVAL_TLS_CLIENT_CA_FILE",
+        Retrieval,
+        T_TRANSPORT,
+        Kind::Path,
+        "unset (no client certificates)",
+        "PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes.",
+    ),
+    Entry::new(
+        "DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT",
+        Retrieval,
+        T_TRANSPORT,
+        Kind::BOOL,
+        "off",
+        "Refuse every client that presents no certificate chaining to `DASH_RETRIEVAL_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead.",
+    ),
+    Entry::new(
         "DASH_RETRIEVAL_WAL_PATH",
         Retrieval,
         T_WAL,
@@ -1431,7 +1553,7 @@ pub static REGISTRY: &[Entry] = &[
         T_REPLICATION,
         Kind::Url,
         "unset (follower off)",
-        "Base URL of the ingestion service, for example `http://ingestion:8081`.",
+        "Base URL of the ingestion service, for example `https://ingestion:8081` (leader with `DASH_INGEST_TLS_CERT_FILE`) or `http://127.0.0.1:8081`.",
     )
     .eme(),
     Entry::new(
@@ -1626,6 +1748,38 @@ pub static REGISTRY: &[Entry] = &[
         "Listen address (`host:port`).",
     )
     .eme(),
+    Entry::new(
+        "DASH_CONTROL_PLANE_TLS_CERT_FILE",
+        ControlPlane,
+        T_SERVER,
+        Kind::Path,
+        "unset (plain HTTP)",
+        "PEM certificate chain (leaf first) for the control-plane listener. With `DASH_CONTROL_PLANE_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_TLS_KEY_FILE",
+        ControlPlane,
+        T_SERVER,
+        Kind::Path,
+        "unset",
+        "PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_CONTROL_PLANE_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE",
+        ControlPlane,
+        T_SERVER,
+        Kind::Path,
+        "unset (no client certificates)",
+        "PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes. The placement client in ingestion and retrieval presents `DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE`.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT",
+        ControlPlane,
+        T_SERVER,
+        Kind::BOOL,
+        "off",
+        "Refuse every client that presents no certificate chaining to `DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead.",
+    ),
     Entry::new(
         "DASH_CONTROL_PLANE_WORKERS",
         ControlPlane,

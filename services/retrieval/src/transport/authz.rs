@@ -28,6 +28,7 @@ static POLICY: PolicyCell = PolicyCell::new();
 /// On unix the policy is rebuilt on SIGHUP (see `dash_common::PolicyCell::reload`).
 pub fn initialize_auth_policy() -> Result<(), String> {
     POLICY.pin(&SERVICE_AUTH)?;
+    dash_common::tls::check_listener_tls(&dash_common::tls::RETRIEVAL_TLS_ENV)?;
     dash_common::audit::warn_if_fail_open("RETRIEVAL");
     dash_common::spawn_sighup_reload(&POLICY, SERVICE_AUTH);
     Ok(())
