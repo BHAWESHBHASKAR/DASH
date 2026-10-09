@@ -2,12 +2,11 @@ use std::{
     collections::HashMap,
     fs,
     io::Write,
-    net::{IpAddr, TcpListener, TcpStream},
+    net::{IpAddr, TcpListener},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
-        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -22,7 +21,11 @@ pub mod leader;
 pub mod server;
 
 pub use server::ServerConfig;
-use server::{HttpRequest, ReadError, content_length, find_header_end, parse_head, read_request};
+#[cfg(test)]
+use server::find_header_end;
+
+use dash_http::json_escape;
+type HttpRequest = dash_http::Request;
 
 /// Authentication policy for the control-plane HTTP API.
 ///
@@ -859,62 +862,26 @@ pub fn serve_listener(
     state: Arc<Mutex<ControlPlanePlacementState>>,
     config: ServerConfig,
 ) -> std::io::Result<()> {
-    let (sender, receiver) = mpsc::sync_channel::<TcpStream>(config.queue_depth.max(1));
-    let receiver = Arc::new(Mutex::new(receiver));
-    let config = Arc::new(config);
-    for index in 0..config.workers.max(1) {
-        let receiver = Arc::clone(&receiver);
-        let state = Arc::clone(&state);
-        let config = Arc::clone(&config);
-        std::thread::Builder::new()
-            .name(format!("control-plane-worker-{index}"))
-            .spawn(move || {
-                loop {
-                    let next = match receiver.lock() {
-                        Ok(guard) => guard.recv(),
-                        Err(_) => return,
-                    };
-                    match next {
-                        Ok(stream) => {
-                            let _ = handle_connection(stream, &state, &config);
-                        }
-                        Err(_) => return,
-                    }
-                }
-            })?;
-    }
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => match sender.try_send(stream) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(mut stream)) => {
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                    let response = HttpResponse::error(503, "control-plane is overloaded")
-                        .with_header("Retry-After", "1");
-                    let _ = stream.write_all(render_response_text(&response).as_bytes());
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
-            },
-            Err(err) => eprintln!("control-plane accept error: {err}"),
-        }
-    }
-    Ok(())
+    let handler: dash_http::Handler = Arc::new(move |request| {
+        let peer = request.peer.map(|addr| addr.ip());
+        handle_request(&state, request, peer).into()
+    });
+    dash_http::serve(
+        listener,
+        config.to_http(),
+        handler,
+        |_, _| false,
+        &dash_http::NeverShutdown,
+        Arc::new(dash_http::NoHooks),
+    )
 }
 
 pub fn handle_http_request_bytes(
     state: &Arc<Mutex<ControlPlanePlacementState>>,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let header_end =
-        find_header_end(raw_request).ok_or_else(|| "missing HTTP header terminator".to_string())?;
-    let head = std::str::from_utf8(&raw_request[..header_end])
-        .map_err(|_| "request must be valid UTF-8".to_string())?;
-    let mut request = parse_head(head)?;
-    let body = &raw_request[header_end + 4..];
-    if content_length(&request)? != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-    request.body = body.to_vec();
+    let request = dash_http::parse_request_bytes(raw_request, &ServerConfig::default().to_http())
+        .map_err(|err| err.message)?;
     let response = handle_request(state, request, None);
     Ok(render_response_text(&response).into_bytes())
 }
@@ -926,40 +893,10 @@ pub fn handle_http_request_bytes_from_peer(
     raw_request: &[u8],
     peer: IpAddr,
 ) -> Result<Vec<u8>, String> {
-    let header_end =
-        find_header_end(raw_request).ok_or_else(|| "missing HTTP header terminator".to_string())?;
-    let head = std::str::from_utf8(&raw_request[..header_end])
-        .map_err(|_| "request must be valid UTF-8".to_string())?;
-    let mut request = parse_head(head)?;
-    let body = &raw_request[header_end + 4..];
-    if content_length(&request)? != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-    request.body = body.to_vec();
+    let request = dash_http::parse_request_bytes(raw_request, &ServerConfig::default().to_http())
+        .map_err(|err| err.message)?;
     let response = handle_request(state, request, Some(peer));
     Ok(render_response_text(&response).into_bytes())
-}
-
-fn handle_connection(
-    mut stream: TcpStream,
-    state: &Arc<Mutex<ControlPlanePlacementState>>,
-    config: &ServerConfig,
-) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(config.write_timeout))?;
-    let peer = stream.peer_addr().ok().map(|addr| addr.ip());
-    let response = match read_request(&mut stream, config) {
-        Ok(request) => handle_request(state, request, peer),
-        Err(ReadError::Closed) => return Ok(()),
-        Err(ReadError::Io(err)) => return Err(err),
-        Err(ReadError::Timeout) => HttpResponse::error(408, "request timed out"),
-        Err(ReadError::HeaderTooLarge) => HttpResponse::error(431, "request headers too large"),
-        Err(ReadError::BodyTooLarge) => HttpResponse::error(413, "request body too large"),
-        Err(ReadError::Malformed(reason)) => HttpResponse::bad_request(&reason),
-    };
-    stream.write_all(render_response_text(&response).as_bytes())?;
-    stream.flush()?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1343,6 +1280,8 @@ fn handle_request(
     }
 }
 
+/// Control-plane query parameters are used verbatim (no percent-decoding), as
+/// before the shared server; only the surrounding whitespace is trimmed.
 fn split_target(target: &str) -> (String, HashMap<String, String>) {
     let (path, query) = target
         .split_once('?')
@@ -1438,44 +1377,19 @@ fn persist_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         })
 }
 
-fn render_response_text(response: &HttpResponse) -> String {
-    let status_text = match response.status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        413 => "Payload Too Large",
-        429 => "Too Many Requests",
-        431 => "Request Header Fields Too Large",
-        503 => "Service Unavailable",
-        _ => "Internal Server Error",
-    };
-    let mut extra = String::new();
-    for (name, value) in &response.headers {
-        extra.push_str(&format!("{name}: {value}\r\n"));
+impl From<HttpResponse> for dash_http::Response {
+    fn from(response: HttpResponse) -> Self {
+        let mut out =
+            dash_http::Response::new(response.status, response.content_type, response.body);
+        for (name, value) in response.headers {
+            out = out.with_header(name, value);
+        }
+        out
     }
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
-        response.status,
-        status_text,
-        response.content_type,
-        response.body.len(),
-        extra,
-        response.body
-    )
 }
 
-fn json_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+fn render_response_text(response: &HttpResponse) -> String {
+    dash_http::render_response(&response.clone().into())
 }
 
 fn replica_role_str(role: ReplicaRole) -> &'static str {

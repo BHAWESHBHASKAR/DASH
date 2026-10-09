@@ -1,7 +1,7 @@
 use super::*;
 use metadata_router::{ReplicaHealth, ReplicaPlacement};
 use std::io::Read;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const TOKEN: &str = "test-token";

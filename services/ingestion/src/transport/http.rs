@@ -1,8 +1,11 @@
-use std::{collections::HashMap, io::Write, net::TcpStream, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use super::json::json_escape;
 
-const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: ingestion worker queue full";
+pub(super) const SOCKET_TIMEOUT_SECS: u64 = 5;
+/// Workers reserved for health-class requests (`/health`, `/live`, ...).
+const HEALTH_WORKERS: usize = 2;
+const HEALTH_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpRequest {
@@ -146,62 +149,42 @@ impl HttpResponse {
     }
 }
 
-pub(crate) fn backpressure_rejection_response() -> HttpResponse {
-    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
+impl From<dash_http::Request> for HttpRequest {
+    fn from(request: dash_http::Request) -> Self {
+        Self {
+            method: request.method,
+            target: request.target,
+            headers: request.headers,
+            body: request.body,
+        }
+    }
 }
 
-pub(crate) fn write_backpressure_response(
-    mut stream: TcpStream,
-    socket_timeout_secs: u64,
-) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(Duration::from_secs(socket_timeout_secs)))?;
-    let response = backpressure_rejection_response();
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response.content_type,
-        response.body.len(),
-        response.body
-    );
-    stream.write_all(response.as_bytes())
+impl From<HttpResponse> for dash_http::Response {
+    fn from(response: HttpResponse) -> Self {
+        let out = dash_http::Response::new(response.status, response.content_type, response.body);
+        match response.retry_after_secs {
+            Some(secs) => out.with_header("Retry-After", secs.to_string()),
+            None => out,
+        }
+    }
 }
 
-pub(crate) fn write_response(
-    stream: &mut TcpStream,
-    response: HttpResponse,
-) -> std::io::Result<()> {
-    stream.write_all(render_response_text(&response).as_bytes())?;
-    stream.flush()
+/// Server settings for ingestion: the shared defaults plus the
+/// `DASH_HTTP_*` environment overrides.
+pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_http::ServerConfig {
+    let env = dash_common::conn::ConnConfig::from_env();
+    let mut config = dash_http::ServerConfig::new("ingestion", worker_count, queue_capacity);
+    config.health_workers = HEALTH_WORKERS;
+    config.health_queue_capacity = HEALTH_QUEUE_CAPACITY;
+    config.write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
+    config.reject_write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
+    config.request_deadline = env.request_timeout;
+    config.first_byte_timeout = env.first_byte_timeout;
+    config.max_conns_per_ip = env.max_per_ip;
+    config
 }
 
-pub(crate) fn render_response_text(response: &HttpResponse) -> String {
-    let status_text = match response.status {
-        200 => "200 OK",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        409 => "409 Conflict",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        408 => "408 Request Timeout",
-        411 => "411 Length Required",
-        413 => "413 Payload Too Large",
-        417 => "417 Expectation Failed",
-        429 => "429 Too Many Requests",
-        431 => "431 Request Header Fields Too Large",
-        501 => "501 Not Implemented",
-        502 => "502 Bad Gateway",
-        503 => "503 Service Unavailable",
-        505 => "505 HTTP Version Not Supported",
-        500 => "500 Internal Server Error",
-        _ => "500 Internal Server Error",
-    };
-    let body_len = response.body.len();
-    let retry_after = response
-        .retry_after_secs
-        .map(|secs| format!("Retry-After: {secs}\r\n"))
-        .unwrap_or_default();
-    format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\n{retry_after}Connection: close\r\n\r\n{}",
-        response.content_type, response.body
-    )
+pub(super) fn render_response_text(response: &HttpResponse) -> String {
+    dash_http::render_response(&response.clone().into())
 }

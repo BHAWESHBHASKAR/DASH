@@ -43,21 +43,7 @@ fn convert(value: serde_json::Value) -> JsonValue {
     }
 }
 
-pub(super) fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
+pub(super) use dash_http::json_escape;
 
 #[cfg(test)]
 mod escape_tests {

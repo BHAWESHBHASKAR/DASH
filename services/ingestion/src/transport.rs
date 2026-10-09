@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -38,9 +38,7 @@ use config::{
 };
 use dash_common::AuthPolicy;
 use document_parser_debug::render_document_parser_debug_json;
-use http::{
-    HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,
-};
+use http::{HttpRequest, HttpResponse, render_response_text, server_config};
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, route_write_with_placement,
 };
@@ -60,10 +58,7 @@ use replication::{
     ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
     render_replication_export_frame, run_replication_pull_tick,
 };
-use request::{
-    parse_query_usize, parse_request_line, query_encoding_is_invalid, read_http_request_until,
-    resolve_request_timeout, split_target,
-};
+use request::{parse_query_usize, query_encoding_is_invalid, split_target};
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
@@ -1294,11 +1289,6 @@ dash_ingest_uptime_seconds {:.4}\n",
 }
 
 pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;
-const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
-const SOCKET_TIMEOUT_SECS: u64 = 5;
-/// Workers reserved for health-class requests (`/health`, `/live`, ...).
-const HEALTH_WORKERS: usize = 2;
-const HEALTH_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
@@ -1338,51 +1328,9 @@ pub fn handle_http_request_bytes(
     runtime: &Arc<Mutex<IngestionRuntime>>,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let request_text =
-        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
-    let (header_block, body) = request_text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
-    let (method, target) = parse_request_line(request_line)?;
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
-    };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
-        ));
-    }
-    if content_length != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-
-    let request = HttpRequest {
-        method,
-        target,
-        headers,
-        body: body.as_bytes().to_vec(),
-    };
-    let response = handle_request(runtime, &request);
+    let request = dash_http::parse_request_bytes(raw_request, &server_config(1, 1))
+        .map_err(|err| err.message)?;
+    let response = handle_request(runtime, &HttpRequest::from(request));
     Ok(render_response_text(&response).into_bytes())
 }
 

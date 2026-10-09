@@ -442,6 +442,7 @@ dependencies = [
  "axum",
  "chrono",
  "dash-common",
+ "dash-http",
  "libc",
  "metadata-router",
  "serde",
@@ -646,6 +647,10 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "dash-http"
+version = "0.1.0"
 
 [[package]]
 name = "deranged"
@@ -1191,6 +1196,7 @@ dependencies = [
  "axum",
  "chrono",
  "dash-common",
+ "dash-http",
  "embeddings",
  "indexer",
  "metadata-router",
@@ -1813,6 +1819,7 @@ dependencies = [
  "axum",
  "chrono",
  "dash-common",
+ "dash-http",
  "embeddings",
  "graph",
  "indexer",

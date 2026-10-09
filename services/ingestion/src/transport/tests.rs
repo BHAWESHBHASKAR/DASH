@@ -6,8 +6,6 @@ mod review_fixes;
 mod write_path;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
 use metadata_router::{ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader};
-use std::io::Read;
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1332,24 +1330,15 @@ fn resolve_http_queue_capacity_prefers_env_override() {
 }
 
 #[test]
-fn write_backpressure_response_returns_http_503_payload() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
-    let addr = listener.local_addr().expect("local addr should resolve");
-    let client = std::thread::spawn(move || {
-        let mut stream = TcpStream::connect(addr).expect("client connect should succeed");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("client should read response");
-        response
-    });
-
-    let (server_stream, _) = listener.accept().expect("accept should succeed");
-    write_backpressure_response(server_stream, SOCKET_TIMEOUT_SECS)
-        .expect("response write should succeed");
-    let response = client.join().expect("client thread should join");
+fn overload_response_is_the_http_503_payload() {
+    let config = server_config(1, 1);
+    let response = dash_http::render_response(&config.overload_response);
     assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
-    assert!(response.contains("content-type: application/json"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: application/json")
+    );
     assert!(response.contains("ingestion worker queue full"));
 }
 
