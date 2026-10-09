@@ -1,5 +1,13 @@
 package dash
 
+import (
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+)
+
 // EmbeddingRequest is the request body for POST /v1/embeddings.
 //
 // Mirrors services/retrieval/src/openai_embeddings.rs.
@@ -15,12 +23,17 @@ type EmbeddingRequest struct {
 	// in the response. Defaults to "text-embedding-3-small" to
 	// match OpenAI's own default.
 	Model string
-	// EncodingFormat is "float" only; other values are rejected by
-	// the server. Omit for the default behaviour.
+	// EncodingFormat is "float" (default) or "base64". Base64 payloads
+	// are decoded for you, so EmbeddingData.Embedding is always a
+	// []float32.
 	EncodingFormat string
 	// User is an opaque OpenAI-style user identifier. Omit for the
 	// default behaviour.
 	User string
+	// Dimensions is the expected embedding size. The server rejects
+	// values that differ from its provider's dimensionality. Zero omits
+	// the parameter.
+	Dimensions int
 }
 
 // EmbeddingData is one embedding vector in a response.
@@ -28,6 +41,54 @@ type EmbeddingData struct {
 	Object    string    `json:"object"`
 	Embedding []float32 `json:"embedding"`
 	Index     int       `json:"index"`
+}
+
+// UnmarshalJSON accepts both wire forms of the embedding: a JSON array of
+// floats (encoding_format "float") and a base64 string (encoding_format
+// "base64"; float32 values packed little-endian).
+func (d *EmbeddingData) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		Object    string          `json:"object"`
+		Embedding json.RawMessage `json:"embedding"`
+		Index     int             `json:"index"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	d.Object = wire.Object
+	d.Index = wire.Index
+	d.Embedding = nil
+	if len(wire.Embedding) == 0 || string(wire.Embedding) == "null" {
+		return nil
+	}
+	if wire.Embedding[0] == '"' {
+		var encoded string
+		if err := json.Unmarshal(wire.Embedding, &encoded); err != nil {
+			return err
+		}
+		floats, err := decodeBase64Embedding(encoded)
+		if err != nil {
+			return err
+		}
+		d.Embedding = floats
+		return nil
+	}
+	return json.Unmarshal(wire.Embedding, &d.Embedding)
+}
+
+func decodeBase64Embedding(encoded string) ([]float32, error) {
+	bytes, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("dash: embedding is not valid base64: %w", err)
+	}
+	if len(bytes)%4 != 0 {
+		return nil, fmt.Errorf("dash: base64 embedding has %d bytes, not a multiple of 4", len(bytes))
+	}
+	out := make([]float32, len(bytes)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(bytes[i*4:]))
+	}
+	return out, nil
 }
 
 // EmbeddingUsage is the token usage block returned alongside the

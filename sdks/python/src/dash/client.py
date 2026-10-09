@@ -67,6 +67,7 @@ class EmbeddingsNamespace:
         *,
         encoding_format: Optional[str] = None,
         user: Optional[str] = None,
+        dimensions: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> EmbeddingResponse:
         """Call ``POST /v1/embeddings`` and return a typed response.
@@ -79,10 +80,14 @@ class EmbeddingsNamespace:
             Model name. DASH treats this as a hint and uses its
             configured embedding provider for the actual vector.
         encoding_format:
-            Currently DASH only supports ``"float"``; anything else
-            returns an error from the server.
+            ``"float"`` (default) or ``"base64"``. Base64 payloads are
+            decoded for you, so ``EmbeddingData.embedding`` is always a
+            list of floats.
         user:
             Optional OpenAI-style opaque user identifier.
+        dimensions:
+            Expected embedding size. The server rejects values that
+            differ from its provider's dimensionality.
         timeout:
             Per-request timeout in seconds. Overrides the
             :class:`Client`-level default.
@@ -92,6 +97,7 @@ class EmbeddingsNamespace:
             model=model,
             encoding_format=encoding_format,
             user=user,
+            dimensions=dimensions,
         )
         return self._client._request_embeddings(request, timeout=timeout)
 

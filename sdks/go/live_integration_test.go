@@ -9,11 +9,8 @@
 // tests are additionally skipped if the variable is unset, so the
 // default `go test ./...` is offline.
 //
-// Note: the Go SDK currently deserializes EmbeddingData.Embedding
-// as []float32, so the base64 wire format is not directly testable
-// from this SDK. A follow-up SDK change (a `json.RawMessage` field
-// or a separate `EmbeddingString` field) is required to expose
-// base64. The float path is exercised here.
+// Environment: DASH_LIVE_URL (required), DASH_LIVE_RETRIEVAL_URL (defaults
+// to DASH_LIVE_URL) and DASH_LIVE_INGESTION_URL (defaults to DASH_LIVE_URL).
 package dash
 
 import (
@@ -37,6 +34,14 @@ func liveURL(t *testing.T) string {
 func retrievalURL(t *testing.T) string {
 	t.Helper()
 	if v := os.Getenv("DASH_LIVE_RETRIEVAL_URL"); v != "" {
+		return v
+	}
+	return liveURL(t)
+}
+
+func ingestionURL(t *testing.T) string {
+	t.Helper()
+	if v := os.Getenv("DASH_LIVE_INGESTION_URL"); v != "" {
 		return v
 	}
 	return liveURL(t)
@@ -91,27 +96,23 @@ func TestLive_Embed_Float(t *testing.T) {
 	}
 }
 
-func TestLive_Embed_EncodingFormatPassesThrough(t *testing.T) {
-	// The wire format sent on the request is correct; the server
-	// will return a base64 string in the JSON. The SDK currently
-	// cannot deserialize that into []float32, so this test only
-	// verifies the request body is built correctly. A full
-	// round-trip is exercised by the Python and TypeScript tests.
+func TestLive_Embed_Base64(t *testing.T) {
 	url := retrievalURL(t)
 	waitForHealth(t, url)
 	client := New(url, WithAPIKey("not_needed"))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Use a different input here to ensure the body builder doesn't
-	// drop encoding_format. We don't care about decoding the result.
-	_, _ = client.Embeddings().Create(ctx, EmbeddingRequest{
+	resp, err := client.Embeddings().Create(ctx, EmbeddingRequest{
 		Model:          "text-embedding-3-small",
 		Input:          "base64 test",
 		EncodingFormat: "base64",
 	})
-	// Even if the server returns a string the SDK can't parse, the
-	// request itself was correct. Accept any outcome here; the
-	// server-level validation is covered by other tests.
+	if err != nil {
+		t.Fatalf("embed base64: %v", err)
+	}
+	if len(resp.Data) != 1 || len(resp.Data[0].Embedding) == 0 {
+		t.Fatalf("expected one decoded float embedding, got %+v", resp.Data)
+	}
 }
 
 func TestLive_RetrieveAfterDirectIngest(t *testing.T) {
@@ -120,21 +121,31 @@ func TestLive_RetrieveAfterDirectIngest(t *testing.T) {
 	// native HTTP client. This is still an end-to-end test of the
 	// SDK's contract: the response shape and the wire format must
 	// match what production clients see.
-	ingestURL := liveURL(t)
+	ingestURL := ingestionURL(t)
 	retrieve := retrievalURL(t)
 	waitForHealth(t, retrieve)
 
 	tenantID := "test-tenant-" + strings.ReplaceAll(time.Now().Format("20060102T150405.000000"), ".", "")
 	phrase := "distinctive phrase " + time.Now().Format("150405.000000000")
 
-	ingestBody := `{"tenant_id":"` + tenantID + `","bundles":[{"claim_id":"claim-1","text":"` + phrase + `","evidence":[{"evidence_id":"ev-1","text":"Evidence supporting: ` + phrase + `"}]}]}`
+	// Claim ids are global across tenants, so keep them unique per run.
+	claimID := "claim-" + tenantID
+	ingestBody := `{"claim":{"claim_id":"` + claimID + `","tenant_id":"` + tenantID + `","canonical_text":"` + phrase + `","confidence":0.9},` +
+		`"evidence":[{"evidence_id":"ev-` + tenantID + `","claim_id":"` + claimID + `","source_id":"test://integration","stance":"supports","source_quality":0.8}],"edges":[]}`
 	ingestReq, _ := http.NewRequest("POST", strings.TrimRight(ingestURL, "/")+"/v1/ingest", strings.NewReader(ingestBody))
 	ingestReq.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("DASH_LIVE_INGEST_API_KEY"); key != "" {
+		ingestReq.Header.Set("Authorization", "Bearer "+key)
+	}
 	ingestResp, err := http.DefaultClient.Do(ingestReq)
 	if err != nil {
 		t.Fatalf("ingest http: %v", err)
 	}
+	ingestStatus := ingestResp.StatusCode
 	_ = ingestResp.Body.Close()
+	if ingestStatus != http.StatusOK {
+		t.Fatalf("ingest status: got %d want 200", ingestStatus)
+	}
 
 	time.Sleep(500 * time.Millisecond)
 

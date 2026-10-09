@@ -53,6 +53,7 @@ class AsyncEmbeddingsNamespace:
         *,
         encoding_format: Optional[str] = None,
         user: Optional[str] = None,
+        dimensions: Optional[int] = None,
         timeout: Optional[float] = None,
     ) -> EmbeddingResponse:
         """Call ``POST /v1/embeddings`` asynchronously.
@@ -65,6 +66,7 @@ class AsyncEmbeddingsNamespace:
             model=model,
             encoding_format=encoding_format,
             user=user,
+            dimensions=dimensions,
         )
         return await self._client._request_embeddings(request, timeout=timeout)
 

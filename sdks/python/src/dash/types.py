@@ -11,6 +11,9 @@ shapes documented in:
 
 from __future__ import annotations
 
+import base64
+import binascii
+import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Union
 
@@ -32,6 +35,7 @@ class EmbeddingRequest:
     model: str = "text-embedding-3-small"
     encoding_format: Optional[str] = None
     user: Optional[str] = None
+    dimensions: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {"input": self.input, "model": self.model}
@@ -39,6 +43,8 @@ class EmbeddingRequest:
             body["encoding_format"] = self.encoding_format
         if self.user is not None:
             body["user"] = self.user
+        if self.dimensions is not None:
+            body["dimensions"] = self.dimensions
         return body
 
     @classmethod
@@ -48,7 +54,26 @@ class EmbeddingRequest:
             model=data.get("model", "text-embedding-3-small"),
             encoding_format=data.get("encoding_format"),
             user=data.get("user"),
+            dimensions=data.get("dimensions"),
         )
+
+
+def decode_base64_embedding(encoded: str) -> List[float]:
+    """Decode the server's ``encoding_format="base64"`` embedding.
+
+    The payload is the float32 components packed little-endian and encoded
+    with the standard base64 alphabet. Raises :class:`ValueError` for input
+    that is not valid base64 or not a whole number of float32 values.
+    """
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"embedding is not valid base64: {exc}") from exc
+    if len(raw) % 4 != 0:
+        raise ValueError(
+            f"base64 embedding has {len(raw)} bytes, not a multiple of 4"
+        )
+    return list(struct.unpack(f"<{len(raw) // 4}f", raw))
 
 
 @dataclass
@@ -64,8 +89,11 @@ class EmbeddingData:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EmbeddingData":
+        raw = data["embedding"]
+        # ``encoding_format="base64"`` makes the server return a string.
+        embedding = decode_base64_embedding(raw) if isinstance(raw, str) else list(raw)
         return cls(
-            embedding=list(data["embedding"]),
+            embedding=embedding,
             index=int(data["index"]),
             object=data.get("object", "embedding"),
         )

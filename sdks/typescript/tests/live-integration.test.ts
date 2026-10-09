@@ -4,20 +4,13 @@
  * Skipped by default; runs only when DASH_LIVE_URL is set.
  * Run with:  DASH_LIVE_URL=http://127.0.0.1:8080 npm test
  *
- * The TypeScript SDK types EmbeddingData.embedding as number[],
- * so the base64 wire format is not directly testable from this
- * SDK. The Python SDK has the same test using the openai drop-in
- * (which handles string/number polymorphism via OpenAI's own
- * types). The float path is exercised here.
+ * Environment: DASH_LIVE_URL (required), DASH_LIVE_RETRIEVAL_URL and
+ * DASH_LIVE_INGESTION_URL (both default to DASH_LIVE_URL), and optionally
+ * DASH_LIVE_INGEST_API_KEY for an authenticated ingestion service.
  */
 import { describe, test, expect, beforeAll } from 'vitest';
 import { DashClient } from '../src/client';
-import type {
-  HealthResponse,
-  EmbeddingResponse,
-  IngestResponse,
-  RetrieveResponse,
-} from '../src/types';
+import type { EmbeddingResponse, RetrieveResponse } from '../src/types';
 
 const LIVE = !!process.env.DASH_LIVE_URL;
 
@@ -31,14 +24,16 @@ const retrievalURL = (): string =>
 const ingestionURL = (): string =>
   process.env.DASH_LIVE_INGESTION_URL || liveURL();
 
+const trimSlash = (url: string): string => url.replace(/\/$/, '');
+
 async function waitForHealth(baseURL: string, timeoutMs = 10000): Promise<void> {
-  const client = new DashClient({ baseUrl: baseURL, apiKey: 'not_needed' });
   const deadline = Date.now() + timeoutMs;
   let lastErr: unknown;
   while (Date.now() < deadline) {
     try {
-      await client.health();
-      return;
+      const res = await fetch(`${trimSlash(baseURL)}/v1/health`);
+      if (res.status === 200) return;
+      lastErr = new Error(`status ${res.status}`);
     } catch (e) {
       lastErr = e;
     }
@@ -60,68 +55,68 @@ describeIfLive('live integration', () => {
   });
 
   test('health endpoint returns ok', async () => {
-    const h: HealthResponse = await client.health();
-    expect(h.status).toBe('ok');
+    const res = await fetch(`${trimSlash(retrievalURL())}/v1/health`);
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { status: string }).status).toBe('ok');
   });
 
   test('embed returns float vector', async () => {
-    const resp: EmbeddingResponse = await client.embeddings.create({
-      input: 'hello world',
+    const resp: EmbeddingResponse = await client.embeddings.create('hello world', {
       model: 'text-embedding-3-small',
     });
     expect(resp.model).toBe('text-embedding-3-small');
     expect(resp.data).toHaveLength(1);
-    expect(resp.data[0].embedding.length).toBeGreaterThan(0);
-    expect(typeof resp.data[0].embedding[0]).toBe('number');
+    expect(resp.data[0]!.embedding.length).toBeGreaterThan(0);
+    expect(typeof resp.data[0]!.embedding[0]).toBe('number');
   });
 
-  test('embed base64 encoding_format is accepted in the request', async () => {
-    // The TS SDK's EmbeddingData.embedding is number[] only, so we
-    // cannot assert the round-trip here. This test verifies that
-    // the SDK does not drop the encoding_format field from the
-    // outgoing request body, and that the server accepts it.
-    try {
-      await client.embeddings.create({
-        input: 'base64 probe',
-        model: 'text-embedding-3-small',
-        encoding_format: 'base64',
-      });
-    } catch (e: unknown) {
-      // A decode error on the response is acceptable here: it means
-      // the server honored the encoding_format and returned a
-      // base64 string that the SDK couldn't parse. The fact that
-      // the request body was correct is what we're verifying.
-      const err = e as { statusCode?: number; message?: string };
-      if (!err.message?.includes('JSON') && err.statusCode === undefined) {
-        throw e;
-      }
-    }
+  test('embeddings with encoding_format base64 decode to floats', async () => {
+    const resp: EmbeddingResponse = await client.embeddings.create('base64 test', {
+      encoding_format: 'base64',
+    });
+    expect(resp.data).toHaveLength(1);
+    expect(resp.data[0]!.embedding.length).toBeGreaterThan(0);
+    expect(resp.data[0]!.embedding.every((v) => Number.isFinite(v))).toBe(true);
   });
 
   test('ingest then retrieve returns the ingested phrase', async () => {
-    const ing = new DashClient({ baseUrl: ingestionURL(), apiKey: 'not_needed' });
-    const ret = new DashClient({ baseUrl: retrievalURL(), apiKey: 'not_needed' });
     const tenantId = `test-tenant-${Date.now()}`;
     const phrase = `distinctive phrase ${Date.now()}`;
+    // Claim ids are global across tenants, so keep them unique per run.
+    const claimId = `claim-${tenantId}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const ingestKey = process.env.DASH_LIVE_INGEST_API_KEY;
+    if (ingestKey) headers.Authorization = `Bearer ${ingestKey}`;
 
-    const ingestResp: IngestResponse = await ing.ingest({
-      tenant_id: tenantId,
-      bundles: [
-        {
-          claim_id: 'claim-1',
-          text: phrase,
-          evidence: [
-            { evidence_id: 'ev-1', text: `Evidence supporting: ${phrase}` },
-          ],
+    // The SDK has no ingest method; post the real ingestion wire shape.
+    const ingest = await fetch(`${trimSlash(ingestionURL())}/v1/ingest`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        claim: {
+          claim_id: claimId,
+          tenant_id: tenantId,
+          canonical_text: phrase,
+          confidence: 0.9,
         },
-      ],
+        evidence: [
+          {
+            evidence_id: `ev-${tenantId}`,
+            claim_id: claimId,
+            source_id: 'test://integration',
+            stance: 'supports',
+            source_quality: 0.8,
+          },
+        ],
+        edges: [],
+      }),
     });
-    expect(ingestResp).toBeDefined();
+    expect(ingest.status).toBe(200);
 
-    // Allow the WAL flush / write-through to settle.
+    // Allow the WAL flush / replication to settle.
     await new Promise((r) => setTimeout(r, 500));
 
-    const resp: RetrieveResponse = await ret.retrieve.query({
+    const resp: RetrieveResponse = await client.retrieve.query({
       tenant_id: tenantId,
       query: phrase,
       top_k: 3,
@@ -133,15 +128,12 @@ describeIfLive('live integration', () => {
     expect(found).toBe(true);
   });
 
-  test('delete accepts claim ids', async () => {
-    const ing = new DashClient({ baseUrl: ingestionURL(), apiKey: 'not_needed' });
-    try {
-      await ing.delete({ tenant_id: 'test-tenant', claim_ids: ['nonexistent-id'] });
-    } catch (e: unknown) {
-      const err = e as { statusCode?: number };
-      if (err.statusCode !== undefined) {
-        expect(err.statusCode).toBeLessThan(500);
-      }
-    }
+  test('delete of an unknown claim never returns 5xx', async () => {
+    const res = await fetch(`${trimSlash(ingestionURL())}/v1/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tenant_id: 'test-tenant', claim_ids: ['nonexistent-id'] }),
+    });
+    expect(res.status).toBeLessThan(500);
   });
 });
