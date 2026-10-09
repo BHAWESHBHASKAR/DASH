@@ -77,7 +77,7 @@ If no API key, scoped key or JWT secret is configured, today's services accept u
 | `_JWT_AUDIENCE` | unset | Required `aud`, if set. |
 | `_JWT_LEEWAY_SECS` | `0` | Clock skew allowance. |
 | `_JWT_REQUIRE_EXP` | `true` | Require an `exp` claim. |
-| `_JWT_ROLE_CLAIM` | `dash_roles` | Claim carrying the roles. |
+| `_JWT_ROLE_CLAIM` | `dash_roles` | Claim carrying the roles. A token without this claim is granted all roles today (register SEC-11). |
 | `_JWT_PROVIDER` | `hs256` | Set to `oidc` to validate against a JWKS instead. |
 | `_JWT_JWKS_URL` | unset | JWKS URL (OIDC mode; required with the issuer). |
 | `_JWT_JWKS_REFRESH_MINUTES` | `15` | JWKS cache refresh interval. |

@@ -1,71 +1,41 @@
 # Multi-tenancy
 
-DASH is multi-tenant by design. Every `Claim`, `Evidence`, `Vector`, `AuditEvent`, and `ClaimEdge` carries a `tenant_id`, and the API rejects any request that would cross tenant boundaries. This page describes the isolation guarantees, the per-tenant rate limiting, and the per-tenant key spaces inside `redb`.
+DASH is multi-tenant by design: every `Claim` carries a `tenant_id`, evidence and edges hang off claims, and the retrieval path filters on the tenant. This page describes what is enforced today, what is not, and what is planned. Isolation is enforced by application code; there is no separate storage per tenant.
 
-## Isolation guarantees
+!!! warning "Isolation has known gaps in v0.2.x"
+    The isolation guarantees below describe the intended model. The 2026-10 review found cases that weaken them (register items SEC-18, SEC-19 and others, listed under [Known gaps](#known-gaps)). Do not host mutually untrusted tenants on one deployment until they are closed.
 
-DASH provides **hard tenant isolation**. The guarantees are:
+## What is enforced
 
-1. **No cross-tenant reads.** A `POST /v1/retrieve` request that names tenant `t1` will return only claims from `t1`. This is enforced at two layers:
-   - The retrieval API rejects requests without a `tenant_id` (HTTP 400).
-   - The `InMemoryStore` and `DiskBackedStore` look up by `(tenant_id, claim_id)`; a missing `tenant_id` cannot match.
+1. **Retrieval is tenant-filtered.** `POST /v1/retrieve` requires `tenant_id`; candidate generation (lexical, entity, temporal and ANN) and the final claim filter compare against it. Evidence for each result comes from the claim's own record.
+2. **Credentials are tenant-scoped.** A scoped API key (`DASH_*_API_KEY_SCOPES`, entries `key:tenantA,tenantB[:roles]`) or a JWT tenant claim limits which tenants a caller may act on; a mismatch returns 403. A service-wide allowlist (`DASH_*_ALLOWED_TENANTS`) applies on top. Tests: `transport_denies_cross_tenant_retrieval_for_scoped_key` (retrieval) and `transport_denies_cross_tenant_ingest_for_scoped_key` (ingestion).
+3. **ANN graphs are per tenant.** The in-memory store keeps one HNSW-style graph per tenant (`TenantAnnGraph`), with the vector dimension pinned at that tenant's first vector. The index is in-repo code, not `usearch`.
+4. **Claim ids are validated across tenants on write.** Reusing a `claim_id` that belongs to another tenant is rejected by the store (unit tests exercise this in `pkg/store`).
 
-2. **No cross-tenant writes.** A `POST /v1/ingest` request with `tenant_id: t1` cannot write a claim that names `tenant_id: t2` in any nested field (evidence, edges, vectors). The validation step rejects mismatches with HTTP 400.
+## Where the tenant comes from
 
-3. **No cross-tenant graph edges.** `ClaimEdge` endpoints must belong to the same tenant. An edge from `t1/c1` to `t2/c2` is rejected at validation time.
-
-4. **No cross-tenant audit visibility.** A JWT with `tenant: ["t1"]` cannot read audit events for `t2`. The audit log is partitioned by tenant, and the reader path is gated by the same JWT scope check as the write path.
-
-5. **No shared ANN index.** Each tenant has its own `usearch` index, dimension-pinned at first ingest. The ANN graphs do not see each other's vectors.
-
-## Per-tenant rate limiting
-
-DASH enforces a per-tenant token-bucket rate limit on the **retrieval service**. The defaults:
-
-| Tenant tier   | `RATE_LIMIT_RPS` | `RATE_LIMIT_BURST` |
-| ------------- | ---------------: | -----------------: |
-| `free`        |               10 |                 20 |
-| `pro`         |              100 |                200 |
-| `enterprise`  | 1 000 (or higher)| 2 000 (or higher) |
-
-The values are env-driven per service (`DASH_RETRIEVAL_RATE_LIMIT_RPS`, `DASH_RETRIEVAL_RATE_LIMIT_BURST`). A request that exceeds the bucket returns HTTP 429 with a `Retry-After` header.
-
-The bucket is **per-tenant**, not per-IP and not per-token. Two clients within the same tenant share the bucket; a single client across two tenants gets two independent buckets. This is deliberate — the threat model treats the tenant as the principal, not the caller.
-
-## Per-tenant key spaces in redb
-
-`redb` is a key-value store with typed tables. DASH uses a table-per-type layout, and the keys are `(tenant_id, claim_id)` pairs (or the analogous pair for the other types).
-
-```text
-Table "claims"      : key   = (tenant_id: String, claim_id: String)
-                    : value = Claim (bincode)
-
-Table "evidence"    : key   = (tenant_id: String, claim_id: String, evidence_id: String)
-                    : value = Evidence
-
-Table "vectors"     : key   = (tenant_id: String, claim_id: String)
-                    : value = Vector (base64-encoded values)
-
-Table "ann_index"   : key   = (tenant_id: String)
-                    : value = bytes of the usearch HNSW index
-
-Table "audit_log"   : key   = (tenant_id: String, seq: u64)
-                    : value = AuditEvent
-```
-
-The `(tenant_id, claim_id)` prefix is the **isolation boundary**. The redb API does not support prefix scans, so the isolation is enforced at the application layer — the store never exposes a "list all claims" operation that omits the tenant prefix.
-
-The ANN index is one HNSW graph per tenant. The cost is **O(tenants × dim × 2 bytes)** of RAM for vectors, plus the graph overhead. For 1 000 tenants at 768-dim with 10 000 vectors each, that is ~30 GB of vector RAM. The path for tenants that exceed a single host is **sharding** — see [Scaling](../operations/scaling.md#ann-index-sharding).
+The tenant is read from the **request** (`claim.tenant_id` for ingest, `tenant_id` for retrieve) and then checked against the credential. It is not taken solely from the token. A caller whose credential allows tenant `t1` and who names `t2` gets 403; a credential with a wildcard (`*`) or, today, an unconfigured service allows any tenant.
 
 ## Tenant lifecycle
 
-A tenant is created out-of-band — by an admin in the control plane, by a `POST /v1/tenants` request from an operator-scoped JWT, or by the bootstrap process. The retrieval service does not auto-provision tenants on first request; a request to an unknown tenant returns HTTP 404.
+There is no tenant registry and no tenant API. A tenant comes into existence when the first claim with that `tenant_id` is ingested, if the credential and allowlist permit it. A retrieve for a tenant with no data returns no results; there is no "unknown tenant" error. There is no tenant deletion: no claim, evidence, edge or tenant delete path exists yet (register DATA-14, planned for P2). See [Planned API](../reference/planned-api.md).
 
-When a tenant is deleted:
+## Rate limiting
 
-1. All `Claim` rows in the `claims` table with `tenant_id == deleted` are removed.
-2. All `Evidence` rows are removed.
-3. All `Vector` rows are removed; the ANN graph is dropped.
-4. The `audit_log` table is **not** removed — the audit history is retained for the regulatory retention window (default: 7 years, configurable via `DASH_AUDIT_RETENTION_DAYS`). An audit event of kind `tenant.deleted` is appended to the chain.
+Per-tenant rate limits are configured with `DASH_INGEST_RATE_LIMIT_PER_TENANT_RPS` / `DASH_INGEST_RATE_LIMIT_BURST` and the `DASH_RETRIEVAL_` equivalents (defaults 100 and 200). In v0.2.x these settings do **not** throttle: the limiter is rebuilt on every request, and a rejection would surface as 401. v0.3.0 enforces the limit and returns 429 (register SEC-06). There are no tenant tiers.
 
-Tenant deletion is **irreversible** from the storage layer's perspective. Operators are expected to take a `redb` snapshot before deletion if they want a recovery path.
+## Storage layout
+
+- **WAL:** one append-only file per service, shared by all tenants. Records carry the tenant id inside the claim.
+- **redb:** `dash_claims`, `dash_evidence`, `dash_edges`, `dash_claim_vectors`, `dash_tenant_dims`, `dash_tenant_claims_set`, plus batch-commit records. Keys are strings; the tenant is part of the stored value and of the `(tenant, claim)` membership table, not a per-tenant database.
+- **Segments:** published per tenant under the segment directory, in a directory derived from the tenant id.
+
+## Known gaps
+
+- Conflict errors name the owning tenant and the claim-id namespace is global, so a caller can learn whether another tenant has a given `claim_id` (SEC-18).
+- An edge's `to_claim_id` is not tenant-checked, and graph output can emit another tenant's ids (SEC-18).
+- Tenant ids are sanitized into directory names with collisions (`a.b` and `a_b` map to the same directory), so two tenants can share segment files (SEC-19, P0).
+- Roles have no hierarchy and a JWT without a roles claim is granted all roles (SEC-11).
+- There is no dedicated multi-tenant isolation test suite. The tests listed above cover the credential check; the store-level isolation is covered by unit tests only.
+
+The full list, with severities and target phases, is in [`docs/plans/2026-10-09-issue-register.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/plans/2026-10-09-issue-register.md).

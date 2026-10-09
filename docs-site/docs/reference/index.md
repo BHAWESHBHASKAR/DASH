@@ -4,9 +4,10 @@ The reference section is the **wire-level** description of DASH. It is precise, 
 
 ## Pages
 
-- [**HTTP API**](api.md) — every endpoint, every method, every request and response shape, every error code.
-- [**Configuration**](configuration.md) — every environment variable, the default, and the meaning.
-- [**Benchmarks**](benchmarks.md) — the methodology and the latest published numbers.
+- [**HTTP API**](api.md) — the routes that exist today, with auth requirements, request and response shapes, and status codes.
+- [**Planned API**](planned-api.md) — routes and fields described in earlier drafts that are **not implemented**.
+- [**Configuration**](configuration.md) — the environment variables the code reads, with defaults and the service that reads each.
+- [**Benchmarks**](benchmarks.md) — the methodology and the status of the published numbers.
 - [**Architecture decisions**](architecture-decisions.md) — the ADRs that explain *why* DASH is shaped the way it is.
 
 ## How to read this section

@@ -79,6 +79,7 @@ nav:
   - Reference:
       - Overview: reference/index.md
       - HTTP API: reference/api.md
+      - Planned API: reference/planned-api.md
       - Configuration: reference/configuration.md
       - Benchmarks: reference/benchmarks.md
       - Architecture decisions: reference/architecture-decisions.md
