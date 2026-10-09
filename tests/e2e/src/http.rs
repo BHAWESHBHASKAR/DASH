@@ -130,7 +130,7 @@ pub fn read_optional(s: &mut TcpStream) -> std::io::Result<Option<Resp>> {
     }
 }
 
-pub fn read_response(s: &mut TcpStream) -> std::io::Result<Resp> {
+pub fn read_response<S: Read + ?Sized>(s: &mut S) -> std::io::Result<Resp> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {

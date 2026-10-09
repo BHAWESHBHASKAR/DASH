@@ -703,7 +703,9 @@ name = "dash-e2e"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dash-tls-fixtures",
  "rand 0.8.7",
+ "rustls",
  "serde_json",
  "sha2",
  "tempfile",
