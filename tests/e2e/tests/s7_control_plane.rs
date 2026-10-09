@@ -71,6 +71,40 @@ fn lease_env(dir: &Path) -> Vec<(&'static str, String)> {
 }
 
 #[test]
+fn repeated_bad_tokens_are_throttled() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = random_secret();
+    let cp = start(
+        dir.path(),
+        "throttle",
+        &token,
+        &[("DASH_CONTROL_PLANE_REQUEST_DEADLINE_MS", "3000".into())],
+    );
+    let c = cp.client();
+    let bad = [("Authorization", "Bearer guess-guess-guess")];
+
+    // Ten wrong tokens are answered 401, the eleventh is throttled.
+    for n in 1..=10 {
+        let r = c.get("/v1/control-plane/leader", &bad);
+        assert_eq!(r.status, 401, "wrong token #{n}: {}", r.body);
+    }
+    let r = c.get("/v1/control-plane/leader", &bad);
+    assert_eq!(r.status, 429, "eleventh wrong token: {}", r.body);
+    let retry: u64 = r
+        .header("retry-after")
+        .and_then(|v| v.parse().ok())
+        .expect("429 carries a numeric Retry-After");
+    assert!(
+        (1..=60).contains(&retry),
+        "Retry-After within the window: {retry}"
+    );
+
+    // Open probes are not affected by the throttle.
+    assert_eq!(c.get("/v1/control-plane/health", &[]).status, 200);
+    assert_eq!(c.get("/health", &[]).status, 200);
+}
+
+#[test]
 fn requests_need_the_bearer_token() {
     let dir = tempfile::tempdir().unwrap();
     let token = random_secret();
@@ -82,14 +116,22 @@ fn requests_need_the_bearer_token() {
     );
     let c = cp.client();
 
-    for (m, p) in [
+    // The service throttles repeated bad credentials per peer (10 per minute),
+    // so this loop stays under that budget: a request with no credential is
+    // not counted, a wrong token is (6), and the wrong-scheme probe runs on
+    // the first three routes only (3), for 9 counted failures. The throttle
+    // itself is covered by `repeated_bad_tokens_are_throttled`.
+    for (i, (m, p)) in [
         ("GET", "/v1/control-plane/leader"),
         ("GET", "/v1/control-plane/placement"),
         ("PUT", "/v1/control-plane/placement"),
         ("POST", "/v1/control-plane/leader/acquire"),
         ("POST", "/v1/control-plane/failover/promote"),
         ("POST", "/v1/control-plane/replica-lag"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let r = c.request(m, p, &[], Some(CSV.as_bytes())).unwrap();
         assert_eq!(r.status, 401, "{m} {p} without a token: {}", r.body);
         let r = c
@@ -101,18 +143,20 @@ fn requests_need_the_bearer_token() {
             )
             .unwrap();
         assert_eq!(r.status, 401, "{m} {p} with a wrong token");
-        let r = c
-            .request(
-                m,
-                p,
-                &[("Authorization", &format!("Basic {token}"))],
-                Some(CSV.as_bytes()),
-            )
-            .unwrap();
-        assert_eq!(
-            r.status, 401,
-            "{m} {p} with the right secret under the wrong scheme"
-        );
+        if i < 3 {
+            let r = c
+                .request(
+                    m,
+                    p,
+                    &[("Authorization", &format!("Basic {token}"))],
+                    Some(CSV.as_bytes()),
+                )
+                .unwrap();
+            assert_eq!(
+                r.status, 401,
+                "{m} {p} with the right secret under the wrong scheme"
+            );
+        }
     }
     // Probes are open.
     assert_eq!(c.get("/v1/control-plane/health", &[]).status, 200);

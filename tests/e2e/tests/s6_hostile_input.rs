@@ -90,11 +90,22 @@ impl Target<'_> {
         c.timeout = Duration::from_secs(30);
         let key = self.key();
         let started = Instant::now();
-        let r = c.post_json(
+        // A 503 means "shed load, retry": after a burst the bounded accept
+        // queue may still be draining dead connections. The server must
+        // recover within `limit`; anything else is a failure.
+        let mut r = c.post_json(
             self.path(),
             &[("x-api-key", &key)],
             &self.good_body(&after.replace(' ', "-")),
         );
+        while r.status == 503 && started.elapsed() < limit {
+            std::thread::sleep(Duration::from_millis(100));
+            r = c.post_json(
+                self.path(),
+                &[("x-api-key", &key)],
+                &self.good_body(&after.replace(' ', "-")),
+            );
+        }
         assert_eq!(
             r.status,
             200,

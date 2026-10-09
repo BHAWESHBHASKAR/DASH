@@ -34,6 +34,8 @@ pub struct Stack {
     pub ingest_keys: BTreeMap<String, String>,
     /// tenant -> retrieve key (roles: retrieve, read_only; that tenant only).
     pub retrieve_keys: BTreeMap<String, String>,
+    /// Unscoped admin credential for the operations routes (`/metrics`, `/debug/*`).
+    pub ops_key: String,
     pub ingest: Option<Proc>,
     pub retrieval: Option<Proc>,
 }
@@ -64,6 +66,7 @@ impl Stack {
             replication_token: random_secret(),
             ingest_keys,
             retrieve_keys,
+            ops_key: random_secret(),
             ingest: None,
             retrieval: None,
         }
@@ -110,7 +113,11 @@ impl Stack {
             ),
             (
                 "DASH_INGEST_API_KEY_SCOPES".into(),
-                Self::scopes(&self.ingest_keys, "ingest,read_only"),
+                format!(
+                    "{};{}:*:admin,read_only",
+                    Self::scopes(&self.ingest_keys, "ingest,read_only"),
+                    self.ops_key
+                ),
             ),
             (
                 "DASH_INGEST_REPLICATION_TOKEN".into(),
@@ -143,7 +150,11 @@ impl Stack {
             ),
             (
                 "DASH_RETRIEVAL_API_KEY_SCOPES".into(),
-                Self::scopes(&self.retrieve_keys, "retrieve,read_only"),
+                format!(
+                    "{};{}:*:admin,read_only",
+                    Self::scopes(&self.retrieve_keys, "retrieve,read_only"),
+                    self.ops_key
+                ),
             ),
             (
                 "DASH_RETRIEVAL_REPLICATION_SOURCE_URL".into(),

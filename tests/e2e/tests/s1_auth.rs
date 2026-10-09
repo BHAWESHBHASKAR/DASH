@@ -234,12 +234,27 @@ fn api_keys_are_enforced_on_every_route_of_both_services() {
         200,
         "embeddings with a retrieve key"
     );
-    assert_eq!(rc.get("/metrics", &[("x-api-key", &a_ret)]).status, 200);
-    assert_eq!(ic.get("/metrics", &[("x-api-key", &a_ing)]).status, 200);
+    // Operations routes expose all-tenant topology and counters: a
+    // tenant-scoped key is refused, an unscoped admin key is served.
+    for path in ["/metrics", "/debug/placement"] {
+        assert_eq!(
+            rc.get(path, &[("x-api-key", &a_ret)]).status,
+            403,
+            "tenant-scoped retrieve key on {path}"
+        );
+    }
     assert_eq!(
-        rc.get("/debug/placement", &[("x-api-key", &a_ret)]).status,
+        ic.get("/metrics", &[("x-api-key", &a_ing)]).status,
+        403,
+        "tenant-scoped ingest key on ingestion /metrics"
+    );
+    let ops = s.ops_key.clone();
+    assert_eq!(rc.get("/metrics", &[("x-api-key", &ops)]).status, 200);
+    assert_eq!(
+        rc.get("/debug/placement", &[("x-api-key", &ops)]).status,
         200
     );
+    assert_eq!(ic.get("/metrics", &[("x-api-key", &ops)]).status, 200);
     // The same key also works as a bearer token.
     assert_eq!(
         rc.post_json(
