@@ -1,17 +1,21 @@
----
 # Defense-in-depth traffic rules for the dash-system namespace.
 #
 # Layers (evaluated additively):
-#   1. default-deny-all       - block everything by default.
-#   2. allow-dns              - kube-system DNS is required for service
-#                               resolution and pod startup.
-#   3. allow-retrieval-egress - retrieval -> ingestion:8081 and
-#                               retrieval -> external embedding
-#                               providers (OpenAI/Ollama).
-#   4. allow-ingestion-egress - ingestion needs DNS only; data plane
-#                               is inbound via service mesh / future
-#                               internal ingress.
-#   5. allow-nginx-ingress    - ingress controller -> retrieval:8080.
+#   1. default-deny-all         - block everything by default.
+#   2. allow-dns                - kube-system DNS for every pod.
+#   3. allow-retrieval-egress   - retrieval -> ingestion (replication) and
+#                                 retrieval -> external HTTPS providers.
+#   4. allow-ingestion-egress   - ingestion -> external HTTPS providers.
+#   5. allow-ingress-controller - ingress controller -> retrieval and
+#                                 ingestion HTTP ports.
+#   6. allow-retrieval-to-ingestion - retrieval pods -> ingestion:8081
+#                                 (WAL replication).
+#   7. allow-control-plane / allow-control-plane-egress - ingestion and
+#                                 retrieval <-> control plane:8090.
+#
+# In-cluster Ollama (private CIDRs, port 11434) is NOT allowed by default.
+# Apply deploy/k8s/optional/ollama-egress.yaml when
+# DASH_EMBEDDING_PROVIDER=ollama.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -58,8 +62,7 @@ spec:
   policyTypes:
   - Egress
   egress:
-  # Internal: forward to ingestion for /v1/ingest (and any future
-  # in-cluster RPC).
+  # Replication: pull the WAL from the ingestion pod.
   - to:
     - podSelector:
         matchLabels:
@@ -68,9 +71,8 @@ spec:
     ports:
     - port: 8081
       protocol: TCP
-  # External: OpenAI (HTTPS) and self-hosted Ollama.
-  # The ipBlock excludes the in-cluster CIDRs so that traffic to
-  # pod IPs / services is still governed by the rule above.
+  # External HTTPS (OpenAI). Private ranges are excluded here; see the
+  # optional Ollama policy for in-cluster providers.
   - to:
     - ipBlock:
         cidr: 0.0.0.0/0
@@ -81,19 +83,42 @@ spec:
     ports:
     - port: 443
       protocol: TCP
-    - port: 11434
-      protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: allow-nginx-ingress
+  name: allow-ingestion-egress
   namespace: dash-system
 spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/name: dash
-      app.kubernetes.io/component: retrieval
+      app.kubernetes.io/component: ingestion
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+    ports:
+    - port: 443
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-controller
+  namespace: dash-system
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
   policyTypes:
   - Ingress
   ingress:
@@ -107,5 +132,72 @@ spec:
     ports:
     - port: http
       protocol: TCP
-    - port: http-alt
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-retrieval-to-ingestion
+  namespace: dash-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: ingestion
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: dash
+          app.kubernetes.io/component: retrieval
+    ports:
+    - port: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane
+  namespace: dash-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - key: app.kubernetes.io/component
+          operator: In
+          values: [retrieval, ingestion]
+    ports:
+    - port: http
+      protocol: TCP
+---
+# Egress from retrieval/ingestion pods to the control plane (router client).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-egress
+  namespace: dash-system
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: dash
+          app.kubernetes.io/component: control-plane
+    ports:
+    - port: http
       protocol: TCP

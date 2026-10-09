@@ -1,9 +1,9 @@
 ---
-# Non-sensitive runtime configuration shared by both DASH services.
-# Everything that is not a secret lives here. Secret material lives in
-# 11-secrets.yaml. Values can be overridden per environment with
-# `kubectl create configmap ... --from-literal=...` or via Kustomize
-# patches.
+# Non-sensitive runtime configuration shared by the DASH services.
+# Everything that is not a secret lives here. Secret material is NOT part of
+# these manifests; see 11-secrets.yaml for how to create it.
+# Every key below is an environment variable the Rust services actually
+# read; scripts/check_deploy_env.sh enforces that in CI.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,38 +14,53 @@ metadata:
     app.kubernetes.io/name: dash
     app.kubernetes.io/component: config
 data:
-  # ----- shared tunables (consumed by ingestion AND retrieval) -----
-  DASH_LOG_LEVEL: "info"
+  # ----- shared tunables -----
+  RUST_LOG: "info"
+  DASH_STRICT_SECRETS: "1"
+  # One of: hash | openai | ollama. For ollama, also set DASH_OLLAMA_ENDPOINT
+  # and enable the in-cluster egress rule in 50-networkpolicy.yaml.
   DASH_EMBEDDING_PROVIDER: "hash"
-  # When set, the binary uses this as the redb persistence root.
-  # The PVC is mounted at this path, so keep the two in sync.
-  DASH_RETRIEVAL_PERSISTENCE_PATH: "/var/lib/dash"
-  DASH_INGESTION_PERSISTENCE_PATH: "/var/lib/dash"
-  # HTTP worker / queue knobs (mirror docker-compose defaults).
+  # DASH_OLLAMA_ENDPOINT: "http://ollama.ollama.svc.cluster.local:11434"
+
+  # ----- persistence (all paths live on the per-pod PVC at /var/lib/dash) -----
+  # redb persistence paths are FILE paths, not directories.
+  DASH_INGEST_PERSISTENCE_PATH: "/var/lib/dash/state/ingestion.redb"
+  DASH_RETRIEVAL_PERSISTENCE_PATH: "/var/lib/dash/state/retrieval.redb"
+  DASH_INGEST_WAL_PATH: "/var/lib/dash/wal/ingestion.wal"
+  DASH_INGEST_SEGMENT_DIR: "/var/lib/dash/segments/ingestion"
+  DASH_RETRIEVAL_SEGMENT_DIR: "/var/lib/dash/segments/retrieval"
+  # Audit logs on the persistent volume.
+  DASH_INGEST_AUDIT_LOG_PATH: "/var/lib/dash/audit/ingestion.audit.jsonl"
+  DASH_RETRIEVAL_AUDIT_LOG_PATH: "/var/lib/dash/audit/retrieval.audit.jsonl"
+
+  # ----- HTTP -----
   DASH_INGEST_HTTP_WORKERS: "8"
   DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
-  DASH_INGEST_TRANSPORT_RUNTIME: "std"
   DASH_RETRIEVAL_HTTP_WORKERS: "8"
-  DASH_RETRIEVAL_TRANSPORT_RUNTIME: "std"
-  # WAL durability knobs honored by both services.
+  DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY: "512"
+
+  # ----- WAL durability (ingestion) -----
   DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
   DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
   DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
   DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
   DASH_INGEST_WAL_SYNC_INTERVAL_MS: "1000"
-  # WAL file paths inside the persisted volume. Distinct filenames so
-  # the two services can share a single PVC namespace cleanly.
-  DASH_INGEST_WAL_PATH: "/var/lib/dash/wal/ingestion.wal"
-  DASH_RETRIEVAL_WAL_PATH: "/var/lib/dash/wal/retrieval.wal"
-  DASH_INGEST_SEGMENT_DIR: "/var/lib/dash/segments/ingestion"
-  DASH_RETRIEVAL_SEGMENT_DIR: "/var/lib/dash/segments/retrieval"
-  # Segment maintenance is driven by the ingestion service when this
-  # interval is non-zero. Disabled (0) by default; the standalone
-  # segment-maintenance-daemon is not shipped in this chart.
+  # Segment maintenance runs inside the ingestion service when non-zero.
   DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
-  # Checkpoint thresholds.
   DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
   DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
-  # Bind addresses. 0.0.0.0 inside the pod; the Service fronts the port.
+
+  # ----- bind addresses (inside the pod; Services front the ports) -----
   DASH_INGEST_BIND: "0.0.0.0:8081"
   DASH_RETRIEVAL_BIND: "0.0.0.0:8080"
+  DASH_CONTROL_PLANE_BIND: "0.0.0.0:8090"
+
+  # ----- replication: every retrieval pod follows the single ingestion pod -----
+  DASH_RETRIEVAL_REPLICATION_SOURCE_URL: "http://dash-ingestion.dash-system.svc.cluster.local:80"
+  DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
+  DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: "/var/lib/dash/state/retrieval-replication.offset"
+
+  # ----- control plane -----
+  DASH_CONTROL_PLANE_STATE_PATH: "/var/lib/dash/state/control-plane.csv"
+  DASH_CONTROL_PLANE_STATE_SHA256_PATH: "/var/lib/dash/state/control-plane.csv.sha256"
+  DASH_CONTROL_PLANE_LEASE_PATH: "/var/lib/dash/state/control-plane.lease"
