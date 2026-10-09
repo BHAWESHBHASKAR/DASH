@@ -1141,9 +1141,14 @@ impl TenantVectorIndex {
             }
             Backend::Hnsw(hnsw) => {
                 put_u64(&mut out, hnsw.len as u64);
-                let native = hnsw.serialize()?;
-                put_u64(&mut out, native.len() as u64);
-                out.extend_from_slice(&native);
+                // Serialise straight into `out` (no second copy of the graph).
+                let native_len = hnsw.index.serialized_length();
+                put_u64(&mut out, native_len as u64);
+                let start = out.len();
+                out.resize(start + native_len, 0);
+                hnsw.index
+                    .save_to_buffer(&mut out[start..])
+                    .map_err(backend_err)?;
             }
         }
         Ok(out)
