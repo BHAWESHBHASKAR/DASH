@@ -73,7 +73,7 @@ Evidence ties a claim to a source. It is what makes the citation defensible.
 
 ## Vector
 
-An optional embedding per claim, supplied as `claim.embedding_vector` (or top-level `claim_embedding`) on ingest or computed by the configured provider. Vectors are stored in the WAL and redb as raw `f32` data and fed to the per-tenant ANN graph. The dimension is pinned per tenant when its first vector is stored; a later vector of a different dimension is rejected as an invalid vector (400). The default hash provider produces 384-dimension vectors; the ingestion-side `hash_vector` provider defaults to 64 dimensions. There is no 768-dimension default. Re-ingesting a claim currently drops its in-memory vector while redb keeps it (register DATA-04).
+An optional embedding per claim, supplied as `claim.embedding_vector` (or top-level `claim_embedding`) on ingest or computed by the configured provider. Vectors are stored in the WAL and redb as raw `f32` data and fed to the per-tenant ANN graph. The dimension is pinned per tenant when its first vector is stored; a later vector of a different dimension is rejected as an invalid vector (400). The default hash provider produces 384-dimension vectors; the ingestion-side `hash_vector` provider used by `/v1/ingest/raw` and `/v1/ingest/document` defaults to 64 dimensions (mixing the two for one tenant trips the dimension check). There is no 768-dimension default. Re-ingesting a claim currently drops its in-memory vector while redb keeps it (register DATA-04).
 
 ## Contradiction (derived)
 

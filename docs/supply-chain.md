@@ -1,5 +1,14 @@
 # DASH Supply-Chain Security
 
+> **Status (2026-10-09): mostly aspirational; read as a target design.** Implemented today: the release workflow
+> (`.github/workflows/release.yml`, on `v*` tags) cross-compiles binaries, pushes images to
+> `ghcr.io/<owner>/dash-<service>`, and generates an SBOM with `anchore/sbom-action`; `.github/workflows/security.yml`
+> runs `cargo audit`, a Trivy filesystem scan, CodeQL and Gitleaks. **NOT IMPLEMENTED:** `cargo cyclonedx` SBOMs
+> attached as `dash-<version>-sbom.spdx.json`, Sigstore/cosign image signing, signed provenance (SLSA) attestations,
+> digest-pinned base images, SHA-pinned actions (register SEC-21, planned for phase P7). No release has been
+> tagged, so no signed or unsigned release artifacts exist yet. Sections 2 and 3 below describe the intended end
+> state, not the current pipeline.
+
 This document describes the supply-chain controls applied to DASH artifacts
 (source, dependencies, container images, and SDKs). It is referenced from
 `SECURITY.md` and from the pre-release checklist in

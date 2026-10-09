@@ -5,7 +5,7 @@ These pages describe **what DASH is** and **why it is shaped the way it is**. Th
 ## Pages
 
 - [**Why DASH**](why-dash.md) — the problem with vanilla vector databases, and the claim/evidence/contradiction model that fixes it.
-- [**Architecture**](architecture.md) — the two-service topology (ingestion + retrieval), the data flow, and the persistence stack.
+- [**Architecture**](architecture.md) — the service topology (ingestion, retrieval, control-plane, indexer), the data flow, and the persistence stack.
 - [**Data model**](data-model.md) — `Tenant`, `Vector`, `Claim`, `Evidence`, `Contradiction`, `AuditEvent`. The fields, the relationships, and JSON examples for each.
 - [**Multi-tenancy**](multi-tenancy.md) — isolation guarantees, per-tenant rate limits, and the per-tenant key spaces inside `redb`.
 - [**Persistence**](persistence.md) — `redb` architecture, the WAL fallback path, crash-recovery semantics, and the backup procedure.

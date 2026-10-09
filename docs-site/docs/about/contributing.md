@@ -325,3 +325,7 @@ Contributors are recognized in:
 - Tag maintainers in issues if blocked.
 
 **Thank you for contributing to DASH!**
+
+## Closing issues and status claims
+
+An issue is closed only when the fix is merged with a regression test that fails on the old code; plan status lines must link to evidence. Capability claims in the README are tracked in `docs/claims-ledger.md` and checked by `scripts/check_claims_ledger.sh`. See `CONTRIBUTING.md` in the repository root for the full rule.

@@ -6,7 +6,7 @@ The guides are task-oriented. They show the request and the response, the option
 
 - [**Ingest**](ingest.md) — `POST /v1/ingest`. The `IngestRequest` shape, idempotency, and bulk ingest.
 - [**Retrieve**](retrieve.md) — `POST /v1/retrieve`. The retrieval request, dense vs sparse vs hybrid ranking, and the stance / time filters.
-- [**Embeddings**](embeddings.md) — `POST /v1/embeddings`. The OpenAI drop-in, provider selection, and the base64 encoding.
+- [**Embeddings**](embeddings.md) — `POST /v1/embeddings`. The OpenAI-compatible endpoint, provider selection, and the base64 encoding.
 - [**SDKs**](sdks.md) — Python, Go, TypeScript, Java, and C#. The package, the import, and a complete example for each.
 
 ## How to read this section
