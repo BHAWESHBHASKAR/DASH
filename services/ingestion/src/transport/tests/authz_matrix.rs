@@ -122,8 +122,6 @@ fn authz_decision_matrix_covers_every_route_and_credential_type() {
     ];
 
     let tenant_scoped = [401, 401, 403, 200, 401, 401, 200];
-    // Not tenant-scoped: any authenticated principal with the role may call.
-    let any_tenant = [401, 401, 200, 200, 401, 401, 200];
     // Tenant-less operations routes expose all-tenant topology: tenant-scoped
     // keys and non-admin JWTs are refused (see the dedicated ops test below).
     let ops = [401, 401, 403, 403, 401, 401, 403];

@@ -44,8 +44,8 @@ use audit::is_sha256_hex;
 use audit::{AuditEvent, append_audit_record, audit_gate};
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
-    AuthDecision, Role, authorize_request_any_tenant, authorize_request_ops, authorize_request_for_tenant,
-    shared_auth_policy,
+    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
+    authorize_request_ops, shared_auth_policy,
 };
 use dash_common::AuthPolicy;
 use debug_render::{
