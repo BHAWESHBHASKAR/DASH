@@ -252,6 +252,14 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        if load_stats.replay.quarantined_records > 0 || load_stats.replay.dependent_skipped > 0 {
+            tracing::warn!(
+                "ingestion startup replay quarantined {} unreadable legacy record(s) and skipped {} dependent record(s); see '{}.quarantine' and docs/operations/wal-recovery.md",
+                load_stats.replay.quarantined_records,
+                load_stats.replay.dependent_skipped,
+                wal_path
+            );
+        }
         tracing::info!(
             "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, async_flush_interval_ms={}, background_flush_only={}, unsafe_override={}",
             wal.sync_every_records(),

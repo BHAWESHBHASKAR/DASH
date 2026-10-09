@@ -74,6 +74,14 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        if load_stats.replay.quarantined_records > 0 || load_stats.replay.dependent_skipped > 0 {
+            tracing::warn!(
+                "retrieval startup replay quarantined {} unreadable legacy record(s) and skipped {} dependent record(s); see '{}.quarantine' and docs/operations/wal-recovery.md",
+                load_stats.replay.quarantined_records,
+                load_stats.replay.dependent_skipped,
+                wal_path
+            );
+        }
         if !disk_disabled {
             store = attach_disk(store, &disk_path);
         }

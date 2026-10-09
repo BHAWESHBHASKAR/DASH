@@ -16,6 +16,7 @@
 //! etc.) that the rest of the crate consumes via re-exports from
 //! `lib.rs`.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all, rename};
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -78,6 +79,42 @@ pub struct WalReplayStats {
     /// Number of torn (incomplete or corrupt) final WAL lines that were
     /// discarded since this WAL handle was opened.
     pub torn_tail_dropped: usize,
+    /// Records that could not be replayed (legacy records that no longer
+    /// parse or validate, poisoned vectors) and were copied to
+    /// `<wal>.quarantine` instead of being applied.
+    pub quarantined_records: usize,
+    /// Otherwise valid records skipped because they depend on a
+    /// quarantined claim (evidence, edges, vectors).
+    pub dependent_skipped: usize,
+}
+
+/// Environment variable that switches replay to strict mode.
+pub const WAL_REPLAY_STRICT_ENV: &str = "DASH_WAL_REPLAY_STRICT";
+
+/// How replay treats records that cannot be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplayPolicy {
+    /// Legacy (pre-checksum) records that fail to parse or validate, and
+    /// poisoned vectors, are quarantined; replay continues.
+    #[default]
+    Lenient,
+    /// Any record that cannot be applied fails replay.
+    Strict,
+}
+
+impl ReplayPolicy {
+    /// Parses the value of [`WAL_REPLAY_STRICT_ENV`]: `1`, `true`, `yes`
+    /// or `on` (case-insensitive) select strict mode.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => Self::Strict,
+            _ => Self::Lenient,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var(WAL_REPLAY_STRICT_ENV).ok().as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -542,36 +579,62 @@ impl FileWal {
         Ok(())
     }
 
-    pub(crate) fn replay_records_with_stats(
-        &self,
-    ) -> Result<(Vec<PersistedRecord>, WalReplayStats), StoreError> {
-        let snapshot_records = self.replay_snapshot_records()?;
-        let mut wal_records = self.replay_wal_records()?;
-        if !self.append_buffer.is_empty() {
-            for line in &self.append_buffer {
-                wal_records.push(line_to_record(line)?);
-            }
-        }
-        let stats = WalReplayStats {
-            snapshot_records: snapshot_records.len(),
-            wal_records: wal_records.len(),
-            torn_tail_dropped: self.torn_tail_dropped,
-        };
-
-        let mut out = snapshot_records;
-        out.extend(wal_records);
-        Ok((out, stats))
+    /// Path of the quarantine file: `<wal>.quarantine`.
+    pub fn quarantine_path(&self) -> PathBuf {
+        quarantine_path_for(&self.path)
     }
 
-    fn replay_snapshot_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
-        self.replay_snapshot_lines_raw()?
-            .into_iter()
-            .enumerate()
-            .map(|(idx, line)| {
-                line_to_record(&line)
-                    .map_err(|e| with_context(e, &format!("snapshot record {}", idx + 1)))
-            })
-            .collect()
+    /// Parses the snapshot and WAL (plus the unflushed append buffer)
+    /// into replayable items, applying `policy` to lines that cannot be
+    /// parsed. See [`ReplayPolicy`] and `docs/operations/wal-recovery.md`.
+    pub(crate) fn replay_with_policy(&self, policy: ReplayPolicy) -> Result<WalReplay, StoreError> {
+        let mut sink = QuarantineSink::load(self.quarantine_path())?;
+        let mut parser = ReplayParser::new(policy);
+        let mut items = Vec::new();
+
+        let snapshot_lines = self.replay_snapshot_lines_raw()?;
+        let snapshot_count = {
+            let mut n = 0usize;
+            for (idx, line) in snapshot_lines.into_iter().enumerate() {
+                let origin = format!("snapshot record {}", idx + 1);
+                if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                    items.push(item);
+                    n += 1;
+                }
+            }
+            n
+        };
+        let scan = scan_wal(&self.path)?;
+        let mut wal_count = 0usize;
+        for (line_no, line) in scan.lines {
+            let origin = format!("wal line {line_no}");
+            if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                items.push(item);
+                wal_count += 1;
+            }
+        }
+        for line in &self.append_buffer {
+            items.push(ReplayItem {
+                record: line_to_record(line)?,
+                legacy: false,
+                raw: None,
+                origin: "unflushed wal buffer".to_string(),
+            });
+            wal_count += 1;
+        }
+        let stats = WalReplayStats {
+            snapshot_records: snapshot_count,
+            wal_records: wal_count,
+            torn_tail_dropped: self.torn_tail_dropped,
+            quarantined_records: parser.quarantined,
+            dependent_skipped: 0,
+        };
+        Ok(WalReplay {
+            items,
+            stats,
+            sink,
+            quarantined_claim_ids: parser.quarantined_claim_ids,
+        })
     }
 
     fn replay_snapshot_lines_raw(&self) -> Result<Vec<String>, StoreError> {
@@ -609,18 +672,6 @@ impl FileWal {
                 continue;
             }
             out.push(line);
-        }
-        Ok(out)
-    }
-
-    fn replay_wal_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
-        let scan = scan_wal(&self.path)?;
-        let mut out = Vec::with_capacity(scan.lines.len());
-        for (line_no, line) in &scan.lines {
-            out.push(
-                line_to_record(line)
-                    .map_err(|e| with_context(e, &format!("wal line {line_no}")))?,
-            );
         }
         Ok(out)
     }
@@ -833,18 +884,7 @@ fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
         .open(path)?
         .read_to_end(&mut bytes)?;
 
-    // Split into physical lines keeping byte offsets.
-    let mut raw: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, terminated)
-    let mut start = 0usize;
-    for (i, b) in bytes.iter().enumerate() {
-        if *b == b'\n' {
-            raw.push((start, i, true));
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        raw.push((start, bytes.len(), false));
-    }
+    let raw = physical_lines(&bytes);
 
     // Decode text; invalid UTF-8 is treated as an unparseable line.
     let decode = |s: usize, e: usize| -> Option<String> {
@@ -868,15 +908,9 @@ fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
         let text = decode(s, e);
         let is_last = Some(idx) == last_content;
         if is_last {
-            let ok = match &text {
-                Some(t) => {
-                    let parses = line_to_record(t).is_ok();
-                    // An unterminated line is only trusted when it carries a
-                    // verified checksum.
-                    parses && (terminated || split_and_verify_crc(t).is_ok_and(|(_, c)| c))
-                }
-                None => false,
-            };
+            let ok = text
+                .as_deref()
+                .is_some_and(|t| is_valid_tail(t, terminated));
             if !ok {
                 torn_tail = true;
                 valid_len = s as u64;
@@ -904,6 +938,208 @@ fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
         torn_tail,
         missing_newline,
     })
+}
+
+/// Splits `bytes` into physical lines: `(start, end, terminated)` with `end`
+/// exclusive of the newline.
+fn physical_lines(bytes: &[u8]) -> Vec<(usize, usize, bool)> {
+    let mut raw = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            raw.push((start, i, true));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        raw.push((start, bytes.len(), false));
+    }
+    raw
+}
+
+/// Whether a final line is a complete record. An unterminated line is only
+/// trusted when it carries a verified checksum.
+fn is_valid_tail(text: &str, terminated: bool) -> bool {
+    // A newline-terminated legacy line is a complete (if possibly unreadable)
+    // record, not a torn write: keep it so replay can quarantine it instead
+    // of silently truncating it away.
+    if terminated && is_legacy_kind(record_kind(text)) {
+        return true;
+    }
+    line_to_record(text).is_ok() && (terminated || split_and_verify_crc(text).is_ok_and(|(_, c)| c))
+}
+
+fn quarantine_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".quarantine");
+    PathBuf::from(path)
+}
+
+fn record_kind(line: &str) -> &str {
+    line.split('\t').next().unwrap_or("")
+}
+
+/// Record kinds written before checksums and escape-safe encoding existed.
+fn is_legacy_kind(kind: &str) -> bool {
+    matches!(kind, "C" | "E" | "G" | "V" | "B")
+}
+
+fn is_known_kind(kind: &str) -> bool {
+    is_legacy_kind(kind) || matches!(kind, "C2" | "E2" | "G2" | "V2" | "B2")
+}
+
+/// One parsed replay record plus the metadata the replay policy needs.
+pub(crate) struct ReplayItem {
+    pub(crate) record: PersistedRecord,
+    /// The record was written in a legacy (unchecksummed) format.
+    pub(crate) legacy: bool,
+    /// Raw line, kept only for legacy records (the quarantine copy).
+    pub(crate) raw: Option<String>,
+    /// Human-readable position, e.g. `wal line 12`.
+    pub(crate) origin: String,
+}
+
+impl ReplayItem {
+    /// Raw line for the quarantine file: the original text for legacy
+    /// records, the canonical encoding otherwise.
+    pub(crate) fn quarantine_line(&self) -> String {
+        match &self.raw {
+            Some(raw) => raw.clone(),
+            None => record_to_line(&self.record),
+        }
+    }
+
+    /// Whether this record references a claim id in `ids`.
+    pub(crate) fn depends_on(&self, ids: &HashSet<String>) -> bool {
+        match &self.record {
+            PersistedRecord::Evidence(e) => ids.contains(&e.claim_id),
+            PersistedRecord::Edge(e) => {
+                ids.contains(&e.from_claim_id) || ids.contains(&e.to_claim_id)
+            }
+            PersistedRecord::ClaimVector(v) => ids.contains(&v.claim_id),
+            PersistedRecord::Claim(_) | PersistedRecord::BatchCommit(_) => false,
+        }
+    }
+}
+
+pub(crate) struct WalReplay {
+    pub(crate) items: Vec<ReplayItem>,
+    pub(crate) stats: WalReplayStats,
+    pub(crate) sink: QuarantineSink,
+    /// Claim ids of legacy claim lines quarantined at parse time.
+    pub(crate) quarantined_claim_ids: HashSet<String>,
+}
+
+/// Collects quarantined raw lines and appends them (fsynced) to
+/// `<wal>.quarantine`. Lines already present in the file are not appended
+/// again, so restarting never grows the file.
+pub(crate) struct QuarantineSink {
+    path: PathBuf,
+    seen: HashSet<String>,
+    pending: Vec<String>,
+}
+
+impl QuarantineSink {
+    fn load(path: PathBuf) -> Result<Self, StoreError> {
+        let mut seen = HashSet::new();
+        if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            for line in String::from_utf8_lossy(&bytes).lines() {
+                seen.insert(line.to_string());
+            }
+        }
+        Ok(Self {
+            path,
+            seen,
+            pending: Vec::new(),
+        })
+    }
+
+    pub(crate) fn push(&mut self, raw: &str) {
+        if self.seen.insert(raw.to_string()) {
+            self.pending.push(raw.to_string());
+        }
+    }
+
+    pub(crate) fn flush(&mut self) -> Result<(), StoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let existed = self.path.exists();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        for line in &self.pending {
+            write_line(&mut file, line)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        if !existed {
+            sync_parent_dir(&self.path)?;
+        }
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+struct ReplayParser {
+    policy: ReplayPolicy,
+    quarantined: usize,
+    quarantined_claim_ids: HashSet<String>,
+    /// The previous line was quarantined as an unparseable legacy record, so
+    /// an unrecognisable line directly after it is the remainder of the same
+    /// record (a legacy field containing a raw newline).
+    prev_failed: bool,
+}
+
+impl ReplayParser {
+    fn new(policy: ReplayPolicy) -> Self {
+        Self {
+            policy,
+            quarantined: 0,
+            quarantined_claim_ids: HashSet::new(),
+            prev_failed: false,
+        }
+    }
+
+    fn parse(
+        &mut self,
+        line: String,
+        origin: String,
+        sink: &mut QuarantineSink,
+    ) -> Result<Option<ReplayItem>, StoreError> {
+        match line_to_record(&line) {
+            Ok(record) => {
+                self.prev_failed = false;
+                let legacy = is_legacy_kind(record_kind(&line));
+                Ok(Some(ReplayItem {
+                    record,
+                    legacy,
+                    raw: legacy.then_some(line),
+                    origin,
+                }))
+            }
+            Err(err) => {
+                let kind = record_kind(&line);
+                let legacy = is_legacy_kind(kind);
+                let continuation = self.prev_failed && !is_known_kind(kind);
+                if self.policy == ReplayPolicy::Strict || !(legacy || continuation) {
+                    return Err(with_context(err, &origin));
+                }
+                eprintln!("warning: quarantining unreadable legacy record at {origin}: {err:?}");
+                if kind == "C"
+                    && let Some(id) = line.split('\t').nth(1).and_then(|f| unescape_field(f).ok())
+                {
+                    self.quarantined_claim_ids.insert(id);
+                }
+                sink.push(&line);
+                self.quarantined += 1;
+                self.prev_failed = true;
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Truncates a torn final WAL line (and terminates an otherwise valid
@@ -1534,6 +1770,334 @@ fn str_to_relation(raw: &str) -> Result<Relation, StoreError> {
         "depends_on" => Ok(Relation::DependsOn),
         _ => Err(StoreError::Parse("invalid relation in wal".to_string())),
     }
+}
+
+// ---------------------------------------------------------------------
+// Offline inspection and repair (used by the `wal-inspect` tool).
+// These functions never go through `FileWal::open`, so inspecting a file
+// does not modify it.
+// ---------------------------------------------------------------------
+
+/// A line that failed to parse or verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalInvalidLine {
+    /// 1-based physical line number.
+    pub line_no: usize,
+    pub error: String,
+    /// The error is a checksum failure (mismatch, malformed or missing).
+    pub checksum_failure: bool,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalInspection {
+    /// The file is a `<wal>.snapshot` (it starts with the snapshot header).
+    pub is_snapshot: bool,
+    /// Valid records by on-disk kind (`C`, `C2`, `V2`, ...).
+    pub kind_counts: BTreeMap<String, usize>,
+    pub valid_records: usize,
+    /// Valid records in a legacy (unchecksummed) format.
+    pub legacy_records: usize,
+    /// WAL lineage id from `<wal>.gen`, if present.
+    pub generation: Option<u64>,
+    /// 1-based line number of a torn final line, if any.
+    pub torn_tail_line: Option<usize>,
+    pub torn_tail_bytes: u64,
+    /// The final valid line lacks its newline terminator.
+    pub missing_final_newline: bool,
+    /// Invalid lines that are not the torn tail (in file order).
+    pub invalid_lines: Vec<WalInvalidLine>,
+}
+
+impl WalInspection {
+    pub fn first_invalid(&self) -> Option<&WalInvalidLine> {
+        self.invalid_lines.first()
+    }
+
+    pub fn checksum_failures(&self) -> usize {
+        self.invalid_lines
+            .iter()
+            .filter(|l| l.checksum_failure)
+            .count()
+    }
+}
+
+struct ClassifiedLine {
+    line_no: usize,
+    start: usize,
+    end: usize,
+    terminated: bool,
+    /// `Ok(kind)` for a valid record.
+    verdict: Result<String, WalInvalidLine>,
+}
+
+struct Classified {
+    is_snapshot: bool,
+    header_end: usize,
+    lines: Vec<ClassifiedLine>,
+    /// Index into `lines` of a torn final line.
+    torn_tail: Option<usize>,
+}
+
+fn classify_file(bytes: &[u8]) -> Classified {
+    let phys = physical_lines(bytes);
+    let decode = |s: usize, e: usize| -> Option<&str> {
+        let mut slice = &bytes[s..e];
+        if slice.last() == Some(&b'\r') {
+            slice = &slice[..slice.len() - 1];
+        }
+        std::str::from_utf8(slice).ok()
+    };
+    let mut lines = Vec::new();
+    let mut is_snapshot = false;
+    let mut header_end = 0usize;
+    let mut header_seen = false;
+    for (idx, &(s, e, terminated)) in phys.iter().enumerate() {
+        let text = decode(s, e);
+        if text.is_some_and(|t| t.trim().is_empty()) {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            if text == Some(SNAPSHOT_HEADER) {
+                is_snapshot = true;
+                header_end = if terminated { e + 1 } else { e };
+                continue;
+            }
+        }
+        let verdict = match text {
+            None => Err(WalInvalidLine {
+                line_no: idx + 1,
+                error: "invalid UTF-8".to_string(),
+                checksum_failure: false,
+                raw: bytes[s..e].to_vec(),
+            }),
+            Some(t) => match line_to_record(t) {
+                Ok(_) => Ok(record_kind(t).to_string()),
+                Err(err) => {
+                    let error = match err {
+                        StoreError::Parse(m) => m,
+                        other => format!("{other:?}"),
+                    };
+                    Err(WalInvalidLine {
+                        line_no: idx + 1,
+                        checksum_failure: error.contains("checksum"),
+                        error,
+                        raw: bytes[s..e].to_vec(),
+                    })
+                }
+            },
+        };
+        lines.push(ClassifiedLine {
+            line_no: idx + 1,
+            start: s,
+            end: e,
+            terminated,
+            verdict,
+        });
+    }
+    // Only a WAL has a torn tail; a snapshot is replaced atomically.
+    let torn_tail = if is_snapshot {
+        None
+    } else {
+        lines.last().and_then(|last| {
+            let ok =
+                decode(last.start, last.end).is_some_and(|t| is_valid_tail(t, last.terminated));
+            (!ok).then_some(lines.len() - 1)
+        })
+    };
+    Classified {
+        is_snapshot,
+        header_end,
+        lines,
+        torn_tail,
+    }
+}
+
+fn read_generation(path: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(generation_path_for(path)).ok()?;
+    u64::from_str_radix(raw.trim(), 16).ok().filter(|v| *v != 0)
+}
+
+/// Inspects a WAL or snapshot file without modifying it.
+pub fn inspect_wal_file(path: impl AsRef<Path>) -> Result<WalInspection, StoreError> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let classified = classify_file(&bytes);
+    let mut out = WalInspection {
+        is_snapshot: classified.is_snapshot,
+        generation: if classified.is_snapshot {
+            None
+        } else {
+            read_generation(path)
+        },
+        ..WalInspection::default()
+    };
+    for (idx, line) in classified.lines.into_iter().enumerate() {
+        if classified.torn_tail == Some(idx) {
+            out.torn_tail_line = Some(line.line_no);
+            out.torn_tail_bytes = bytes.len() as u64 - line.start as u64;
+            continue;
+        }
+        match line.verdict {
+            Ok(kind) => {
+                out.valid_records += 1;
+                if is_legacy_kind(&kind) {
+                    out.legacy_records += 1;
+                }
+                *out.kind_counts.entry(kind).or_default() += 1;
+                if !line.terminated {
+                    out.missing_final_newline = true;
+                }
+            }
+            Err(invalid) => out.invalid_lines.push(invalid),
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalRepairOptions {
+    /// Report what would change without touching any file.
+    pub dry_run: bool,
+    /// Move invalid non-tail lines into `<wal>.quarantine` and drop them
+    /// from the rewritten file. Without this they are left in place.
+    pub quarantine_invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalRepairReport {
+    pub dry_run: bool,
+    pub torn_tail_bytes: u64,
+    pub torn_tail_dropped: bool,
+    pub quarantined_lines: usize,
+    /// Invalid lines still present in the file after the repair.
+    pub invalid_remaining: usize,
+    pub records_kept: usize,
+    /// Whether the file was (or, for a dry run, would be) rewritten.
+    pub changed: bool,
+    pub backup_path: Option<PathBuf>,
+    pub quarantine_path: Option<PathBuf>,
+}
+
+/// Repairs a WAL (or snapshot) file in place: drops a torn tail and,
+/// optionally, quarantines invalid interior lines. Before any change a
+/// `<file>.bak` copy is taken (an existing `.bak` is never overwritten) and
+/// the new contents are written to a temporary file that is renamed over
+/// the original.
+pub fn repair_wal_file(
+    path: impl AsRef<Path>,
+    options: WalRepairOptions,
+) -> Result<WalRepairReport, StoreError> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let classified = classify_file(&bytes);
+    let mut report = WalRepairReport {
+        dry_run: options.dry_run,
+        ..WalRepairReport::default()
+    };
+    let mut out: Vec<u8> = bytes[..classified.header_end].to_vec();
+    if classified.is_snapshot && !out.is_empty() && !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let mut quarantined: Vec<Vec<u8>> = Vec::new();
+    let mut rewrite_needed = false;
+    for (idx, line) in classified.lines.iter().enumerate() {
+        if classified.torn_tail == Some(idx) {
+            report.torn_tail_dropped = true;
+            report.torn_tail_bytes = bytes.len() as u64 - line.start as u64;
+            rewrite_needed = true;
+            continue;
+        }
+        if !line.terminated {
+            rewrite_needed = true;
+        }
+        match &line.verdict {
+            Err(invalid) if options.quarantine_invalid => {
+                quarantined.push(invalid.raw.clone());
+                rewrite_needed = true;
+            }
+            Err(_) => {
+                report.invalid_remaining += 1;
+                out.extend_from_slice(&bytes[line.start..line.end]);
+                out.push(b'\n');
+            }
+            Ok(_) => {
+                report.records_kept += 1;
+                out.extend_from_slice(&bytes[line.start..line.end]);
+                out.push(b'\n');
+            }
+        }
+    }
+    report.quarantined_lines = quarantined.len();
+    report.changed = rewrite_needed && out != bytes;
+    if !report.changed {
+        return Ok(report);
+    }
+
+    let wal_path = if classified.is_snapshot {
+        path.to_str()
+            .and_then(|p| p.strip_suffix(".snapshot"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let mut backup = path.to_path_buf().into_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    report.backup_path = Some(backup.clone());
+    if !quarantined.is_empty() {
+        report.quarantine_path = Some(quarantine_path_for(&wal_path));
+    }
+    if options.dry_run {
+        return Ok(report);
+    }
+
+    if backup.exists() {
+        return Err(StoreError::Io(format!(
+            "refusing to overwrite existing backup {}; move it away first",
+            backup.display()
+        )));
+    }
+    std::fs::copy(path, &backup)?;
+    File::open(&backup)?.sync_all()?;
+    sync_parent_dir(&backup)?;
+
+    if let Some(qpath) = &report.quarantine_path {
+        let existed = qpath.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(qpath)?;
+        for raw in &quarantined {
+            file.write_all(raw)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        drop(file);
+        if !existed {
+            sync_parent_dir(qpath)?;
+        }
+    }
+
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".repair.tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(&out)?;
+    file.sync_all()?;
+    drop(file);
+    rename(&tmp, path)?;
+    sync_parent_dir(path)?;
+
+    // Removing interior records shifts replication offsets; start a new
+    // lineage so followers resync instead of silently skipping.
+    if !classified.is_snapshot && !quarantined.is_empty() {
+        write_generation(&generation_path_for(&wal_path), new_generation())?;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
