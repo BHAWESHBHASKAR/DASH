@@ -6,6 +6,46 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (vector index persistence; P2 engine step 2)
+
+- **Restarts no longer rebuild the vector index.** Each service with a WAL
+  path saves its per-tenant vector indexes (flat rows or the `usearch` HNSW in
+  its native format, plus the claim-id key table) to `<WAL path>.vindex`
+  (`DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PATH`), and at startup loads that file
+  and applies only the vector records written to the WAL after it was saved.
+  Measured in release mode on 4 vCPUs (`tests/benchmarks/src/bin/cold_start.rs`):
+  50k x 384-d vectors start in 3.7 to 3.9 s instead of 8.0 to 12.0 s, 100k in
+  8.8 s instead of 23 to 27.5 s; what remains is the WAL replay itself (4.0 s
+  and 9.0 s without any HNSW work). Re-applying vectors written after the
+  last save costs about 0.7 ms each.
+- **Never a stale or corrupt index.** The file carries a manifest (format
+  version, ANN tuning, the WAL generation and record count it reflects, vector
+  counts, per-tenant SHA-256) and a header checksum. It is used only when every
+  checksum verifies, the format version and tuning match the configuration and
+  the WAL generation is the current one; after the catch-up every indexed
+  vector must match the fingerprint of the vector replayed from the WAL. Any
+  mismatch logs a warning and the indexes are rebuilt from the WAL as before.
+- **Saving never blocks requests for long.** A save takes a copy-on-write
+  snapshot of the indexes under the store lock and writes the file without it,
+  atomically (temporary file, fsync, rename, directory fsync). Saves run every
+  `DASH_*_VECTOR_INDEX_SAVE_INTERVAL_MS` (default 300000; `0` turns periodic
+  saves off) when the WAL moved, after every ingestion checkpoint and at a
+  clean shutdown. The first write to an HNSW index after a snapshot copies it
+  once (the existing copy-on-write path).
+- New settings `DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PERSIST` (default on;
+  shared `DASH_VECTOR_INDEX_PERSIST`), `..._VECTOR_INDEX_PATH` and
+  `..._VECTOR_INDEX_SAVE_INTERVAL_MS` (shared
+  `DASH_VECTOR_INDEX_SAVE_INTERVAL_MS`). New store API:
+  `InMemoryStore::load_from_wal_with_vector_index`, `vector_index_snapshot`,
+  `wal_position`/`set_wal_position`, `VectorIndexSnapshot::save`,
+  `VectorIndexPersistence`, `FileWal::position`; `StoreLoadStats` gains
+  `vector_index` (how the indexes were obtained).
+- Benchmark `tests/benchmarks/src/bin/cold_start.rs` measures cold start with
+  and without the saved index. ADR 0003 section 11 and
+  `docs/operations/wal-recovery.md` describe the format, the load rules and
+  operations (the file is derived data: safe to delete while stopped, not
+  needed in backups).
+
 ### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
 
 - **Semantic retrieval now finds the true nearest neighbours.** The in-repo
@@ -33,9 +73,10 @@ to [Semantic Versioning](https://semver.org/).
   touches another tenant.
 - **Startup builds the vector index once.** WAL replay and the redb bulk load
   collect vectors first and build each tenant's index at the end (multi-threaded
-  for large tenants). The index is still not persisted, so cold start grows
-  with the vector count (about 24 s for 100,000 x 384-d vectors on 4 vCPUs); persisting or memory-mapping it is a
-  follow-up. `set_ann_tuning` rebuilds existing indexes.
+  for large tenants). At this step the index was not persisted, so cold start
+  grew with the vector count (about 24 s for 100,000 x 384-d vectors on 4
+  vCPUs); see "vector index persistence" above. `set_ann_tuning` rebuilds
+  existing indexes.
 - **Tuning settings changed.** Removed (they described the old graph; if still
   set they are ignored): `DASH_{INGEST,RETRIEVAL}_ANN_MAX_NEIGHBORS_UPPER`,
   `..._ANN_SEARCH_EXPANSION_FACTOR`, `..._ANN_SEARCH_EXPANSION_MAX`, their shared

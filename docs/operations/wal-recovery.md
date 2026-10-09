@@ -14,6 +14,51 @@ Files involved, for a WAL at `<wal>` (for example the path in
 | `<wal>.gen` | WAL lineage id used by replication |
 | `<wal>.quarantine` | records replay could not apply (created on demand) |
 | `<wal>.bak` | copy taken by `wal-inspect repair` before it changes a file |
+| `<wal>.vindex` | saved vector indexes (default `DASH_*_VECTOR_INDEX_PATH`); a cache, rebuilt from the WAL when missing or stale. See [Saved vector indexes](#saved-vector-indexes) |
+| `<wal>.vindex.tmp` | a vector index save in progress; a leftover one is ignored and overwritten |
+
+## Saved vector indexes
+
+With `DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PERSIST` on (the default) and a WAL
+path set, each service saves its per-tenant vector indexes to
+`<wal>.vindex` (or `DASH_*_VECTOR_INDEX_PATH`): every
+`DASH_*_VECTOR_INDEX_SAVE_INTERVAL_MS` (default 5 minutes) when the WAL moved,
+after every checkpoint (ingestion) and at a clean shutdown (SIGTERM/SIGINT).
+The file is written to `<path>.tmp`, fsynced, renamed over the old file and
+the directory is fsynced, so a crash leaves the old or the new file, never a
+partial one. A save copies the indexes under the store lock (copy-on-write,
+milliseconds) and writes the file without holding it.
+
+At startup the file is loaded instead of rebuilding every HNSW, then the
+vector records written after it (the WAL tail since the save) are applied.
+It is used only if its checksums verify, its format version and ANN tuning
+match the configuration, it was saved for the current WAL generation and,
+after the catch-up, every indexed vector matches the fingerprint of the vector
+replayed from the WAL. Otherwise the service logs a warning such as
+
+```text
+ingestion vector index '/var/lib/dash/state/ingest.wal.vindex': discarded (saved for WAL generation 1f0c..., the WAL is at generation 9a42...); indexes rebuilt from the WAL
+```
+
+and rebuilds from the WAL, which costs the full cold-start time for that
+start only (the next save writes a fresh file). Expected causes: a checkpoint
+or replication resync after the last save (new generation), changed
+`DASH_*_ANN_*` or `DASH_*_VECTOR_*` tuning, a `wal-inspect repair` that
+shortened the WAL, an upgrade that changed the file format, or a damaged file.
+
+Operations:
+
+- The file is derived data. It is safe to delete while the service is
+  stopped; the next start rebuilds it. Delete it if you ever suspect it.
+- Backups do not need it: `scripts/backup_state_bundle.sh` copies the WAL and
+  snapshot only, and a restore without `<wal>.vindex` (or with one from
+  another moment) rebuilds on first start. Including it in a backup taken
+  together with the WAL saves that rebuild.
+- Size: about `dim` bytes plus the HNSW graph per vector (the quantised index),
+  plus claim ids; `4 * dim` bytes per vector for tenants below the flat
+  threshold. Keep it on the WAL volume.
+- `DASH_*_VECTOR_INDEX_PERSIST=0` turns saving and loading off (every start
+  rebuilds).
 
 ## Record formats
 

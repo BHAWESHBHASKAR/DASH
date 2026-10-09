@@ -57,6 +57,9 @@ Status: **superseded** (corrected 2026-10-09)
 | `DASH_INGEST_ANN_EXPANSION_ADD` | no | `128` | HNSW construction beam (ef_construction) | none |
 | `DASH_INGEST_VECTOR_FLAT_THRESHOLD` | no | `8192` | exact flat scan up to this many vectors per tenant, HNSW above | none |
 | `DASH_INGEST_VECTOR_RERANK` | no | `50` | HNSW candidates re-scored exactly in f32 (`0` disables) | none |
+| `DASH_INGEST_VECTOR_INDEX_PERSIST` | no | on | save the vector indexes and load them at startup instead of rebuilding | none |
+| `DASH_INGEST_VECTOR_INDEX_PATH` | no | `<WAL path>.vindex` | saved vector index file | none |
+| `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS` | no | `300000` | periodic save interval; `0` saves only after checkpoints and at shutdown | none |
 
 Ingestion segment lifecycle daemon note:
 
@@ -100,6 +103,9 @@ Ingestion segment lifecycle daemon note:
 | `DASH_RETRIEVAL_ANN_EXPANSION_ADD` | no | `128` | HNSW construction beam (ef_construction) | none |
 | `DASH_RETRIEVAL_VECTOR_FLAT_THRESHOLD` | no | `8192` | exact flat scan up to this many vectors per tenant, HNSW above | none |
 | `DASH_RETRIEVAL_VECTOR_RERANK` | no | `50` | HNSW candidates re-scored exactly in f32 (`0` disables) | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_PERSIST` | no | on | save the vector indexes and load them at startup instead of rebuilding (needs `DASH_RETRIEVAL_WAL_PATH`) | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_PATH` | no | `<WAL path>.vindex` | saved vector index file | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_SAVE_INTERVAL_MS` | no | `300000` | periodic save interval; `0` saves only at shutdown | none |
 
 Runtime note:
 
