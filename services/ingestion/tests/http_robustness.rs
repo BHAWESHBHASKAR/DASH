@@ -12,9 +12,18 @@ use store::InMemoryStore;
 
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+    LOCK.get_or_init(|| {
+        // These tests exercise transport behaviour, not authentication, so
+        // they run in explicit dev mode (the only open configuration).
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+            std::env::set_var("DASH_STRICT_SECRETS", "0");
+        }
+        Mutex::new(())
+    })
+    .lock()
+    .unwrap_or_else(|p| p.into_inner())
 }
 
 struct EnvGuard(&'static str);

@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 pub mod oidc;
 pub use oidc::{
-    OidcValidationConfig, clear_jwks_cache, verify_oidc_token_for_tenant,
+    OidcValidationConfig, clear_jwks_cache, verify_oidc_token, verify_oidc_token_for_tenant,
     verify_oidc_token_with_jwks,
 };
 
@@ -163,6 +163,27 @@ pub fn verify_hs256_token_for_tenant(
     config: &JwtValidationConfig,
     now_unix_secs: u64,
 ) -> Result<Value, JwtValidationError> {
+    verify_hs256_token_inner(token, Some(tenant_id), config, now_unix_secs)
+}
+
+/// Verify signature, issuer/audience and time bounds of an HS256 token
+/// without checking any tenant allowlist. Used for endpoints that are not
+/// tenant-scoped (for example `/metrics` or `/v1/embeddings`), where the
+/// caller only needs to be an authenticated principal.
+pub fn verify_hs256_token(
+    token: &str,
+    config: &JwtValidationConfig,
+    now_unix_secs: u64,
+) -> Result<Value, JwtValidationError> {
+    verify_hs256_token_inner(token, None, config, now_unix_secs)
+}
+
+fn verify_hs256_token_inner(
+    token: &str,
+    tenant_id: Option<&str>,
+    config: &JwtValidationConfig,
+    now_unix_secs: u64,
+) -> Result<Value, JwtValidationError> {
     let header = decode_header(token).map_err(map_jwt_error)?;
     if header.alg != Algorithm::HS256 {
         return Err(JwtValidationError::UnsupportedAlgorithm);
@@ -196,7 +217,9 @@ pub fn verify_hs256_token_for_tenant(
         match decode::<Value>(token, &key, &validation) {
             Ok(data) => {
                 check_time_bounds(&data.claims, config, now_unix_secs)?;
-                check_tenant_allowlist(&data.claims, tenant_id)?;
+                if let Some(tenant_id) = tenant_id {
+                    check_tenant_allowlist(&data.claims, tenant_id)?;
+                }
                 return Ok(data.claims);
             }
             Err(e) => {
@@ -230,7 +253,11 @@ fn select_hs256_secrets_for_header<'a>(
     }
 
     let mut out = Vec::with_capacity(1 + config.hs256_fallback_secrets.len());
-    out.push(config.hs256_secret.as_str());
+    // Never accept an empty signing key, even if configuration left the
+    // primary secret blank.
+    if !config.hs256_secret.is_empty() {
+        out.push(config.hs256_secret.as_str());
+    }
     for secret in &config.hs256_fallback_secrets {
         if !secret.is_empty() && !out.contains(&secret.as_str()) {
             out.push(secret.as_str());
@@ -629,6 +656,41 @@ mod tests {
                 | Err(JwtValidationError::InvalidJson)
                 | Err(JwtValidationError::InvalidUtf8)
         ));
+    }
+
+    #[test]
+    fn verify_hs256_token_without_tenant_checks_signature_and_expiry_only() {
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "secret",
+        )
+        .unwrap();
+        assert!(verify_hs256_token(&token, &sample_config(), 1_000).is_ok());
+        assert_eq!(
+            verify_hs256_token(&token, &sample_config(), 4_102_444_801),
+            Err(JwtValidationError::Expired)
+        );
+        let forged = encode_hs256_token(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "other-secret",
+        )
+        .unwrap();
+        assert_eq!(
+            verify_hs256_token(&forged, &sample_config(), 1_000),
+            Err(JwtValidationError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn empty_primary_secret_is_never_accepted_as_a_signing_key() {
+        let mut config = sample_config();
+        config.hs256_secret = String::new();
+        let token = encode_hs256_token(
+            r#"{"tenant_id":"tenant-a","iss":"dash","aud":"ingestion","exp":4102444800}"#,
+            "",
+        )
+        .unwrap();
+        assert!(verify_hs256_token_for_tenant(&token, "tenant-a", &config, 1_000).is_err());
     }
 
     #[test]

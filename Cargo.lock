@@ -617,7 +617,11 @@ dependencies = [
 name = "dash-common"
 version = "0.1.0"
 dependencies = [
+ "auth",
+ "serde_json",
  "signal-hook",
+ "tempfile",
+ "tracing",
  "tracing-subscriber",
 ]
 

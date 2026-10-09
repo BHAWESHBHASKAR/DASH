@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+auth = { path = "../../pkg/auth" }
+tracing = { workspace = true }
+serde_json = { workspace = true }
 signal-hook = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

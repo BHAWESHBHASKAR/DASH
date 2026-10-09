@@ -1,47 +1,46 @@
 use super::*;
 
 pub(super) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> HttpResponse {
+    let auth_policy = shared_auth_policy();
+    handle_request_with_policy(runtime, request, &auth_policy)
+}
+
+pub(super) fn handle_request_with_policy(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
     let (path, query) = split_target(&request.target);
-    let auth_policy = AuthPolicy::from_env(
-        env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY"),
-        env_with_fallback("DASH_INGEST_API_KEYS", "EME_INGEST_API_KEYS"),
-        env_with_fallback(
-            "DASH_INGEST_REVOKED_API_KEYS",
-            "EME_INGEST_REVOKED_API_KEYS",
-        ),
-        env_with_fallback("DASH_INGEST_ALLOWED_TENANTS", "EME_INGEST_ALLOWED_TENANTS"),
-        env_with_fallback("DASH_INGEST_API_KEY_SCOPES", "EME_INGEST_API_KEY_SCOPES"),
-    );
     let audit_log_path =
         env_with_fallback("DASH_INGEST_AUDIT_LOG_PATH", "EME_INGEST_AUDIT_LOG_PATH");
     match (request.method.as_str(), path.as_str()) {
-        ("GET", _) => read_routes::handle_get_request(runtime, request, &path, &query),
+        ("GET", _) => read_routes::handle_get_request(runtime, request, &path, &query, auth_policy),
         ("POST", "/v1/ingest") => ingest_routes::handle_ingest_post(
             runtime,
             request,
             &query,
-            &auth_policy,
+            auth_policy,
             audit_log_path.as_deref(),
         ),
         ("POST", "/v1/ingest/raw") => ingest_routes::handle_ingest_raw_post(
             runtime,
             request,
             &query,
-            &auth_policy,
+            auth_policy,
             audit_log_path.as_deref(),
         ),
         ("POST", "/v1/ingest/document") => ingest_routes::handle_ingest_document_post(
             runtime,
             request,
             &query,
-            &auth_policy,
+            auth_policy,
             audit_log_path.as_deref(),
         ),
         ("POST", "/v1/ingest/batch") => ingest_routes::handle_ingest_batch_post(
             runtime,
             request,
             &query,
-            &auth_policy,
+            auth_policy,
             audit_log_path.as_deref(),
         ),
         ("POST", "/internal/replication/ack") => {

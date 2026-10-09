@@ -1,3 +1,4 @@
+use super::ingest_routes::{observe_auth_failure, observe_authz_denied};
 use super::*;
 
 pub(super) fn handle_get_request(
@@ -5,7 +6,16 @@ pub(super) fn handle_get_request(
     request: &HttpRequest,
     path: &str,
     query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
 ) -> HttpResponse {
+    if matches!(path, "/debug/placement" | "/debug/document-parser")
+        && let Some(denied) = deny_unless_allowed(
+            runtime,
+            authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+        )
+    {
+        return denied;
+    }
     match path {
         // Versioned + unversioned health endpoints. The unversioned
         // paths are kept for backward compat with existing k8s
@@ -33,6 +43,7 @@ pub(super) fn handle_get_request(
                             content_type: "application/json",
                             body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
                                 .to_string(),
+                            retry_after_secs: None,
                         }
                     } else {
                         HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
@@ -42,6 +53,14 @@ pub(super) fn handle_get_request(
             Err(_) => HttpResponse::internal_server_error("runtime_unavailable"),
         },
         "/metrics" => {
+            if !auth_policy.metrics_public()
+                && let Some(denied) = deny_unless_allowed(
+                    runtime,
+                    authorize_request_any_tenant(request, auth_policy, Role::ReadOnly),
+                )
+            {
+                return denied;
+            }
             let body = match runtime.lock() {
                 Ok(mut rt) => {
                     rt.flush_wal_if_due();
@@ -68,6 +87,30 @@ pub(super) fn handle_get_request(
             handle_replication_commit_status_get(runtime, request, query)
         }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+/// Map a non-`Allowed` decision to its response (`None` when allowed),
+/// recording the denial metrics.
+fn deny_unless_allowed(runtime: &SharedRuntime, decision: AuthDecision) -> Option<HttpResponse> {
+    match decision {
+        // Operational endpoints do not count towards the auth success counter.
+        AuthDecision::Allowed => None,
+        AuthDecision::Unauthorized(reason) => {
+            observe_auth_failure(runtime);
+            Some(HttpResponse::unauthorized(reason))
+        }
+        AuthDecision::Forbidden(reason) => {
+            observe_authz_denied(runtime);
+            Some(HttpResponse::forbidden(reason))
+        }
+        AuthDecision::RateLimited { retry_after_secs } => {
+            observe_authz_denied(runtime);
+            Some(HttpResponse::too_many_requests(
+                "rate limit exceeded",
+                retry_after_secs,
+            ))
+        }
     }
 }
 
