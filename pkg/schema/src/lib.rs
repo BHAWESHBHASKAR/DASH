@@ -178,6 +178,17 @@ pub struct RetrievalResult {
 pub enum ValidationError {
     MissingField(&'static str),
     InvalidRange(&'static str),
+    /// An identifier-like field contains a control character (C0 or DEL).
+    InvalidCharacters(&'static str),
+}
+
+/// Identifier-like fields (ids, tenant ids, entity names, ...) must not
+/// contain C0 control characters or DEL.
+fn check_identifier(value: &str, field: &'static str) -> Result<(), ValidationError> {
+    if value.chars().any(|c| c.is_control() && c.is_ascii()) {
+        return Err(ValidationError::InvalidCharacters(field));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +222,8 @@ pub fn validate_claim(claim: &Claim) -> Result<(), ValidationError> {
     if claim.canonical_text.trim().is_empty() {
         return Err(ValidationError::MissingField("canonical_text"));
     }
+    check_identifier(&claim.claim_id, "claim_id")?;
+    check_identifier(&claim.tenant_id, "tenant_id")?;
     if !(0.0..=1.0).contains(&claim.confidence) {
         return Err(ValidationError::InvalidRange("confidence"));
     }
@@ -218,11 +231,13 @@ pub fn validate_claim(claim: &Claim) -> Result<(), ValidationError> {
         if entity.trim().is_empty() {
             return Err(ValidationError::MissingField("entities[]"));
         }
+        check_identifier(entity, "entities[]")?;
     }
     for embedding_id in &claim.embedding_ids {
         if embedding_id.trim().is_empty() {
             return Err(ValidationError::MissingField("embedding_ids[]"));
         }
+        check_identifier(embedding_id, "embedding_ids[]")?;
     }
     // Validate temporal validity window
     if let (Some(from), Some(to)) = (claim.valid_from, claim.valid_to)
@@ -243,6 +258,8 @@ pub fn validate_evidence(evidence: &Evidence) -> Result<(), ValidationError> {
     if evidence.source_id.trim().is_empty() {
         return Err(ValidationError::MissingField("source_id"));
     }
+    check_identifier(&evidence.evidence_id, "evidence_id")?;
+    check_identifier(&evidence.claim_id, "claim_id")?;
     if !(0.0..=1.0).contains(&evidence.source_quality) {
         return Err(ValidationError::InvalidRange("source_quality"));
     }
@@ -273,6 +290,9 @@ pub fn validate_edge(edge: &ClaimEdge) -> Result<(), ValidationError> {
     if edge.to_claim_id.trim().is_empty() {
         return Err(ValidationError::MissingField("to_claim_id"));
     }
+    check_identifier(&edge.edge_id, "edge_id")?;
+    check_identifier(&edge.from_claim_id, "from_claim_id")?;
+    check_identifier(&edge.to_claim_id, "to_claim_id")?;
     if !(0.0..=1.0).contains(&edge.strength) {
         return Err(ValidationError::InvalidRange("strength"));
     }
@@ -280,6 +300,7 @@ pub fn validate_edge(edge: &ClaimEdge) -> Result<(), ValidationError> {
         if code.trim().is_empty() {
             return Err(ValidationError::MissingField("reason_codes[]"));
         }
+        check_identifier(code, "reason_codes[]")?;
     }
     Ok(())
 }
@@ -309,6 +330,76 @@ mod tests {
 
     fn test_claim(id: &str, text: &str) -> Claim {
         claim_builder(id, "t1", text, 0.9)
+    }
+
+    #[test]
+    fn rejects_control_characters_in_identifier_fields() {
+        for bad in ["a\tb", "a\nb", "a\rb", "a\0b", "a\x1fb", "a\x7fb"] {
+            let mut claim = test_claim("c1", "text");
+            claim.claim_id = bad.to_string();
+            assert_eq!(
+                validate_claim(&claim),
+                Err(ValidationError::InvalidCharacters("claim_id"))
+            );
+            let mut claim = test_claim("c1", "text");
+            claim.tenant_id = bad.to_string();
+            assert!(validate_claim(&claim).is_err());
+            let mut claim = test_claim("c1", "text");
+            claim.entities = vec![bad.to_string()];
+            assert_eq!(
+                validate_claim(&claim),
+                Err(ValidationError::InvalidCharacters("entities[]"))
+            );
+            let mut claim = test_claim("c1", "text");
+            claim.embedding_ids = vec![bad.to_string()];
+            assert_eq!(
+                validate_claim(&claim),
+                Err(ValidationError::InvalidCharacters("embedding_ids[]"))
+            );
+        }
+        // Free text and non-ASCII identifiers stay valid.
+        let mut claim = test_claim("c\u{e9}1", "line one\nline\ttwo\\");
+        claim.entities = vec!["Zo\u{eb}".to_string()];
+        assert_eq!(validate_claim(&claim), Ok(()));
+    }
+
+    #[test]
+    fn rejects_control_characters_in_evidence_and_edge_ids() {
+        let ev = Evidence {
+            evidence_id: "e\t1".to_string(),
+            claim_id: "c1".to_string(),
+            source_id: "s".to_string(),
+            stance: Stance::Supports,
+            source_quality: 0.5,
+            chunk_id: None,
+            span_start: None,
+            span_end: None,
+            doc_id: None,
+            extraction_model: None,
+            ingested_at: None,
+        };
+        assert_eq!(
+            validate_evidence(&ev),
+            Err(ValidationError::InvalidCharacters("evidence_id"))
+        );
+        let mut ev2 = ev.clone();
+        ev2.evidence_id = "e1".to_string();
+        // source_id is free-form (URLs, paths); the WAL escapes it.
+        ev2.source_id = "s\n".to_string();
+        assert_eq!(validate_evidence(&ev2), Ok(()));
+        let edge = ClaimEdge {
+            edge_id: "g\0".to_string(),
+            from_claim_id: "a".to_string(),
+            to_claim_id: "b".to_string(),
+            relation: Relation::Supports,
+            strength: 0.5,
+            reason_codes: vec![],
+            created_at: None,
+        };
+        assert_eq!(
+            validate_edge(&edge),
+            Err(ValidationError::InvalidCharacters("edge_id"))
+        );
     }
 
     #[test]
