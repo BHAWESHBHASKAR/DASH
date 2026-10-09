@@ -23,7 +23,7 @@ use std::path::Path;
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use schema::{Claim, ClaimEdge, Evidence};
 
-use crate::{BatchCommitMetadata, InMemoryStore, StoreIndexStats};
+use crate::{BatchCommitMetadata, InMemoryStore, StoreIndexStats, value_codec};
 
 const TABLE_CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_claims");
 const TABLE_EVIDENCE: TableDefinition<&str, &[u8]> = TableDefinition::new("dash_evidence");
@@ -67,8 +67,8 @@ fn err<E: std::fmt::Display>(ctx: &str, e: E) -> String {
     format!("redb {ctx}: {e}")
 }
 
-fn map_bincode_err(ctx: &str, e: bincode::Error) -> String {
-    format!("bincode {ctx}: {e}")
+fn map_codec_err(ctx: &str, e: value_codec::CodecError) -> String {
+    format!("value codec {ctx}: {e}")
 }
 
 /// Collapse duplicate evidence ids: the last occurrence wins, positioned
@@ -112,7 +112,7 @@ fn dedupe_edges(edges: &[ClaimEdge]) -> Vec<ClaimEdge> {
 }
 
 fn read_bytes<V: serde::de::DeserializeOwned>(bytes: Vec<u8>, ctx: &str) -> Result<V, String> {
-    bincode::deserialize(&bytes).map_err(|e| map_bincode_err(ctx, e))
+    value_codec::decode(&bytes).map_err(|e| map_codec_err(ctx, e))
 }
 
 /// `redb`-backed persistence for the in-memory store.
@@ -178,7 +178,7 @@ impl DiskBackedStore {
     /// `claim_id`) and record its tenant membership in the SAME write
     /// transaction, so the claim row and the tenant set cannot diverge.
     pub fn put_claim(&self, claim: &Claim) -> Result<(), String> {
-        let bytes = bincode::serialize(claim).map_err(|e| map_bincode_err("serialize claim", e))?;
+        let bytes = value_codec::encode(claim).map_err(|e| map_codec_err("serialize claim", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -223,7 +223,7 @@ impl DiskBackedStore {
     pub fn put_evidence_blob(&self, claim_id: &str, evidence: &[Evidence]) -> Result<(), String> {
         let evidence = dedupe_evidence(evidence);
         let bytes =
-            bincode::serialize(&evidence).map_err(|e| map_bincode_err("serialize evidence", e))?;
+            value_codec::encode(&evidence).map_err(|e| map_codec_err("serialize evidence", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -255,8 +255,8 @@ impl DiskBackedStore {
             };
             current.push(evidence.clone());
             let current = dedupe_evidence(&current);
-            let bytes = bincode::serialize(&current)
-                .map_err(|e| map_bincode_err("serialize evidence", e))?;
+            let bytes = value_codec::encode(&current)
+                .map_err(|e| map_codec_err("serialize evidence", e))?;
             table
                 .insert(evidence.claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -283,7 +283,7 @@ impl DiskBackedStore {
             current.push(edge.clone());
             let current = dedupe_edges(&current);
             let bytes =
-                bincode::serialize(&current).map_err(|e| map_bincode_err("serialize edges", e))?;
+                value_codec::encode(&current).map_err(|e| map_codec_err("serialize edges", e))?;
             table
                 .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;
@@ -318,8 +318,7 @@ impl DiskBackedStore {
     /// collapsed (last wins).
     pub fn put_edge_blob(&self, from: &str, edges: &[ClaimEdge]) -> Result<(), String> {
         let edges = dedupe_edges(edges);
-        let bytes =
-            bincode::serialize(&edges).map_err(|e| map_bincode_err("serialize edges", e))?;
+        let bytes = value_codec::encode(&edges).map_err(|e| map_codec_err("serialize edges", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -357,7 +356,7 @@ impl DiskBackedStore {
     /// vector for the same `claim_id` atomically.
     pub fn put_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), String> {
         let bytes =
-            bincode::serialize(vector).map_err(|e| map_bincode_err("serialize vector", e))?;
+            value_codec::encode(vector).map_err(|e| map_codec_err("serialize vector", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -395,7 +394,7 @@ impl DiskBackedStore {
     /// the same `commit_id` atomically.
     pub fn put_batch_commit(&self, commit: &BatchCommitMetadata) -> Result<(), String> {
         let bytes =
-            bincode::serialize(commit).map_err(|e| map_bincode_err("serialize batch_commit", e))?;
+            value_codec::encode(commit).map_err(|e| map_codec_err("serialize batch_commit", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -523,7 +522,7 @@ impl DiskBackedStore {
 
     /// Persist the index stats singleton.
     pub fn set_stats(&self, stats: &StoreIndexStats) -> Result<(), String> {
-        let bytes = bincode::serialize(stats).map_err(|e| map_bincode_err("serialize stats", e))?;
+        let bytes = value_codec::encode(stats).map_err(|e| map_codec_err("serialize stats", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -582,8 +581,8 @@ impl DiskBackedStore {
             for entry in iter {
                 let entry = entry.map_err(|e| err("scan claims", e))?;
                 let value = entry.1.value().to_vec();
-                let claim: Claim = bincode::deserialize(&value)
-                    .map_err(|e| map_bincode_err("deserialize claim", e))?;
+                let claim: Claim = value_codec::decode(&value)
+                    .map_err(|e| map_codec_err("deserialize claim", e))?;
                 dest.apply_claim_for_load(claim)
                     .map_err(|e| format!("apply_claim_for_load: {e:?}"))?;
                 claims_loaded += 1;
@@ -601,8 +600,8 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan evidence", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let evidence: Vec<Evidence> = bincode::deserialize(&value)
-                        .map_err(|e| map_bincode_err("deserialize evidence", e))?;
+                    let evidence: Vec<Evidence> = value_codec::decode(&value)
+                        .map_err(|e| map_codec_err("deserialize evidence", e))?;
                     let evidence = dedupe_evidence(&evidence);
                     dest.apply_evidence_blob_for_load(&key, &evidence)
                         .map_err(|e| format!("apply_evidence_blob_for_load: {e:?}"))?;
@@ -619,8 +618,8 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan edges", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let edges: Vec<ClaimEdge> = bincode::deserialize(&value)
-                        .map_err(|e| map_bincode_err("deserialize edges", e))?;
+                    let edges: Vec<ClaimEdge> = value_codec::decode(&value)
+                        .map_err(|e| map_codec_err("deserialize edges", e))?;
                     let edges = dedupe_edges(&edges);
                     dest.apply_edge_blob_for_load(&key, &edges)
                         .map_err(|e| format!("apply_edge_blob_for_load: {e:?}"))?;
@@ -639,8 +638,8 @@ impl DiskBackedStore {
                         let entry = entry.map_err(|e| err("scan claim_vectors", e))?;
                         let key = entry.0.value().to_string();
                         let value = entry.1.value().to_vec();
-                        let vector: Vec<f32> = bincode::deserialize(&value)
-                            .map_err(|e| map_bincode_err("deserialize vector", e))?;
+                        let vector: Vec<f32> = value_codec::decode(&value)
+                            .map_err(|e| map_codec_err("deserialize vector", e))?;
                         dest.apply_claim_vector_blob_for_load(&key, vector)
                             .map_err(|e| format!("apply_claim_vector_blob_for_load: {e:?}"))?;
                     }
@@ -660,8 +659,8 @@ impl DiskBackedStore {
                 for entry in iter {
                     let entry = entry.map_err(|e| err("scan batch_commits", e))?;
                     let value = entry.1.value().to_vec();
-                    let commit: BatchCommitMetadata = bincode::deserialize(&value)
-                        .map_err(|e| map_bincode_err("deserialize batch_commit", e))?;
+                    let commit: BatchCommitMetadata = value_codec::decode(&value)
+                        .map_err(|e| map_codec_err("deserialize batch_commit", e))?;
                     dest.apply_batch_commit_for_load(&commit)
                         .map_err(|e| format!("apply_batch_commit_for_load: {e:?}"))?;
                 }
@@ -739,7 +738,7 @@ impl DiskBackedStore {
                 .map_err(|e| err("open claims", e))?;
             for claim in store.claims_iter() {
                 let bytes =
-                    bincode::serialize(claim).map_err(|e| map_bincode_err("serialize claim", e))?;
+                    value_codec::encode(claim).map_err(|e| map_codec_err("serialize claim", e))?;
                 claims_table
                     .insert(claim.claim_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write claim", e))?;
@@ -750,8 +749,8 @@ impl DiskBackedStore {
                 .map_err(|e| err("open evidence", e))?;
             for (claim_id, evidence) in store.evidence_iter() {
                 let evidence = dedupe_evidence(evidence);
-                let bytes = bincode::serialize(&evidence)
-                    .map_err(|e| map_bincode_err("serialize evidence", e))?;
+                let bytes = value_codec::encode(&evidence)
+                    .map_err(|e| map_codec_err("serialize evidence", e))?;
                 evidence_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write evidence", e))?;
@@ -762,8 +761,8 @@ impl DiskBackedStore {
                 .map_err(|e| err("open edges", e))?;
             for (from, edges) in store.edges_iter() {
                 let edges = dedupe_edges(edges);
-                let bytes = bincode::serialize(&edges)
-                    .map_err(|e| map_bincode_err("serialize edges", e))?;
+                let bytes =
+                    value_codec::encode(&edges).map_err(|e| map_codec_err("serialize edges", e))?;
                 edges_table
                     .insert(from, bytes.as_slice())
                     .map_err(|e| err("write edges", e))?;
@@ -773,8 +772,8 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIM_VECTORS)
                 .map_err(|e| err("open claim_vectors", e))?;
             for (claim_id, vector) in store.claim_vectors_iter() {
-                let bytes = bincode::serialize(vector)
-                    .map_err(|e| map_bincode_err("serialize vector", e))?;
+                let bytes = value_codec::encode(vector)
+                    .map_err(|e| map_codec_err("serialize vector", e))?;
                 vectors_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write claim_vector", e))?;
@@ -784,8 +783,8 @@ impl DiskBackedStore {
                 .open_table(TABLE_BATCH_COMMITS)
                 .map_err(|e| err("open batch_commits", e))?;
             for commit in store.batch_commits_iter() {
-                let bytes = bincode::serialize(commit)
-                    .map_err(|e| map_bincode_err("serialize batch_commit", e))?;
+                let bytes = value_codec::encode(commit)
+                    .map_err(|e| map_codec_err("serialize batch_commit", e))?;
                 batch_commits_table
                     .insert(commit.commit_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write batch_commit", e))?;
