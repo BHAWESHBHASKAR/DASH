@@ -7,11 +7,13 @@
 
 pub mod http;
 pub mod jwt;
+pub mod leader;
 pub mod proc;
 pub mod stack;
 
 pub use http::{Client, Resp};
 pub use proc::{Proc, bin_path, free_port, random_secret};
+pub use leader::LeaderState;
 pub use stack::{Stack, StackOpts};
 
 use serde_json::{Value, json};

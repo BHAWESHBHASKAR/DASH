@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::http::{Client, Resp};
+use crate::leader::LeaderState;
 use crate::proc::{Proc, free_port, random_secret};
 
 #[derive(Clone, Default)]
@@ -262,7 +263,6 @@ impl Stack {
             if rep["generation"].as_u64() == Some(generation)
                 && rep["offset"].as_u64() == Some(total as u64)
                 && rep["lag_records"].as_u64() == Some(0)
-                && total > 0
             {
                 return rep;
             }
@@ -290,6 +290,17 @@ impl Stack {
                 .to_string()
         };
         (kv("generation").parse().unwrap(), kv("total_records").parse().unwrap())
+    }
+
+    /// The leader's durable state as exported for followers (snapshot plus
+    /// WAL), reduced to ids. Claims and evidence are last-write-wins by id.
+    pub fn leader_state(&self) -> LeaderState {
+        let r = self.ic().get(
+            "/internal/replication/export",
+            &[("x-replication-token", self.replication_token.as_str())],
+        );
+        assert_eq!(r.status, 200, "leader export: {}", r.body);
+        LeaderState::parse(&r.body)
     }
 
     /// Poll retrieval until `claim_id` is visible for `tenant`.
