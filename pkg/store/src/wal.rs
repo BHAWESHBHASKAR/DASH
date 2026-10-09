@@ -171,7 +171,7 @@ pub const SINGLE_TX_PREFIX: &str = "~tx:";
 /// Upper bound on how far a replication frame may be extended past
 /// `max_records` to end on a commit-group boundary. Followers accept frames
 /// of `max_records + REPLICATION_GROUP_EXTENSION_MAX` lines.
-pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 100_000;
+pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 1_000_000;
 
 enum GroupEvent {
     Begin(String),
@@ -215,33 +215,60 @@ pub fn complete_group_prefix_len(lines: &[String]) -> usize {
     open.map_or(lines.len(), |(start, _)| start)
 }
 
+/// Why a frame cannot be extended to the end of its commit group.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupTooLarge {
+    start: usize,
+    cap: usize,
+}
+
 /// Moves `next` forward so a frame `[from, next)` does not end inside a
-/// commit group, when the group closes within the extension bound.
-fn extend_to_group_end(lines: &[String], from: usize, next: usize) -> usize {
-    let mut open: Option<String> = None;
-    for line in &lines[from..next] {
+/// commit group. A group that closes within `cap` records of its first line
+/// is shipped whole. A larger group that starts after `from` is left for the
+/// next frame (the frame ends just before it); one that starts at `from`
+/// can never be shipped, which is an error rather than a frame the follower
+/// would hold back forever. A group still open at the end of the log is a
+/// write in progress and is left as is.
+fn extend_to_group_end(
+    lines: &[String],
+    from: usize,
+    next: usize,
+    cap: usize,
+) -> Result<usize, GroupTooLarge> {
+    let mut open: Option<(usize, String)> = None;
+    for (offset, line) in lines[from..next].iter().enumerate() {
         match group_event(line) {
-            Some(GroupEvent::Begin(id)) => open = Some(id),
-            Some(GroupEvent::End(id)) if open.as_ref().is_some_and(|o| closes_group(o, &id)) => {
+            Some(GroupEvent::Begin(id)) => open = Some((from + offset, id)),
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
                 open = None;
             }
             _ => {}
         }
     }
-    let Some(id) = open else {
-        return next;
+    let Some((start, id)) = open else {
+        return Ok(next);
     };
-    let bound = lines
-        .len()
-        .min(next.saturating_add(REPLICATION_GROUP_EXTENSION_MAX));
+    let bound = lines.len().min(start.saturating_add(cap));
     for (offset, line) in lines[next..bound].iter().enumerate() {
         if let Some(GroupEvent::End(end)) = group_event(line)
             && closes_group(&id, &end)
         {
-            return next + offset + 1;
+            return Ok(next + offset + 1);
         }
     }
-    next
+    let closes_beyond_cap = lines[bound..]
+        .iter()
+        .any(|line| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end)));
+    if !closes_beyond_cap {
+        return Ok(next);
+    }
+    if start > from {
+        Ok(start)
+    } else {
+        Err(GroupTooLarge { start, cap })
+    }
 }
 
 /// The commit id carried by a batch-commit WAL line (legacy `B` or checksummed
@@ -320,6 +347,10 @@ pub struct FileWal {
     /// Lines left out of the most recent replication view because lenient
     /// replay would quarantine them.
     replication_skipped: usize,
+    /// Largest commit group (in records) a replication frame may be
+    /// extended to cover.
+    replication_group_cap: usize,
+    replication_group_too_large_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,6 +427,8 @@ impl FileWal {
             generation,
             torn_tail_dropped,
             replication_skipped: 0,
+            replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
+            replication_group_too_large_total: 0,
         })
     }
 
@@ -412,6 +445,18 @@ impl FileWal {
     /// followers; offsets index the served (filtered) view.
     pub fn replication_skipped_lines(&self) -> usize {
         self.replication_skipped
+    }
+
+    /// Overrides the largest commit group (in records) a replication frame
+    /// may be extended to cover (default [`REPLICATION_GROUP_EXTENSION_MAX`]).
+    pub fn set_replication_group_cap(&mut self, cap: usize) {
+        self.replication_group_cap = cap.max(1);
+    }
+
+    /// Frame requests refused because a commit group exceeded the cap
+    /// (`replication_group_too_large`).
+    pub fn replication_group_too_large_total(&self) -> u64 {
+        self.replication_group_too_large_total
     }
 
     /// Torn tail lines discarded since this handle was opened.
@@ -640,7 +685,22 @@ impl FileWal {
         let limit = max_records.max(1);
         let next_offset = from_offset.saturating_add(limit).min(total_records);
         // Never cut a frame inside a commit group when it can be avoided.
-        let next_offset = extend_to_group_end(&wal_lines, from_offset, next_offset);
+        let next_offset = match extend_to_group_end(
+            &wal_lines,
+            from_offset,
+            next_offset,
+            self.replication_group_cap,
+        ) {
+            Ok(next) => next,
+            Err(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                return Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )));
+            }
+        };
         Ok(WalReplicationFrame {
             generation: self.generation,
             from_offset,

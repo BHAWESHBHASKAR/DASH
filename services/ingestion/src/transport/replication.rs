@@ -615,6 +615,8 @@ impl IngestionRuntime {
     ) -> Result<(), StoreError> {
         if !frame.wal_lines.is_empty() {
             let mut staged_store = self.store.clone_detached();
+            #[cfg(test)]
+            failpoint::maybe_panic();
             for line in &frame.wal_lines {
                 staged_store.apply_persisted_record_line(line)?;
             }
@@ -770,6 +772,27 @@ dash_ingest_replication_generation {}\n",
     }
 }
 
+/// Test-only failpoint: makes the next replication apply on this thread
+/// panic, to prove a panic never wedges the shared runtime.
+#[cfg(test)]
+mod failpoint {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PANIC_NEXT_APPLY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn arm() {
+        PANIC_NEXT_APPLY.with(|flag| flag.set(true));
+    }
+
+    pub(super) fn maybe_panic() {
+        if PANIC_NEXT_APPLY.with(|flag| flag.replace(false)) {
+            panic!("injected replication apply panic");
+        }
+    }
+}
+
 /// Run one pull. Returns the consecutive failure count afterwards so the
 /// caller can back off. Never panics: a panic inside the tick is caught,
 /// logged and counted as a failure.
@@ -780,18 +803,20 @@ pub(super) fn run_replication_pull_tick(
     let outcome = match catch_unwind(AssertUnwindSafe(|| pull_tick(runtime, config))) {
         Ok(outcome) => outcome,
         Err(panic) => {
-            if let Ok(mut guard) = runtime.lock() {
-                guard.replication_follower.force_resync = true;
-            }
+            // The follower rebuilds its state from a full export, so the
+            // possibly half-updated state is replaced wholesale: it is safe
+            // to recover a mutex poisoned by this panic.
+            let mut guard = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.replication_follower.force_resync = true;
+            drop(guard);
+            runtime.clear_poison();
             Err(format!(
                 "replication pull panicked: {}",
                 panic_message(&panic)
             ))
         }
     };
-    let Ok(mut guard) = runtime.lock() else {
-        return 0;
-    };
+    let mut guard = runtime.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match outcome {
         Ok(()) => {
             guard.record_replication_pull_success();
@@ -805,6 +830,29 @@ pub(super) fn run_replication_pull_tick(
                 .consecutive_failures
                 .saturating_add(1);
             guard.replication_follower.consecutive_failures
+        }
+    }
+}
+
+/// Runs `apply` on the runtime under its lock without ever poisoning the
+/// mutex: a panic is caught while the guard is still held, so the guard is
+/// dropped on the normal path. State may be half-updated after a panic, so
+/// the follower is flagged for a full resync (which replaces it wholesale).
+fn apply_guarded<T>(
+    runtime: &SharedRuntime,
+    apply: impl FnOnce(&mut IngestionRuntime) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let mut guard = runtime
+        .lock()
+        .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))?;
+    match catch_unwind(AssertUnwindSafe(|| apply(&mut guard))) {
+        Ok(result) => result,
+        Err(panic) => {
+            guard.replication_follower.force_resync = true;
+            Err(StoreError::Io(format!(
+                "replication apply panicked: {}",
+                panic_message(&panic)
+            )))
         }
     }
 }
@@ -868,10 +916,7 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
         delta_frame.next_offset = delta_frame.from_offset + keep;
     }
     let commit_ids = extract_batch_commit_ids_from_wal_lines(&delta_frame.wal_lines)?;
-    runtime
-        .lock()
-        .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
-        .and_then(|mut guard| guard.apply_replication_delta_frame(&delta_frame))
+    apply_guarded(runtime, |rt| rt.apply_replication_delta_frame(&delta_frame))
         .map_err(|err| format!("replication delta apply failed: {err:?}"))?;
     acknowledge_replication_commits(config, &commit_ids)
         .map_err(|err| format!("replication delta commit ack failed: {err}"))
@@ -898,10 +943,7 @@ fn resync_from_export(
     combined_lines.extend(export_frame.snapshot_lines.iter().cloned());
     combined_lines.extend(export_frame.wal_lines.iter().cloned());
     let commit_ids = extract_batch_commit_ids_from_wal_lines(&combined_lines)?;
-    runtime
-        .lock()
-        .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))
-        .and_then(|mut guard| guard.apply_replication_export_frame(export_frame))
+    apply_guarded(runtime, |rt| rt.apply_replication_export_frame(export_frame))
         .map_err(|err| format!("replication resync apply failed: {err:?}"))?;
     acknowledge_replication_commits(config, &commit_ids)
         .map_err(|err| format!("replication resync commit ack failed: {err}"))
@@ -1401,6 +1443,49 @@ mod tests {
         assert_eq!(guard.replication_last_offset, 2);
         assert_eq!(guard.replication_pull_success_total, 1);
         assert_eq!(guard.replication_pull_failure_total, 0);
+    }
+
+    #[test]
+    fn panic_during_replication_apply_does_not_poison_the_runtime() {
+        let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
+            store::InMemoryStore::new(),
+        )));
+        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-p\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-p\t1\t1700000000000\t7:claim-p\n".to_string();
+        let (source_base_url, _requests, source_handle) =
+            spawn_mock_replication_source(delta_body, 1);
+        let config = ReplicationPullConfig {
+            source_base_url,
+            poll_interval: Duration::from_millis(500),
+            max_records: 64,
+            token: None,
+            local_replica_id: None,
+            ..ReplicationPullConfig::new("http://127.0.0.1:1")
+        };
+
+        failpoint::arm();
+        let failures = run_replication_pull_tick(&runtime, &config);
+        source_handle
+            .join()
+            .expect("mock replication source should join cleanly");
+
+        assert_eq!(failures, 1, "the panic counts as one failed pull");
+        assert!(
+            !runtime.is_poisoned(),
+            "a panic during apply must not poison the runtime mutex"
+        );
+        let guard = runtime
+            .lock()
+            .expect("runtime must stay lockable after a panic in replication apply");
+        assert_eq!(guard.claims_len(), 0, "the panicked batch is not applied");
+        assert!(guard.replication_follower.force_resync, "state is rebuilt");
+        assert!(
+            guard
+                .replication_last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("panicked")),
+            "{:?}",
+            guard.replication_last_error
+        );
     }
 
     #[test]
