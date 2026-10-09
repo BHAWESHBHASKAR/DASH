@@ -3,13 +3,31 @@ use std::thread;
 use std::time::Duration;
 
 use control_plane::{
-    ControlPlanePersistence, ControlPlanePlacementState, leader::LeaderLease, serve_http,
+    ControlPlanePersistence, ControlPlanePlacementState, LeaderStatus, LeaseMaintainer,
+    leader::LeaderLease, resolve_security, serve_http,
 };
 use metadata_router::load_shard_placements_csv;
 
 fn main() {
-    let bind_addr = env_with_fallback("DASH_CONTROL_PLANE_BIND", "EME_CONTROL_PLANE_BIND")
+    let requested_bind = env_with_fallback("DASH_CONTROL_PLANE_BIND", "EME_CONTROL_PLANE_BIND")
         .unwrap_or_else(|| "127.0.0.1:8090".to_string());
+    let insecure_dev = matches!(
+        std::env::var("DASH_INSECURE_DEV_MODE").ok().as_deref(),
+        Some("1")
+    );
+    let security = resolve_security(
+        env_with_fallback("DASH_CONTROL_PLANE_TOKEN", "EME_CONTROL_PLANE_TOKEN").as_deref(),
+        insecure_dev,
+        &requested_bind,
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("control-plane refusing to start: {err}");
+        std::process::exit(2);
+    });
+    for warning in &security.warnings {
+        eprintln!("WARNING: {warning}");
+    }
+    let bind_addr = security.bind_addr.clone();
     let node_id = env_with_fallback("DASH_CONTROL_PLANE_NODE_ID", "EME_CONTROL_PLANE_NODE_ID")
         .unwrap_or_else(|| format!("control-plane-{}", std::process::id()));
     let state_path = env_with_fallback(
@@ -36,6 +54,12 @@ fn main() {
     )
     .and_then(|value| value.parse::<u64>().ok())
     .unwrap_or(10_000);
+    let lease_safety_margin_ms = env_with_fallback(
+        "DASH_CONTROL_PLANE_LEASE_SAFETY_MARGIN_MS",
+        "EME_CONTROL_PLANE_LEASE_SAFETY_MARGIN_MS",
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(1_000);
 
     let initial_placements =
         env_with_fallback("DASH_ROUTER_PLACEMENT_FILE", "EME_ROUTER_PLACEMENT_FILE")
@@ -49,7 +73,7 @@ fn main() {
             })
             .unwrap_or_default();
 
-    let mut state = ControlPlanePlacementState::new(initial_placements);
+    let mut state = ControlPlanePlacementState::new(initial_placements).with_auth(security.auth);
     if let Some(state_path) = state_path {
         let persistence = ControlPlanePersistence::new(
             std::path::PathBuf::from(state_path),
@@ -65,7 +89,9 @@ fn main() {
                     eprintln!("control-plane failed replaying persisted placement state: {err}");
                     std::process::exit(2);
                 });
-            state = ControlPlanePlacementState::new(replayed).with_persistence(persistence);
+            state = ControlPlanePlacementState::new(replayed)
+                .with_auth(state.auth_mode().clone())
+                .with_persistence(persistence);
         } else {
             state = state.with_persistence(persistence);
             if let Err(err) = state.persist_if_configured() {
@@ -82,55 +108,44 @@ fn main() {
     // Configure leader election when a lease path is provided. Without a lease
     // path the control-plane is standalone and always behaves as leader.
     let state = if let Some(lease_path) = lease_path {
-        let lease = Arc::new(LeaderLease::new(
-            node_id.clone(),
-            lease_path,
-            lease_duration_ms,
-            lease_renewal_ms,
-        ));
-        match lease.try_acquire(state.highest_epoch()) {
-            Ok(true) => eprintln!("control-plane '{node_id}' acquired leader lease"),
-            Ok(false) => eprintln!(
+        let lease = Arc::new(
+            LeaderLease::new(
+                node_id.clone(),
+                lease_path,
+                lease_duration_ms,
+                lease_renewal_ms,
+            )
+            .with_safety_margin_ms(lease_safety_margin_ms),
+        );
+        let mut state = state.with_lease(lease);
+        // Acquire (and, if leader, reload persisted placements) before
+        // serving anything.
+        match state.try_acquire_and_sync() {
+            Ok(LeaderStatus::Leader { fencing_token }) => eprintln!(
+                "control-plane '{node_id}' acquired leader lease (fencing token {})",
+                fencing_token.unwrap_or(0)
+            ),
+            Ok(LeaderStatus::Follower) => eprintln!(
                 "control-plane '{node_id}' started as follower; another node holds the lease"
             ),
             Err(err) => {
-                eprintln!("control-plane failed to read leader lease: {err}");
+                eprintln!("control-plane failed to acquire or sync leader lease: {err}");
                 std::process::exit(2);
             }
         }
-        let state = state.with_lease(lease.clone());
 
-        // Spawn a background thread to keep the lease renewed while this
-        // process remains the leader. The thread exits if the lease is lost.
+        // Keep the lease renewed while leader and keep trying (with backoff)
+        // to acquire it while follower. This thread never exits.
         let state = Arc::new(Mutex::new(state));
-        let state_for_renewal = state.clone();
-        let lease_for_renewal = lease;
-        let node_id_for_renewal = node_id.clone();
-        thread::spawn(move || {
-            let renewal_interval = Duration::from_millis(lease_for_renewal.renewal_interval_ms());
-            loop {
-                thread::sleep(renewal_interval);
-                let epoch = state_for_renewal
-                    .lock()
-                    .map(|guard| guard.highest_epoch())
-                    .unwrap_or(0);
-                match lease_for_renewal.renew(epoch) {
-                    Ok(true) => {
-                        // Still leader; continue.
-                    }
-                    Ok(false) => {
-                        eprintln!("control-plane '{node_id_for_renewal}' lost leader lease");
-                        return;
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "control-plane '{node_id_for_renewal}' leader renewal failed: {err}"
-                        );
-                        return;
-                    }
-                }
-            }
-        });
+        let maintainer = LeaseMaintainer::new(
+            state.clone(),
+            Duration::from_millis(lease_renewal_ms),
+            Duration::from_millis(lease_duration_ms),
+        );
+        thread::Builder::new()
+            .name("control-plane-lease".to_string())
+            .spawn(move || maintainer.run())
+            .expect("failed to spawn lease maintenance thread");
         state
     } else {
         Arc::new(Mutex::new(state))
