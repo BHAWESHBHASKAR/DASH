@@ -16,6 +16,7 @@ mod disk;
 pub use disk::{DiskBackedStore, DiskStatus};
 
 mod ann;
+pub mod vector_index;
 #[cfg(feature = "gpu-backend")]
 mod gpu;
 mod metrics;
