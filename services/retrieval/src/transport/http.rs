@@ -8,8 +8,6 @@ pub(super) use dash_http::{query_encoding_is_invalid, split_target};
 
 use super::{HttpRequest, HttpResponse};
 
-/// Default whole-request read deadline.
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
 pub(super) const SOCKET_TIMEOUT_SECS: u64 = 5;
 /// Workers reserved for health-class requests (`/health`, `/live`, ...).
 pub(super) const HEALTH_WORKERS: usize = 2;
@@ -36,16 +34,6 @@ impl From<HttpResponse> for dash_http::Response {
     }
 }
 
-/// Resolve the whole-request deadline from `DASH_HTTP_REQUEST_TIMEOUT_MS`.
-fn resolve_request_timeout() -> Duration {
-    let millis = std::env::var("DASH_HTTP_REQUEST_TIMEOUT_MS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
-    Duration::from_millis(millis)
-}
-
 /// Server settings for retrieval: the shared defaults plus the
 /// `DASH_HTTP_*` environment overrides.
 pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_http::ServerConfig {
@@ -55,7 +43,7 @@ pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_
     config.health_queue_capacity = HEALTH_QUEUE_CAPACITY;
     config.write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
     config.reject_write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
-    config.request_deadline = resolve_request_timeout();
+    config.request_deadline = env.request_timeout;
     config.first_byte_timeout = env.first_byte_timeout;
     config.max_conns_per_ip = env.max_per_ip;
     config
