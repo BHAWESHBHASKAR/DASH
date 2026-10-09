@@ -630,5 +630,5 @@ fn transport_authorizes_before_calling_the_embedding_provider() {
         )
     };
     assert_eq!(send(""), "401");
-    assert_eq!(send(&format!("X-API-Key: {STRONG_API_KEY}\r\n")), "400");
+    assert_eq!(send(&format!("X-API-Key: {STRONG_API_KEY}\r\n")), "502");
 }

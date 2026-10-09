@@ -1,25 +1,39 @@
+{{- $p := .Values.config.persistencePath -}}
+{{- $ns := include "dash.namespace" . -}}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "dash.fullname" . }}-config
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ $ns }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: config
 data:
   # ----- shared tunables -----
-  DASH_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  RUST_LOG: {{ .Values.config.logLevel | quote }}
+  DASH_STRICT_SECRETS: {{ ternary "1" "0" .Values.config.strictSecrets | quote }}
   DASH_EMBEDDING_PROVIDER: {{ .Values.config.embeddingProvider | quote }}
-  DASH_RETRIEVAL_PERSISTENCE_PATH: {{ .Values.config.persistencePath | quote }}
-  DASH_INGESTION_PERSISTENCE_PATH: {{ .Values.config.persistencePath | quote }}
+  {{- if eq .Values.config.embeddingProvider "ollama" }}
+  DASH_OLLAMA_ENDPOINT: {{ required "config.ollamaEndpoint is required when embeddingProvider=ollama" .Values.config.ollamaEndpoint | quote }}
+  {{- end }}
 
-  # ----- HTTP / transport -----
+  # ----- persistence (file paths on the per-pod PVC; redb paths are FILES) -----
+  DASH_INGEST_PERSISTENCE_PATH: {{ printf "%s/state/ingestion.redb" $p | quote }}
+  DASH_RETRIEVAL_PERSISTENCE_PATH: {{ printf "%s/state/retrieval.redb" $p | quote }}
+  DASH_INGEST_WAL_PATH: {{ printf "%s/wal/ingestion.wal" $p | quote }}
+  DASH_INGEST_SEGMENT_DIR: {{ printf "%s/segments/ingestion" $p | quote }}
+  DASH_RETRIEVAL_SEGMENT_DIR: {{ printf "%s/segments/retrieval" $p | quote }}
+  {{- if .Values.config.audit.enabled }}
+  DASH_INGEST_AUDIT_LOG_PATH: {{ printf "%s/audit/ingestion.audit.jsonl" $p | quote }}
+  DASH_RETRIEVAL_AUDIT_LOG_PATH: {{ printf "%s/audit/retrieval.audit.jsonl" $p | quote }}
+  {{- end }}
+
+  # ----- HTTP -----
   DASH_INGEST_HTTP_WORKERS: {{ .Values.config.http.ingestWorkers | quote }}
   DASH_INGEST_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.ingestQueueCapacity | quote }}
-  DASH_INGEST_TRANSPORT_RUNTIME: {{ .Values.config.http.ingestTransportRuntime | quote }}
   DASH_RETRIEVAL_HTTP_WORKERS: {{ .Values.config.http.retrievalWorkers | quote }}
-  DASH_RETRIEVAL_TRANSPORT_RUNTIME: {{ .Values.config.http.retrievalTransportRuntime | quote }}
+  DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.retrievalQueueCapacity | quote }}
 
   # ----- WAL durability -----
   DASH_INGEST_WAL_SYNC_EVERY_RECORDS: {{ .Values.config.wal.ingestSyncEveryRecords | quote }}
@@ -27,60 +41,25 @@ data:
   DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: {{ .Values.config.wal.ingestAsyncFlushIntervalMs | quote }}
   DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: {{ .Values.config.wal.ingestBackgroundFlushOnly | quote }}
   DASH_INGEST_WAL_SYNC_INTERVAL_MS: {{ .Values.config.wal.ingestSyncIntervalMs | quote }}
-
-  # ----- Filesystem layout (WAL + segments) -----
-  DASH_INGEST_WAL_PATH: {{ printf "%s/wal/ingestion.wal" .Values.config.persistencePath | quote }}
-  DASH_RETRIEVAL_WAL_PATH: {{ printf "%s/wal/retrieval.wal" .Values.config.persistencePath | quote }}
-  DASH_INGEST_SEGMENT_DIR: {{ printf "%s/segments/ingestion" .Values.config.persistencePath | quote }}
-  DASH_RETRIEVAL_SEGMENT_DIR: {{ printf "%s/segments/retrieval" .Values.config.persistencePath | quote }}
   DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: {{ .Values.config.segment.ingestMaintenanceIntervalMs | quote }}
 
-  # ----- Checkpoint thresholds -----
+  # ----- checkpoint thresholds -----
   DASH_CHECKPOINT_MAX_WAL_RECORDS: {{ .Values.config.checkpoint.maxWalRecords | quote }}
   DASH_CHECKPOINT_MAX_WAL_BYTES: {{ .Values.config.checkpoint.maxWalBytes | quote }}
 
-  # ----- Bind addresses (inside the pod) -----
+  # ----- bind addresses (inside the pod) -----
   DASH_INGEST_BIND: {{ .Values.config.bind.ingestion | quote }}
   DASH_RETRIEVAL_BIND: {{ .Values.config.bind.retrieval | quote }}
   DASH_CONTROL_PLANE_BIND: {{ .Values.config.bind.controlPlane | quote }}
 
-  # ----- Control-plane persistence paths -----
-  DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" .Values.config.persistencePath | quote }}
-  DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" .Values.config.persistencePath | quote }}
-  DASH_CONTROL_PLANE_LEASE_PATH: {{ printf "%s/state/control-plane.lease" .Values.config.persistencePath | quote }}
+  # ----- replication: every retrieval pod follows the single ingestion pod -----
+  DASH_RETRIEVAL_REPLICATION_SOURCE_URL: {{ printf "http://%s.%s.svc.cluster.local:%v" (include "dash.componentName" (list . "ingestion")) $ns .Values.service.ports.http | quote }}
+  DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | quote }}
+  DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: {{ printf "%s/state/retrieval-replication.offset" $p | quote }}
+
+  # ----- control plane -----
+  DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" $p | quote }}
+  DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" $p | quote }}
+  DASH_CONTROL_PLANE_LEASE_PATH: {{ printf "%s/state/control-plane.lease" $p | quote }}
   DASH_CONTROL_PLANE_LEASE_DURATION_MS: {{ .Values.config.controlPlane.leaseDurationMs | quote }}
   DASH_CONTROL_PLANE_LEASE_RENEWAL_MS: {{ .Values.config.controlPlane.leaseRenewalMs | quote }}
-{{- if .Values.secret.create }}
----
-# Per-service Secret split: a compromised pod should only see the
-# keys it needs. Two Secrets keep blast radius small.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "dash.fullname" . }}-retrieval-secrets
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
-  labels:
-    {{- include "dash.labels" . | nindent 4 }}
-    app.kubernetes.io/component: retrieval
-type: Opaque
-stringData:
-  DASH_RETRIEVAL_JWT_PUBLIC_KEY: {{ .Values.secret.jwtPublicKey | default "change-me-jwt-public-key" | quote }}
-  DASH_RETRIEVAL_JWT_HS256_SECRET: {{ .Values.secret.retrieval.hs256Secret | default "change-me-retrieval-jwt" | quote }}
-  DASH_RETRIEVAL_API_KEY: {{ .Values.secret.retrieval.apiKey | default "change-me-retrieval-key" | quote }}
-  DASH_OPENAI_API_KEY: {{ .Values.secret.openaiApiKey | default "change-me-openai-api-key" | quote }}
-  DASH_OLLAMA_BASE_URL: {{ .Values.secret.ollamaBaseUrl | quote }}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "dash.fullname" . }}-ingestion-secrets
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
-  labels:
-    {{- include "dash.labels" . | nindent 4 }}
-    app.kubernetes.io/component: ingestion
-type: Opaque
-stringData:
-  DASH_INGESTION_JWT_PUBLIC_KEY: {{ .Values.secret.jwtPublicKey | default "change-me-jwt-public-key" | quote }}
-  DASH_INGESTION_JWT_HS256_SECRET: {{ .Values.secret.ingestion.hs256Secret | default "change-me-ingest-jwt" | quote }}
-  DASH_INGESTION_API_KEY: {{ .Values.secret.ingestion.apiKey | default "change-me-ingest-key" | quote }}
-{{- end }}

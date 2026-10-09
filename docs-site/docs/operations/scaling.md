@@ -62,7 +62,7 @@ PR 3 is not in the current release. The design doc is at `docs/plans/2026-06-13-
 
 ## ANN index sharding
 
-For tenants with more vectors than fit on a single host, the ANN index is **sharded** by claim-ID range. Each shard is a separate `usearch` HNSW graph on a separate host; the retrieval service fans out the query to all shards and merges the top-*N* results.
+**Planned, not implemented.** Today each retrieval process holds every tenant's ANN graph in memory; there is no cross-host ANN sharding and no query fan-out. The metadata-router and control-plane model shard placements and replicas (a CSV placement file, leader/follower roles per shard), but the retrieval service does not scatter-gather a query across hosts. Sharded cluster mode is scheduled in the master plan (P3). The diagram below shows the intended design.
 
 ```text
                  ┌──────────────────────┐

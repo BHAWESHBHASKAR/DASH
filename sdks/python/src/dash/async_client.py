@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 from types import TracebackType
-from typing import Any, Dict, List, Mapping, Optional, Type, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
 import httpx
 
@@ -33,6 +33,7 @@ from .types import (
     EmbeddingResponse,
     RetrieveRequest,
     RetrieveResponse,
+    TimeRange,
 )
 
 _DEFAULT_TIMEOUT: float = 30.0
@@ -142,11 +143,16 @@ class AsyncClient:
         self,
         tenant_id: str,
         query: str,
-        top_k: int = 10,
+        top_k: int = 5,
         stance_mode: str = "balanced",
         *,
         return_graph: Optional[bool] = None,
         timeout: Optional[float] = None,
+        query_embedding: Optional[Sequence[float]] = None,
+        entity_filters: Optional[Sequence[str]] = None,
+        embedding_id_filters: Optional[Sequence[str]] = None,
+        time_range: Optional[Union[TimeRange, Mapping[str, Any]]] = None,
+        read_consistency: Optional[str] = None,
     ) -> RetrieveResponse:
         """Call ``POST /v1/retrieve`` asynchronously.
 
@@ -159,6 +165,13 @@ class AsyncClient:
             top_k=top_k,
             stance_mode=stance_mode,
             return_graph=return_graph,
+            query_embedding=list(query_embedding) if query_embedding is not None else None,
+            entity_filters=list(entity_filters) if entity_filters is not None else None,
+            embedding_id_filters=(
+                list(embedding_id_filters) if embedding_id_filters is not None else None
+            ),
+            time_range=time_range,
+            read_consistency=read_consistency,
         )
         return await self._request_retrieve(request, timeout=timeout)
 

@@ -1,6 +1,7 @@
 [Unit]
 Description=DASH Retrieval Service
-After=network.target
+After=network.target dash-ingestion.service
+Wants=dash-ingestion.service
 
 [Service]
 Type=simple
@@ -11,11 +12,40 @@ EnvironmentFile=/etc/dash/retrieval.env
 ExecStart=/opt/dash/bin/retrieval --serve
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=30
+
+# Writable state lives under /var/lib/<StateDirectory>; systemd creates it,
+# owns it by the service user, and makes it writable despite ProtectSystem=strict.
+StateDirectory=dash/retrieval
+StateDirectoryMode=0750
+
+# Sandboxing
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/dash
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

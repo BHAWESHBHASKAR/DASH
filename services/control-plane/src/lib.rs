@@ -1,10 +1,15 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::Write,
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    time::Duration,
 };
 
 use auth::sha256_hex;
@@ -14,6 +19,136 @@ use metadata_router::{
 };
 
 pub mod leader;
+pub mod server;
+
+pub use server::ServerConfig;
+use server::{HttpRequest, ReadError, content_length, find_header_end, parse_head, read_request};
+
+/// Authentication policy for the control-plane HTTP API.
+///
+/// The default is [`AuthMode::Deny`]: a state object that was never given a
+/// token rejects every protected route instead of serving it openly.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum AuthMode {
+    /// No credentials configured: every protected route is refused.
+    #[default]
+    Deny,
+    /// Require `Authorization: Bearer <token>` on protected routes.
+    Token(String),
+    /// Explicit local-development escape hatch (`DASH_INSECURE_DEV_MODE=1`).
+    InsecureDev,
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Deny => f.write_str("Deny"),
+            AuthMode::Token(_) => f.write_str("Token(<redacted>)"),
+            AuthMode::InsecureDev => f.write_str("InsecureDev"),
+        }
+    }
+}
+
+impl AuthMode {
+    fn authorize(&self, authorization_header: Option<&str>) -> Result<(), HttpResponse> {
+        match self {
+            AuthMode::InsecureDev => Ok(()),
+            AuthMode::Deny => Err(HttpResponse::error(
+                403,
+                "control-plane authentication is not configured; set DASH_CONTROL_PLANE_TOKEN",
+            )),
+            AuthMode::Token(expected) => {
+                let presented = authorization_header.and_then(|value| {
+                    let value = value.trim();
+                    let (scheme, token) = value.split_once(' ')?;
+                    scheme
+                        .eq_ignore_ascii_case("bearer")
+                        .then_some(token.trim())
+                });
+                match presented {
+                    Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+                        Ok(())
+                    }
+                    _ => Err(HttpResponse::error(401, "missing or invalid bearer token")
+                        .with_header("WWW-Authenticate", "Bearer")),
+                }
+            }
+        }
+    }
+}
+
+/// Compare secrets without an early exit on the first differing byte. Both
+/// inputs are hashed first so the comparison time does not depend on the
+/// length of the expected token either.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let a = sha256_hex(a);
+    let b = sha256_hex(b);
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Result of validating startup security configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityConfig {
+    pub auth: AuthMode,
+    /// Address the server must bind (may differ from the requested one in
+    /// insecure dev mode, where only loopback is permitted).
+    pub bind_addr: String,
+    /// Warnings to log loudly at startup.
+    pub warnings: Vec<String>,
+}
+
+/// Decide the auth mode and bind address from the environment-provided
+/// token and dev-mode flag. Refuses to run without a token unless
+/// `insecure_dev` is set, and then restricts the listener to loopback.
+pub fn resolve_security(
+    token: Option<&str>,
+    insecure_dev: bool,
+    bind_addr: &str,
+) -> Result<SecurityConfig, String> {
+    let token = token.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(token) = token {
+        return Ok(SecurityConfig {
+            auth: AuthMode::Token(token.to_string()),
+            bind_addr: bind_addr.to_string(),
+            warnings: Vec::new(),
+        });
+    }
+    if !insecure_dev {
+        return Err(
+            "DASH_CONTROL_PLANE_TOKEN is required; set it, or set DASH_INSECURE_DEV_MODE=1 for local development only"
+                .to_string(),
+        );
+    }
+    let (host, port) = bind_addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("control-plane bind address '{bind_addr}' must be host:port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let mut warnings = vec![
+        "DASH_INSECURE_DEV_MODE=1: control-plane authentication is DISABLED. Never use this outside local development."
+            .to_string(),
+    ];
+    let bind = if is_loopback {
+        bind_addr.to_string()
+    } else {
+        warnings.push(format!(
+            "insecure dev mode only binds to 127.0.0.1; overriding requested bind host '{host}'"
+        ));
+        format!("127.0.0.1:{port}")
+    };
+    Ok(SecurityConfig {
+        auth: AuthMode::InsecureDev,
+        bind_addr: bind,
+        warnings,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlanePersistence {
@@ -41,11 +176,42 @@ impl ControlPlanePersistence {
     }
 }
 
+/// Whether this node may currently act as leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderStatus {
+    /// Leader. `fencing_token` is the lease epoch (`None` when standalone).
+    Leader {
+        fencing_token: Option<u64>,
+    },
+    Follower,
+}
+
+/// Outcome of one lease maintenance step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseTick {
+    Leader {
+        fencing_token: Option<u64>,
+        newly_acquired: bool,
+    },
+    Follower,
+}
+
+type LagKey = (String, u32, String);
+
 #[derive(Default)]
 pub struct ControlPlanePlacementState {
     placements: Vec<ShardPlacement>,
     persistence: Option<ControlPlanePersistence>,
     lease: Option<Arc<leader::LeaderLease>>,
+    auth: AuthMode,
+    /// Last reported replication lag (in records) per replica. In-memory
+    /// only: after a restart or leader change every lag is "unknown" and a
+    /// promotion needs `force=true`.
+    replica_lag: HashMap<LagKey, u64>,
+    /// Fencing token for which in-memory placements were last synced from
+    /// disk. A mismatch with the live lease epoch forces a reload before the
+    /// node serves or persists anything.
+    synced_lease_epoch: Option<u64>,
 }
 
 impl std::fmt::Debug for ControlPlanePlacementState {
@@ -54,6 +220,7 @@ impl std::fmt::Debug for ControlPlanePlacementState {
             .field("placements", &self.placements)
             .field("persistence", &self.persistence)
             .field("lease", &self.lease.as_ref().map(|_| "..."))
+            .field("auth", &self.auth)
             .finish()
     }
 }
@@ -70,8 +237,7 @@ impl ControlPlanePlacementState {
     pub fn new(placements: Vec<ShardPlacement>) -> Self {
         Self {
             placements,
-            persistence: None,
-            lease: None,
+            ..Self::default()
         }
     }
 
@@ -83,6 +249,23 @@ impl ControlPlanePlacementState {
     pub fn with_lease(mut self, lease: Arc<leader::LeaderLease>) -> Self {
         self.lease = Some(lease);
         self
+    }
+
+    pub fn with_auth(mut self, auth: AuthMode) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    pub fn with_auth_token(self, token: impl Into<String>) -> Self {
+        self.with_auth(AuthMode::Token(token.into()))
+    }
+
+    pub fn auth_mode(&self) -> &AuthMode {
+        &self.auth
+    }
+
+    pub fn lease(&self) -> Option<Arc<leader::LeaderLease>> {
+        self.lease.clone()
     }
 
     pub fn load_persisted_csv(path: &Path) -> Result<Vec<ShardPlacement>, String> {
@@ -169,6 +352,14 @@ impl ControlPlanePlacementState {
         }
     }
 
+    /// The fencing token this node currently holds, if it is the leader.
+    pub fn fencing_token(&self) -> Result<Option<u64>, String> {
+        match &self.lease {
+            Some(lease) => lease.fencing_token(),
+            None => Ok(None),
+        }
+    }
+
     pub fn try_acquire_leader(&self, epoch: u64) -> Result<bool, String> {
         match &self.lease {
             Some(lease) => lease.try_acquire(epoch),
@@ -190,30 +381,116 @@ impl ControlPlanePlacementState {
         }
     }
 
+    /// Reload the persisted placements from disk (the shared source of truth
+    /// when another node was leader) after verifying the checksum. Epoch
+    /// regressions are refused. A missing state file is not an error.
+    pub fn reload_from_disk(&mut self) -> Result<(), String> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        if !persistence.state_path().exists() {
+            return Ok(());
+        }
+        self.verify_checksum_if_configured()?;
+        let loaded = Self::load_persisted_csv(
+            self.persistence
+                .as_ref()
+                .map_or_else(|| Path::new(""), ControlPlanePersistence::state_path),
+        )?;
+        self.replace_placements_monotonic(loaded)
+    }
+
+    /// Verify leadership and make sure in-memory placements reflect the
+    /// latest persisted state for the current fencing token. Call before
+    /// serving placement data or persisting anything.
+    pub fn ensure_leader_synced(&mut self) -> Result<LeaderStatus, String> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(LeaderStatus::Leader {
+                fencing_token: None,
+            });
+        };
+        match lease.fencing_token()? {
+            None => {
+                self.synced_lease_epoch = None;
+                Ok(LeaderStatus::Follower)
+            }
+            Some(token) => {
+                self.sync_for_token(token)?;
+                Ok(LeaderStatus::Leader {
+                    fencing_token: Some(token),
+                })
+            }
+        }
+    }
+
+    fn sync_for_token(&mut self, token: u64) -> Result<(), String> {
+        if self.synced_lease_epoch != Some(token) {
+            self.synced_lease_epoch = None;
+            self.reload_from_disk()
+                .map_err(|err| format!("failed syncing placements after acquiring lease: {err}"))?;
+            self.synced_lease_epoch = Some(token);
+        }
+        Ok(())
+    }
+
+    /// Try to acquire (or extend) the lease and, when leadership is newly
+    /// obtained, reload persisted placements before returning.
+    pub fn try_acquire_and_sync(&mut self) -> Result<LeaderStatus, String> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(LeaderStatus::Leader {
+                fencing_token: None,
+            });
+        };
+        match lease.acquire()? {
+            Some(acquisition) => {
+                if acquisition.newly_acquired {
+                    self.synced_lease_epoch = None;
+                }
+                self.sync_for_token(acquisition.record.epoch)?;
+                Ok(LeaderStatus::Leader {
+                    fencing_token: Some(acquisition.record.epoch),
+                })
+            }
+            None => {
+                self.synced_lease_epoch = None;
+                Ok(LeaderStatus::Follower)
+            }
+        }
+    }
+
+    /// One maintenance step: extend the lease if held, otherwise try to
+    /// acquire it; reload persisted state whenever leadership is new.
+    pub fn maintain_lease(&mut self) -> Result<LeaseTick, String> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(LeaseTick::Leader {
+                fencing_token: None,
+                newly_acquired: false,
+            });
+        };
+        match lease.acquire()? {
+            Some(acquisition) => {
+                let was_synced = self.synced_lease_epoch == Some(acquisition.record.epoch);
+                if acquisition.newly_acquired {
+                    self.synced_lease_epoch = None;
+                }
+                self.sync_for_token(acquisition.record.epoch)?;
+                Ok(LeaseTick::Leader {
+                    fencing_token: Some(acquisition.record.epoch),
+                    newly_acquired: acquisition.newly_acquired || !was_synced,
+                })
+            }
+            None => {
+                self.synced_lease_epoch = None;
+                Ok(LeaseTick::Follower)
+            }
+        }
+    }
+
     pub fn replace_placements_monotonic(
         &mut self,
         candidate: Vec<ShardPlacement>,
     ) -> Result<(), String> {
-        let mut current_epochs: HashMap<(String, u32), u64> = HashMap::new();
-        for placement in &self.placements {
-            current_epochs.insert(
-                (placement.tenant_id.clone(), placement.shard_id),
-                placement.epoch,
-            );
-        }
-
-        for placement in &candidate {
-            let key = (placement.tenant_id.clone(), placement.shard_id);
-            if let Some(current_epoch) = current_epochs.get(&key)
-                && placement.epoch < *current_epoch
-            {
-                return Err(format!(
-                    "epoch regression for tenant '{}' shard {}: current={}, candidate={}",
-                    placement.tenant_id, placement.shard_id, current_epoch, placement.epoch
-                ));
-            }
-        }
-
+        metadata_router::ensure_no_epoch_regression(&self.placements, &candidate)?;
         self.placements = candidate;
         Ok(())
     }
@@ -236,12 +513,57 @@ impl ControlPlanePlacementState {
         Ok(())
     }
 
+    /// Record the replication lag (records behind the shard leader) a
+    /// replica reported. Lag `0` means fully caught up.
+    pub fn report_replica_lag(
+        &mut self,
+        tenant_id: &str,
+        shard_id: u32,
+        node_id: &str,
+        lag: u64,
+    ) -> Result<(), String> {
+        let placement = self
+            .placements
+            .iter()
+            .find(|placement| placement.tenant_id == tenant_id && placement.shard_id == shard_id)
+            .ok_or_else(|| {
+                format!(
+                    "placement not found for tenant '{}' shard {}",
+                    tenant_id, shard_id
+                )
+            })?;
+        if !placement
+            .replicas
+            .iter()
+            .any(|replica| replica.node_id == node_id)
+        {
+            return Err(format!(
+                "replica '{}' not found in shard {}",
+                node_id, shard_id
+            ));
+        }
+        self.replica_lag
+            .insert((tenant_id.to_string(), shard_id, node_id.to_string()), lag);
+        Ok(())
+    }
+
+    pub fn replica_lag(&self, tenant_id: &str, shard_id: u32, node_id: &str) -> Option<u64> {
+        self.replica_lag
+            .get(&(tenant_id.to_string(), shard_id, node_id.to_string()))
+            .copied()
+    }
+
+    /// Promote `node_id` to shard leader. Unless `force` is set, the replica
+    /// must have reported a lag of exactly zero: promoting a replica whose
+    /// lag is unknown or non-zero can discard acknowledged writes.
     pub fn promote_replica(
         &mut self,
         tenant_id: &str,
         shard_id: u32,
         node_id: &str,
+        force: bool,
     ) -> Result<u64, String> {
+        let lag = self.replica_lag(tenant_id, shard_id, node_id);
         let placement = self
             .placements
             .iter_mut()
@@ -253,7 +575,29 @@ impl ControlPlanePlacementState {
                 )
             })?;
 
-        promote_replica_to_leader(placement, node_id).map_err(|err| match err {
+        let already_leader = placement
+            .replicas
+            .iter()
+            .any(|replica| replica.node_id == node_id && replica.role == ReplicaRole::Leader);
+        if !force && !already_leader && placement.replicas.iter().any(|r| r.node_id == node_id) {
+            match lag {
+                Some(0) => {}
+                Some(behind) => {
+                    return Err(format!(
+                        "replica '{}' is {} records behind; refusing promotion (pass force=true to override)",
+                        node_id, behind
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "replica '{}' has no reported replication lag; refusing promotion (report lag or pass force=true)",
+                        node_id
+                    ));
+                }
+            }
+        }
+
+        let epoch = promote_replica_to_leader(placement, node_id).map_err(|err| match err {
             PlacementRouteError::ReplicaNotFound { .. } => {
                 format!("replica '{}' not found in shard {}", node_id, shard_id)
             }
@@ -261,7 +605,13 @@ impl ControlPlanePlacementState {
                 format!("replica '{}' is not promotable due to health", node_id)
             }
             other => format!("promotion failed: {other:?}"),
-        })
+        })?;
+        if !already_leader {
+            // Lag figures were relative to the old leader and are now moot.
+            self.replica_lag
+                .retain(|(tenant, shard, _), _| !(tenant == tenant_id && *shard == shard_id));
+        }
+        Ok(epoch)
     }
 
     pub fn persist_if_configured(&self) -> Result<(), String> {
@@ -286,11 +636,16 @@ impl ControlPlanePlacementState {
                     .replicas
                     .iter()
                     .map(|replica| {
+                        let lag_json = self
+                            .replica_lag(&placement.tenant_id, placement.shard_id, &replica.node_id)
+                            .map(|lag| format!(",\"replica_lag\":{lag}"))
+                            .unwrap_or_default();
                         format!(
-                            "{{\"node_id\":\"{}\",\"role\":\"{}\",\"health\":\"{}\"}}",
+                            "{{\"node_id\":\"{}\",\"role\":\"{}\",\"health\":\"{}\"{}}}",
                             json_escape(&replica.node_id),
                             replica_role_str(replica.role),
                             replica_health_str(replica.health),
+                            lag_json,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -314,19 +669,131 @@ impl ControlPlanePlacementState {
     }
 }
 
+/// Drives lease renewal and re-acquisition for a node. Unlike the previous
+/// renewal thread it never exits: after losing leadership it keeps trying to
+/// re-acquire with exponential backoff, reloading persisted placements each
+/// time it becomes leader again.
+pub struct LeaseMaintainer {
+    state: Arc<Mutex<ControlPlanePlacementState>>,
+    backoff: leader::Backoff,
+    renewal_interval: Duration,
+    was_leader: Option<bool>,
+}
+
+impl LeaseMaintainer {
+    pub fn new(
+        state: Arc<Mutex<ControlPlanePlacementState>>,
+        renewal_interval: Duration,
+        lease_duration: Duration,
+    ) -> Self {
+        let max_backoff = (lease_duration / 2).max(renewal_interval);
+        Self {
+            state,
+            backoff: leader::Backoff::new(renewal_interval, max_backoff),
+            renewal_interval,
+            was_leader: None,
+        }
+    }
+
+    /// Run one maintenance step and return how long to wait before the next.
+    pub fn step(&mut self) -> Duration {
+        let result = match self.state.lock() {
+            Ok(mut guard) => guard.maintain_lease(),
+            Err(_) => Err("control-plane state lock poisoned".to_string()),
+        };
+        match result {
+            Ok(LeaseTick::Leader {
+                fencing_token,
+                newly_acquired,
+            }) => {
+                if newly_acquired || self.was_leader != Some(true) {
+                    eprintln!(
+                        "control-plane acquired leader lease (fencing token {})",
+                        fencing_token.map_or("none".to_string(), |token| token.to_string())
+                    );
+                }
+                self.was_leader = Some(true);
+                self.backoff.reset();
+                self.renewal_interval
+            }
+            Ok(LeaseTick::Follower) => {
+                if self.was_leader != Some(false) {
+                    eprintln!(
+                        "control-plane is not the leader; will keep retrying acquisition with backoff"
+                    );
+                }
+                self.was_leader = Some(false);
+                self.backoff.next_delay()
+            }
+            Err(err) => {
+                eprintln!("control-plane lease maintenance failed: {err}");
+                self.backoff.next_delay()
+            }
+        }
+    }
+
+    /// Loop forever.
+    pub fn run(mut self) -> ! {
+        loop {
+            let delay = self.step();
+            std::thread::sleep(delay);
+        }
+    }
+}
+
+/// Serve on `bind_addr` with configuration from the environment.
 pub fn serve_http(
     bind_addr: &str,
     state: Arc<Mutex<ControlPlanePlacementState>>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind_addr)?;
-    for stream in listener.incoming() {
+    serve_listener(listener, state, ServerConfig::from_env())
+}
+
+/// Serve connections from `listener` using a bounded worker pool. When all
+/// workers are busy and the queue is full, new connections receive an
+/// immediate 503 instead of spawning unbounded threads.
+pub fn serve_listener(
+    listener: TcpListener,
+    state: Arc<Mutex<ControlPlanePlacementState>>,
+    config: ServerConfig,
+) -> std::io::Result<()> {
+    let (sender, receiver) = mpsc::sync_channel::<TcpStream>(config.queue_depth.max(1));
+    let receiver = Arc::new(Mutex::new(receiver));
+    let config = Arc::new(config);
+    for index in 0..config.workers.max(1) {
+        let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
+        let config = Arc::clone(&config);
+        std::thread::Builder::new()
+            .name(format!("control-plane-worker-{index}"))
+            .spawn(move || {
+                loop {
+                    let next = match receiver.lock() {
+                        Ok(guard) => guard.recv(),
+                        Err(_) => return,
+                    };
+                    match next {
+                        Ok(stream) => {
+                            let _ = handle_connection(stream, &state, &config);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            })?;
+    }
+    for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                std::thread::spawn(move || {
-                    let _ = handle_connection(stream, state);
-                });
-            }
+            Ok(stream) => match sender.try_send(stream) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(mut stream)) => {
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let response = HttpResponse::error(503, "control-plane is overloaded")
+                        .with_header("Retry-After", "1");
+                    let _ = stream.write_all(render_response_text(&response).as_bytes());
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            },
             Err(err) => eprintln!("control-plane accept error: {err}"),
         }
     }
@@ -337,32 +804,39 @@ pub fn handle_http_request_bytes(
     state: &Arc<Mutex<ControlPlanePlacementState>>,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let request_text =
-        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
-    let request = parse_http_request_text(request_text)?;
+    let header_end =
+        find_header_end(raw_request).ok_or_else(|| "missing HTTP header terminator".to_string())?;
+    let head = std::str::from_utf8(&raw_request[..header_end])
+        .map_err(|_| "request must be valid UTF-8".to_string())?;
+    let mut request = parse_head(head)?;
+    let body = &raw_request[header_end + 4..];
+    if content_length(&request)? != body.len() {
+        return Err("content-length does not match body size".to_string());
+    }
+    request.body = body.to_vec();
     let response = handle_request(state, request);
     Ok(render_response_text(&response).into_bytes())
 }
 
 fn handle_connection(
     mut stream: TcpStream,
-    state: Arc<Mutex<ControlPlanePlacementState>>,
+    state: &Arc<Mutex<ControlPlanePlacementState>>,
+    config: &ServerConfig,
 ) -> std::io::Result<()> {
-    let mut request_bytes = Vec::new();
-    stream.read_to_end(&mut request_bytes)?;
-    let response = match handle_http_request_bytes(&state, &request_bytes) {
-        Ok(bytes) => bytes,
-        Err(reason) => render_response_text(&HttpResponse::bad_request(&reason)).into_bytes(),
+    stream.set_write_timeout(Some(config.write_timeout))?;
+    let response = match read_request(&mut stream, config) {
+        Ok(request) => handle_request(state, request),
+        Err(ReadError::Closed) => return Ok(()),
+        Err(ReadError::Io(err)) => return Err(err),
+        Err(ReadError::Timeout) => HttpResponse::error(408, "request timed out"),
+        Err(ReadError::HeaderTooLarge) => HttpResponse::error(431, "request headers too large"),
+        Err(ReadError::BodyTooLarge) => HttpResponse::error(413, "request body too large"),
+        Err(ReadError::Malformed(reason)) => HttpResponse::bad_request(&reason),
     };
-    stream.write_all(&response)?;
-    stream.flush()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpRequest {
-    method: String,
-    target: String,
-    body: Vec<u8>,
+    stream.write_all(render_response_text(&response).as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +844,7 @@ struct HttpResponse {
     status: u16,
     content_type: &'static str,
     body: String,
+    headers: Vec<(&'static str, String)>,
 }
 
 impl HttpResponse {
@@ -378,6 +853,7 @@ impl HttpResponse {
             status: 200,
             content_type: "application/json",
             body,
+            headers: Vec::new(),
         }
     }
 
@@ -386,6 +862,7 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; charset=utf-8",
             body,
+            headers: Vec::new(),
         }
     }
 
@@ -394,6 +871,7 @@ impl HttpResponse {
             status,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(reason)),
+            headers: Vec::new(),
         }
     }
 
@@ -408,44 +886,65 @@ impl HttpResponse {
     fn method_not_allowed(reason: &str) -> Self {
         Self::error(405, reason)
     }
-}
 
-fn parse_http_request_text(text: &str) -> Result<HttpRequest, String> {
-    let (header_block, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-    let mut lines = header_block.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts
-        .next()
-        .ok_or_else(|| "missing HTTP method".to_string())?;
-    let target = request_parts
-        .next()
-        .ok_or_else(|| "missing request target".to_string())?;
+    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
 
-    let mut content_length = 0usize;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "invalid content-length header".to_string())?;
+    /// Mark the response as coming from the leader, with its fencing token.
+    fn marked_leader(self, fencing_token: Option<u64>) -> Self {
+        let response = self.with_header("X-Dash-Leader", "true");
+        match fencing_token {
+            Some(token) => response.with_header("X-Dash-Fencing-Token", token.to_string()),
+            None => response,
         }
     }
-    if content_length != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
+}
 
-    Ok(HttpRequest {
-        method: method.to_string(),
-        target: target.to_string(),
-        body: body.as_bytes().to_vec(),
-    })
+fn fencing_json(token: Option<u64>) -> String {
+    token.map_or_else(|| "null".to_string(), |token| token.to_string())
+}
+
+fn lock_state(
+    state: &Arc<Mutex<ControlPlanePlacementState>>,
+) -> Result<MutexGuard<'_, ControlPlanePlacementState>, HttpResponse> {
+    state
+        .lock()
+        .map_err(|_| HttpResponse::error(500, "control-plane state lock unavailable"))
+}
+
+/// Gate a request on this node being the leader with up-to-date state.
+/// Followers answer 503 with `X-Dash-Leader: false` instead of serving
+/// possibly stale data.
+fn require_leader(
+    guard: &mut ControlPlanePlacementState,
+    follower_message: &str,
+) -> Result<Option<u64>, HttpResponse> {
+    match guard.ensure_leader_synced() {
+        Ok(LeaderStatus::Leader { fencing_token }) => Ok(fencing_token),
+        Ok(LeaderStatus::Follower) => {
+            let leader_hint = guard
+                .current_leader_info()
+                .ok()
+                .flatten()
+                .map(|record| record.node_id);
+            let mut response =
+                HttpResponse::error(503, follower_message).with_header("X-Dash-Leader", "false");
+            if let Some(leader) = leader_hint
+                && !leader.contains(['\r', '\n'])
+            {
+                response = response.with_header("X-Dash-Leader-Node", leader);
+            }
+            Err(response)
+        }
+        Err(reason) => Err(HttpResponse::error(500, &reason)),
+    }
+}
+
+fn requires_auth(path: &str) -> bool {
+    path.starts_with("/v1/control-plane/")
+        && !matches!(path, "/v1/control-plane/health" | "/v1/control-plane/ready")
 }
 
 fn handle_request(
@@ -453,14 +952,25 @@ fn handle_request(
     request: HttpRequest,
 ) -> HttpResponse {
     let (path, query) = split_target(&request.target);
+
+    if requires_auth(&path) {
+        let auth = match lock_state(state) {
+            Ok(guard) => guard.auth_mode().clone(),
+            Err(response) => return response,
+        };
+        if let Err(response) = auth.authorize(request.header("authorization")) {
+            return response;
+        }
+    }
+
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/health") | ("GET", "/v1/control-plane/health") => {
             HttpResponse::ok_json("{\"status\":\"ok\"}".to_string())
         }
         ("GET", "/ready") | ("GET", "/v1/control-plane/ready") => {
-            let guard = match state.lock() {
+            let guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
             };
             match guard.is_leader() {
                 Ok(true) => {
@@ -471,9 +981,9 @@ fn handle_request(
             }
         }
         ("GET", "/v1/control-plane/leader") => {
-            let guard = match state.lock() {
+            let guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
             };
             let info = match guard.current_leader_info() {
                 Ok(Some(record)) => record,
@@ -483,43 +993,56 @@ fn handle_request(
             let local = guard.local_node_id_or_unknown();
             let is_leader = info.node_id == local;
             HttpResponse::ok_json(format!(
-                "{{\"is_leader\":{},\"leader_node_id\":\"{}\",\"epoch\":{},\"expires_at_ms\":{},\"local_node_id\":\"{}\"}}",
+                "{{\"is_leader\":{},\"leader_node_id\":\"{}\",\"epoch\":{},\"fencing_token\":{},\"expires_at_ms\":{},\"local_node_id\":\"{}\"}}",
                 is_leader,
                 json_escape(&info.node_id),
+                info.epoch,
                 info.epoch,
                 info.expires_at_ms,
                 json_escape(&local)
             ))
         }
         ("POST", "/v1/control-plane/leader/acquire") => {
-            let guard = match state.lock() {
+            let mut guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
             };
-            let epoch = guard.highest_epoch();
-            match guard.try_acquire_leader(epoch) {
-                Ok(true) => HttpResponse::ok_json(format!(
-                    "{{\"status\":\"ok\",\"is_leader\":true,\"node_id\":\"{}\",\"epoch\":{}}}",
+            match guard.try_acquire_and_sync() {
+                Ok(LeaderStatus::Leader { fencing_token }) => HttpResponse::ok_json(format!(
+                    "{{\"status\":\"ok\",\"is_leader\":true,\"node_id\":\"{}\",\"epoch\":{},\"fencing_token\":{},\"placement_epoch\":{}}}",
                     json_escape(&guard.local_node_id_or_unknown()),
-                    epoch
-                )),
-                Ok(false) => HttpResponse::error(503, "leader lease is held by another node"),
+                    fencing_token.unwrap_or_else(|| guard.highest_epoch()),
+                    fencing_json(fencing_token),
+                    guard.highest_epoch(),
+                ))
+                .marked_leader(fencing_token),
+                Ok(LeaderStatus::Follower) => {
+                    HttpResponse::error(503, "leader lease is held by another node")
+                }
                 Err(reason) => HttpResponse::error(500, &reason),
             }
         }
         ("GET", "/v1/control-plane/placement") => {
-            let guard = match state.lock() {
+            let mut guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
             };
-            if query
+            let token = match require_leader(
+                &mut guard,
+                "this node is a follower and may hold stale placements; query the leader",
+            ) {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
+            let response = if query
                 .get("format")
                 .is_some_and(|value| value.eq_ignore_ascii_case("csv"))
             {
                 HttpResponse::ok_text(render_shard_placements_csv(guard.placements()))
             } else {
                 HttpResponse::ok_json(guard.render_placement_json())
-            }
+            };
+            response.marked_leader(token)
         }
         ("PUT", "/v1/control-plane/placement") => {
             let expected_epoch = match parse_optional_u64(query.get("expected_epoch")) {
@@ -530,15 +1053,14 @@ fn handle_request(
                 Ok(value) => value,
                 Err(_) => return HttpResponse::bad_request("placement body must be UTF-8 CSV"),
             };
-            let mut guard = match state.lock() {
+            let mut guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
             };
-            if let Err(reason) = guard.is_leader() {
-                return HttpResponse::error(500, &reason);
-            } else if !guard.is_leader().unwrap_or(false) {
-                return HttpResponse::error(503, "only the leader may update placements");
-            }
+            let token = match require_leader(&mut guard, "only the leader may update placements") {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
             if let Err(reason) = guard.cas_matches(expected_epoch) {
                 return HttpResponse::error(409, &reason);
             }
@@ -546,10 +1068,12 @@ fn handle_request(
             match guard.replace_placements_from_csv_monotonic(csv) {
                 Ok(()) => match guard.persist_if_configured() {
                     Ok(()) => HttpResponse::ok_json(format!(
-                        "{{\"status\":\"ok\",\"placement_count\":{},\"commit_epoch\":{}}}",
+                        "{{\"status\":\"ok\",\"placement_count\":{},\"commit_epoch\":{},\"fencing_token\":{}}}",
                         guard.placements().len(),
                         guard.highest_epoch(),
-                    )),
+                        fencing_json(token),
+                    ))
+                    .marked_leader(token),
                     Err(reason) => {
                         guard.placements = previous;
                         let _ = guard.persist_if_configured();
@@ -564,16 +1088,6 @@ fn handle_request(
                 Ok(value) => value,
                 Err(reason) => return HttpResponse::bad_request(&reason),
             };
-            let guard = match state.lock() {
-                Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
-            };
-            if let Err(reason) = guard.is_leader() {
-                return HttpResponse::error(500, &reason);
-            } else if !guard.is_leader().unwrap_or(false) {
-                return HttpResponse::error(503, "only the leader may promote a replica");
-            }
-            drop(guard);
             let tenant_id = match query.get("tenant_id") {
                 Some(value) if !value.trim().is_empty() => value.trim(),
                 _ => {
@@ -601,25 +1115,37 @@ fn handle_request(
                     );
                 }
             };
-            let mut guard = match state.lock() {
+            let force = query
+                .get("force")
+                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "True"));
+            let mut guard = match lock_state(state) {
                 Ok(guard) => guard,
-                Err(_) => return HttpResponse::error(500, "control-plane state lock unavailable"),
+                Err(response) => return response,
+            };
+            let token = match require_leader(&mut guard, "only the leader may promote a replica") {
+                Ok(token) => token,
+                Err(response) => return response,
             };
             if let Err(reason) = guard.cas_matches(expected_epoch) {
                 return HttpResponse::error(409, &reason);
             }
             let previous = guard.placements.clone();
-            match guard.promote_replica(tenant_id, shard_id, node_id) {
+            let previous_lag = guard.replica_lag.clone();
+            match guard.promote_replica(tenant_id, shard_id, node_id, force) {
                 Ok(epoch) => match guard.persist_if_configured() {
                     Ok(()) => HttpResponse::ok_json(format!(
-                        "{{\"status\":\"ok\",\"tenant_id\":\"{}\",\"shard_id\":{},\"leader_node_id\":\"{}\",\"epoch\":{}}}",
+                        "{{\"status\":\"ok\",\"tenant_id\":\"{}\",\"shard_id\":{},\"leader_node_id\":\"{}\",\"epoch\":{},\"fencing_token\":{},\"forced\":{}}}",
                         json_escape(tenant_id),
                         shard_id,
                         json_escape(node_id),
-                        epoch
-                    )),
+                        epoch,
+                        fencing_json(token),
+                        force,
+                    ))
+                    .marked_leader(token),
                     Err(reason) => {
                         guard.placements = previous;
+                        guard.replica_lag = previous_lag;
                         let _ = guard.persist_if_configured();
                         HttpResponse::error(500, &reason)
                     }
@@ -627,10 +1153,52 @@ fn handle_request(
                 Err(reason) => HttpResponse::error(409, &reason),
             }
         }
+        ("POST", "/v1/control-plane/replica-lag") => {
+            let tenant_id = match query.get("tenant_id") {
+                Some(value) if !value.trim().is_empty() => value.trim(),
+                _ => return HttpResponse::bad_request("tenant_id query parameter is required"),
+            };
+            let shard_id = match query
+                .get("shard_id")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                Some(value) => value,
+                None => {
+                    return HttpResponse::bad_request(
+                        "shard_id query parameter must be a valid u32",
+                    );
+                }
+            };
+            let node_id = match query.get("node_id") {
+                Some(value) if !value.trim().is_empty() => value.trim(),
+                _ => return HttpResponse::bad_request("node_id query parameter is required"),
+            };
+            let lag = match query
+                .get("lag")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+            {
+                Some(value) => value,
+                None => return HttpResponse::bad_request("lag query parameter must be a u64"),
+            };
+            let mut guard = match lock_state(state) {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            };
+            let token = match require_leader(&mut guard, "only the leader accepts lag reports") {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
+            match guard.report_replica_lag(tenant_id, shard_id, node_id, lag) {
+                Ok(()) => {
+                    HttpResponse::ok_json("{\"status\":\"ok\"}".to_string()).marked_leader(token)
+                }
+                Err(reason) => HttpResponse::error(404, &reason),
+            }
+        }
         (_, "/v1/control-plane/placement") => {
             HttpResponse::method_not_allowed("only GET and PUT are supported")
         }
-        (_, "/v1/control-plane/failover/promote") => {
+        (_, "/v1/control-plane/failover/promote") | (_, "/v1/control-plane/replica-lag") => {
             HttpResponse::method_not_allowed("only POST is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
@@ -671,52 +1239,93 @@ fn parse_optional_u64(value: Option<&String>) -> Result<Option<u64>, String> {
     }
 }
 
+static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Durable atomic replace: temp file, fsync, rename, fsync of the directory.
 fn persist_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed creating parent directory '{}': {err}",
-                parent.display()
-            )
-        })?;
-    }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    fs::create_dir_all(&parent).map_err(|err| {
+        format!(
+            "failed creating parent directory '{}': {err}",
+            parent.display()
+        )
+    })?;
     let tmp_path = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
-        std::thread::current().name().unwrap_or("control-plane")
+        PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&tmp_path, bytes).map_err(|err| {
-        format!(
-            "failed writing temp persistence file '{}': {err}",
-            tmp_path.display()
-        )
-    })?;
+    let write_result = (|| -> Result<(), String> {
+        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+            format!(
+                "failed creating temp persistence file '{}': {err}",
+                tmp_path.display()
+            )
+        })?;
+        file.write_all(bytes).map_err(|err| {
+            format!(
+                "failed writing temp persistence file '{}': {err}",
+                tmp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "failed syncing temp persistence file '{}': {err}",
+                tmp_path.display()
+            )
+        })
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
     fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
         format!(
             "failed renaming '{}' to '{}': {err}",
             tmp_path.display(),
             path.display()
         )
-    })
+    })?;
+    fs::File::open(&parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| {
+            format!(
+                "failed syncing parent directory '{}': {err}",
+                parent.display()
+            )
+        })
 }
 
 fn render_response_text(response: &HttpResponse) -> String {
     let status_text = match response.status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
+    let mut extra = String::new();
+    for (name, value) in &response.headers {
+        extra.push_str(&format!("{name}: {value}\r\n"));
+    }
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
         response.status,
         status_text,
         response.content_type,
         response.body.len(),
+        extra,
         response.body
     )
 }
@@ -746,132 +1355,4 @@ fn replica_health_str(health: metadata_router::ReplicaHealth) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use metadata_router::{ReplicaHealth, ReplicaPlacement};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn sample_placements(epoch: u64) -> Vec<ShardPlacement> {
-        vec![ShardPlacement {
-            tenant_id: "tenant-a".to_string(),
-            shard_id: 1,
-            epoch,
-            replicas: vec![
-                ReplicaPlacement {
-                    node_id: "node-a".to_string(),
-                    role: ReplicaRole::Leader,
-                    health: ReplicaHealth::Healthy,
-                },
-                ReplicaPlacement {
-                    node_id: "node-b".to_string(),
-                    role: ReplicaRole::Follower,
-                    health: ReplicaHealth::Healthy,
-                },
-            ],
-        }]
-    }
-
-    #[test]
-    fn replace_placements_monotonic_rejects_epoch_regression() {
-        let mut state = ControlPlanePlacementState::new(sample_placements(7));
-        let err = state
-            .replace_placements_monotonic(sample_placements(6))
-            .expect_err("epoch regression should fail");
-        assert!(err.contains("epoch regression"));
-    }
-
-    #[test]
-    fn promote_replica_increments_epoch_and_flips_leader() {
-        let mut state = ControlPlanePlacementState::new(sample_placements(7));
-        let epoch = state
-            .promote_replica("tenant-a", 1, "node-b")
-            .expect("promotion should succeed");
-        assert_eq!(epoch, 8);
-        let leader = state.placements()[0]
-            .replicas
-            .iter()
-            .find(|replica| replica.role == ReplicaRole::Leader)
-            .expect("leader should exist");
-        assert_eq!(leader.node_id, "node-b");
-    }
-
-    #[test]
-    fn http_get_placement_csv_returns_csv() {
-        let state = Arc::new(Mutex::new(ControlPlanePlacementState::new(
-            sample_placements(2),
-        )));
-        let request = b"GET /v1/control-plane/placement?format=csv HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
-        let response = handle_http_request_bytes(&state, request).expect("request should parse");
-        let text = String::from_utf8(response).expect("response should be utf8");
-        assert!(text.contains("HTTP/1.1 200 OK"));
-        assert!(text.contains("tenant-a,1,2,node-a,leader,healthy"));
-    }
-
-    #[test]
-    fn put_placement_rejects_stale_expected_epoch() {
-        let state = Arc::new(Mutex::new(ControlPlanePlacementState::new(
-            sample_placements(7),
-        )));
-        let csv = "tenant-a,1,8,node-a,leader,healthy\ntenant-a,1,8,node-b,follower,healthy\n";
-        let request = format!(
-            "PUT /v1/control-plane/placement?expected_epoch=6 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
-            csv.len(),
-            csv
-        );
-        let response =
-            handle_http_request_bytes(&state, request.as_bytes()).expect("request should parse");
-        let text = String::from_utf8(response).expect("response should be utf8");
-        assert!(text.contains("HTTP/1.1 409 Conflict"));
-        assert!(text.contains("stale placement epoch"));
-    }
-
-    #[test]
-    fn persistence_round_trip_replays_on_restart() {
-        let temp_root = unique_temp_dir("control-plane-persist-replay");
-        let state_path = temp_root.join("placement.csv");
-        let checksum_path = temp_root.join("placement.csv.sha256");
-        let persistence = ControlPlanePersistence::new(state_path.clone(), Some(checksum_path))
-            .expect("persistence config should be valid");
-
-        let state =
-            ControlPlanePlacementState::new(sample_placements(9)).with_persistence(persistence);
-        state
-            .persist_if_configured()
-            .expect("persistence should succeed");
-        let loaded = ControlPlanePlacementState::load_persisted_csv(&state_path)
-            .expect("persisted state should parse");
-        assert_eq!(loaded, sample_placements(9));
-        state
-            .verify_checksum_if_configured()
-            .expect("checksum should verify");
-    }
-
-    #[test]
-    fn checksum_mismatch_is_rejected() {
-        let temp_root = unique_temp_dir("control-plane-checksum-mismatch");
-        let state_path = temp_root.join("placement.csv");
-        let checksum_path = temp_root.join("placement.csv.sha256");
-        let persistence = ControlPlanePersistence::new(state_path.clone(), Some(checksum_path))
-            .expect("persistence config should be valid");
-        let state =
-            ControlPlanePlacementState::new(sample_placements(11)).with_persistence(persistence);
-        state
-            .persist_if_configured()
-            .expect("persist should succeed");
-        fs::write(&state_path, "tampered\n").expect("tamper write should succeed");
-        let err = state
-            .verify_checksum_if_configured()
-            .expect_err("tamper should be detected");
-        assert!(err.contains("checksum mismatch"));
-    }
-
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be valid")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("dash-{prefix}-{nanos}"));
-        fs::create_dir_all(&dir).expect("temp dir should be creatable");
-        dir
-    }
-}
+mod tests;

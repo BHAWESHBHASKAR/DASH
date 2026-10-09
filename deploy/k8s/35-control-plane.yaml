@@ -1,0 +1,185 @@
+---
+# Control plane: shard placement metadata and leader lease. Not exposed
+# through the Ingress; it is reachable only inside the cluster (see
+# 50-networkpolicy.yaml). Leader election is file-backed, so exactly one
+# replica is supported. Requires the dash-control-plane-secrets Secret
+# (DASH_CONTROL_PLANE_TOKEN), see 11-secrets.yaml.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dash-control-plane
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: control-plane
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dash-control-plane
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: control-plane
+  ports:
+  - name: http
+    port: 8090
+    targetPort: http
+    protocol: TCP
+    appProtocol: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dash-control-plane
+  namespace: dash-system
+  labels:
+    app.kubernetes.io/part-of: dash
+    app.kubernetes.io/name: dash
+    app.kubernetes.io/component: control-plane
+spec:
+  serviceName: dash-control-plane
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dash
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: dash
+        app.kubernetes.io/name: dash
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: dash-control-plane
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      initContainers:
+      # A fresh PVC is empty; create the directories the service writes to.
+      - name: init-data-dirs
+        image: ghcr.io/bhaweshbhaskar/dash-control-plane:0.2.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "mkdir -p /var/lib/dash/state"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 32Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          privileged: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/dash
+      containers:
+      - name: control-plane
+        image: ghcr.io/bhaweshbhaskar/dash-control-plane:0.2.0
+        imagePullPolicy: IfNotPresent
+        # Matches the image ENTRYPOINT (/opt/dash/bin/dash-entrypoint), which
+        # selects the binary from DASH_BIN.
+        command: ["/opt/dash/bin/dash-entrypoint"]
+        args: ["--serve"]
+        env:
+        - name: DASH_BIN
+          value: "control-plane"
+        - name: DASH_CONTROL_PLANE_NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        envFrom:
+        - configMapRef:
+            name: dash-config
+        - secretRef:
+            name: dash-control-plane-secrets
+        ports:
+        - name: http
+          containerPort: 8090
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+            ephemeral-storage: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+            ephemeral-storage: 512Mi
+        startupProbe:
+          httpGet:
+            path: /v1/control-plane/ready
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /v1/control-plane/health
+            port: http
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /v1/control-plane/ready
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          privileged: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/dash
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Mi
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app.kubernetes.io/part-of: dash
+        app.kubernetes.io/component: control-plane
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard
+      resources:
+        requests:
+          storage: 1Gi

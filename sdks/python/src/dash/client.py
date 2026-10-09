@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 from types import TracebackType
-from typing import Any, Dict, List, Mapping, Optional, Type, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
 import requests
 
@@ -38,6 +38,7 @@ from .types import (
     RetrieveRequest,
     RetrieveResponse,
     RetrieveResult,
+    TimeRange,
 )
 
 # Default timeout (seconds) for connect+read. ``None`` would disable
@@ -173,11 +174,16 @@ class Client:
         self,
         tenant_id: str,
         query: str,
-        top_k: int = 10,
+        top_k: int = 5,
         stance_mode: str = "balanced",
         *,
         return_graph: Optional[bool] = None,
         timeout: Optional[float] = None,
+        query_embedding: Optional[Sequence[float]] = None,
+        entity_filters: Optional[Sequence[str]] = None,
+        embedding_id_filters: Optional[Sequence[str]] = None,
+        time_range: Optional[Union[TimeRange, Mapping[str, Any]]] = None,
+        read_consistency: Optional[str] = None,
     ) -> RetrieveResponse:
         """Call ``POST /v1/retrieve`` and return a typed response.
 
@@ -188,7 +194,7 @@ class Client:
         query:
             Free-text query.
         top_k:
-            Maximum number of claims to return.
+            Maximum number of claims to return (server default 5).
         stance_mode:
             Either ``"balanced"`` (default) or ``"support_only"``.
             ``"support_only"`` filters out claims whose contradiction
@@ -199,6 +205,18 @@ class Client:
         timeout:
             Per-request timeout in seconds. Overrides the client
             default.
+        query_embedding:
+            Optional pre-computed query vector (skips server-side
+            embedding).
+        entity_filters / embedding_id_filters:
+            Optional lists restricting results to the given entities or
+            embedding ids.
+        time_range:
+            Optional :class:`TimeRange` (or a mapping with ``from_unix``
+            / ``to_unix``) restricting results by event time.
+        read_consistency:
+            Optional read consistency policy name (for example
+            ``"one"`` or ``"quorum"``).
         """
         request = RetrieveRequest(
             tenant_id=tenant_id,
@@ -206,6 +224,13 @@ class Client:
             top_k=top_k,
             stance_mode=stance_mode,
             return_graph=return_graph,
+            query_embedding=list(query_embedding) if query_embedding is not None else None,
+            entity_filters=list(entity_filters) if entity_filters is not None else None,
+            embedding_id_filters=(
+                list(embedding_id_filters) if embedding_id_filters is not None else None
+            ),
+            time_range=time_range,
+            read_consistency=read_consistency,
         )
         return self._request_retrieve(request, timeout=timeout)
 

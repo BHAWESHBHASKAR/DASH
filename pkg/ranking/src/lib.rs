@@ -65,6 +65,27 @@ pub fn bm25_score(
     score.max(0.0)
 }
 
+/// Marginal support bonus of the first distinct source (same slope as the
+/// historical linear `0.08 * n` near zero).
+pub const SUPPORT_PER_SOURCE: f32 = 0.08;
+/// Marginal contradiction penalty of the first distinct source.
+pub const CONTRADICTION_PER_SOURCE: f32 = 0.1;
+/// Hard ceiling on the support bonus, however many sources there are.
+pub const MAX_SUPPORT_BONUS: f32 = 0.4;
+/// Hard ceiling on the contradiction penalty.
+pub const MAX_CONTRADICTION_PENALTY: f32 = 0.5;
+
+/// Saturating contribution of `count` distinct sources: roughly linear
+/// (`count * per_source`) for small counts and bounded by `cap`
+/// (IDX-05), so an author cannot buy rank by stacking supporting
+/// edges or evidence.
+pub fn saturating_signal(count: usize, per_source: f32, cap: f32) -> f32 {
+    if count == 0 || cap <= 0.0 || per_source <= 0.0 {
+        return 0.0;
+    }
+    cap * ((count as f32 * per_source) / cap).tanh()
+}
+
 pub fn score_claim_with_bm25(
     query: &str,
     claim: &Claim,
@@ -83,8 +104,12 @@ pub fn score_claim(
     signals: RankSignals,
 ) -> f32 {
     let semantic = lexical_overlap_score(query, &claim.canonical_text);
-    let support_score = signals.supports as f32 * 0.08;
-    let contradiction_penalty = signals.contradicts as f32 * 0.1;
+    let support_score = saturating_signal(signals.supports, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+    let contradiction_penalty = saturating_signal(
+        signals.contradicts,
+        CONTRADICTION_PER_SOURCE,
+        MAX_CONTRADICTION_PENALTY,
+    );
     let quality = avg_source_quality * 0.15;
     let confidence = claim.confidence * 0.25;
 
@@ -139,6 +164,55 @@ mod tests {
             },
         );
         assert!(with_support > with_contradiction);
+    }
+
+    #[test]
+    fn support_bonus_saturates_instead_of_growing_linearly() {
+        // Old formula: 0.08 * n, i.e. 80.0 for n = 1000.
+        let huge = saturating_signal(1000, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+        assert!(huge <= MAX_SUPPORT_BONUS + 1e-6, "bonus {huge} exceeds cap");
+        let many = saturating_signal(50, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+        assert!((huge - many).abs() < 0.01, "bonus should plateau");
+    }
+
+    #[test]
+    fn saturating_signal_is_monotonic_and_near_linear_for_small_counts() {
+        let mut previous = 0.0;
+        for n in 0..20 {
+            let value = saturating_signal(n, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+            assert!(value >= previous);
+            previous = value;
+        }
+        let one = saturating_signal(1, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+        assert!((one - 0.08).abs() < 0.005);
+        assert_eq!(saturating_signal(0, 0.08, 0.4), 0.0);
+    }
+
+    #[test]
+    fn contradiction_penalty_is_capped() {
+        let claim = Claim {
+            claim_id: "c1".into(),
+            tenant_id: "t1".into(),
+            canonical_text: "alpha beta".into(),
+            confidence: 0.5,
+            event_time_unix: None,
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: None,
+            valid_to: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let signals = |contradicts| RankSignals {
+            supports: 0,
+            contradicts,
+        };
+        let a = score_claim("alpha", &claim, 0.5, signals(100));
+        let b = score_claim("alpha", &claim, 0.5, signals(100_000));
+        assert!((a - b).abs() < 1e-3);
+        let none = score_claim("alpha", &claim, 0.5, signals(0));
+        assert!(none - b <= MAX_CONTRADICTION_PENALTY + 1e-4);
     }
 
     #[test]

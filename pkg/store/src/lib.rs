@@ -1,13 +1,13 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
-use graph::summarize_edges;
+use graph::summarize_incoming_edges;
 use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, Stance, StanceMode,
-    ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, RetrievalResult, Stance,
+    StanceMode, ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
 };
 
 mod disk;
@@ -33,7 +33,8 @@ pub(crate) struct Bm25Context {
 pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
 pub use wal::{
     CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
-    WalReplicationDelta, WalReplicationExport, WalRollbackPoint, WalWritePolicy,
+    WalReplicationDelta, WalReplicationExport, WalReplicationFrame, WalRollbackPoint,
+    WalWritePolicy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -88,20 +89,108 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-#[derive(Default, Clone)]
-/// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
-/// deep redb copy). This is the redb PR 2 fix: cloning a store no
-/// longer silently drops the disk handle. Before this change, a
-/// manual `Clone` impl was required because `redb::Database` is not
-/// `Clone`; the impl set `disk: None` and `disk_status: Unavailable`
-/// on the clone, which caused disk writes to be silently lost on any
-/// code path that cloned the store. With `Arc<DiskBackedStore>`,
-/// the cloned store shares the same redb handle and writes to either
-/// are visible to both.
+/// Upper bound on the in-memory WAL event ring (PERF-05). The ring is
+/// only an observability aid (`wal_len`); the durable log is the
+/// `FileWal`. Without a bound the leader grew by one entry per applied
+/// record, forever.
+pub const DEFAULT_WAL_EVENT_CAPACITY: usize = 8192;
+
+/// Bounded ring of recent [`WalEvent`]s plus a monotonic total.
+#[derive(Debug)]
+struct WalEventRing {
+    events: VecDeque<WalEvent>,
+    total: u64,
+    capacity: usize,
+}
+
+impl Default for WalEventRing {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            total: 0,
+            capacity: DEFAULT_WAL_EVENT_CAPACITY,
+        }
+    }
+}
+
+impl WalEventRing {
+    fn push(&mut self, event: WalEvent) {
+        self.total = self.total.saturating_add(1);
+        if self.capacity == 0 {
+            return;
+        }
+        while self.events.len() >= self.capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    fn trim(&mut self) {
+        while self.events.len() > self.capacity {
+            self.events.pop_front();
+        }
+    }
+}
+
+impl Clone for WalEventRing {
+    /// A cloned ring starts empty (it keeps the capacity and the running
+    /// total) so cloning a store never copies thousands of events.
+    fn clone(&self) -> Self {
+        Self {
+            events: VecDeque::new(),
+            total: self.total,
+            capacity: self.capacity,
+        }
+    }
+}
+
+/// One disk mutation recorded by a detached (staged) store so that
+/// [`InMemoryStore::commit_staged`] can replay it onto the real redb
+/// handle after the WAL append succeeded (DATA-09).
+#[derive(Debug, Clone)]
+enum StagedDiskOp {
+    Claim(Claim),
+    Evidence(Evidence),
+    Edge(ClaimEdge),
+    Vector {
+        claim_id: String,
+        tenant_id: String,
+        vector: Vec<f32>,
+        new_dim: Option<usize>,
+    },
+    BatchCommit(BatchCommitMetadata),
+}
+
+/// Reverse edge index entry: `from` points at the indexed claim.
+#[derive(Debug, Clone)]
+struct IncomingEdge {
+    from_claim_id: String,
+    relation: Relation,
+    strength: f32,
+}
+
+/// In-memory claim store.
+///
+/// # Cloning and the disk handle (DATA-09)
+///
+/// `Clone` is **detached**: the clone never holds the redb handle. A
+/// clone is meant to be a *staged* copy: mutate it, append to the WAL,
+/// and only then call [`InMemoryStore::commit_staged`] on the live
+/// store, which replays the staged disk writes onto redb and swaps the
+/// in-memory state. If the batch is rolled back, the staged clone is
+/// simply dropped and redb was never touched. `clone_detached` is the
+/// explicit spelling of the same operation.
+///
+/// Do not assign a staged clone over the live store (`self.store =
+/// staged`) when a disk is attached: that would drop the handle. Use
+/// `commit_staged`.
+#[derive(Default)]
 pub struct InMemoryStore {
     claims: HashMap<String, Claim>,
     evidence_by_claim: HashMap<String, Vec<Evidence>>,
     edges_by_claim: HashMap<String, Vec<ClaimEdge>>,
+    /// Reverse index: target claim id -> edges pointing at it.
+    edges_in: HashMap<String, Vec<IncomingEdge>>,
     claim_vectors: HashMap<String, Vec<f32>>,
     ann_vector_graphs: HashMap<String, TenantAnnGraph>,
     tenant_vector_dims: HashMap<String, usize>,
@@ -114,9 +203,20 @@ pub struct InMemoryStore {
     claim_tokens: HashMap<String, Vec<String>>,
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
-    wal: Vec<WalEvent>,
+    wal: WalEventRing,
     disk: Option<Arc<disk::DiskBackedStore>>,
     disk_status: disk::DiskStatus,
+    /// `Some` only on detached clones: disk writes recorded for
+    /// `commit_staged`.
+    staged_disk_ops: Option<Vec<StagedDiskOp>>,
+}
+
+impl Clone for InMemoryStore {
+    /// Detached clone; see the type-level docs. Equivalent to
+    /// [`InMemoryStore::clone_detached`].
+    fn clone(&self) -> Self {
+        self.clone_detached()
+    }
 }
 
 impl InMemoryStore {
@@ -183,6 +283,88 @@ impl InMemoryStore {
     /// no disk was attached (the default in-memory mode).
     pub fn disk_status(&self) -> &disk::DiskStatus {
         &self.disk_status
+    }
+
+    /// Clone the in-memory state WITHOUT the redb handle (DATA-09).
+    ///
+    /// The returned store records the disk writes it would have made
+    /// instead of performing them. Use it as the staging area for an
+    /// atomic batch: mutate the clone, append to the WAL, and only after
+    /// the WAL append succeeded call [`InMemoryStore::commit_staged`] on
+    /// the live store. Dropping the clone (rollback) leaves redb
+    /// untouched. `Clone::clone` is the same operation.
+    pub fn clone_detached(&self) -> Self {
+        Self {
+            claims: self.claims.clone(),
+            evidence_by_claim: self.evidence_by_claim.clone(),
+            edges_by_claim: self.edges_by_claim.clone(),
+            edges_in: self.edges_in.clone(),
+            claim_vectors: self.claim_vectors.clone(),
+            ann_vector_graphs: self.ann_vector_graphs.clone(),
+            tenant_vector_dims: self.tenant_vector_dims.clone(),
+            tenant_claim_ids: self.tenant_claim_ids.clone(),
+            inverted_index: self.inverted_index.clone(),
+            entity_index: self.entity_index.clone(),
+            embedding_index: self.embedding_index.clone(),
+            temporal_index: self.temporal_index.clone(),
+            batch_commits: self.batch_commits.clone(),
+            claim_tokens: self.claim_tokens.clone(),
+            ann_tuning: self.ann_tuning.clone(),
+            vector_backend_runtime: self.vector_backend_runtime,
+            wal: self.wal.clone(),
+            disk: None,
+            disk_status: self.disk_status.clone(),
+            staged_disk_ops: Some(Vec::new()),
+        }
+    }
+
+    /// Adopt a staged clone produced by [`InMemoryStore::clone_detached`]
+    /// (or `clone()`), after the caller has durably appended the same
+    /// mutations to the WAL.
+    ///
+    /// In-memory state is swapped in first (the WAL is the source of
+    /// truth and is already committed), then the staged disk writes are
+    /// replayed onto this store's redb handle. If a disk write fails the
+    /// disk handle is dropped and `disk_status` becomes `Unavailable` so
+    /// redb is never left silently diverging, and the error is returned;
+    /// the in-memory commit still stands. A no-disk store simply swaps.
+    pub fn commit_staged(&mut self, staged: InMemoryStore) -> Result<(), StoreError> {
+        let mut staged = staged;
+        let ops = staged.staged_disk_ops.take().unwrap_or_default();
+
+        let disk = self.disk.take();
+        let disk_status = self.disk_status.clone();
+        let mut own_staging = self.staged_disk_ops.take();
+        let mut ring = std::mem::take(&mut self.wal);
+        ring.total = ring.total.max(staged.wal.total);
+        ring.events.append(&mut staged.wal.events);
+        ring.trim();
+
+        *self = staged;
+        self.wal = ring;
+        self.disk = disk;
+        self.disk_status = disk_status;
+
+        match self.disk.clone() {
+            Some(disk) => {
+                for op in &ops {
+                    if let Err(reason) = write_disk_op(&disk, op) {
+                        self.disk = None;
+                        self.disk_status = disk::DiskStatus::Unavailable {
+                            reason: reason.clone(),
+                        };
+                        return Err(StoreError::Io(reason));
+                    }
+                }
+            }
+            None => {
+                if let Some(buffer) = own_staging.as_mut() {
+                    buffer.extend(ops);
+                }
+            }
+        }
+        self.staged_disk_ops = own_staging;
+        Ok(())
     }
 
     /// Construct an `InMemoryStore` by bulk-loading from a disk
@@ -383,7 +565,9 @@ impl InMemoryStore {
         claim_id: &str,
         vector: Vec<f32>,
     ) -> Result<(), StoreError> {
-        validate_vector(&vector)?;
+        // Validate (claim exists, finite, dimension) BEFORE the WAL append
+        // so a rejected request can never poison replay (DATA-03).
+        self.validate_claim_vector(claim_id, &vector)?;
         wal.append_claim_vector(claim_id, &vector)?;
         self.apply_claim_vector(claim_id, vector)
     }
@@ -519,6 +703,15 @@ impl InMemoryStore {
         query_vector: Option<&[f32]>,
         candidates: Vec<String>,
     ) -> Vec<RetrievalResult> {
+        // DATA-05: a malformed query vector (non-finite, zero norm, wrong
+        // dimension) must not silently degrade into NaN scores or a
+        // cross-dimension scan. Callers wanting a precise error use
+        // `validate_query_vector`.
+        if let Some(vector) = query_vector
+            && self.validate_query_vector(&req.tenant_id, vector).is_err()
+        {
+            return Vec::new();
+        }
         let mut ranked: Vec<RetrievalResult> = Vec::new();
         let bm25_context = self.bm25_context_for_tenant(&req.tenant_id, &req.query);
         let dense_similarities = query_vector.map(|vector| {
@@ -543,28 +736,56 @@ impl InMemoryStore {
                 continue;
             };
 
-            let evidence = self
+            // Borrow, never clone, on the scoring path (PERF-02).
+            let evidence: &[Evidence] = self
                 .evidence_by_claim
                 .get(&claim.claim_id)
-                .cloned()
-                .unwrap_or_default();
-            let edges = self
-                .edges_by_claim
-                .get(&claim.claim_id)
-                .cloned()
-                .unwrap_or_default();
-            let edge_summary = summarize_edges(&edges);
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
 
-            let supports = evidence
-                .iter()
-                .filter(|e| matches!(e.stance, Stance::Supports))
-                .count()
-                + edge_summary.supports;
-            let contradicts = evidence
-                .iter()
-                .filter(|e| matches!(e.stance, Stance::Contradicts))
-                .count()
-                + edge_summary.contradicts;
+            // IDX-05: an edge `from --supports--> to` supports the TARGET
+            // claim. Only edges pointing at this claim count, both
+            // endpoints must exist in this claim's tenant, and
+            // self-edges are ignored.
+            let edge_summary = summarize_incoming_edges(
+                self.edges_in
+                    .get(&claim.claim_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|edge| {
+                        edge.from_claim_id != claim.claim_id
+                            && self
+                                .claims
+                                .get(&edge.from_claim_id)
+                                .is_some_and(|source| source.tenant_id == claim.tenant_id)
+                    })
+                    .map(|edge| (edge.from_claim_id.as_str(), &edge.relation, edge.strength)),
+            );
+
+            let mut evidence_supports = 0usize;
+            let mut evidence_contradicts = 0usize;
+            let mut support_sources: HashSet<&str> = HashSet::new();
+            let mut contradiction_sources: HashSet<&str> = HashSet::new();
+            for evd in evidence {
+                match evd.stance {
+                    Stance::Supports => {
+                        evidence_supports += 1;
+                        support_sources.insert(evd.source_id.as_str());
+                    }
+                    Stance::Contradicts => {
+                        evidence_contradicts += 1;
+                        contradiction_sources.insert(evd.source_id.as_str());
+                    }
+                    Stance::Neutral => {}
+                }
+            }
+            // Reported counts are raw (evidence rows + distinct edge
+            // sources); the ranking signal counts each distinct
+            // source_id once and is saturated inside `ranking`.
+            let supports = evidence_supports + edge_summary.supports;
+            let contradicts = evidence_contradicts + edge_summary.contradicts;
+            let signal_supports = support_sources.len() + edge_summary.supports;
+            let signal_contradicts = contradiction_sources.len() + edge_summary.contradicts;
 
             if matches!(req.stance_mode, StanceMode::SupportOnly) && contradicts > supports {
                 continue;
@@ -601,8 +822,8 @@ impl InMemoryStore {
                 claim,
                 avg_quality,
                 RankSignals {
-                    supports,
-                    contradicts,
+                    supports: signal_supports,
+                    contradicts: signal_contradicts,
                 },
                 bm25,
             );
@@ -653,12 +874,30 @@ impl InMemoryStore {
         ranked.into_iter().take(req.top_k).collect()
     }
 
+    /// All claims of a tenant, sorted by `claim_id`. Uses the per-tenant
+    /// claim-id index, so the cost is O(tenant), not O(all claims)
+    /// (PERF-02).
     pub fn claims_for_tenant(&self, tenant_id: &str) -> Vec<Claim> {
-        self.claims
-            .values()
-            .filter(|claim| claim.tenant_id == tenant_id)
-            .cloned()
-            .collect()
+        let mut out: Vec<Claim> = self.tenant_claims(tenant_id).cloned().collect();
+        out.sort_unstable_by(|a, b| a.claim_id.cmp(&b.claim_id));
+        out
+    }
+
+    /// Number of claims owned by `tenant_id` (O(1)).
+    pub fn claim_count_for_tenant(&self, tenant_id: &str) -> usize {
+        self.tenant_claim_ids
+            .get(tenant_id)
+            .map(HashSet::len)
+            .unwrap_or(0)
+    }
+
+    /// Borrowing iterator over a tenant's claims, in unspecified order.
+    fn tenant_claims<'a>(&'a self, tenant_id: &str) -> impl Iterator<Item = &'a Claim> + 'a {
+        self.tenant_claim_ids
+            .get(tenant_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|claim_id| self.claims.get(claim_id))
     }
 
     pub fn tenant_ids(&self) -> Vec<String> {
@@ -836,18 +1075,19 @@ impl InMemoryStore {
         query_vector: &[f32],
         top_n: usize,
     ) -> Vec<String> {
-        if query_vector.is_empty() || top_n == 0 {
+        if top_n == 0 || self.validate_query_vector(tenant_id, query_vector).is_err() {
             return Vec::new();
         }
 
+        // Scan only this tenant's claims (IDX-03), never the global
+        // vector map.
         let candidate_vectors: Vec<(String, &[f32])> = self
-            .claim_vectors
-            .iter()
-            .filter_map(|(claim_id, vector)| {
-                let claim = self.claims.get(claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
-                }
+            .tenant_claim_ids
+            .get(tenant_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|claim_id| {
+                let vector = self.claim_vectors.get(claim_id)?;
                 Some((claim_id.clone(), vector.as_slice()))
             })
             .collect();
@@ -860,8 +1100,29 @@ impl InMemoryStore {
             .collect()
     }
 
+    /// Number of events currently buffered in the in-memory event ring.
+    /// The ring is bounded (see [`DEFAULT_WAL_EVENT_CAPACITY`]), so this
+    /// never exceeds the configured capacity; use
+    /// [`InMemoryStore::wal_events_total`] for the monotonic count.
     pub fn wal_len(&self) -> usize {
-        self.wal.len()
+        self.wal.events.len()
+    }
+
+    /// Monotonic number of events ever applied to this store instance.
+    pub fn wal_events_total(&self) -> u64 {
+        self.wal.total
+    }
+
+    /// Maximum number of events retained in the in-memory ring.
+    pub fn wal_event_capacity(&self) -> usize {
+        self.wal.capacity
+    }
+
+    /// Change the in-memory event ring capacity (0 keeps nothing).
+    /// Shrinking drops the oldest buffered events immediately.
+    pub fn set_wal_event_capacity(&mut self, capacity: usize) {
+        self.wal.capacity = capacity;
+        self.wal.trim();
     }
 
     /// Clear the in-memory WAL event buffer without affecting the
@@ -869,7 +1130,7 @@ impl InMemoryStore {
     /// that apply replicated records to an in-memory store but never
     /// truncate their own WAL file.
     pub fn clear_wal_events(&mut self) {
-        self.wal.clear();
+        self.wal.events.clear();
     }
 
     pub fn claims_len(&self) -> usize {
@@ -996,20 +1257,21 @@ impl InMemoryStore {
         query_vector: &[f32],
         top_n: usize,
     ) -> Vec<String> {
-        if query_vector.is_empty() {
+        // Invalid (empty, non-finite, zero-norm, wrong-dimension) query
+        // vectors yield no candidates: never a fallback scan (IDX-03).
+        if self.validate_query_vector(tenant_id, query_vector).is_err() {
             return Vec::new();
         }
 
         let mut scoped_ids = self.approximate_vector_candidate_ids(tenant_id, query_vector, top_n);
         if scoped_ids.is_empty() {
+            // Exact fallback, scoped to this tenant's own claim ids.
             scoped_ids = self
-                .claim_vectors
-                .keys()
-                .filter(|claim_id| {
-                    self.claims
-                        .get(*claim_id)
-                        .is_some_and(|claim| claim.tenant_id == tenant_id)
-                })
+                .tenant_claim_ids
+                .get(tenant_id)
+                .into_iter()
+                .flatten()
+                .filter(|claim_id| self.claim_vectors.contains_key(*claim_id))
                 .cloned()
                 .collect();
         }
@@ -1267,15 +1529,7 @@ impl InMemoryStore {
         evidence: &[Evidence],
         edges: &[ClaimEdge],
     ) -> Result<(), StoreError> {
-        validate_claim(claim)?;
-        if let Some(existing) = self.claims.get(&claim.claim_id)
-            && existing.tenant_id != claim.tenant_id
-        {
-            return Err(StoreError::Conflict(format!(
-                "claim_id '{}' already exists for tenant '{}'",
-                claim.claim_id, existing.tenant_id
-            )));
-        }
+        self.check_claim_applicable(claim)?;
         for evd in evidence {
             validate_evidence(evd)?;
             if evd.claim_id != claim.claim_id {
@@ -1287,6 +1541,78 @@ impl InMemoryStore {
             if edge.from_claim_id != claim.claim_id {
                 return Err(StoreError::MissingClaim(edge.from_claim_id.clone()));
             }
+        }
+        Ok(())
+    }
+
+    /// Validate a claim-vector upsert against the current state without
+    /// mutating anything. Callers that append to a WAL MUST call this
+    /// (or go through `upsert_claim_vector_persistent`) BEFORE the
+    /// append so a rejected request never reaches the log (DATA-03).
+    ///
+    /// Rejects: empty or non-finite vectors, an unknown claim, and a
+    /// dimension that differs from the tenant's established dimension.
+    pub fn validate_claim_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), StoreError> {
+        validate_vector(vector)?;
+        let claim = self
+            .claims
+            .get(claim_id)
+            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
+        if let Some(existing_dim) = self.tenant_vector_dims.get(&claim.tenant_id)
+            && *existing_dim != vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "vector dimension mismatch for tenant '{}': expected {}, got {}",
+                claim.tenant_id,
+                existing_dim,
+                vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a query vector for `tenant_id` (DATA-05, IDX-03): it must
+    /// be non-empty, finite, have a non-zero norm, and match the tenant's
+    /// vector dimension when the tenant has vectors. Retrieval entry
+    /// points return an empty result for an invalid query vector; call
+    /// this first to surface a precise error to the client.
+    pub fn validate_query_vector(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+    ) -> Result<(), StoreError> {
+        validate_vector(query_vector)?;
+        let norm_sq: f64 = query_vector
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum();
+        if norm_sq <= 0.0 {
+            return Err(StoreError::InvalidVector(
+                "query vector must have a non-zero norm".to_string(),
+            ));
+        }
+        if let Some(dim) = self.tenant_vector_dims.get(tenant_id)
+            && *dim != query_vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "query vector dimension mismatch: expected {}, got {}",
+                dim,
+                query_vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Claim-level checks shared by the pre-WAL validation and the apply
+    /// path: field validation plus the cross-tenant `claim_id` conflict.
+    /// The conflict error is deliberately generic (SEC-18): it must not
+    /// reveal which other tenant owns the id.
+    fn check_claim_applicable(&self, claim: &Claim) -> Result<(), StoreError> {
+        validate_claim(claim)?;
+        if let Some(existing) = self.claims.get(&claim.claim_id)
+            && existing.tenant_id != claim.tenant_id
+        {
+            return Err(StoreError::Conflict("claim_id already exists".to_string()));
         }
         Ok(())
     }
@@ -1319,14 +1645,26 @@ impl InMemoryStore {
         }
     }
 
-    fn apply_claim(&mut self, claim: Claim) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state. If the disk
-        // write fails, the in-memory state is unchanged.
+    /// Mirror one mutation to the disk store. With a disk attached the
+    /// write happens immediately (disk BEFORE memory, as before). On a
+    /// detached staged clone the op is only recorded; `commit_staged`
+    /// replays it after the caller's WAL append (DATA-09). With neither,
+    /// this is a no-op.
+    fn mirror_op(&mut self, op: StagedDiskOp) -> Result<(), StoreError> {
         if let Some(disk) = self.disk.as_ref() {
-            disk.put_claim(&claim).map_err(StoreError::Io)?;
-            disk.add_claim_to_tenant(&claim.tenant_id, &claim.claim_id)
-                .map_err(StoreError::Io)?;
+            write_disk_op(disk, &op).map_err(StoreError::Io)
+        } else {
+            if let Some(buffer) = self.staged_disk_ops.as_mut() {
+                buffer.push(op);
+            }
+            Ok(())
         }
+    }
+
+    fn apply_claim(&mut self, claim: Claim) -> Result<(), StoreError> {
+        // Validate first so a rejected claim never touches disk.
+        self.check_claim_applicable(&claim)?;
+        self.mirror_op(StagedDiskOp::Claim(claim.clone()))?;
         self.apply_claim_inner(claim)
     }
 
@@ -1338,15 +1676,12 @@ impl InMemoryStore {
     }
 
     fn apply_claim_inner(&mut self, claim: Claim) -> Result<(), StoreError> {
-        validate_claim(&claim)?;
+        self.check_claim_applicable(&claim)?;
         let claim_id = claim.claim_id.clone();
         if let Some(previous) = self.claims.get(&claim_id).cloned() {
-            if previous.tenant_id != claim.tenant_id {
-                return Err(StoreError::Conflict(format!(
-                    "claim_id '{}' already exists for tenant '{}'",
-                    claim_id, previous.tenant_id
-                )));
-            }
+            // Re-upsert: refresh the text-derived indexes only. The
+            // claim's vector and ANN entry are kept (DATA-04); a new
+            // vector replaces them only via an explicit vector upsert.
             self.remove_claim_indexes(&previous);
         }
         self.add_claim_indexes(&claim);
@@ -1355,26 +1690,24 @@ impl InMemoryStore {
         Ok(())
     }
 
-    fn apply_evidence(&mut self, evidence: Evidence) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            // Read the current evidence blob (if any), append the
-            // new evidence, write it back. The on-disk blob is
-            // always a full Vec<Evidence> for the claim, so a single
-            // append + replace keeps the on-disk state consistent.
-            let mut current: Vec<Evidence> = disk
-                .get_evidence_blob(&evidence.claim_id)
-                .map_err(StoreError::Io)?
-                .unwrap_or_default();
-            current.push(evidence.clone());
-            disk.put_evidence_blob(&evidence.claim_id, &current)
-                .map_err(StoreError::Io)?;
+    fn check_evidence_applicable(&self, evidence: &Evidence) -> Result<(), StoreError> {
+        validate_evidence(evidence)?;
+        if !self.claims.contains_key(&evidence.claim_id) {
+            return Err(StoreError::MissingClaim(evidence.claim_id.clone()));
         }
+        Ok(())
+    }
+
+    fn apply_evidence(&mut self, evidence: Evidence) -> Result<(), StoreError> {
+        self.check_evidence_applicable(&evidence)?;
+        self.mirror_op(StagedDiskOp::Evidence(evidence.clone()))?;
         self.apply_evidence_inner(evidence)
     }
 
     /// Apply a pre-built evidence blob to the in-memory state.
-    /// No disk mirror. Used by the bulk-load path.
+    /// No disk mirror. Used by the bulk-load path. Upserts by
+    /// `evidence_id`, so a blob that already contains duplicates (from
+    /// before DATA-01) is collapsed on load.
     pub(crate) fn apply_evidence_blob_for_load(
         &mut self,
         claim_id: &str,
@@ -1388,41 +1721,41 @@ impl InMemoryStore {
             .entry(claim_id.to_string())
             .or_default();
         for evd in evidence {
-            entry.push(evd.clone());
+            upsert_evidence(entry, evd.clone());
         }
         Ok(())
     }
 
     fn apply_evidence_inner(&mut self, evidence: Evidence) -> Result<(), StoreError> {
-        validate_evidence(&evidence)?;
-        if !self.claims.contains_key(&evidence.claim_id) {
-            return Err(StoreError::MissingClaim(evidence.claim_id));
+        self.check_evidence_applicable(&evidence)?;
+        let evidence_id = evidence.evidence_id.clone();
+        upsert_evidence(
+            self.evidence_by_claim
+                .entry(evidence.claim_id.clone())
+                .or_default(),
+            evidence,
+        );
+        self.wal.push(WalEvent::EvidenceUpsert(evidence_id));
+        Ok(())
+    }
+
+    fn check_edge_applicable(&self, edge: &ClaimEdge) -> Result<(), StoreError> {
+        validate_edge(edge)?;
+        if !self.claims.contains_key(&edge.from_claim_id) {
+            return Err(StoreError::MissingClaim(edge.from_claim_id.clone()));
         }
-        self.evidence_by_claim
-            .entry(evidence.claim_id.clone())
-            .or_default()
-            .push(evidence.clone());
-        self.wal
-            .push(WalEvent::EvidenceUpsert(evidence.evidence_id));
         Ok(())
     }
 
     fn apply_edge(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            let mut current: Vec<ClaimEdge> = disk
-                .get_edge_blob(&edge.from_claim_id)
-                .map_err(StoreError::Io)?
-                .unwrap_or_default();
-            current.push(edge.clone());
-            disk.put_edge_blob(&edge.from_claim_id, &current)
-                .map_err(StoreError::Io)?;
-        }
+        self.check_edge_applicable(&edge)?;
+        self.mirror_op(StagedDiskOp::Edge(edge.clone()))?;
         self.apply_edge_inner(edge)
     }
 
     /// Apply a pre-built edge blob to the in-memory state. No disk
-    /// mirror. Used by the bulk-load path.
+    /// mirror. Used by the bulk-load path. Upserts by
+    /// `(from, to, relation)`.
     pub(crate) fn apply_edge_blob_for_load(
         &mut self,
         from: &str,
@@ -1431,55 +1764,75 @@ impl InMemoryStore {
         if !self.claims.contains_key(from) {
             return Err(StoreError::MissingClaim(from.to_string()));
         }
-        let entry = self.edges_by_claim.entry(from.to_string()).or_default();
         for edge in edges {
-            entry.push(edge.clone());
+            self.upsert_edge_in_memory(edge.clone());
         }
         Ok(())
     }
 
     fn apply_edge_inner(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
-        validate_edge(&edge)?;
-        if !self.claims.contains_key(&edge.from_claim_id) {
-            return Err(StoreError::MissingClaim(edge.from_claim_id));
-        }
-        self.edges_by_claim
-            .entry(edge.from_claim_id.clone())
-            .or_default()
-            .push(edge.clone());
-        self.wal.push(WalEvent::EdgeUpsert(edge.edge_id));
+        self.check_edge_applicable(&edge)?;
+        let edge_id = edge.edge_id.clone();
+        self.upsert_edge_in_memory(edge);
+        self.wal.push(WalEvent::EdgeUpsert(edge_id));
         Ok(())
     }
 
-    fn apply_claim_vector(&mut self, claim_id: &str, vector: Vec<f32>) -> Result<(), StoreError> {
-        // Resolve the tenant and check the dimension match BEFORE
-        // doing any disk I/O, so we don't write a half-bad state.
-        let claim = self
-            .claims
-            .get(claim_id)
-            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
-        let tenant_id = claim.tenant_id.clone();
-        let new_dim_needed = match self.tenant_vector_dims.get(&tenant_id) {
-            Some(existing_dim) if *existing_dim != vector.len() => {
-                return Err(StoreError::InvalidVector(format!(
-                    "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id,
-                    existing_dim,
-                    vector.len()
-                )));
+    /// Upsert by `(from, to, relation)` and keep the reverse index in
+    /// sync. Re-applying the same edge never adds a second copy.
+    fn upsert_edge_in_memory(&mut self, edge: ClaimEdge) {
+        let list = self
+            .edges_by_claim
+            .entry(edge.from_claim_id.clone())
+            .or_default();
+        let existing = list
+            .iter()
+            .position(|e| e.to_claim_id == edge.to_claim_id && e.relation == edge.relation);
+        match existing {
+            Some(pos) => {
+                if let Some(incoming) = self.edges_in.get_mut(&edge.to_claim_id)
+                    && let Some(entry) = incoming.iter_mut().find(|i| {
+                        i.from_claim_id == edge.from_claim_id && i.relation == edge.relation
+                    })
+                {
+                    entry.strength = edge.strength;
+                }
+                list[pos] = edge;
             }
-            None => Some(vector.len()),
-            _ => None,
-        };
-
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            disk.put_vector(claim_id, &vector).map_err(StoreError::Io)?;
-            if let Some(dim) = new_dim_needed {
-                disk.put_tenant_dim(&tenant_id, dim)
-                    .map_err(StoreError::Io)?;
+            None => {
+                self.edges_in
+                    .entry(edge.to_claim_id.clone())
+                    .or_default()
+                    .push(IncomingEdge {
+                        from_claim_id: edge.from_claim_id.clone(),
+                        relation: edge.relation.clone(),
+                        strength: edge.strength,
+                    });
+                list.push(edge);
             }
         }
+    }
+
+    fn apply_claim_vector(&mut self, claim_id: &str, vector: Vec<f32>) -> Result<(), StoreError> {
+        // Validate (claim exists, finite, dimension) BEFORE any disk I/O
+        // so we never write a half-bad state.
+        self.validate_claim_vector(claim_id, &vector)?;
+        let tenant_id = self
+            .claims
+            .get(claim_id)
+            .map(|claim| claim.tenant_id.clone())
+            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
+        let new_dim = if self.tenant_vector_dims.contains_key(&tenant_id) {
+            None
+        } else {
+            Some(vector.len())
+        };
+        self.mirror_op(StagedDiskOp::Vector {
+            claim_id: claim_id.to_string(),
+            tenant_id,
+            vector: vector.clone(),
+            new_dim,
+        })?;
         self.apply_claim_vector_inner(claim_id, vector)
     }
 
@@ -1498,37 +1851,22 @@ impl InMemoryStore {
         claim_id: &str,
         vector: Vec<f32>,
     ) -> Result<(), StoreError> {
-        validate_vector(&vector)?;
-        let claim = self
+        self.validate_claim_vector(claim_id, &vector)?;
+        let tenant_id = self
             .claims
             .get(claim_id)
+            .map(|claim| claim.tenant_id.clone())
             .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
-        let tenant_id = claim.tenant_id.clone();
-        match self.tenant_vector_dims.get(&tenant_id) {
-            Some(existing_dim) if *existing_dim != vector.len() => {
-                return Err(StoreError::InvalidVector(format!(
-                    "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id,
-                    existing_dim,
-                    vector.len()
-                )));
-            }
-            None => {
-                self.tenant_vector_dims
-                    .insert(tenant_id.clone(), vector.len());
-            }
-            _ => {}
-        }
+        self.tenant_vector_dims
+            .entry(tenant_id.clone())
+            .or_insert(vector.len());
 
         if self.claim_vectors.contains_key(claim_id) {
             self.remove_vector_index_entry(&tenant_id, claim_id);
         }
 
+        let stored_vector = vector.clone();
         self.claim_vectors.insert(claim_id.to_string(), vector);
-        let stored_vector =
-            self.claim_vectors.get(claim_id).cloned().ok_or_else(|| {
-                StoreError::InvalidVector("failed to store claim vector".to_string())
-            })?;
         self.add_vector_index_entry(&tenant_id, claim_id, &stored_vector);
         self.wal
             .push(WalEvent::ClaimVectorUpsert(claim_id.to_string()));
@@ -1558,9 +1896,7 @@ impl InMemoryStore {
             claim_ids: record.claim_ids.clone(),
             payload_fingerprint: payload_fingerprint.clone(),
         };
-        if let Some(disk) = self.disk.as_ref() {
-            disk.put_batch_commit(&metadata).map_err(StoreError::Io)?;
-        }
+        self.mirror_op(StagedDiskOp::BatchCommit(metadata.clone()))?;
         self.batch_commits
             .insert(record.commit_id.clone(), metadata);
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
@@ -1881,11 +2217,8 @@ impl InMemoryStore {
     }
 
     fn remove_claim_indexes(&mut self, claim: &Claim) {
-        if let Some(previous) = self.claim_vectors.remove(&claim.claim_id) {
-            let _ = previous;
-            self.remove_vector_index_entry(&claim.tenant_id, &claim.claim_id);
-        }
-
+        // Vectors and ANN entries are intentionally NOT touched here
+        // (DATA-04): re-upserting a claim keeps its vector.
         let mut drop_tenant_claim_ids = false;
         if let Some(ids) = self.tenant_claim_ids.get_mut(&claim.tenant_id) {
             ids.remove(&claim.claim_id);
@@ -1985,15 +2318,6 @@ impl InMemoryStore {
         }
         if remove_temporal_index {
             self.temporal_index.remove(&claim.tenant_id);
-        }
-
-        let has_remaining_vectors_for_tenant = self.claim_vectors.keys().any(|claim_id| {
-            self.claims
-                .get(claim_id)
-                .is_some_and(|stored_claim| stored_claim.tenant_id == claim.tenant_id)
-        });
-        if !has_remaining_vectors_for_tenant {
-            self.tenant_vector_dims.remove(&claim.tenant_id);
         }
     }
 }
@@ -2116,24 +2440,105 @@ fn validate_vector(vector: &[f32]) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Replace the evidence with the same `evidence_id`, or append it
+/// (DATA-01). Returns `true` when a new entry was appended.
+fn upsert_evidence(list: &mut Vec<Evidence>, evidence: Evidence) -> bool {
+    match list
+        .iter_mut()
+        .find(|existing| existing.evidence_id == evidence.evidence_id)
+    {
+        Some(slot) => {
+            *slot = evidence;
+            false
+        }
+        None => {
+            list.push(evidence);
+            true
+        }
+    }
+}
+
+/// Replace the edge with the same `(from, to, relation)`, or append it
+/// (DATA-01). Returns `true` when a new entry was appended.
+fn upsert_edge(list: &mut Vec<ClaimEdge>, edge: ClaimEdge) -> bool {
+    match list.iter_mut().find(|existing| {
+        existing.from_claim_id == edge.from_claim_id
+            && existing.to_claim_id == edge.to_claim_id
+            && existing.relation == edge.relation
+    }) {
+        Some(slot) => {
+            *slot = edge;
+            false
+        }
+        None => {
+            list.push(edge);
+            true
+        }
+    }
+}
+
+/// Perform one mirrored write on the redb handle. Evidence and edge
+/// blobs are read-modify-write upserts so re-applying a record (retry,
+/// replication re-apply, WAL replay over a snapshot) never duplicates.
+fn write_disk_op(disk: &disk::DiskBackedStore, op: &StagedDiskOp) -> Result<(), String> {
+    match op {
+        StagedDiskOp::Claim(claim) => {
+            disk.put_claim(claim)?;
+            disk.add_claim_to_tenant(&claim.tenant_id, &claim.claim_id)
+        }
+        StagedDiskOp::Evidence(evidence) => {
+            let mut current = disk
+                .get_evidence_blob(&evidence.claim_id)?
+                .unwrap_or_default();
+            upsert_evidence(&mut current, evidence.clone());
+            disk.put_evidence_blob(&evidence.claim_id, &current)
+        }
+        StagedDiskOp::Edge(edge) => {
+            let mut current = disk.get_edge_blob(&edge.from_claim_id)?.unwrap_or_default();
+            upsert_edge(&mut current, edge.clone());
+            disk.put_edge_blob(&edge.from_claim_id, &current)
+        }
+        StagedDiskOp::Vector {
+            claim_id,
+            tenant_id,
+            vector,
+            new_dim,
+        } => {
+            disk.put_vector(claim_id, vector)?;
+            if let Some(dim) = new_dim {
+                disk.put_tenant_dim(tenant_id, *dim)?;
+            }
+            Ok(())
+        }
+        StagedDiskOp::BatchCommit(metadata) => disk.put_batch_commit(metadata),
+    }
+}
+
+/// Cosine similarity accumulated in `f64` and clamped to `[-1, 1]`
+/// (DATA-05). Returns `None` for mismatched/empty inputs, zero norms, or
+/// any non-finite intermediate, so callers can never see a NaN score.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom <= f32::EPSILON {
-        None
-    } else {
-        Some(dot / denom)
+    if !denom.is_finite() || denom <= f64::MIN_POSITIVE {
+        return None;
     }
+    let cosine = dot / denom;
+    if !cosine.is_finite() {
+        return None;
+    }
+    Some(cosine.clamp(-1.0, 1.0) as f32)
 }
 
 #[cfg(test)]
@@ -3903,6 +4308,20 @@ mod tests {
     }
 
     #[test]
+    fn cosine_similarity_is_clamped_finite_and_rejects_degenerate_input() {
+        // f32 accumulation would overflow to inf/NaN here.
+        let huge = [3.0e38f32, 3.0e38, 3.0e38];
+        let one = cosine_similarity(&huge, &huge).expect("finite result");
+        assert!((-1.0..=1.0).contains(&one));
+        assert!((one - 1.0).abs() < 1e-6);
+        let opposite = [-3.0e38f32, -3.0e38, -3.0e38];
+        assert!((cosine_similarity(&huge, &opposite).unwrap() + 1.0).abs() < 1e-6);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[f32::NAN, 1.0], &[1.0, 1.0]), None);
+    }
+
+    #[test]
     fn claim_id_reuse_across_tenants_is_rejected() {
         let mut store = InMemoryStore::new();
         store
@@ -3922,8 +4341,9 @@ mod tests {
             .expect_err("cross-tenant claim_id reuse should be rejected");
         match err {
             StoreError::Conflict(message) => {
-                assert!(message.contains("c-tenant-collision"));
-                assert!(message.contains("tenant-a"));
+                // SEC-18: the error must not reveal the owning tenant.
+                assert_eq!(message, "claim_id already exists");
+                assert!(!message.contains("tenant-a"));
             }
             other => panic!("expected Conflict, got {other:?}"),
         }

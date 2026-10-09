@@ -11,7 +11,7 @@
 
     <name>dash-java</name>
     <description>Idiomatic Java client for the DASH retrieval engine</description>
-    <url>https://github.com/dash-retrieval/dash</url>
+    <url>https://github.com/BHAWESHBHASKAR/DASH</url>
 
     <licenses>
         <license>
@@ -28,9 +28,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com/dash-retrieval/dash.git</connection>
-        <developerConnection>scm:git:ssh://git@github.com/dash-retrieval/dash.git</developerConnection>
-        <url>https://github.com/dash-retrieval/dash</url>
+        <connection>scm:git:git://github.com/BHAWESHBHASKAR/DASH.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/BHAWESHBHASKAR/DASH.git</developerConnection>
+        <url>https://github.com/BHAWESHBHASKAR/DASH</url>
     </scm>
 
     <properties>

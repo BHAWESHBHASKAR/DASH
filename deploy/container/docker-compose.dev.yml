@@ -2,6 +2,9 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
 #
+# Requires deploy/container/.env (run scripts/generate-secrets.sh first); the
+# secrets from the base file are reused, no weak dev secrets are defined here.
+#
 # Provides:
 #   - dev build target (rust toolchain + cargo-watch)
 #   - source code mounted at /build for hot-reload via cargo-watch
@@ -21,9 +24,10 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: dev
-    image: dash/ingestion:dev
+    image: dash-ingestion:dev
     container_name: dash-ingestion-dev
     user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    read_only: false
     # cargo-watch rebuilds + restarts the binary when source changes.
     # -w paths limit watch to ingestion sources and shared packages; tweak
     #   to taste if you want to also watch tests, etc.
@@ -47,12 +51,10 @@ services:
       CARGO_TERM_COLOR: always
       CARGO_HOME: /usr/local/cargo
       DASH_BIN: ingestion
-      DASH_HEALTHCHECK_URL: http://127.0.0.1:8081/health
       DASH_INGEST_BIND: 0.0.0.0:8081
       DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
+      DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
       DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
-      DASH_INGEST_API_KEY: dev-ingest-key
-      DASH_INGEST_JWT_HS256_SECRET: dev-ingest-jwt
       DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
       DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
       DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
@@ -66,7 +68,7 @@ services:
       - dash-dev-target:/build/target
       - dash-dev-state:/var/lib/dash
     ports:
-      - "8081:8081"
+      - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8081:8081"
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -80,9 +82,10 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: dev
-    image: dash/retrieval:dev
+    image: dash-retrieval:dev
     container_name: dash-retrieval-dev
     user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    read_only: false
     command:
       - cargo
       - watch
@@ -103,21 +106,16 @@ services:
       CARGO_TERM_COLOR: always
       CARGO_HOME: /usr/local/cargo
       DASH_BIN: retrieval
-      DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
       DASH_RETRIEVAL_BIND: 0.0.0.0:8080
-      DASH_RETRIEVAL_WAL_PATH: /var/lib/dash/wal/retrieval.wal
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
-      DASH_RETRIEVAL_API_KEY: dev-retrieval-key
-      DASH_RETRIEVAL_JWT_HS256_SECRET: dev-retrieval-jwt
       DASH_RETRIEVAL_HTTP_WORKERS: "4"
-      DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
     volumes:
       - ../..:/build
       - dash-dev-cargo:/usr/local/cargo
       - dash-dev-target:/build/target
       - dash-dev-state:/var/lib/dash
     ports:
-      - "8080:8080"
+      - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -133,9 +131,10 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: dev
-    image: dash/segment-maintenance:dev
+    image: dash-segment-maintenance:dev
     container_name: dash-segment-maintenance-dev
     user: "${DASH_DEV_UID:-1000}:${DASH_DEV_GID:-1000}"
+    read_only: false
     command:
       - cargo
       - watch

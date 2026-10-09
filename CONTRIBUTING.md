@@ -103,6 +103,18 @@ Open a pull request on GitHub. Reference any related issues (e.g., `Closes #42`)
 - Make requested changes in new commits (don't force-push during review)
 - Once approved, a maintainer will merge your PR
 
+### 6. Closing Issues and Status Claims
+
+**An issue is closed only when the fix is merged with a regression test that fails on the old code; plan status lines must link to evidence.**
+
+In practice:
+
+- A pull request that closes an issue (including a row in `docs/plans/2026-10-09-issue-register.md`) must add or change a test that fails without the fix, and the PR description names that test and the CI run that executed it.
+- A plan, roadmap or changelog line may say "done" or "fixed" only if it links to evidence: the test (`path::name`), a CI job, or a drill record. No link means not done.
+- Capability claims in `README.md` are listed in `docs/claims-ledger.md` with the test that proves them. Run `scripts/check_claims_ledger.sh` after changing either file; it fails if a referenced test or file does not exist, or if the README test count is stale.
+- Changes to security, storage format or replication need a second reviewer and an update to `docs/threat-model.md` (or an ADR line) when behavior changes.
+- Configuration and API reference pages must list only what the code reads and serves. When you add an environment variable or a route, update `docs-site/docs/reference/configuration.md` or `api.md` in the same PR.
+
 ---
 
 ## Project Structure
@@ -266,7 +278,7 @@ pub fn ingest_bundle(
 
 ### Architecture Docs
 
-- For architectural decisions, update `EME_ARCHITECTURE.md`
+- For architectural decisions, update `docs/architecture/eme-architecture.md`
 - For execution details, add to `docs/execution/`
 
 ---
@@ -317,7 +329,7 @@ Contributors are recognized in:
 
 ## Questions?
 
-- Check [`EME_ARCHITECTURE.md`](EME_ARCHITECTURE.md) for system design
+- Check [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) for system design
 - Check [`feasibility.md`](feasibility.md) for roadmap and priorities
 - Open a [GitHub Discussion](https://github.com/your-org/dash/discussions) for questions
 - Tag maintainers in issues if blocked

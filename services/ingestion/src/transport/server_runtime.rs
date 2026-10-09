@@ -98,6 +98,7 @@ pub(super) fn serve_http_with_workers(
         listener
             .set_nonblocking(true)
             .expect("set listener non-blocking");
+        let mut accept_error_streak: u32 = 0;
         loop {
             if shutdown.is_triggered() {
                 eprintln!("ingestion: shutdown signal received, draining in-flight requests");
@@ -105,6 +106,7 @@ pub(super) fn serve_http_with_workers(
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    accept_error_streak = 0;
                     backpressure_metrics.observe_enqueued();
                     match tx.try_send(stream) {
                         Ok(()) => {}
@@ -130,9 +132,15 @@ pub(super) fn serve_http_with_workers(
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => {
+                    // Transient failures (EMFILE, ECONNABORTED, ...) must not
+                    // take the server down; back off briefly and keep serving.
+                    // Only the shutdown flag ends this loop.
+                    accept_error_streak = accept_error_streak.saturating_add(1);
                     eprintln!("ingestion transport accept error: {err}");
-                    break;
+                    std::thread::sleep(accept_error_backoff(accept_error_streak));
+                    continue;
                 }
             }
         }
@@ -145,14 +153,27 @@ pub(super) fn serve_http_with_workers(
     Ok(())
 }
 
+/// Bounded exponential backoff (10ms .. 100ms) for repeated accept failures.
+fn accept_error_backoff(streak: u32) -> Duration {
+    let millis = 10u64.saturating_mul(1u64 << streak.saturating_sub(1).min(4));
+    Duration::from_millis(millis.min(100))
+}
+
 fn handle_connection(runtime: &SharedRuntime, mut stream: TcpStream) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+    stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
 
-    let request = match read_http_request(&mut stream) {
+    // The read deadline covers the whole request (headers and body), not
+    // each individual read, so slow-trickle clients are dropped.
+    let request = match read_http_request(&mut stream, resolve_request_timeout()) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
-        Err(err) => return write_response(&mut stream, HttpResponse::bad_request(&err)),
+        Err(err) => {
+            return write_response(
+                &mut stream,
+                HttpResponse::error_with_status(err.status, &err.message),
+            );
+        }
     };
 
     let response = handle_request(runtime, &request);

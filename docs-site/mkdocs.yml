@@ -1,5 +1,5 @@
 site_name: DASH
-site_description: Production-grade vector database with claim, evidence, and contradiction tracking
+site_description: Pre-1.0 evidence-first vector database with claim, evidence, and contradiction tracking
 site_url: https://BHAWESHBHASKAR.github.io/DASH/
 repo_url: https://github.com/BHAWESHBHASKAR/DASH
 repo_name: BHAWESHBHASKAR/DASH
@@ -79,6 +79,7 @@ nav:
   - Reference:
       - Overview: reference/index.md
       - HTTP API: reference/api.md
+      - Planned API: reference/planned-api.md
       - Configuration: reference/configuration.md
       - Benchmarks: reference/benchmarks.md
       - Architecture decisions: reference/architecture-decisions.md

@@ -688,6 +688,8 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "ureq",
+ "url",
 ]
 
 [[package]]
@@ -1143,6 +1145,7 @@ dependencies = [
  "schema",
  "serde",
  "serde_json",
+ "sha2",
  "store",
  "thiserror 1.0.69",
 ]

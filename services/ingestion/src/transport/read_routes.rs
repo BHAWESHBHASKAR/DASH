@@ -37,16 +37,20 @@ pub(super) fn handle_get_request(
                 }
                 DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
-                        // The underlying reason may contain paths or OS
-                        // errors; keep it in the log, not in the response.
-                        eprintln!("ingestion readiness: disk unavailable: {reason}");
-                        HttpResponse::error_with_status(503, "not ready")
+                        eprintln!("ingestion /ready: disk unavailable: {reason}");
+                        HttpResponse {
+                            status: 503,
+                            content_type: "application/json",
+                            body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
+                                .to_string(),
+                            retry_after_secs: None,
+                        }
                     } else {
                         HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                     }
                 }
             },
-            Err(_) => HttpResponse::internal_server_error("runtime mutex poisoned"),
+            Err(_) => HttpResponse::internal_server_error("runtime_unavailable"),
         },
         "/metrics" => {
             if !auth_policy.metrics_public()

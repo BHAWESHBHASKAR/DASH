@@ -11,10 +11,10 @@ Usage: scripts/deploy_container.sh <action>
 
 Actions:
   build    Build container images
-  up       Start stack in detached mode
+  up       Start stack in detached mode (generates secrets on first use)
   down     Stop and remove stack
   ps       Show service status
-  logs     Tail logs for both services
+  logs     Tail logs for all services
   help
 
 Examples:
@@ -47,11 +47,20 @@ run_compose() {
   "${COMPOSE[@]}" -f "${COMPOSE_FILE}" "$@"
 }
 
+# Compose requires every secret; create deploy/container/.env on first use.
+ensure_secrets() {
+  if [[ ! -f "${ROOT_DIR}/deploy/container/.env" ]]; then
+    "${ROOT_DIR}/scripts/generate-secrets.sh"
+  fi
+}
+
 case "${ACTION}" in
   build)
+    ensure_secrets
     run_compose build
     ;;
   up)
+    ensure_secrets
     run_compose up -d
     ;;
   down)

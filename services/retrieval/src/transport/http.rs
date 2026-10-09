@@ -1,55 +1,215 @@
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
+    io::{ErrorKind, Read, Write},
     net::TcpStream,
+    time::{Duration, Instant},
 };
 
 use super::{HttpRequest, HttpResponse, MAX_HTTP_BODY_BYTES};
 
-pub(super) fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>, String> {
-    let mut reader = BufReader::new(stream);
+/// Maximum length of a single header line (including the request line).
+pub(super) const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+/// Maximum total size of the request line plus all headers.
+pub(super) const MAX_HEADER_BLOCK_BYTES: usize = 32 * 1024;
+/// Maximum number of header fields.
+pub(super) const MAX_HEADER_COUNT: usize = 100;
+/// Default whole-request read deadline.
+pub(super) const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 10_000;
+/// Upper bound on bytes allocated ahead of bytes actually received.
+const READ_CHUNK_BYTES: usize = 4096;
 
-    let mut request_line = String::new();
-    let bytes = reader
-        .read_line(&mut request_line)
-        .map_err(|e| e.to_string())?;
-    if bytes == 0 {
-        return Ok(None);
-    }
+/// A request-reading failure carrying the HTTP status that should be returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HttpReadError {
+    pub(super) status: u16,
+    pub(super) message: String,
+}
 
-    let (method, target) = parse_request_line(&request_line)?;
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut header_line = String::new();
-        let bytes = reader
-            .read_line(&mut header_line)
-            .map_err(|e| e.to_string())?;
-        if bytes == 0 || header_line == "\r\n" {
-            break;
+impl HttpReadError {
+    fn new(status: u16, message: &str) -> Self {
+        Self {
+            status,
+            message: message.to_string(),
         }
-
-        let (name, value) = header_line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
 
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
+    fn bad_request(message: &str) -> Self {
+        Self::new(400, message)
+    }
+}
+
+/// Resolve the whole-request deadline from `DASH_HTTP_REQUEST_TIMEOUT_MS`.
+pub(super) fn resolve_request_timeout() -> Duration {
+    let millis = std::env::var("DASH_HTTP_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+    Duration::from_millis(millis)
+}
+
+fn map_io_error(err: &std::io::Error) -> HttpReadError {
+    match err.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => HttpReadError::new(408, "request timed out"),
+        _ => HttpReadError::bad_request("failed to read request"),
+    }
+}
+
+/// Read once from the stream, never waiting past the whole-request deadline.
+fn read_with_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<usize, HttpReadError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HttpReadError::new(408, "request timed out"));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|err| map_io_error(&err))?;
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(map_io_error(&err)),
+        }
+    }
+}
+
+fn find_header_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    // Returns (end_of_headers, start_of_body). Accepts CRLFCRLF and bare LFLF.
+    let mut i = from;
+    while i < buf.len() {
+        if buf[i] == b'\n' {
+            if buf.get(i + 1) == Some(&b'\n') {
+                return Some((i + 1, i + 2));
+            }
+            if buf.get(i + 1) == Some(&b'\r') && buf.get(i + 2) == Some(&b'\n') {
+                return Some((i + 1, i + 3));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+pub(super) fn read_http_request(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> Result<Option<HttpRequest>, HttpReadError> {
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_BYTES);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    let mut scan_from = 0usize;
+
+    let (head_end, body_start) = loop {
+        if let Some(found) = find_header_end(&buf, scan_from) {
+            break found;
+        }
+        scan_from = buf.len().saturating_sub(3);
+        if buf.len() > MAX_HEADER_BLOCK_BYTES {
+            return Err(HttpReadError::new(431, "request headers too large"));
+        }
+        let n = read_with_deadline(stream, &mut chunk, deadline)?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Err(HttpReadError::bad_request("unexpected end of request"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
     };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
+    if head_end > MAX_HEADER_BLOCK_BYTES {
+        return Err(HttpReadError::new(431, "request headers too large"));
+    }
+
+    let head = std::str::from_utf8(&buf[..head_end])
+        .map_err(|_| HttpReadError::bad_request("request headers must be valid UTF-8"))?;
+    let mut lines = head
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line));
+    let request_line = lines.next().unwrap_or("");
+    if request_line.len() > MAX_HEADER_LINE_BYTES {
+        return Err(HttpReadError::new(431, "request line too large"));
+    }
+    let (method, target) =
+        parse_request_line(request_line).map_err(|e| HttpReadError::bad_request(&e))?;
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    let mut header_count = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_HEADER_LINE_BYTES {
+            return Err(HttpReadError::new(431, "request header line too large"));
+        }
+        header_count += 1;
+        if header_count > MAX_HEADER_COUNT {
+            return Err(HttpReadError::new(431, "too many request headers"));
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| HttpReadError::bad_request("invalid HTTP header"))?;
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "content-length"
+            && let Some(existing) = headers.get(&name)
+            && *existing != value
+        {
+            return Err(HttpReadError::bad_request(
+                "conflicting content-length headers",
+            ));
+        }
+        headers.insert(name, value);
+    }
+
+    if headers.contains_key("transfer-encoding") {
+        return Err(HttpReadError::new(
+            501,
+            "transfer-encoding is not supported; send a content-length body",
         ));
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+    let content_length = match headers.get("content-length") {
+        Some(raw) => {
+            if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(HttpReadError::bad_request("invalid content-length header"));
+            }
+            match raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(_) => {
+                    return Err(HttpReadError::new(
+                        413,
+                        &format!(
+                            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
+                        ),
+                    ));
+                }
+            }
+        }
+        None => 0,
+    };
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(HttpReadError::new(
+            413,
+            &format!("content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"),
+        ));
+    }
+
+    // Allocate only what has actually arrived (plus one chunk); the buffer
+    // grows as bytes are received so a lying Content-Length costs nothing.
+    let mut body: Vec<u8> = Vec::with_capacity(content_length.min(READ_CHUNK_BYTES));
+    let already = &buf[body_start.min(buf.len())..];
+    body.extend_from_slice(&already[..already.len().min(content_length)]);
+    while body.len() < content_length {
+        let want = (content_length - body.len()).min(READ_CHUNK_BYTES);
+        let n = read_with_deadline(stream, &mut chunk[..want], deadline)?;
+        if n == 0 {
+            return Err(HttpReadError::bad_request("request body truncated"));
+        }
+        body.extend_from_slice(&chunk[..n]);
     }
 
     Ok(Some(HttpRequest {
@@ -121,7 +281,13 @@ pub(super) fn render_response_text(response: &HttpResponse) -> String {
         403 => "403 Forbidden",
         404 => "404 Not Found",
         405 => "405 Method Not Allowed",
+        408 => "408 Request Timeout",
+        411 => "411 Length Required",
+        413 => "413 Payload Too Large",
         429 => "429 Too Many Requests",
+        431 => "431 Request Header Fields Too Large",
+        501 => "501 Not Implemented",
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
@@ -171,5 +337,53 @@ fn decode_hex(byte: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err("invalid hex digit".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_line_for(status: u16) -> String {
+        let response = HttpResponse {
+            status,
+            content_type: "application/json",
+            body: "{}".to_string(),
+            retry_after_secs: None,
+        };
+        render_response_text(&response)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn status_lines_cover_all_supported_codes() {
+        for (code, expected) in [
+            (400, "HTTP/1.1 400 Bad Request"),
+            (401, "HTTP/1.1 401 Unauthorized"),
+            (403, "HTTP/1.1 403 Forbidden"),
+            (404, "HTTP/1.1 404 Not Found"),
+            (405, "HTTP/1.1 405 Method Not Allowed"),
+            (408, "HTTP/1.1 408 Request Timeout"),
+            (411, "HTTP/1.1 411 Length Required"),
+            (413, "HTTP/1.1 413 Payload Too Large"),
+            (429, "HTTP/1.1 429 Too Many Requests"),
+            (431, "HTTP/1.1 431 Request Header Fields Too Large"),
+            (500, "HTTP/1.1 500 Internal Server Error"),
+            (501, "HTTP/1.1 501 Not Implemented"),
+            (502, "HTTP/1.1 502 Bad Gateway"),
+            (503, "HTTP/1.1 503 Service Unavailable"),
+        ] {
+            assert_eq!(status_line_for(code), expected);
+        }
+    }
+
+    #[test]
+    fn error_with_status_preserves_status_code() {
+        for code in [408u16, 411, 413, 429, 431, 501, 502] {
+            assert_eq!(HttpResponse::error_with_status(code, "x").status, code);
+        }
     }
 }

@@ -71,6 +71,46 @@ fn map_bincode_err(ctx: &str, e: bincode::Error) -> String {
     format!("bincode {ctx}: {e}")
 }
 
+/// Collapse duplicate evidence ids: the last occurrence wins, positioned
+/// where the id first appeared.
+fn dedupe_evidence(evidence: &[Evidence]) -> Vec<Evidence> {
+    let mut out: Vec<Evidence> = Vec::with_capacity(evidence.len());
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for item in evidence {
+        match index.get(item.evidence_id.as_str()) {
+            Some(&pos) => out[pos] = item.clone(),
+            None => {
+                index.insert(item.evidence_id.as_str(), out.len());
+                out.push(item.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Collapse duplicate edges keyed by `(from, to, relation)`: the last
+/// occurrence wins, positioned where the key first appeared.
+fn dedupe_edges(edges: &[ClaimEdge]) -> Vec<ClaimEdge> {
+    let mut out: Vec<ClaimEdge> = Vec::with_capacity(edges.len());
+    let mut index: std::collections::HashMap<(&str, &str, String), usize> =
+        std::collections::HashMap::new();
+    for edge in edges {
+        let key = (
+            edge.from_claim_id.as_str(),
+            edge.to_claim_id.as_str(),
+            format!("{:?}", edge.relation),
+        );
+        match index.get(&key) {
+            Some(&pos) => out[pos] = edge.clone(),
+            None => {
+                index.insert(key, out.len());
+                out.push(edge.clone());
+            }
+        }
+    }
+    out
+}
+
 fn read_bytes<V: serde::de::DeserializeOwned>(bytes: Vec<u8>, ctx: &str) -> Result<V, String> {
     bincode::deserialize(&bytes).map_err(|e| map_bincode_err(ctx, e))
 }
@@ -135,7 +175,8 @@ impl DiskBackedStore {
     }
 
     /// Persist a claim (replaces any prior claim with the same
-    /// `claim_id`).
+    /// `claim_id`) and record its tenant membership in the SAME write
+    /// transaction, so the claim row and the tenant set cannot diverge.
     pub fn put_claim(&self, claim: &Claim) -> Result<(), String> {
         let bytes = bincode::serialize(claim).map_err(|e| map_bincode_err("serialize claim", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
@@ -146,6 +187,12 @@ impl DiskBackedStore {
             table
                 .insert(claim.claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write claim", e))?;
+            let mut set = txn
+                .open_table(TABLE_TENANT_CLAIMS_SET)
+                .map_err(|e| err("open tenant_claims_set", e))?;
+            let key: (&str, &str) = (claim.tenant_id.as_str(), claim.claim_id.as_str());
+            set.insert(key, ())
+                .map_err(|e| err("write tenant_claims_set", e))?;
         }
         txn.commit().map_err(|e| err("commit claim", e))?;
         Ok(())
@@ -172,9 +219,11 @@ impl DiskBackedStore {
 
     /// Persist the full evidence blob for a claim. Replaces any prior
     /// evidence list for the same `claim_id` atomically.
+    /// Duplicate `evidence_id`s inside the blob are collapsed (last wins).
     pub fn put_evidence_blob(&self, claim_id: &str, evidence: &[Evidence]) -> Result<(), String> {
+        let evidence = dedupe_evidence(evidence);
         let bytes =
-            bincode::serialize(evidence).map_err(|e| map_bincode_err("serialize evidence", e))?;
+            bincode::serialize(&evidence).map_err(|e| map_bincode_err("serialize evidence", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -185,6 +234,61 @@ impl DiskBackedStore {
                 .map_err(|e| err("write evidence", e))?;
         }
         txn.commit().map_err(|e| err("commit evidence", e))?;
+        Ok(())
+    }
+
+    /// Insert or replace one evidence record, keyed by `evidence_id`, in a
+    /// single read-modify-write transaction. Re-upserting the same id never
+    /// duplicates.
+    pub fn upsert_evidence(&self, evidence: &Evidence) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
+        {
+            let mut table = txn
+                .open_table(TABLE_EVIDENCE)
+                .map_err(|e| err("open evidence", e))?;
+            let mut current: Vec<Evidence> = match table
+                .get(evidence.claim_id.as_str())
+                .map_err(|e| err("read evidence", e))?
+            {
+                Some(v) => read_bytes(v.value().to_vec(), "deserialize evidence")?,
+                None => Vec::new(),
+            };
+            current.push(evidence.clone());
+            let current = dedupe_evidence(&current);
+            let bytes = bincode::serialize(&current)
+                .map_err(|e| map_bincode_err("serialize evidence", e))?;
+            table
+                .insert(evidence.claim_id.as_str(), bytes.as_slice())
+                .map_err(|e| err("write evidence", e))?;
+        }
+        txn.commit().map_err(|e| err("commit evidence", e))?;
+        Ok(())
+    }
+
+    /// Insert or replace one edge, keyed by `(from, to, relation)`, in a
+    /// single read-modify-write transaction.
+    pub fn upsert_edge(&self, edge: &ClaimEdge) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
+        {
+            let mut table = txn
+                .open_table(TABLE_EDGES)
+                .map_err(|e| err("open edges", e))?;
+            let mut current: Vec<ClaimEdge> = match table
+                .get(edge.from_claim_id.as_str())
+                .map_err(|e| err("read edges", e))?
+            {
+                Some(v) => read_bytes(v.value().to_vec(), "deserialize edges")?,
+                None => Vec::new(),
+            };
+            current.push(edge.clone());
+            let current = dedupe_edges(&current);
+            let bytes =
+                bincode::serialize(&current).map_err(|e| map_bincode_err("serialize edges", e))?;
+            table
+                .insert(edge.from_claim_id.as_str(), bytes.as_slice())
+                .map_err(|e| err("write edges", e))?;
+        }
+        txn.commit().map_err(|e| err("commit edges", e))?;
         Ok(())
     }
 
@@ -210,8 +314,12 @@ impl DiskBackedStore {
 
     /// Persist the full edge blob for a source claim. Replaces any
     /// prior edge list for the same `from` atomically.
+    /// Duplicate `(from, to, relation)` edges inside the blob are
+    /// collapsed (last wins).
     pub fn put_edge_blob(&self, from: &str, edges: &[ClaimEdge]) -> Result<(), String> {
-        let bytes = bincode::serialize(edges).map_err(|e| map_bincode_err("serialize edges", e))?;
+        let edges = dedupe_edges(edges);
+        let bytes =
+            bincode::serialize(&edges).map_err(|e| map_bincode_err("serialize edges", e))?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -495,6 +603,7 @@ impl DiskBackedStore {
                     let value = entry.1.value().to_vec();
                     let evidence: Vec<Evidence> = bincode::deserialize(&value)
                         .map_err(|e| map_bincode_err("deserialize evidence", e))?;
+                    let evidence = dedupe_evidence(&evidence);
                     dest.apply_evidence_blob_for_load(&key, &evidence)
                         .map_err(|e| format!("apply_evidence_blob_for_load: {e:?}"))?;
                 }
@@ -512,6 +621,7 @@ impl DiskBackedStore {
                     let value = entry.1.value().to_vec();
                     let edges: Vec<ClaimEdge> = bincode::deserialize(&value)
                         .map_err(|e| map_bincode_err("deserialize edges", e))?;
+                    let edges = dedupe_edges(&edges);
                     dest.apply_edge_blob_for_load(&key, &edges)
                         .map_err(|e| format!("apply_edge_blob_for_load: {e:?}"))?;
                 }
@@ -614,7 +724,8 @@ impl DiskBackedStore {
                 .open_table(TABLE_EVIDENCE)
                 .map_err(|e| err("open evidence", e))?;
             for (claim_id, evidence) in store.evidence_iter() {
-                let bytes = bincode::serialize(evidence)
+                let evidence = dedupe_evidence(evidence);
+                let bytes = bincode::serialize(&evidence)
                     .map_err(|e| map_bincode_err("serialize evidence", e))?;
                 evidence_table
                     .insert(claim_id, bytes.as_slice())
@@ -625,8 +736,9 @@ impl DiskBackedStore {
                 .open_table(TABLE_EDGES)
                 .map_err(|e| err("open edges", e))?;
             for (from, edges) in store.edges_iter() {
-                let bytes =
-                    bincode::serialize(edges).map_err(|e| map_bincode_err("serialize edges", e))?;
+                let edges = dedupe_edges(edges);
+                let bytes = bincode::serialize(&edges)
+                    .map_err(|e| map_bincode_err("serialize edges", e))?;
                 edges_table
                     .insert(from, bytes.as_slice())
                     .map_err(|e| err("write edges", e))?;

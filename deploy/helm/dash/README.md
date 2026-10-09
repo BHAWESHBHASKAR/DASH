@@ -1,287 +1,164 @@
 # DASH Helm Chart
 
-Production-grade Helm chart for the DASH vector store.
+Helm chart for the DASH evidence-first vector store. It deploys three
+`StatefulSet` workloads with per-pod `ReadWriteOnce` PVCs:
 
-DASH exposes an OpenAI-compatible `/v1/embeddings` surface and a
-parallel ingestion API. The chart deploys three workloads backed by
-per-pod persistence: `retrieval` (serves `/v1/*`), `ingestion`
-(writes only), and `control-plane` (shard placement and leader
-election). Each workload is a `StatefulSet` with per-pod
-`ReadWriteOnce` PVCs so state survives pod restarts and re-scheduling.
+| Workload | Replicas | Role |
+|----------|----------|------|
+| `ingestion` | 1 (fixed) | Single writer: owns the WAL and redb store, serves `/v1/ingest*` and the replication endpoint. |
+| `retrieval` | `replicas.retrieval` (default 2) | Serves `/v1/retrieve` and `/v1/embeddings`. Every replica has its own PVC and follows the single ingestion pod over WAL replication. |
+| `control-plane` | 1 (fixed, optional) | Shard placement metadata and file-backed leader lease. |
 
-## TL;DR
+There is **no HorizontalPodAutoscaler**: replicas of a StatefulSet that each
+own a PVC are not interchangeable until the clustering phase. Scale retrieval
+manually (`kubectl -n <ns> scale statefulset <release>-dash-retrieval --replicas=N`);
+a new replica starts empty and catches up from ingestion. Never scale
+ingestion or the control plane above 1.
+
+## Images
+
+One image per service, named `<registry>/<repository>-<service>:<tag>`, for
+example `ghcr.io/bhaweshbhaskar/dash-retrieval:0.2.0`. This is what
+`.github/workflows/release.yml` publishes and what `deploy/k8s` pulls. Each
+image's entrypoint selects its binary from `DASH_BIN`.
+
+## Secrets are required (no defaults)
+
+The chart ships **no** default secrets. `helm template` and `helm install`
+fail until every secret is supplied or an existing Secret is referenced.
+Values must be at least 32 characters and must not look like placeholders.
 
 ```bash
 helm install dash ./deploy/helm/dash \
-  --namespace dash-system \
-  --create-namespace \
-  --set secret.openaiApiKey="$OPENAI_API_KEY" \
+  --namespace dash-system --create-namespace \
   --set secret.retrieval.apiKey="$(openssl rand -hex 32)" \
-  --set secret.ingestion.apiKey="$(openssl rand -hex 32)"
+  --set secret.retrieval.hs256Secret="$(openssl rand -hex 32)" \
+  --set secret.ingestion.apiKey="$(openssl rand -hex 32)" \
+  --set secret.ingestion.hs256Secret="$(openssl rand -hex 32)" \
+  --set secret.replicationToken="$(openssl rand -hex 32)" \
+  --set secret.controlPlane.token="$(openssl rand -hex 32)"
 ```
 
-The install will:
+For GitOps, create the Secrets yourself (External Secrets, Sealed Secrets,
+SOPS, `kubectl create secret`) and reference them. The chart then renders no
+Secret for that component:
 
-1. Create the `dash-system` namespace (`--create-namespace`).
-2. Render a `ConfigMap` and per-service `Secret`s.
-3. Create three `StatefulSet`s, each with a headless identity service
-   and a `ClusterIP` fronting service.
-4. Attach a `PodDisruptionBudget`, `HorizontalPodAutoscaler`, and
-   `NetworkPolicy` set to each workload.
-5. Mint a `cert-manager` certificate and wire up the
-   `nginx`-class `Ingress` for `/v1/*` (and `/health`) on
-   `dash.example.com` (override with `--set ingress.hosts[0].host=...`).
+```yaml
+secret:
+  existingSecret:
+    retrieval: my-dash-retrieval      # DASH_RETRIEVAL_API_KEY, DASH_RETRIEVAL_JWT_HS256_SECRET,
+                                      # DASH_RETRIEVAL_REPLICATION_TOKEN
+    ingestion: my-dash-ingestion      # DASH_INGEST_API_KEY, DASH_INGEST_JWT_HS256_SECRET,
+                                      # DASH_INGEST_REPLICATION_TOKEN
+    controlPlane: my-dash-cp          # DASH_CONTROL_PLANE_TOKEN
+```
+
+The replication token must be identical in the retrieval and ingestion
+Secrets. When `config.embeddingProvider=openai`, both Secrets also need
+`DASH_OPENAI_API_KEY` (`secret.openaiApiKey` for chart-managed Secrets).
+Set `controlPlane.enabled=false` to skip the control plane and its token.
 
 ## Prerequisites
 
-| Component    | Version     | Why                                |
-|--------------|-------------|------------------------------------|
-| Kubernetes   | >= 1.25     | HPA v2, `seccompProfile` defaults  |
-| Helm         | >= 3.10     | API v2 chart features              |
-| cert-manager | >= 1.13     | TLS for the ingress                |
-| nginx-ingress| >= 1.9      | Annotations target nginx-ingress   |
-| Metrics      | metrics-server | HPA needs CPU utilization       |
+| Component     | Version | Why |
+|---------------|---------|-----|
+| Kubernetes    | >= 1.25 | `seccompProfile` defaults, restricted pod security |
+| Helm          | >= 3.10 | chart features |
+| cert-manager  | >= 1.13 | TLS for the ingress (optional) |
+| nginx-ingress | >= 1.9  | annotations target ingress-nginx |
+
+## Data path
+
+```
+ clients ──TLS──▶ ingress ─┬─ /v1/ingest*  ─▶ Service dash-ingestion  ─▶ StatefulSet ingestion (1 replica, PVC)
+                           └─ /v1, /health ─▶ Service dash-retrieval  ─▶ StatefulSet retrieval (N replicas, N PVCs)
+                                                                              │ polls /internal/replication/*
+                                                                              └──────────▶ ingestion (token auth)
+```
+
+`/internal/*` and `/metrics` are never routed by the ingress. Set
+`ingress.exposeIngestion=false` to keep the write API cluster-internal.
+
+## Persistence layout (per pod, mounted at `config.persistencePath`)
+
+```
+/var/lib/dash/
+├── wal/ingestion.wal
+├── state/{ingestion.redb,retrieval.redb,retrieval-replication.offset,control-plane.*}
+├── segments/{ingestion,retrieval}/
+└── audit/{ingestion,retrieval}.audit.jsonl    # config.audit.enabled
+```
+
+The root filesystem is read-only; `/tmp` is a memory-backed `emptyDir`.
+`/opt/dash` is not mounted over, so the image's entrypoint is intact. An init
+container creates the data directories on a fresh PVC.
 
 ## Configuration
 
-The full set of values lives in `values.yaml`. The table below
-summarizes the high-impact knobs; the file is the source of truth.
+`values.yaml` is the source of truth. High-impact keys:
 
-| Key                                  | Default                                     | Description |
-|--------------------------------------|---------------------------------------------|-------------|
-| `image.registry`                     | `ghcr.io`                                   | Container registry |
-| `image.repository`                   | `bhaweshbhaskar/dash`                       | Base image repo (per-service suffix is appended) |
-| `image.tag`                          | `0.2.0`                                     | Image tag; pin in lockstep with `Chart.appVersion` |
-| `image.pullPolicy`                   | `IfNotPresent`                              | K8s image pull policy |
-| `image.pullSecrets`                  | `[]`                                        | List of `imagePullSecret` names |
-| `replicas.retrieval`                 | `2`                                         | Initial retrieval replica count (HPA lower bound) |
-| `replicas.ingestion`                 | `2`                                         | Initial ingestion replica count (HPA lower bound) |
-| `service.type`                       | `ClusterIP`                                 | K8s service type |
-| `service.ports.http`                 | `80`                                        | Fronting port; keep in sync with `ingress` |
-| `ingress.enabled`                    | `true`                                      | Render the ingress |
-| `ingress.className`                  | `nginx`                                     | IngressClass |
-| `ingress.hosts[0].host`              | `dash.example.com`                          | Public hostname |
-| `ingress.tls[0].secretName`          | `dash-retrieval-tls`                        | cert-manager managed TLS secret |
-| `persistence.enabled`                | `true`                                      | Render per-pod PVCs |
-| `persistence.size`                   | `10Gi`                                      | PVC size (RWO) |
-| `persistence.storageClassName`       | `""`                                        | Empty = cluster default |
-| `resources.requests.cpu`             | `250m`                                      | CPU request per pod |
-| `resources.requests.memory`          | `256Mi`                                     | Memory request per pod |
-| `resources.limits.cpu`               | `1000m`                                     | CPU limit per pod |
-| `resources.limits.memory`            | `512Mi`                                     | Memory limit per pod |
-| `hpa.enabled`                        | `true`                                      | Render HPAs |
-| `hpa.minReplicas`                    | `2`                                         | HPA lower bound |
-| `hpa.maxReplicas`                    | `10`                                        | HPA upper bound |
-| `pdb.enabled`                        | `true`                                      | Render PDBs |
-| `pdb.minAvailable`                   | `1`                                         | Always-alive floor |
-| `networkPolicy.enabled`              | `true`                                      | Render default-deny + allow rules |
-| `serviceAccount.create`              | `true`                                      | Create per-service SAs |
-| `namespace.create`                   | `false`                                     | Render the `Namespace` resource |
-| `namespace.name`                     | `dash-system`                               | Target namespace |
-| `config.logLevel`                    | `info`                                      | `DASH_LOG_LEVEL` |
-| `config.embeddingProvider`           | `hash`                                      | `DASH_EMBEDDING_PROVIDER` (hash/openai/ollama) |
-| `config.persistencePath`             | `/var/lib/dash`                             | Mount path for the redb volume |
-| `secret.openaiApiKey`                | `null`                                      | `DASH_OPENAI_API_KEY` (required when provider=openai) |
-| `secret.jwtPublicKey`                | `null`                                      | PEM-encoded RS256/ES256 verification key |
-| `secret.retrieval.apiKey`            | `null`                                      | Static API key for retrieval |
-| `secret.ingestion.apiKey`            | `null`                                      | Static API key for ingestion |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `image.registry` / `image.repository` / `image.tag` | `ghcr.io` / `bhaweshbhaskar/dash` / `0.2.0` | Image is `<registry>/<repository>-<service>:<tag>` |
+| `replicas.retrieval` | `2` | Retrieval replicas (manual scaling) |
+| `controlPlane.enabled` | `true` | Deploy the control plane |
+| `config.logLevel` | `info` | `RUST_LOG` filter |
+| `config.strictSecrets` | `true` | `DASH_STRICT_SECRETS` |
+| `config.embeddingProvider` | `hash` | `DASH_EMBEDDING_PROVIDER` (`hash`, `openai`, `ollama`) |
+| `config.ollamaEndpoint` | in-cluster URL | `DASH_OLLAMA_ENDPOINT` (only when provider is `ollama`) |
+| `config.persistencePath` | `/var/lib/dash` | PVC mount path |
+| `config.audit.enabled` | `true` | Audit logs on the PVC |
+| `persistence.size` / `persistence.storageClassName` | `10Gi` / cluster default | Per-pod volume |
+| `probes.*` | `/v1/live`, `/v1/ready` | Liveness, readiness and startup paths |
+| `ingress.*` | nginx, `dash.example.com` | `/v1/ingest` to ingestion, `/v1` and `/health` to retrieval |
+| `networkPolicy.enabled` | `true` | Default deny plus allow rules |
+| `networkPolicy.ollama.enabled` | `false` | Egress to in-cluster Ollama on private CIDRs (port 11434) |
+| `pdb.enabled` | `true` | PodDisruptionBudget for retrieval only |
+| `secret.*` | none | See "Secrets are required" |
 
-## Install
+For an in-cluster Ollama, set `config.embeddingProvider=ollama`,
+`config.ollamaEndpoint=http://<service>:11434` and
+`networkPolicy.ollama.enabled=true`.
 
-The minimal install requires at least a JWT public key (RS256) or
-HS256 shared secret. Generate one with:
+## Validation
 
 ```bash
-# RSA keypair (preferred)
-openssl genrsa -out jwt.pem 2048
-openssl rsa -in jwt.pem -pubout -out jwt.pub
-
-# Or just use a long random string for HS256
-openssl rand -hex 32
+helm lint deploy/helm/dash --set ... # all secret values as above
+helm template dash deploy/helm/dash --set ... | kubeconform -strict -summary
+scripts/check_deploy_env.sh          # every DASH_* env var must be read by the code
 ```
 
-Then install:
+CI (`.github/workflows/rust.yml`, job `deploy-manifests`) runs these with
+generated secrets.
+
+## Upgrade, rollback, uninstall
 
 ```bash
-helm install dash ./deploy/helm/dash \
-  --namespace dash-system \
-  --create-namespace \
-  --set-file secret.jwtPublicKey=jwt.pub
-```
-
-### Production install with sealed secrets
-
-The chart splits the secret material across two `Secret`s
-(`<release>-retrieval-secrets`, `<release>-ingestion-secrets`).
-For production, encrypt them with [Sealed Secrets] and commit the
-result:
-
-```bash
-kubectl create secret generic dash-retrieval-secrets \
-  --namespace dash-system --dry-run=client -o yaml \
-  --from-file=DASH_RETRIEVAL_JWT_PUBLIC_KEY=jwt.pub \
-  --from-literal=DASH_RETRIEVAL_API_KEY="$RETRIEVAL_KEY" \
-  --from-literal=DASH_OPENAI_API_KEY="$OPENAI_KEY" \
-  | kubeseal -o yaml > deploy/overlays/prod/retrieval-secrets.yaml
-```
-
-Reference the sealed secret in a Kustomize patch and let it
-override the chart-rendered Secret. The chart's `secret.create`
-value can be flipped to `false` to drop the placeholder:
-
-```bash
-helm upgrade dash ./deploy/helm/dash \
-  --reuse-values \
-  --set secret.create=false
-```
-
-[Sealed Secrets]: https://github.com/bitnami-labs/sealed-secrets
-
-## Upgrade
-
-The chart follows standard SemVer:
-
-- **Patch bumps** (`0.1.x`): safe to `helm upgrade` with `--reuse-values`.
-  No resource spec changes; image tags and labels may shift.
-- **Minor bumps** (`0.x.0`): review the *Upgrade Notes* below.
-  Templates are backwards compatible; existing PVCs and Secrets
-  are preserved.
-- **Major bumps** (`x.0.0`): expect breaking changes. Read the
-  `CHANGELOG.md` and pin a previous chart version explicitly:
-  `helm install dash ./deploy/helm/dash --version 0.1.0 ...`.
-
-### Schema change upgrade guide
-
-When a chart release changes the set of `ConfigMap` keys, the
-existing ConfigMap is updated in place (Helm applies the new
-manifest directly). The new keys are picked up on the next pod
-restart; deleted keys are ignored by the running pods but will
-appear as "stale" in `kubectl describe configmap`.
-
-For **secret schema** changes, the chart recreates the Secret only
-if its data hash changes. If you change the secret shape manually,
-delete the Secret first to avoid a stuck upgrade:
-
-```bash
-kubectl delete secret dash-retrieval-secrets -n dash-system
 helm upgrade dash ./deploy/helm/dash --reuse-values
-```
-
-For **PVC schema** changes (e.g. switching from `standard` to
-`ssd-csi` storage class), the StatefulSet will not recreate the
-existing PVCs. Use one of:
-
-1. `kubectl edit pvc` to retag in place (works for `storageClassName`
-   only when the PV's `storageClass` is mutable).
-2. Drain the workload, delete the PVC, and let the StatefulSet
-   recreate it. **This wipes redb state - back up first**.
-
-```bash
-kubectl rollout pause statefulset/dash-retrieval -n dash-system
-kubectl delete pvc data-dash-retrieval-0 data-dash-retrieval-1 -n dash-system
-kubectl rollout resume statefulset/dash-retrieval -n dash-system
-```
-
-For **StatefulSet spec changes** (replicas, affinity, probes) the
-rolling update is automatic. Force a fresh rollout when only
-annotations change:
-
-```bash
-kubectl rollout restart statefulset/dash-retrieval -n dash-system
-```
-
-## Rollback
-
-Helm keeps the last 10 releases. Roll back the workload to the
-previous revision:
-
-```bash
 helm history dash -n dash-system
-helm rollback dash 1 --namespace dash-system
+helm rollback dash <revision> -n dash-system
+helm uninstall dash -n dash-system
 ```
 
-`helm rollback` re-renders the previous templates and applies
-them. **PVCs are not rolled back** - they persist across revisions
-because their lifecycle is independent of the chart. If the
-rollback introduces a breaking storage format, you must:
-
-1. `helm rollback` the chart first.
-2. Drain and delete the PVCs.
-3. Restore the redb files from a backup (snapshot the PVC contents
-   with `kubectl cp` or your storage provider's snapshot API).
-
-To roll back **only** the image tag (most common case):
+PVCs are owned by the StatefulSets and are **not** deleted on uninstall or
+rollback. Back up before deleting them; to wipe state:
 
 ```bash
-helm upgrade dash ./deploy/helm/dash \
-  --reuse-values \
-  --set image.tag=0.1.7
+kubectl delete pvc -n dash-system -l app.kubernetes.io/part-of=dash
 ```
 
-## Uninstall
-
-```bash
-helm uninstall dash --namespace dash-system
-kubectl delete namespace dash-system
-```
-
-> **Warning:** Helm uninstall does not delete PVCs (they are
-> owned by the StatefulSet, not the chart). To wipe redb state:
->
-> ```bash
-> kubectl delete pvc -n dash-system \
->   -l app.kubernetes.io/part-of=dash
-> ```
-
-## Architecture quick reference
-
-```
-   internet
-      │
-      ▼
- ┌──────────────┐    TLS    ┌─────────────────┐
- │  nginx-ingress│──────────▶│ Service:        │
- │  (dash.example.com /v1/*)││ dash-retrieval  │
- └──────────────┘           │  ClusterIP :80  │
-                            └────────┬────────┘
-                                     │ :8080
-                          ┌──────────┴──────────┐
-                          ▼                     ▼
-                ┌────────────────┐    ┌────────────────┐
-                │ StatefulSet:   │    │ StatefulSet:   │
-                │ dash-retrieval │    │ dash-ingestion │
-                │ (redb, RWO)    │◀──▶│ (redb, RWO)    │
-                └────────────────┘    └───────┬────────┘
-                       ▲                      │
-                       │     NetworkPolicy     │
-                       │  (in-cluster, :8081)  │
-                       └──────────────────────┘
-```
-
-- **Egress to OpenAI/Ollama**: 443/11434 via NetworkPolicy.
-- **Service-to-service**: retrieval → ingestion on :8081.
-- **Public ingress**: only the retrieval service.
+A StatefulSet's `volumeClaimTemplates` are immutable, so changing
+`persistence.*` on an existing release requires recreating the StatefulSet
+(`kubectl delete statefulset <name> --cascade=orphan`, then `helm upgrade`).
 
 ## Verifying an install
 
 ```bash
-# 1. Workloads ready?
-kubectl get pods -n dash-system -l app.kubernetes.io/part-of=dash
-
-# 2. HPA wired?
-kubectl get hpa -n dash-system
-
-# 3. PVCs bound?
-kubectl get pvc -n dash-system
-
-# 4. Ingress has an address?
-kubectl get ingress -n dash-system
-
-# 5. End-to-end smoke test
+kubectl get pods,pvc,ingress -n dash-system
 curl -fsS https://dash.example.com/health
-curl -fsS https://dash.example.com/v1/embeddings \
-  -H 'content-type: application/json' \
-  -d '{"model":"text-embedding-3-small","input":"hello"}'
+curl -fsS -X POST https://dash.example.com/v1/retrieve \
+  -H "authorization: Bearer $RETRIEVAL_API_KEY" -H 'content-type: application/json' \
+  -d '{"tenant_id":"t1","query":"hello","top_k":5}'
 ```
 
 ## File layout
@@ -295,11 +172,12 @@ deploy/helm/dash/
     ├── _helpers.tpl
     ├── namespace.yaml
     ├── config.yaml
+    ├── secrets.yaml
     ├── serviceaccount.yaml
     ├── retrieval.yaml
     ├── ingestion.yaml
+    ├── controlplane.yaml
     ├── ingress.yaml
     ├── networkpolicy.yaml
-    ├── pdb.yaml
-    └── hpa.yaml
+    └── pdb.yaml
 ```

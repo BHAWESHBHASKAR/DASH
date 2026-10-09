@@ -53,7 +53,8 @@ use debug_render::{
     resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
 };
 use http::{
-    parse_request_line, read_http_request, render_response_text, split_target, write_response,
+    parse_request_line, read_http_request, render_response_text, resolve_request_timeout,
+    split_target, write_response,
 };
 #[cfg(test)]
 use payload::build_retrieve_request_from_json;
@@ -804,6 +805,12 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     .unwrap_or(default_capacity)
 }
 
+/// Bounded exponential backoff (10ms .. 100ms) for repeated accept failures.
+fn accept_error_backoff(streak: u32) -> Duration {
+    let millis = 10u64.saturating_mul(1u64 << streak.saturating_sub(1).min(4));
+    Duration::from_millis(millis.min(100))
+}
+
 const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: retrieval worker queue full";
 
 pub(crate) fn backpressure_rejection_response() -> HttpResponse {
@@ -890,6 +897,7 @@ pub fn serve_http_with_workers(
         listener
             .set_nonblocking(true)
             .expect("set listener non-blocking");
+        let mut accept_error_streak: u32 = 0;
         loop {
             if shutdown.is_triggered() {
                 eprintln!("retrieval: shutdown signal received, draining in-flight requests");
@@ -897,6 +905,7 @@ pub fn serve_http_with_workers(
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    accept_error_streak = 0;
                     backpressure_metrics.observe_enqueued();
                     match tx.try_send(stream) {
                         Ok(()) => {}
@@ -920,9 +929,15 @@ pub fn serve_http_with_workers(
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => {
+                    // Transient failures (EMFILE, ECONNABORTED, ...) must not
+                    // take the server down; back off briefly and keep serving.
+                    // Only the shutdown flag ends this loop.
+                    accept_error_streak = accept_error_streak.saturating_add(1);
                     eprintln!("retrieval transport accept error: {err}");
-                    break;
+                    std::thread::sleep(accept_error_backoff(accept_error_streak));
+                    continue;
                 }
             }
         }
@@ -1029,14 +1044,19 @@ fn handle_connection(
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
+    stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
 
-    let request = match read_http_request(&mut stream) {
+    // The read deadline covers the whole request (headers and body), not
+    // each individual read, so slow-trickle clients are dropped.
+    let request = match read_http_request(&mut stream, resolve_request_timeout()) {
         Ok(Some(request)) => request,
         Ok(None) => return Ok(()),
         Err(err) => {
-            return write_response(&mut stream, HttpResponse::bad_request(&err));
+            return write_response(
+                &mut stream,
+                HttpResponse::error_with_status(err.status, &err.message),
+            );
         }
     };
 
@@ -1061,9 +1081,11 @@ fn handle_connection(
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_placement_reload_snapshot(&reload_snapshot);
     }
-    let store_guard = store.read().unwrap_or_else(|p| p.into_inner());
+    // The store lock is taken only for the short in-memory read sections inside
+    // the handler (never across embedding calls) and is released before the
+    // response is written to the socket.
     let response = handle_request_with_metrics_and_reload(
-        &store_guard,
+        &**store,
         &request,
         metrics,
         routing_snapshot.as_ref(),
@@ -1120,8 +1142,8 @@ fn handle_request_with_metrics_and_routing(
     handle_request_with_metrics_and_reload(store, request, metrics, placement_routing, None)
 }
 
-fn handle_request_with_metrics_and_reload(
-    store: &InMemoryStore,
+fn handle_request_with_metrics_and_reload<S: StoreAccess + ?Sized>(
+    store: &S,
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
@@ -1138,8 +1160,8 @@ fn handle_request_with_metrics_and_reload(
     )
 }
 
-fn handle_request_with_policy(
-    store: &InMemoryStore,
+fn handle_request_with_policy<S: StoreAccess + ?Sized>(
+    store: &S,
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
@@ -1176,20 +1198,25 @@ fn handle_request_with_policy(
         // configured.
         ("GET", "/ready") | ("GET", "/v1/ready") => {
             if let Err(poisoned) = metrics.lock() {
-                return HttpResponse::internal_server_error(
-                    format!("metrics mutex poisoned: {poisoned}").as_str(),
-                );
+                eprintln!("retrieval /ready: metrics mutex poisoned: {poisoned}");
+                return HttpResponse::internal_server_error("metrics_unavailable");
             }
-            match store.disk_status() {
+            let store_view = store.read_store();
+            let disk_status = store_view.disk_status();
+            match disk_status {
                 store::DiskStatus::Available | store::DiskStatus::Recovering => {
                     HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                 }
                 store::DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
-                        // The underlying reason may contain paths or OS
-                        // errors; keep it in the log, not in the response.
-                        eprintln!("retrieval readiness: disk unavailable: {reason}");
-                        HttpResponse::error_with_status(503, "not ready")
+                        eprintln!("retrieval /ready: disk unavailable: {reason}");
+                        HttpResponse {
+                            status: 503,
+                            content_type: "application/json",
+                            body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
+                                .to_string(),
+                            retry_after_secs: None,
+                        }
                     } else {
                         HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
                     }
@@ -1210,7 +1237,7 @@ fn handle_request_with_policy(
                 return denied;
             }
             let body = if let Ok(guard) = metrics.lock() {
-                guard.render_prometheus(placement_routing, store.disk_status())
+                guard.render_prometheus(placement_routing, store.read_store().disk_status())
             } else {
                 "dash_transport_metrics_unavailable 1\n".to_string()
             };
@@ -1246,7 +1273,7 @@ fn handle_request_with_policy(
                 ) {
                     return denied;
                 }
-                let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                let snapshot = build_retrieve_planner_debug_snapshot(&store.read_store(), &req);
                 emit_audit_event(
                     metrics,
                     audit_log_path.as_deref(),
@@ -1273,9 +1300,9 @@ fn handle_request_with_policy(
                 ) {
                     return denied;
                 }
-                let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
+                let snapshot = build_retrieve_planner_debug_snapshot(&store.read_store(), &req);
                 let (_, merge_snapshot) =
-                    execute_api_query_with_storage_snapshot(store, req.clone());
+                    execute_api_query_with_storage_snapshot(&store.read_store(), req.clone());
                 let warn_delta_count = resolve_storage_divergence_warn_delta_count();
                 let warn_ratio = resolve_storage_divergence_warn_ratio();
                 let (warn, reason, ratio) =
@@ -1400,9 +1427,10 @@ fn handle_request_with_policy(
                     HttpResponse::ok_json(body)
                 }
                 Err(err) => {
+                    let (status, err) = classify_openai_embeddings_error(err);
                     let body = serde_json::to_string(&err)
                         .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
-                    HttpResponse::json_with_status(400, body)
+                    HttpResponse::json_with_status(status, body)
                 }
             }
         }
@@ -1421,6 +1449,33 @@ fn handle_request_with_policy(
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+/// Maps an embeddings-endpoint error to an HTTP status. Client errors stay
+/// 400; provider failures become 502/503 with a generic message (the detail
+/// is logged, not returned).
+fn classify_openai_embeddings_error(
+    err: crate::openai_embeddings::OpenAIErrorResponse,
+) -> (u16, crate::openai_embeddings::OpenAIErrorResponse) {
+    if err.error.kind != "server_error" {
+        return (400, err);
+    }
+    eprintln!(
+        "retrieval embeddings provider failure: {}",
+        err.error.message
+    );
+    let lowered = err.error.message.to_ascii_lowercase();
+    if lowered.contains("circuit breaker") || lowered.contains("timeout") {
+        (
+            503,
+            crate::openai_embeddings::OpenAIErrorResponse::server_error("embedding_unavailable"),
+        )
+    } else {
+        (
+            502,
+            crate::openai_embeddings::OpenAIErrorResponse::server_error("embedding_provider_error"),
+        )
     }
 }
 
@@ -1515,8 +1570,8 @@ fn deny_unless_allowed(
 
 /// Shared tail of `GET`/`POST /v1/retrieve`: authorize first, and only then
 /// spend an embedding provider call on the query.
-fn handle_authorized_retrieve(
-    store: &InMemoryStore,
+fn handle_authorized_retrieve<S: StoreAccess + ?Sized>(
+    store: &S,
     request: &HttpRequest,
     transport_req: RetrieveTransportRequest,
     auth_policy: &AuthPolicy,
@@ -1536,8 +1591,9 @@ fn handle_authorized_retrieve(
     ) {
         return denied;
     }
-    if let Err(err) = embed_query_if_missing(&mut req) {
-        return HttpResponse::bad_request(&err);
+    // Embedding happens only after authorization and before any store lock.
+    if let Err(response) = embed_query_if_missing(&mut req) {
+        return response;
     }
     let response = execute_retrieve_and_observe(
         store,
@@ -1633,20 +1689,29 @@ fn emit_audit_event(
 /// Embed the retrieve query text using the configured `DASH_EMBEDDING_PROVIDER`
 /// when the caller did not supply an explicit `query_embedding`. This makes
 /// semantic retrieval work out of the box for SDKs and curl clients.
-fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), String> {
+fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), HttpResponse> {
     if req.query_embedding.is_some() {
         return Ok(());
     }
     let provider = embedding_provider();
     let vectors = provider
         .embed(std::slice::from_ref(&req.query))
-        .map_err(|e| format!("embedding failed: {e}"))?;
+        .map_err(|err| {
+            eprintln!("retrieval embedding provider failure: {err}");
+            let (status, code) = match &err {
+                embeddings::EmbeddingError::CircuitOpen { .. }
+                | embeddings::EmbeddingError::Timeout(_)
+                | embeddings::EmbeddingError::InvalidConfig(_) => (503, "embedding_unavailable"),
+                _ => (502, "embedding_provider_error"),
+            };
+            HttpResponse::error_with_status(status, code)
+        })?;
     req.query_embedding = vectors.into_iter().next();
     Ok(())
 }
 
-fn execute_retrieve_and_observe(
-    store: &InMemoryStore,
+fn execute_retrieve_and_observe<S: StoreAccess + ?Sized>(
+    store: &S,
     req: RetrieveApiRequest,
     read_consistency: ReadConsistencyPolicy,
     metrics: &Arc<Mutex<TransportMetrics>>,
@@ -1674,11 +1739,13 @@ fn execute_retrieve_and_observe(
 
     let started_at = Instant::now();
     let tenant_id = req.tenant_id.clone();
-    let (response, merge_snapshot) = execute_api_query_with_storage_snapshot(store, req);
+    let store_view = store.read_store();
+    let (response, merge_snapshot) = execute_api_query_with_storage_snapshot(&store_view, req);
     let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let result_count = response.results.len();
     let ingest_to_visible_lag_ms =
-        estimate_ingest_to_visible_lag_ms(store, &tenant_id, &response.results);
+        estimate_ingest_to_visible_lag_ms(&store_view, &tenant_id, &response.results);
+    drop(store_view);
 
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_retrieve(200, latency_ms, result_count, ingest_to_visible_lag_ms);
@@ -2196,16 +2263,48 @@ impl HttpResponse {
     }
 
     fn error_with_status(status: u16, message: &str) -> Self {
-        match status {
-            400 => Self::bad_request(message),
-            401 => Self::unauthorized(message),
-            403 => Self::forbidden(message),
-            404 => Self::not_found(message),
-            429 => Self::too_many_requests(message, 1),
-            405 => Self::method_not_allowed(message),
-            503 => Self::service_unavailable(message),
-            _ => Self::internal_server_error(message),
+        if status == 429 {
+            return Self::too_many_requests(message, 1);
         }
+        Self {
+            status,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// Access to the shared store that lets the handler take the read lock only
+/// for the sections that need it, instead of for the whole request.
+trait StoreAccess {
+    fn read_store(&self) -> StoreView<'_>;
+}
+
+enum StoreView<'a> {
+    Borrowed(&'a InMemoryStore),
+    Guard(std::sync::RwLockReadGuard<'a, InMemoryStore>),
+}
+
+impl std::ops::Deref for StoreView<'_> {
+    type Target = InMemoryStore;
+    fn deref(&self) -> &InMemoryStore {
+        match self {
+            StoreView::Borrowed(store) => store,
+            StoreView::Guard(guard) => guard,
+        }
+    }
+}
+
+impl StoreAccess for InMemoryStore {
+    fn read_store(&self) -> StoreView<'_> {
+        StoreView::Borrowed(self)
+    }
+}
+
+impl StoreAccess for RwLock<InMemoryStore> {
+    fn read_store(&self) -> StoreView<'_> {
+        StoreView::Guard(self.read().unwrap_or_else(|p| p.into_inner()))
     }
 }
 

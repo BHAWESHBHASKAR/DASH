@@ -58,4 +58,4 @@ export type { RequestOptions } from './transport.js';
 export { openAIBaseURL, DASH_TS_VERSION } from './openai-compat.js';
 
 /** The package version. */
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';

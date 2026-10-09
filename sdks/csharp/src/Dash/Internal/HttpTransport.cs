@@ -17,8 +17,9 @@ namespace Dash.Internal;
 ///   <item>Set the <c>Authorization: Bearer &lt;key&gt;</c> header.</item>
 ///   <item>Set the configured <c>User-Agent</c> on every request.</item>
 ///   <item>Serialize JSON bodies with snake_case naming.</item>
-///   <item>Retry on transient failures (network, 5xx, 429) with
-///         exponential backoff.</item>
+///   <item>Retry idempotent requests on transient failures (network, 5xx,
+///         429) with capped, jittered exponential backoff that honours
+///         <c>Retry-After</c>. Non-idempotent requests are sent once.</item>
 ///   <item>Translate non-2xx responses into <see cref="DashException"/>
 ///         subclasses.</item>
 /// </list>
@@ -26,6 +27,12 @@ namespace Dash.Internal;
 internal sealed class HttpTransport
 {
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
+
+    internal static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan MaxRetryAfter = TimeSpan.FromSeconds(30);
+    internal const int MaxRetriesLimit = 10;
+
+    private static readonly Random Jitter = new();
 
     private readonly HttpClient _httpClient;
     private readonly bool _ownsHttpClient;
@@ -56,7 +63,7 @@ internal sealed class HttpTransport
 
     public TimeSpan Timeout => _options.Timeout;
 
-    public int MaxRetries => Math.Max(0, _options.MaxRetries);
+    public int MaxRetries => Math.Min(MaxRetriesLimit, Math.Max(0, _options.MaxRetries));
 
     public TimeSpan RetryBaseDelay => _options.RetryBaseDelay;
 
@@ -71,9 +78,10 @@ internal sealed class HttpTransport
         HttpMethod method,
         string path,
         object? body,
+        RequestOptions requestOptions,
         CancellationToken cancellationToken)
     {
-        var (status, raw, requestId) = await SendRawAsync(method, path, body, cancellationToken)
+        var (status, raw, requestId) = await SendRawAsync(method, path, body, requestOptions, cancellationToken)
             .ConfigureAwait(false);
         EnsureSuccess(status, raw, requestId, path);
 
@@ -94,10 +102,11 @@ internal sealed class HttpTransport
         HttpMethod method,
         string path,
         object? body,
+        RequestOptions requestOptions,
         CancellationToken cancellationToken)
         where TResponse : class
     {
-        var result = await SendAsync<TResponse>(method, path, body, cancellationToken)
+        var result = await SendAsync<TResponse>(method, path, body, requestOptions, cancellationToken)
             .ConfigureAwait(false);
         if (result is null)
         {
@@ -114,10 +123,13 @@ internal sealed class HttpTransport
         HttpMethod method,
         string path,
         object? body,
+        RequestOptions requestOptions,
         CancellationToken cancellationToken)
     {
         var url = _baseUrl + path;
-        var maxAttempts = MaxRetries + 1;
+        // Only requests that are safe to repeat get more than one attempt.
+        var canRetry = method == HttpMethod.Get || requestOptions.CanRetry;
+        var maxAttempts = canRetry ? MaxRetries + 1 : 1;
         Exception? lastTransient = null;
         int? lastStatus = null;
         string? lastRaw = null;
@@ -127,7 +139,7 @@ internal sealed class HttpTransport
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            using var request = BuildRequest(method, url, body);
+            using var request = BuildRequest(method, url, body, requestOptions);
             HttpResponseMessage? response = null;
             string? raw = null;
             string? requestId = null;
@@ -202,11 +214,16 @@ internal sealed class HttpTransport
             lastTransient ?? new InvalidOperationException("unknown transport failure"));
     }
 
-    private HttpRequestMessage BuildRequest(HttpMethod method, string url, object? body)
+    private HttpRequestMessage BuildRequest(HttpMethod method, string url, object? body, RequestOptions requestOptions)
     {
         var request = new HttpRequestMessage(method, url);
         request.Headers.UserAgent.ParseAdd(_options.UserAgent);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+        if (!string.IsNullOrWhiteSpace(requestOptions.IdempotencyKey))
+        {
+            request.Headers.TryAddWithoutValidation("Idempotency-Key", requestOptions.IdempotencyKey);
+        }
 
         if (!string.IsNullOrEmpty(_apiKey))
         {
@@ -245,7 +262,7 @@ internal sealed class HttpTransport
                 => new DashAuthException(fullMessage, statusCode, errorCode, requestId, raw),
             (int)HttpStatusCode.NotFound
                 => new DashNotFoundException(fullMessage, statusCode, errorCode, requestId, raw),
-            (int)HttpStatusCode.TooManyRequests
+            429
                 => new DashRateLimitException(fullMessage, statusCode, errorCode, requestId, raw),
             _ => new DashException(fullMessage, statusCode, errorCode, requestId, raw),
         };
@@ -260,7 +277,7 @@ internal sealed class HttpTransport
 
         try
         {
-            using var doc = JsonDocument.Parse(raw);
+            using var doc = JsonDocument.Parse(raw!);
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
             {
                 return (null, raw);
@@ -305,7 +322,7 @@ internal sealed class HttpTransport
 
     private static bool IsRetryableStatus(int statusCode)
     {
-        if (statusCode == (int)HttpStatusCode.TooManyRequests)
+        if (statusCode == 429)
         {
             return true;
         }
@@ -318,10 +335,21 @@ internal sealed class HttpTransport
 
     private async Task BackoffAsync(int attempt, HttpResponseMessage? response, CancellationToken cancellationToken)
     {
-        // Respect a server-supplied Retry-After header for 429.
-        TimeSpan? retryAfter = null;
+        // Exponential backoff with full jitter, capped at MaxBackoff.
+        var capMs = Math.Min(
+            MaxBackoff.TotalMilliseconds,
+            _options.RetryBaseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(attempt - 1, 20)));
+        double jitterMs;
+        lock (Jitter)
+        {
+            jitterMs = capMs <= 0 ? 0 : Jitter.NextDouble() * capMs;
+        }
+        var delay = TimeSpan.FromMilliseconds(jitterMs);
+
+        // Honour a server-supplied Retry-After (delta-seconds or HTTP-date).
         if (response is not null && response.Headers.RetryAfter is { } ra)
         {
+            TimeSpan? retryAfter = null;
             if (ra.Delta is { } delta)
             {
                 retryAfter = delta;
@@ -331,18 +359,22 @@ internal sealed class HttpTransport
                 var diff = date - DateTimeOffset.UtcNow;
                 retryAfter = diff > TimeSpan.Zero ? diff : TimeSpan.Zero;
             }
+            if (retryAfter is { } serverDelay)
+            {
+                if (serverDelay > MaxRetryAfter)
+                {
+                    serverDelay = MaxRetryAfter;
+                }
+                if (serverDelay > delay)
+                {
+                    delay = serverDelay;
+                }
+            }
         }
 
-        var delay = retryAfter ?? TimeSpan.FromMilliseconds(
-            _options.RetryBaseDelay.TotalMilliseconds * Math.Pow(2, attempt - 1));
-
-        try
+        if (delay > TimeSpan.Zero)
         {
             await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
         }
     }
 

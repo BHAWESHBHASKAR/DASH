@@ -1,16 +1,18 @@
 ---
-# Public ingress for the OpenAI-compatible /v1/* surface exposed by
-# the retrieval service. Ingestion is intentionally not exposed: it
-# is reachable only from inside the cluster (see 50-networkpolicy).
+# Public ingress. Write endpoints (/v1/ingest, /v1/ingest/raw,
+# /v1/ingest/document, /v1/ingest/batch) go to the ingestion service; the
+# rest of /v1 (retrieve, embeddings) and /health go to retrieval. The
+# longest matching prefix wins, so /v1/ingest takes precedence over /v1.
+# /internal/* (replication) and /metrics are never routed from here.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: dash-retrieval
+  name: dash
   namespace: dash-system
   labels:
     app.kubernetes.io/part-of: dash
     app.kubernetes.io/name: dash
-    app.kubernetes.io/component: retrieval
+    app.kubernetes.io/component: ingress
   annotations:
     # Allow 10 MiB request bodies (chunked embedding payloads).
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
@@ -38,6 +40,13 @@ spec:
   - host: dash.example.com
     http:
       paths:
+      - path: /v1/ingest
+        pathType: Prefix
+        backend:
+          service:
+            name: dash-ingestion
+            port:
+              number: 80
       - path: /v1
         pathType: Prefix
         backend:

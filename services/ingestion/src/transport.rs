@@ -61,7 +61,9 @@ use replication::{
     ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
     render_replication_export_frame, run_replication_pull_tick,
 };
-use request::{parse_query_usize, parse_request_line, read_http_request, split_target};
+use request::{
+    parse_query_usize, parse_request_line, read_http_request, resolve_request_timeout, split_target,
+};
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
