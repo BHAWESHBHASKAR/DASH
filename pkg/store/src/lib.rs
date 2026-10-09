@@ -666,6 +666,32 @@ impl InMemoryStore {
         self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
     }
 
+    /// Like [`Self::retrieve_with_time_range_query_vector_and_allowed_claim_ids`]
+    /// but also returns the number of candidates scanned, so callers do not
+    /// need a second candidate pass just to report the count.
+    pub fn retrieve_with_candidate_count_query_vector_and_allowed_claim_ids(
+        &self,
+        req: &RetrievalRequest,
+        from_unix: Option<i64>,
+        to_unix: Option<i64>,
+        query_vector: Option<&[f32]>,
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> (Vec<RetrievalResult>, usize) {
+        let candidates = self.candidate_claim_ids(
+            &req.tenant_id,
+            &req.query,
+            (from_unix, to_unix),
+            query_vector,
+            req.top_k,
+            allowed_claim_ids,
+        );
+        let candidate_count = candidates.len();
+        (
+            self.score_and_rank_candidate_claim_ids(req, query_vector, candidates),
+            candidate_count,
+        )
+    }
+
     pub fn retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
         &self,
         req: &RetrievalRequest,
