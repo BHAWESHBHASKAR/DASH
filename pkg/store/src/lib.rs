@@ -31,12 +31,12 @@ pub(crate) struct Bm25Context {
 }
 
 pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
-pub use wal::{GROUP_BEGIN_PREFIX, SINGLE_TX_PREFIX, is_group_marker_commit_id};
 pub use wal::{
     CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
     WalReplicationDelta, WalReplicationExport, WalReplicationFrame, WalRollbackPoint,
     WalWritePolicy,
 };
+pub use wal::{GROUP_BEGIN_PREFIX, SINGLE_TX_PREFIX, is_group_marker_commit_id};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {

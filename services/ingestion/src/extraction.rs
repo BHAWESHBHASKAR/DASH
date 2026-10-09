@@ -825,7 +825,11 @@ fn id_components(tenant_id: &str, document_id: &str) -> (String, String) {
     let document = sanitize_id_component(document_id, 48);
     let mut state: u64 = 0xcbf29ce484222325;
     for part in [tenant_id, document_id] {
-        for byte in (part.len() as u64).to_le_bytes().iter().chain(part.as_bytes()) {
+        for byte in (part.len() as u64)
+            .to_le_bytes()
+            .iter()
+            .chain(part.as_bytes())
+        {
             state ^= u64::from(*byte);
             state = state.wrapping_mul(0x100000001b3);
         }
@@ -833,7 +837,11 @@ fn id_components(tenant_id: &str, document_id: &str) -> (String, String) {
     // Second, independent pass so the suffix is 128 bits wide.
     let mut state2: u64 = 0x84222325cbf29ce4;
     for part in [document_id, tenant_id] {
-        for byte in (part.len() as u64).to_le_bytes().iter().chain(part.as_bytes()) {
+        for byte in (part.len() as u64)
+            .to_le_bytes()
+            .iter()
+            .chain(part.as_bytes())
+        {
             state2 = state2.rotate_left(5) ^ u64::from(*byte);
             state2 = state2.wrapping_mul(0x9e3779b97f4a7c15);
         }

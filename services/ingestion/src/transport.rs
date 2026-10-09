@@ -55,8 +55,7 @@ use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
     PlacementRoutingState, WriteRouteError, WriteRouteResolution, map_write_route_error,
-    refresh_placement,
-    write_entity_key_for_claim,
+    refresh_placement, write_entity_key_for_claim,
 };
 use replication::{
     ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
@@ -613,7 +612,10 @@ impl IngestionRuntime {
     /// Checkpoint after a committed write. A failure never invalidates the
     /// commit: the write is durable in the WAL, so the caller is told the
     /// checkpoint was deferred and a later write retries it (DATA-10).
-    fn checkpoint_after_commit(&mut self, label: &str) -> (Option<store::WalCheckpointStats>, bool) {
+    fn checkpoint_after_commit(
+        &mut self,
+        label: &str,
+    ) -> (Option<store::WalCheckpointStats>, bool) {
         let Some(wal) = self.wal.as_mut() else {
             return (None, false);
         };
@@ -883,9 +885,7 @@ impl IngestionRuntime {
         self.transport_backpressure = Some(metrics);
     }
 
-    fn begin_placement_refresh(
-        &mut self,
-    ) -> Option<placement_routing::PlacementRefreshJob> {
+    fn begin_placement_refresh(&mut self) -> Option<placement_routing::PlacementRefreshJob> {
         match self.placement_routing.as_mut() {
             Ok(Some(state)) => state.begin_refresh(),
             _ => None,
