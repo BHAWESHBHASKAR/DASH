@@ -1,0 +1,24 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dash-config
+  namespace: dash-system
+data:
+  # ----- listeners -----
+  DASH_INGEST_TLS_CERT_FILE: "/etc/dash/tls/tls.crt"
+  DASH_INGEST_TLS_KEY_FILE: "/etc/dash/tls/tls.key"
+  DASH_RETRIEVAL_TLS_CERT_FILE: "/etc/dash/tls/tls.crt"
+  DASH_RETRIEVAL_TLS_KEY_FILE: "/etc/dash/tls/tls.key"
+  DASH_CONTROL_PLANE_TLS_CERT_FILE: "/etc/dash/tls/tls.crt"
+  DASH_CONTROL_PLANE_TLS_KEY_FILE: "/etc/dash/tls/tls.key"
+  # ----- mutual TLS on replication -----
+  DASH_INGEST_TLS_CLIENT_CA_FILE: "/etc/dash/tls/ca.crt"
+  DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT: "1"
+  # ----- retrieval follower -----
+  DASH_RETRIEVAL_REPLICATION_SOURCE_URL: "https://dash-ingestion.dash-system.svc.cluster.local:80"
+  DASH_REPLICATION_CA_FILE: "/etc/dash/tls/ca.crt"
+  DASH_REPLICATION_CLIENT_CERT_FILE: "/etc/dash/tls/tls.crt"
+  DASH_REPLICATION_CLIENT_KEY_FILE: "/etc/dash/tls/tls.key"
+  # The source is https:// now; the plaintext acknowledgement goes away.
+  DASH_REPLICATION_ALLOW_INSECURE_HTTP: null

@@ -1,0 +1,25 @@
+---
+# Applied to every StatefulSet (ingestion, retrieval, control plane); the
+# service container is containers[0] in each.
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: tls
+    secret:
+      secretName: dash-internal-tls
+      defaultMode: 0440
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: tls
+    mountPath: /etc/dash/tls
+    readOnly: true
+- op: add
+  path: /spec/template/spec/containers/0/startupProbe/httpGet/scheme
+  value: HTTPS
+- op: add
+  path: /spec/template/spec/containers/0/livenessProbe/httpGet/scheme
+  value: HTTPS
+- op: add
+  path: /spec/template/spec/containers/0/readinessProbe/httpGet/scheme
+  value: HTTPS

@@ -3,6 +3,11 @@
 {{- $expose := .Values.ingress.exposeIngestion -}}
 {{- $ing := include "dash.componentName" (list . "ingestion") -}}
 {{- $ret := include "dash.componentName" (list . "retrieval") -}}
+{{- $annotations := deepCopy (default (dict) .Values.ingress.annotations) -}}
+{{- if .Values.tls.enabled -}}
+{{- /* The backends serve HTTPS only. */ -}}
+{{- $_ := set $annotations "nginx.ingress.kubernetes.io/backend-protocol" "HTTPS" -}}
+{{- end -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -11,7 +16,7 @@ metadata:
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingress
-  {{- with .Values.ingress.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

@@ -1,0 +1,9 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dash
+  namespace: dash-system
+  annotations:
+    # The backends serve HTTPS only.
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"

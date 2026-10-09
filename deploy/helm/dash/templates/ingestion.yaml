@@ -20,7 +20,7 @@ spec:
     port: {{ .Values.service.ports.http }}
     targetPort: http
     protocol: TCP
-    appProtocol: http
+    appProtocol: {{ ternary "https" "http" .Values.tls.enabled }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -97,6 +97,7 @@ spec:
           httpGet:
             path: {{ .Values.probes.startup.path }}
             port: http
+            scheme: {{ include "dash.probeScheme" . }}
           initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
@@ -105,6 +106,7 @@ spec:
           httpGet:
             path: {{ .Values.probes.liveness.path }}
             port: http
+            scheme: {{ include "dash.probeScheme" . }}
           initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
@@ -114,6 +116,7 @@ spec:
           httpGet:
             path: {{ .Values.probes.readiness.path }}
             port: http
+            scheme: {{ include "dash.probeScheme" . }}
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
@@ -127,11 +130,13 @@ spec:
         # the image's binaries and entrypoint.
         - name: tmp
           mountPath: /tmp
+        {{- include "dash.tlsVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
+      {{- include "dash.tlsVolume" . | nindent 6 }}
       {{- if not .Values.persistence.enabled }}
       - name: data
         emptyDir: {}

@@ -1,0 +1,36 @@
+---
+# Example cert-manager Certificate for the TLS overlay (not part of the
+# kustomization: it needs cert-manager and an Issuer you choose). It produces
+# the Secret `dash-internal-tls` with tls.crt, tls.key and ca.crt.
+#
+# Use a private CA Issuer (for example a cert-manager CA issuer backed by your
+# internal root): ca.crt is what ingestion trusts for client certificates and
+# what retrieval trusts for the leader, so it must not be a public web CA.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dash-internal-tls
+  namespace: dash-system
+spec:
+  secretName: dash-internal-tls
+  duration: 2160h      # 90 days
+  renewBefore: 360h    # 15 days; the services pick up the new files without a restart
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+    - client auth
+  commonName: dash-internal
+  dnsNames:
+    - dash-ingestion.dash-system.svc.cluster.local
+    - dash-ingestion.dash-system.svc
+    - dash-retrieval.dash-system.svc.cluster.local
+    - dash-retrieval.dash-system.svc
+    - dash-control-plane.dash-system.svc.cluster.local
+    - dash-control-plane.dash-system.svc
+  issuerRef:
+    kind: Issuer
+    name: dash-internal-ca

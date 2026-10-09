@@ -156,6 +156,28 @@ secret:
     token: null
 
 # -----------------------------------------------------------------------------
+# Native TLS on every DASH listener (ingestion, retrieval, control plane) and
+# on replication. Off by default. See docs/operations/tls.md.
+#
+# secretName names a Secret with tls.crt, tls.key and ca.crt (the shape a
+# cert-manager Certificate produces). The certificate must name the in-cluster
+# service DNS names (<release>-dash-ingestion.<ns>.svc.cluster.local, the
+# retrieval and control-plane services) and carry both the "server auth" and
+# "client auth" usages: retrieval also presents it as its replication client
+# certificate. Files are re-read when they change, so cert-manager renewals
+# need no restart. When enabled, probes use HTTPS and the ingress talks HTTPS
+# to the backends.
+# -----------------------------------------------------------------------------
+tls:
+  enabled: false
+  secretName: ""
+  mountPath: /etc/dash/tls
+  # Ingestion verifies client certificates against ca.crt and requires a
+  # verified one (plus the token) on /internal/replication/*. Public routes
+  # still accept clients without a certificate.
+  mutual: true
+
+# -----------------------------------------------------------------------------
 # Persistent storage. Per-pod PVCs via StatefulSet volumeClaimTemplates.
 # -----------------------------------------------------------------------------
 persistence:

@@ -109,6 +109,7 @@ jobs:
         run: |
           shellcheck -S warning \
             scripts/generate-secrets.sh \
+            scripts/generate-dev-tls.sh \
             scripts/check_deploy_env.sh \
             scripts/deploy_systemd.sh \
             scripts/deploy_container.sh \
@@ -161,8 +162,18 @@ jobs:
             --set secret.existingSecret.retrieval=r \
             --set secret.existingSecret.ingestion=i \
             --set secret.existingSecret.controlPlane=c > helm-existing.yaml
+          # Native TLS on every listener (docs/operations/tls.md).
+          helm lint deploy/helm/dash --strict "${args[@]}" \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls > helm-tls.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set tls.enabled=true >/dev/null 2>&1; then
+            echo "helm template with tls.enabled succeeded without tls.secretName" >&2
+            exit 1
+          fi
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
-            helm-default.yaml helm-ollama.yaml helm-existing.yaml
+            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml
 
       - name: Kustomize build and kubeconform
         run: |
@@ -170,6 +181,8 @@ jobs:
           kubectl kustomize deploy/k8s > k8s.yaml
           kubeconform -strict -summary -kubernetes-version 1.29.0 k8s.yaml
           kubeconform -strict -summary -kubernetes-version 1.29.0 deploy/k8s/optional/ollama-egress.yaml
+          kubectl kustomize deploy/k8s-tls > k8s-tls.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 k8s-tls.yaml
 
       - name: Compose config (generated secrets)
         run: |
@@ -178,6 +191,8 @@ jobs:
           docker compose -f deploy/container/docker-compose.yml config -q
           docker compose -f deploy/container/docker-compose.yml --profile control-plane config -q
           docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.dev.yml config -q
+          docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.tls.yml \
+            --profile control-plane config -q
 
       - name: Compose must refuse to start without secrets
         run: |
