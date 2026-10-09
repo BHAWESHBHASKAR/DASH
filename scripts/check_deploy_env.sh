@@ -52,7 +52,10 @@ mapfile -t used < <(
 )
 
 # Names the Rust sources read (string literals).
-rust_names="$(grep -rhoE '"(DASH|EME)_[A-Z0-9_]+"' --include='*.rs' services pkg | tr -d '"' | sort -u)"
+# pkg/config is excluded: it is the registry that *lists* every name (including
+# deprecated and planned ones), so counting its literals would let any name pass.
+rust_names="$(find services pkg -type f -name '*.rs' -not -path 'pkg/config/*' -print0 \
+  | xargs -0 grep -hoE '"(DASH|EME)_[A-Z0-9_]+"' | tr -d '"' | sort -u)"
 
 # The shared auth policy (services/common/src/policy.rs) builds per-service
 # names at runtime as DASH_<PREFIX>_<SUFFIX>. Derive those names from the

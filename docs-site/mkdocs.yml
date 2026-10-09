@@ -76,6 +76,7 @@ nav:
       - Scaling: operations/scaling.md
       - Backup: operations/backup.md
       - Authentication: operations/auth.md
+      - Configuration file: operations/configuration-file.md
       - WAL recovery: operations/wal-recovery.md
       - Audit chain: operations/audit-chain.md
       - Upgrading: operations/upgrading.md
