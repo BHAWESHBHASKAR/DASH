@@ -8,6 +8,7 @@ use store::{AnnTuningConfig, FileWal, InMemoryStore};
 
 fn main() {
     dash_common::init_logging();
+    dash_config::startup_check(dash_config::Service::Retrieval);
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass
     // `--cli` or `--no-serve` to run the one-shot path without

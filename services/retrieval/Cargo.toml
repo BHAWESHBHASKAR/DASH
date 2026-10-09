@@ -26,6 +26,7 @@ uuid = { workspace = true, features = ["v4"] }
 signal-hook = { workspace = true }
 dash-common = { path = "../common" }
 dash-http = { path = "../../pkg/http" }
+dash-config = { path = "../../pkg/config" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -20,6 +20,40 @@ to [Semantic Versioning](https://semver.org/).
 
 The 0.3.0 release has not been tagged yet; its content is below.
 
+### Added (P1 typed configuration)
+
+- **Typed settings registry** (`pkg/config`, crate `dash-config`): one table
+  lists every environment setting the code reads (name, scope, value type,
+  default, description, deprecated aliases). The configuration reference page is
+  now generated from it (`cargo run -p dash-config -- docs`); `scripts/check_config_docs.sh`
+  wraps `dash-config docs --check`. The test
+  `registry_covers_every_env_var_read_by_code` fails when the code reads a
+  variable the registry lacks, or the registry lists one no code reads.
+- **Startup validation.** `ingestion`, `retrieval` and `control-plane` validate
+  their environment at startup: a malformed value of a typed setting (non-number,
+  out of range, unknown enum word, unparsable boolean, blank where blank is
+  meaningless) prints every error and exits with code 2. Unknown `DASH_*` /
+  `EME_*` variables and deprecated spellings (`EME_*`, `DASH_OLLAMA_BASE_URL`,
+  `DASH_*_JWT_ROLE_CLAIM`) are logged as warnings, with a did-you-mean
+  suggestion. `DASH_CONFIG_VALIDATION=warn` downgrades errors to warnings.
+  The validator accepts every value the existing readers accept; where readers
+  differ it accepts the union.
+- **Configuration file.** `DASH_CONFIG_FILE=/path/dash.toml` (tables
+  `[ingestion]`, `[retrieval]`, `[control_plane]`, `[common]`, lowercase keys
+  named after the variable suffix) fills settings that are not set in the
+  environment; the environment wins. Unknown keys are startup errors with a
+  suggestion; a file holding secret-typed keys must have mode 0600 or 0640.
+  See [Configuration file](docs-site/docs/operations/configuration-file.md).
+- **`dash-config` command line tool:** `validate`, `print` (effective value and
+  source, secrets redacted), `docs [--check]`, `list`.
+
+### Changed
+
+- `scripts/check_deploy_env.sh` no longer counts the names listed in
+  `pkg/config` as "read by the code".
+- The `DASH_STRICT_SECRETS` description now states that the control plane
+  applies it to its bearer token (it already did).
+
 ## 0.3.0 (unreleased) - P0 production-readiness hardening
 
 All code listed here is merged in this tree; nothing is tagged or published.
