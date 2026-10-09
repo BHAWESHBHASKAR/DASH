@@ -16,8 +16,10 @@ fn main() {
     // assumed the default was to serve, and the service would
     // silently exit after printing the startup banner.
     let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
-    let bind_addr = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
+    let requested_bind = env_with_fallback("DASH_RETRIEVAL_BIND", "EME_RETRIEVAL_BIND")
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    // Dev mode only ever listens on loopback (see dash_common::resolve_bind_addr).
+    let bind_addr = dash_common::resolve_bind_addr(&requested_bind);
     let http_workers = parse_http_workers();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_RETRIEVAL_SEGMENT_DIR", "EME_RETRIEVAL_SEGMENT_DIR");

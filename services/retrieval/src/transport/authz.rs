@@ -24,8 +24,12 @@ static POLICY: PolicyCell = PolicyCell::new();
 /// Call once at process start; an error means the service must not start
 /// (no auth configured without `DASH_INSECURE_DEV_MODE=1`, placeholder
 /// secrets, incomplete OIDC configuration, ...).
+///
+/// On unix the policy is rebuilt on SIGHUP (see `dash_common::PolicyCell::reload`).
 pub fn initialize_auth_policy() -> Result<(), String> {
-    POLICY.pin(&SERVICE_AUTH).map(|_| ())
+    POLICY.pin(&SERVICE_AUTH)?;
+    dash_common::spawn_sighup_reload(&POLICY, SERVICE_AUTH);
+    Ok(())
 }
 
 /// The policy used by request handling: the pinned startup policy, or (when
