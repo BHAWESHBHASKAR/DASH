@@ -44,6 +44,12 @@ The container image and compose file override the bind addresses to `0.0.0.0:<po
 | `DASH_INGEST_HTTP_QUEUE_CAPACITY` | `workers * 64` | ingestion | Bounded accept queue. When full, the service answers 503 `worker queue full`. |
 | `DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY` | `workers * 64` | retrieval | Same, for retrieval. |
 
+| `DASH_HTTP_REQUEST_TIMEOUT_MS` | `10000` | ingestion, retrieval | Whole-request deadline, measured from accept (queue wait counts). Connections that already waited it out in the queue are closed without work. |
+| `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS` | `2000` | ingestion, retrieval | A new connection that sends nothing within this time is closed before it reaches a worker. |
+| `DASH_HTTP_MAX_CONNS_PER_IP` | `64` | ingestion, retrieval | Concurrent connections allowed per client IP; excess connections get 503. `0` disables the cap. Raise it (or set `0`) behind a load balancer that presents a single source IP. |
+
+`/health`, `/live`, `/ready`, their `/v1/` forms and `/metrics` are served by two reserved workers, so slow requests cannot starve probes. Read-stage failures (400/408/413/417/431/501/505) are counted in `dash_*_transport_read_error_total{status_class}`.
+
 Fixed limits (compiled in, **not** configurable): request body cap 16 MiB on ingestion, per-connection socket timeout 5 seconds. There is no `DASH_MAX_BODY_BYTES` or `DASH_TCP_READ_TIMEOUT_MS`.
 
 ## Authentication and authorization
@@ -198,6 +204,17 @@ Read by the ingestion service (segment publishing) and the `segment-maintenance-
 | `DASH_OLLAMA_MODEL` | `nomic-embed-text` | embeddings library | Ollama model. |
 | `DASH_OPENAI_API_KEY` | unset | embeddings library | Required for `openai`; without it the provider falls back to `hash`. |
 | `DASH_OPENAI_MODEL` | `text-embedding-3-small` | embeddings library | OpenAI model. |
+
+Network providers (`ollama`, `openai`) are wrapped in a circuit breaker and a concurrency cap:
+
+| Variable | Default | Description |
+|---|---|---|
+| `DASH_EMBEDDING_MAX_CONCURRENCY` | `8` | Concurrent provider calls per process; `0` = unlimited. When no slot frees within the queue wait the call fails with 503 `embedding_unavailable` and `Retry-After`. |
+| `DASH_EMBEDDING_QUEUE_WAIT_MS` | `250` | How long a call waits for a slot. |
+| `DASH_EMBEDDING_BREAKER_THRESHOLD` | `5` | Consecutive upstream failures that open the breaker; `0` disables it. Only transport errors, timeouts and 5xx count; 4xx, 429 and payload/dimension errors never do. |
+| `DASH_EMBEDDING_BREAKER_RESET_MS` | `10000` | Time before one probe call is admitted. |
+
+Provider outages (breaker open, timeout, connection error, 429, 5xx, concurrency cap) answer 503 `embedding_unavailable` with `Retry-After` (the upstream's value when present, otherwise 1). Unusable provider output (non-finite values, wrong dimensions, malformed payload, other 4xx) answers 502 `embedding_provider_error` (retrieval) or `embedding_upstream_error` (ingestion).
 
 The hash provider's default dimension is 384. The OpenAI provider in v0.2.x opens a plain TCP connection and cannot reach `https://api.openai.com`; TLS support is a v0.3.0 change. There is no `DASH_EMBEDDING_MODEL`, `DASH_EMBEDDING_DIM`, `DASH_OPENAI_BASE_URL`, `DASH_OPENAI_TIMEOUT_MS` or `DASH_OLLAMA_TIMEOUT_MS` (timeouts are compiled in: Ollama 5 s, OpenAI 30 s).
 

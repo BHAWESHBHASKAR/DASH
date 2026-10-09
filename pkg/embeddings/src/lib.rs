@@ -968,7 +968,7 @@ impl ResilienceConfig {
             max_concurrency: num("DASH_EMBEDDING_MAX_CONCURRENCY")
                 .map_or(d.max_concurrency, |v| v as usize),
             queue_wait: num("DASH_EMBEDDING_QUEUE_WAIT_MS")
-                .map_or(d.queue_wait, |v| Duration::from_millis(v)),
+                .map_or(d.queue_wait, Duration::from_millis),
             breaker_threshold: num("DASH_EMBEDDING_BREAKER_THRESHOLD")
                 .map_or(d.breaker_threshold, |v| v.min(u32::MAX as u64) as u32),
             breaker_reset: num("DASH_EMBEDDING_BREAKER_RESET_MS")

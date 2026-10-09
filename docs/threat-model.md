@@ -124,7 +124,7 @@ TLS is not implemented by any DASH service. It is assumed to be terminated by a 
 | Request-rate abuse | **NOT IMPLEMENTED today:** the per-tenant limiter is rebuilt per request, skips JWT paths and returns 401 (SEC-06). **v0.3.0:** enforced, HTTP 429. Not per-IP. | `authz.rs` | High until v0.3.0 |
 | Expensive queries | **Partial.** `top_k` has no enforced maximum; ANN insert path is quadratic in total vectors (IDX-01). Bounded worker pool. | `payload.rs` | Medium |
 | JWKS outage stalls auth | **Partial** (SEC-14). | `pkg/auth/src/oidc.rs` | Medium |
-| Embedding provider failure | **Implemented:** circuit breaker wraps providers. | tests `circuit_breaker_*` in `pkg/embeddings` | Low |
+| Embedding provider failure | **Implemented:** circuit breaker wraps providers. | tests `circuit_breaker_*`, `breaker_*` and `select_from_env_returns_breaker_wrapped_network_provider` in `pkg/embeddings` | Low |
 
 ### 4.6 Elevation of privilege
 

@@ -68,6 +68,9 @@ impl EmbedFailure {
     }
 }
 
+/// A claim, its optional embedding and its edges, borrowed for validation.
+pub type IngestBundleRef<'a> = (&'a Claim, Option<&'a [f32]>, &'a [ClaimEdge]);
+
 /// Ingest-side checks that need the current store state, run before anything
 /// is written (and before the WAL append) so a rejected request leaves no
 /// trace:
@@ -82,7 +85,7 @@ impl EmbedFailure {
 /// The error never names the other tenant.
 pub fn validate_ingest_bundles(
     store: &store::InMemoryStore,
-    bundles: &[(&Claim, Option<&[f32]>, &[ClaimEdge])],
+    bundles: &[IngestBundleRef<'_>],
 ) -> Result<(), store::StoreError> {
     for (claim, embedding, edges) in bundles {
         if let Some(vector) = embedding {

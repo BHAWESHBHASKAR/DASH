@@ -2877,7 +2877,7 @@ mod tests {
         ] {
             let request = HttpRequest {
                 method: "GET".to_string(),
-                target: format!("/v1/retrieve?tenant_id=tenant-a&top_k=1&{good}"),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&top_k=1&query=x&{good}"),
                 headers: HashMap::new(),
                 body: Vec::new(),
             };
