@@ -13,8 +13,9 @@
 #   E2E_CRASH_CYCLES   kill -9 cycles in the crash-consistency scenario (default 100)
 #   E2E_SEED           fixed RNG seed for that scenario (printed on failure)
 #   DASH_E2E_PROFILE   "release" to test release binaries (default: debug)
-#   DASH_E2E_BIN_DIR   directory with prebuilt ingestion, retrieval and
-#                      control-plane binaries (skips the cargo build)
+#   DASH_E2E_BIN_DIR   directory with prebuilt ingestion, retrieval,
+#                      control-plane and wal-inspect binaries (skips the
+#                      cargo build)
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,7 +28,7 @@ fi
 
 if [[ -z "${DASH_E2E_BIN_DIR:-}" ]]; then
   echo "[e2e] building service binaries"
-  cargo build "${profile_flag[@]}" -p ingestion -p retrieval -p control-plane
+  cargo build "${profile_flag[@]}" -p ingestion -p retrieval -p control-plane -p wal-inspect
 fi
 
 filter=()

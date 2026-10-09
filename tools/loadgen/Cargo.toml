@@ -1,0 +1,16 @@
+[package]
+name = "loadgen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Closed-loop load and soak generator for the DASH ingestion and retrieval services"
+
+[[bin]]
+name = "loadgen"
+path = "src/main.rs"
+
+[dependencies]
+dash-e2e = { path = "../../tests/e2e" }
+hdrhistogram = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }

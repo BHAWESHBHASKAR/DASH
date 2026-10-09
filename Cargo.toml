@@ -18,6 +18,8 @@ members = [
   "tests/e2e",
   "tests/tls-fixtures",
   "tools/audit-verify",
+  "tools/crash-test",
+  "tools/loadgen",
   "tools/wal-inspect",
 ]
 # Standalone benchmark crate with its own workspace (P2 engine spike).
