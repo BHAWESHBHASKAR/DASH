@@ -16,8 +16,8 @@
 //! etc.) that the rest of the crate consumes via re-exports from
 //! `lib.rs`.
 
-use std::fs::{OpenOptions, create_dir_all, rename};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions, create_dir_all, rename};
+use std::io::{BufRead, BufReader, Read, Write};
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";
 use std::path::{Path, PathBuf};
@@ -75,6 +75,9 @@ pub struct CheckpointPolicy {
 pub struct WalReplayStats {
     pub snapshot_records: usize,
     pub wal_records: usize,
+    /// Number of torn (incomplete or corrupt) final WAL lines that were
+    /// discarded since this WAL handle was opened.
+    pub torn_tail_dropped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -83,10 +86,25 @@ pub struct WalReplayBoundary {
     pub snapshot_record_count: usize,
     pub wal_delta_record_count: usize,
     pub total_replay_record_count: usize,
+    /// Persistent identifier of the current WAL file lineage. Changes
+    /// whenever the WAL is compacted or reset.
+    pub wal_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalReplicationDelta {
+    pub from_offset: usize,
+    pub next_offset: usize,
+    pub total_records: usize,
+    pub needs_resync: bool,
+    pub wal_lines: Vec<String>,
+}
+
+/// Generation-aware replication frame. `from_offset`/`next_offset` are
+/// positions inside the WAL lineage identified by `generation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalReplicationFrame {
+    pub generation: u64,
     pub from_offset: usize,
     pub next_offset: usize,
     pub total_records: usize,
@@ -110,6 +128,8 @@ pub struct FileWal {
     append_buffer: Vec<String>,
     pub(crate) unsynced_records: usize,
     last_sync_at: Instant,
+    generation: u64,
+    torn_tail_dropped: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,8 +185,14 @@ impl FileWal {
         {
             create_dir_all(parent)?;
         }
+        let existed = path.exists();
         OpenOptions::new().create(true).append(true).open(&path)?;
+        if !existed {
+            sync_parent_dir(&path)?;
+        }
+        let torn_tail_dropped = repair_torn_tail(&path)?;
         let wal_records = count_non_empty_lines(&path)?;
+        let generation = load_or_create_generation(&generation_path_for(&path))?;
         Ok(Self {
             path,
             wal_records,
@@ -177,7 +203,31 @@ impl FileWal {
             append_buffer: Vec::new(),
             unsynced_records: 0,
             last_sync_at: Instant::now(),
+            generation,
+            torn_tail_dropped,
         })
+    }
+
+    /// Persistent identifier of the current WAL lineage. It changes every
+    /// time the WAL is compacted (checkpoint), replaced by a replication
+    /// export, or rolled back over already-flushed records.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Torn tail lines discarded since this handle was opened.
+    pub fn torn_tail_dropped(&self) -> usize {
+        self.torn_tail_dropped
+    }
+
+    fn bump_generation(&mut self) -> Result<(), StoreError> {
+        let mut next = new_generation();
+        while next == self.generation {
+            next = new_generation();
+        }
+        write_generation(&generation_path_for(&self.path), next)?;
+        self.generation = next;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -206,6 +256,10 @@ impl FileWal {
 
     pub fn buffered_record_count(&self) -> usize {
         self.append_buffer.len()
+    }
+
+    pub fn generation_path(&self) -> PathBuf {
+        generation_path_for(&self.path)
     }
 
     pub fn snapshot_path(&self) -> PathBuf {
@@ -269,6 +323,7 @@ impl FileWal {
             snapshot_record_count,
             wal_delta_record_count,
             total_replay_record_count: snapshot_record_count.saturating_add(wal_delta_record_count),
+            wal_generation: self.generation,
         })
     }
 
@@ -281,6 +336,7 @@ impl FileWal {
     }
 
     pub fn rollback_to(&mut self, point: WalRollbackPoint) -> Result<(), StoreError> {
+        let discards_records = self.wal_records > point.wal_records;
         self.append_buffer.clear();
         let file = OpenOptions::new()
             .create(true)
@@ -289,6 +345,10 @@ impl FileWal {
             .open(&self.path)?;
         file.set_len(point.file_len_bytes)?;
         file.sync_data()?;
+        if discards_records {
+            // Rolled-back lines may already have been served to followers.
+            self.bump_generation()?;
+        }
         self.wal_records = point.wal_records;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
@@ -306,16 +366,57 @@ impl FileWal {
         self.append_raw_record_line_unchecked(line.to_string())
     }
 
+    /// Legacy offset-only delta. Does not detect compaction; prefer
+    /// [`FileWal::replication_frame_from`].
     pub fn replication_delta_from(
         &mut self,
         from_offset: usize,
         max_records: usize,
     ) -> Result<WalReplicationDelta, StoreError> {
+        let frame = self.replication_frame_inner(None, from_offset, max_records, false)?;
+        Ok(WalReplicationDelta {
+            from_offset: frame.from_offset,
+            next_offset: frame.next_offset,
+            total_records: frame.total_records,
+            needs_resync: frame.needs_resync,
+            wal_lines: frame.wal_lines,
+        })
+    }
+
+    /// Generation-aware delta. `from_generation` is the generation the
+    /// follower last observed (`None` if it has never synced). The frame
+    /// has `needs_resync = true` when the generation differs (the WAL was
+    /// compacted or reset, so offsets are meaningless), when the follower
+    /// has no known generation but is not a fresh follower, or when
+    /// `from_offset` is beyond the end of the WAL. On resync,
+    /// `next_offset == total_records` and `wal_lines` is empty.
+    pub fn replication_frame_from(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        self.replication_frame_inner(from_generation, from_offset, max_records, true)
+    }
+
+    fn replication_frame_inner(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+        check_generation: bool,
+    ) -> Result<WalReplicationFrame, StoreError> {
         self.flush_pending_sync()?;
         let wal_lines = self.replay_wal_lines_raw()?;
         let total_records = wal_lines.len();
-        if from_offset > total_records {
-            return Ok(WalReplicationDelta {
+        let generation_ok = !check_generation
+            || match from_generation {
+                Some(g) => g == self.generation,
+                None => from_offset == 0 && !self.snapshot_path().exists(),
+            };
+        if !generation_ok || from_offset > total_records {
+            return Ok(WalReplicationFrame {
+                generation: self.generation,
                 from_offset,
                 next_offset: total_records,
                 total_records,
@@ -325,7 +426,8 @@ impl FileWal {
         }
         let limit = max_records.max(1);
         let next_offset = from_offset.saturating_add(limit).min(total_records);
-        Ok(WalReplicationDelta {
+        Ok(WalReplicationFrame {
+            generation: self.generation,
             from_offset,
             next_offset,
             total_records,
@@ -355,6 +457,7 @@ impl FileWal {
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
+        self.bump_generation()?;
         self.write_wal_lines_raw(&export.wal_lines)?;
         self.wal_records = export.wal_lines.len();
         self.unsynced_records = 0;
@@ -415,7 +518,7 @@ impl FileWal {
             .append(true)
             .open(&self.path)?;
         for line in self.append_buffer.drain(..) {
-            writeln!(file, "{line}")?;
+            write_line(&mut file, &line)?;
         }
         Ok(())
     }
@@ -429,7 +532,7 @@ impl FileWal {
             .append(true)
             .open(&self.path)?;
         for line in self.append_buffer.drain(..) {
-            writeln!(file, "{line}")?;
+            write_line(&mut file, &line)?;
         }
         if self.unsynced_records > 0 {
             file.sync_data()?;
@@ -452,6 +555,7 @@ impl FileWal {
         let stats = WalReplayStats {
             snapshot_records: snapshot_records.len(),
             wal_records: wal_records.len(),
+            torn_tail_dropped: self.torn_tail_dropped,
         };
 
         let mut out = snapshot_records;
@@ -462,7 +566,11 @@ impl FileWal {
     fn replay_snapshot_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
         self.replay_snapshot_lines_raw()?
             .into_iter()
-            .map(|line| line_to_record(&line))
+            .enumerate()
+            .map(|(idx, line)| {
+                line_to_record(&line)
+                    .map_err(|e| with_context(e, &format!("snapshot record {}", idx + 1)))
+            })
             .collect()
     }
 
@@ -506,24 +614,23 @@ impl FileWal {
     }
 
     fn replay_wal_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
-        self.replay_wal_lines_raw()?
-            .into_iter()
-            .map(|line| line_to_record(&line))
-            .collect()
+        let scan = scan_wal(&self.path)?;
+        let mut out = Vec::with_capacity(scan.lines.len());
+        for (line_no, line) in &scan.lines {
+            out.push(
+                line_to_record(line)
+                    .map_err(|e| with_context(e, &format!("wal line {line_no}")))?,
+            );
+        }
+        Ok(out)
     }
 
     fn replay_wal_lines_raw(&self) -> Result<Vec<String>, StoreError> {
-        let file = OpenOptions::new().read(true).open(&self.path)?;
-        let reader = BufReader::new(file);
-        let mut out = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            out.push(line);
-        }
-        Ok(out)
+        Ok(scan_wal(&self.path)?
+            .lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect())
     }
 
     fn write_snapshot_records(&self, records: &[PersistedRecord]) -> Result<(), StoreError> {
@@ -547,12 +654,14 @@ impl FileWal {
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        writeln!(file, "{SNAPSHOT_HEADER}")?;
+        write_line(&mut file, SNAPSHOT_HEADER)?;
         for line in lines {
-            writeln!(file, "{line}")?;
+            write_line(&mut file, line)?;
         }
         file.sync_all()?;
-        rename(tmp_path, snapshot_path)?;
+        drop(file);
+        rename(&tmp_path, &snapshot_path)?;
+        sync_parent_dir(&snapshot_path)?;
         Ok(())
     }
 
@@ -563,19 +672,26 @@ impl FileWal {
             .truncate(true)
             .open(&self.path)?;
         for line in lines {
-            writeln!(file, "{line}")?;
+            write_line(&mut file, line)?;
         }
-        file.sync_data()?;
+        file.sync_all()?;
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
     fn truncate_wal(&mut self) -> Result<(), StoreError> {
         self.append_buffer.clear();
-        OpenOptions::new()
+        // New lineage first: a crash between the bump and the truncation
+        // only causes a spurious resync, never a silent skip.
+        self.bump_generation()?;
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
+        file.sync_all()?;
+        drop(file);
+        sync_parent_dir(&self.path)?;
         self.wal_records = 0;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
@@ -615,94 +731,437 @@ fn count_non_empty_lines(path: &Path) -> Result<usize, StoreError> {
     }
     Ok(count)
 }
+
+fn with_context(err: StoreError, context: &str) -> StoreError {
+    match err {
+        StoreError::Parse(msg) => StoreError::Parse(format!("{context}: {msg}")),
+        other => other,
+    }
+}
+
+fn write_line(file: &mut File, line: &str) -> Result<(), StoreError> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    file.write_all(buf.as_bytes())?;
+    Ok(())
+}
+
+/// fsync the directory containing `path` so that creations, renames and
+/// truncations of directory entries are durable. No-op on platforms where
+/// directories cannot be opened for syncing.
+fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+fn generation_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".gen");
+    PathBuf::from(path)
+}
+
+fn new_generation() -> u64 {
+    loop {
+        let value: u64 = rand::random();
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+fn write_generation(path: &Path, generation: u64) -> Result<(), StoreError> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    write_line(&mut file, &format!("{generation:016x}"))?;
+    file.sync_all()?;
+    drop(file);
+    rename(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn load_or_create_generation(path: &Path) -> Result<u64, StoreError> {
+    if let Ok(raw) = std::fs::read_to_string(path)
+        && let Ok(value) = u64::from_str_radix(raw.trim(), 16)
+        && value != 0
+    {
+        return Ok(value);
+    }
+    let generation = new_generation();
+    write_generation(path, generation)?;
+    Ok(generation)
+}
+
+struct WalScan {
+    /// `(1-based physical line number, line)` for every non-blank line that
+    /// is kept (a torn final line is excluded).
+    lines: Vec<(usize, String)>,
+    /// Byte length of the valid prefix of the file.
+    valid_len: u64,
+    /// Whether a torn tail was discarded.
+    torn_tail: bool,
+    /// Whether the valid prefix lacks a trailing newline.
+    missing_newline: bool,
+}
+
+/// Reads the WAL and separates the valid prefix from a torn tail. Only the
+/// final line is parsed here; interior lines are returned verbatim so
+/// that a corrupt interior line is reported (with its line number) by
+/// the caller rather than silently dropped.
+fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .read_to_end(&mut bytes)?;
+
+    // Split into physical lines keeping byte offsets.
+    let mut raw: Vec<(usize, usize, bool)> = Vec::new(); // (start, end, terminated)
+    let mut start = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            raw.push((start, i, true));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        raw.push((start, bytes.len(), false));
+    }
+
+    // Decode text; invalid UTF-8 is treated as an unparseable line.
+    let decode = |s: usize, e: usize| -> Option<String> {
+        let mut slice = &bytes[s..e];
+        if slice.last() == Some(&b'\r') {
+            slice = &slice[..slice.len() - 1];
+        }
+        std::str::from_utf8(slice).ok().map(str::to_string)
+    };
+
+    // Index of the last non-blank physical line.
+    let last_content = raw
+        .iter()
+        .rposition(|&(s, e, _)| decode(s, e).is_none_or(|t| !t.trim().is_empty()));
+
+    let mut lines = Vec::new();
+    let mut valid_len = bytes.len() as u64;
+    let mut torn_tail = false;
+    let mut missing_newline = false;
+    for (idx, &(s, e, terminated)) in raw.iter().enumerate() {
+        let text = decode(s, e);
+        let is_last = Some(idx) == last_content;
+        if is_last {
+            let ok = match &text {
+                Some(t) => {
+                    let parses = line_to_record(t).is_ok();
+                    // An unterminated line is only trusted when it carries a
+                    // verified checksum.
+                    parses && (terminated || split_and_verify_crc(t).is_ok_and(|(_, c)| c))
+                }
+                None => false,
+            };
+            if !ok {
+                torn_tail = true;
+                valid_len = s as u64;
+                // Blank lines before the torn line stay in the prefix.
+                break;
+            }
+            if !terminated {
+                missing_newline = true;
+            }
+        }
+        match text {
+            Some(t) if t.trim().is_empty() => {}
+            Some(t) => lines.push((idx + 1, t)),
+            None => {
+                return Err(StoreError::Parse(format!(
+                    "wal line {}: invalid UTF-8",
+                    idx + 1
+                )));
+            }
+        }
+    }
+    Ok(WalScan {
+        lines,
+        valid_len,
+        torn_tail,
+        missing_newline,
+    })
+}
+
+/// Truncates a torn final WAL line (and terminates an otherwise valid
+/// unterminated one). Returns the number of dropped lines (0 or 1).
+fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
+    let scan = scan_wal(path)?;
+    if !scan.torn_tail && !scan.missing_newline {
+        return Ok(0);
+    }
+    let file = OpenOptions::new().write(true).open(path)?;
+    if scan.torn_tail {
+        eprintln!(
+            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes)",
+            path.display(),
+            scan.valid_len
+        );
+        file.set_len(scan.valid_len)?;
+        file.sync_all()?;
+        return Ok(1);
+    }
+    drop(file);
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(0)
+}
+
 pub(crate) fn record_to_line(record: &PersistedRecord) -> String {
-    match record {
+    let body = match record {
         PersistedRecord::Claim(c) => format!(
-            "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "C2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&c.claim_id),
             escape_field(&c.tenant_id),
             escape_field(&c.canonical_text),
             c.confidence,
-            c.event_time_unix
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            pack_string_list(&c.entities),
-            pack_string_list(&c.embedding_ids),
+            opt_num(c.event_time_unix),
+            escape_field(&pack_string_list(&c.entities)),
+            escape_field(&pack_string_list(&c.embedding_ids)),
             c.claim_type
                 .as_ref()
                 .map(claim_type_to_str)
                 .unwrap_or("null"),
-            c.valid_from
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.valid_to
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.created_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.updated_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string())
+            opt_num(c.valid_from),
+            opt_num(c.valid_to),
+            opt_num(c.created_at),
+            opt_num(c.updated_at),
         ),
         PersistedRecord::Evidence(e) => format!(
-            "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "E2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&e.evidence_id),
             escape_field(&e.claim_id),
             escape_field(&e.source_id),
             stance_to_str(&e.stance),
             e.source_quality,
-            e.chunk_id
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.span_start
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            e.span_end
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            e.doc_id
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.extraction_model
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.ingested_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string())
+            encode_opt_string(e.chunk_id.as_deref()),
+            opt_num(e.span_start),
+            opt_num(e.span_end),
+            encode_opt_string(e.doc_id.as_deref()),
+            encode_opt_string(e.extraction_model.as_deref()),
+            opt_num(e.ingested_at),
         ),
         PersistedRecord::Edge(edge) => format!(
-            "G\t{}\t{}\t{}\t{}\t{}",
+            "G2\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&edge.edge_id),
             escape_field(&edge.from_claim_id),
             escape_field(&edge.to_claim_id),
             relation_to_str(&edge.relation),
-            edge.strength
+            edge.strength,
+            escape_field(&pack_string_list(&edge.reason_codes)),
+            opt_num(edge.created_at),
         ),
         PersistedRecord::ClaimVector(record) => format!(
-            "V\t{}\t{}",
+            "V2\t{}\t{}",
             escape_field(&record.claim_id),
             pack_f32_list(&record.values)
         ),
         PersistedRecord::BatchCommit(record) => format!(
-            "B\t{}\t{}\t{}\t{}",
+            "B2\t{}\t{}\t{}\t{}",
             escape_field(&record.commit_id),
             record.batch_size,
             record.ts_unix_ms,
-            pack_string_list(&record.claim_ids)
+            escape_field(&pack_string_list(&record.claim_ids))
         ),
+    };
+    format!("{body}\t{CRC_PREFIX}{:08x}", crc32(body.as_bytes()))
+}
+
+fn opt_num<T: ToString>(value: Option<T>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// Optional strings are tagged so that the literal string "null" round-trips:
+/// `-` means absent, `+<escaped>` means present.
+fn encode_opt_string(value: Option<&str>) -> String {
+    match value {
+        None => "-".to_string(),
+        Some(v) => format!("+{}", escape_field(v)),
     }
 }
 
+fn decode_opt_string(raw: &str) -> Result<Option<String>, StoreError> {
+    if raw == "-" {
+        return Ok(None);
+    }
+    match raw.strip_prefix('+') {
+        Some(rest) => Ok(Some(unescape_field(rest)?)),
+        None => Err(StoreError::Parse(
+            "invalid optional string field in wal".to_string(),
+        )),
+    }
+}
+
+fn decode_list(raw: &str) -> Result<Vec<String>, StoreError> {
+    unpack_string_list(&unescape_field(raw)?)
+}
+
+const CRC_PREFIX: &str = "crc=";
+
+/// CRC-32 (IEEE 802.3, reflected) used as a per-record integrity suffix.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Splits a trailing `\tcrc=<8 hex>` suffix off `line`. Returns the body and
+/// whether a checksum was present (and verified).
+fn split_and_verify_crc(line: &str) -> Result<(&str, bool), StoreError> {
+    let Some(idx) = line.rfind('\t') else {
+        return Ok((line, false));
+    };
+    let Some(hex) = line[idx + 1..].strip_prefix(CRC_PREFIX) else {
+        return Ok((line, false));
+    };
+    let body = &line[..idx];
+    let expected = (hex.len() == 8)
+        .then(|| u32::from_str_radix(hex, 16).ok())
+        .flatten()
+        .ok_or_else(|| StoreError::Parse("wal record has malformed checksum".to_string()))?;
+    if crc32(body.as_bytes()) != expected {
+        return Err(StoreError::Parse(
+            "wal record checksum mismatch".to_string(),
+        ));
+    }
+    Ok((body, true))
+}
+
 pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
-    let parts: Vec<&str> = line.split('\t').collect();
+    let (body, has_crc) = split_and_verify_crc(line)?;
+    let parts: Vec<&str> = body.split('\t').collect();
     if parts.is_empty() {
         return Err(StoreError::Parse("empty wal record".to_string()));
     }
+    if matches!(parts[0], "C2" | "E2" | "G2" | "V2" | "B2") && !has_crc {
+        return Err(StoreError::Parse(
+            "wal record is missing its checksum".to_string(),
+        ));
+    }
     match parts[0] {
+        "C2" => {
+            if parts.len() != 13 {
+                return Err(StoreError::Parse(
+                    "claim record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Claim(Claim {
+                claim_id: unescape_field(parts[1])?,
+                tenant_id: unescape_field(parts[2])?,
+                canonical_text: unescape_field(parts[3])?,
+                confidence: parts[4].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("claim record has invalid confidence".to_string())
+                })?,
+                event_time_unix: parse_optional_i64_field(parts[5], "event_time")?,
+                entities: decode_list(parts[6])?,
+                embedding_ids: decode_list(parts[7])?,
+                claim_type: parse_optional_claim_type_field(parts[8])?,
+                valid_from: parse_optional_i64_field(parts[9], "valid_from")?,
+                valid_to: parse_optional_i64_field(parts[10], "valid_to")?,
+                created_at: parse_optional_i64_field(parts[11], "created_at")?,
+                updated_at: parse_optional_i64_field(parts[12], "updated_at")?,
+            }))
+        }
+        "E2" => {
+            if parts.len() != 12 {
+                return Err(StoreError::Parse(
+                    "evidence record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Evidence(Evidence {
+                evidence_id: unescape_field(parts[1])?,
+                claim_id: unescape_field(parts[2])?,
+                source_id: unescape_field(parts[3])?,
+                stance: str_to_stance(parts[4])?,
+                source_quality: parts[5].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("evidence record has invalid source_quality".to_string())
+                })?,
+                chunk_id: decode_opt_string(parts[6])?,
+                span_start: parse_optional_u32_field(parts[7], "span_start")?,
+                span_end: parse_optional_u32_field(parts[8], "span_end")?,
+                doc_id: decode_opt_string(parts[9])?,
+                extraction_model: decode_opt_string(parts[10])?,
+                ingested_at: parse_optional_i64_field(parts[11], "ingested_at")?,
+            }))
+        }
+        "G2" => {
+            if parts.len() != 8 {
+                return Err(StoreError::Parse(
+                    "edge record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Edge(ClaimEdge {
+                edge_id: unescape_field(parts[1])?,
+                from_claim_id: unescape_field(parts[2])?,
+                to_claim_id: unescape_field(parts[3])?,
+                relation: str_to_relation(parts[4])?,
+                strength: parts[5].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("edge record has invalid strength".to_string())
+                })?,
+                reason_codes: decode_list(parts[6])?,
+                created_at: parse_optional_i64_field(parts[7], "created_at")?,
+            }))
+        }
+        "B2" => {
+            if parts.len() != 5 {
+                return Err(StoreError::Parse(
+                    "batch commit record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::BatchCommit(BatchCommitRecord {
+                commit_id: unescape_field(parts[1])?,
+                batch_size: parts[2].parse::<usize>().map_err(|_| {
+                    StoreError::Parse("batch commit record has invalid batch_size".to_string())
+                })?,
+                ts_unix_ms: parts[3].parse::<u64>().map_err(|_| {
+                    StoreError::Parse("batch commit record has invalid ts_unix_ms".to_string())
+                })?,
+                claim_ids: decode_list(parts[4])?,
+            }))
+        }
+        "V2" => {
+            if parts.len() != 3 {
+                return Err(StoreError::Parse(
+                    "vector record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::ClaimVector(ClaimVectorRecord {
+                claim_id: unescape_field(parts[1])?,
+                values: unpack_f32_list(parts[2])?,
+            }))
+        }
         "C" => {
             if !(parts.len() == 6 || parts.len() == 8 || parts.len() == 13) {
                 return Err(StoreError::Parse(
@@ -877,6 +1336,7 @@ fn escape_field(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn pack_string_list(values: &[String]) -> String {
@@ -993,6 +1453,7 @@ fn unescape_field(value: &str) -> Result<String, StoreError> {
                 '\\' => output.push('\\'),
                 't' => output.push('\t'),
                 'n' => output.push('\n'),
+                'r' => output.push('\r'),
                 other => {
                     return Err(StoreError::Parse(format!(
                         "invalid escape sequence: \\{other}"
@@ -1072,5 +1533,176 @@ fn str_to_relation(raw: &str) -> Result<Relation, StoreError> {
         "duplicates" => Ok(Relation::Duplicates),
         "depends_on" => Ok(Relation::DependsOn),
         _ => Err(StoreError::Parse("invalid relation in wal".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    fn random_string(rng: &mut impl Rng) -> String {
+        const POOL: &[&str] = &[
+            "\t",
+            "\n",
+            "\r",
+            "\r\n",
+            "\\",
+            "\\t",
+            "\\n",
+            "null",
+            "-",
+            "+",
+            "crc=00000000",
+            "\t crc=",
+            "\0",
+            "\u{1f}",
+            "a",
+            "Z",
+            "0",
+            ":",
+            ",",
+            " ",
+            "\u{e9}",
+            "\u{65e5}\u{672c}",
+            "\u{1f600}",
+            "\u{2028}",
+        ];
+        let n = rng.gen_range(0..8);
+        (0..n)
+            .map(|_| POOL[rng.gen_range(0..POOL.len())])
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    fn random_opt(rng: &mut impl Rng) -> Option<String> {
+        rng.gen_bool(0.5).then(|| random_string(rng))
+    }
+
+    fn random_list(rng: &mut impl Rng) -> Vec<String> {
+        (0..rng.gen_range(0..4))
+            .map(|_| random_string(rng))
+            .collect()
+    }
+
+    fn roundtrip(record: &PersistedRecord) -> PersistedRecord {
+        let line = record_to_line(record);
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        line_to_record(&line).unwrap_or_else(|e| panic!("{line:?}: {e:?}"))
+    }
+
+    #[test]
+    fn random_strings_round_trip_through_every_record_kind() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..2000 {
+            let claim = Claim {
+                claim_id: random_string(&mut rng),
+                tenant_id: random_string(&mut rng),
+                canonical_text: random_string(&mut rng),
+                confidence: 0.25,
+                event_time_unix: rng.gen_bool(0.5).then(|| rng.gen_range(-5..5)),
+                entities: random_list(&mut rng),
+                embedding_ids: random_list(&mut rng),
+                claim_type: None,
+                valid_from: None,
+                valid_to: Some(9),
+                created_at: Some(1),
+                updated_at: None,
+            };
+            match roundtrip(&PersistedRecord::Claim(claim.clone())) {
+                PersistedRecord::Claim(back) => assert_eq!(back, claim),
+                other => panic!("{other:?}"),
+            }
+            let evidence = Evidence {
+                evidence_id: random_string(&mut rng),
+                claim_id: random_string(&mut rng),
+                source_id: random_string(&mut rng),
+                stance: Stance::Neutral,
+                source_quality: 0.5,
+                chunk_id: random_opt(&mut rng),
+                span_start: Some(1),
+                span_end: None,
+                doc_id: random_opt(&mut rng),
+                extraction_model: random_opt(&mut rng),
+                ingested_at: Some(7),
+            };
+            match roundtrip(&PersistedRecord::Evidence(evidence.clone())) {
+                PersistedRecord::Evidence(back) => assert_eq!(back, evidence),
+                other => panic!("{other:?}"),
+            }
+            let edge = ClaimEdge {
+                edge_id: random_string(&mut rng),
+                from_claim_id: random_string(&mut rng),
+                to_claim_id: random_string(&mut rng),
+                relation: Relation::Refines,
+                strength: 0.75,
+                reason_codes: random_list(&mut rng),
+                created_at: rng.gen_bool(0.5).then_some(1_700_000_000),
+            };
+            match roundtrip(&PersistedRecord::Edge(edge.clone())) {
+                PersistedRecord::Edge(back) => assert_eq!(back, edge),
+                other => panic!("{other:?}"),
+            }
+            let batch = BatchCommitRecord {
+                commit_id: random_string(&mut rng),
+                batch_size: 3,
+                ts_unix_ms: 99,
+                claim_ids: random_list(&mut rng),
+            };
+            match roundtrip(&PersistedRecord::BatchCommit(batch.clone())) {
+                PersistedRecord::BatchCommit(back) => {
+                    assert_eq!(back.commit_id, batch.commit_id);
+                    assert_eq!(back.claim_ids, batch.claim_ids);
+                }
+                other => panic!("{other:?}"),
+            }
+            let vector = ClaimVectorRecord {
+                claim_id: random_string(&mut rng),
+                values: vec![0.5, -1.25],
+            };
+            match roundtrip(&PersistedRecord::ClaimVector(vector.clone())) {
+                PersistedRecord::ClaimVector(back) => {
+                    assert_eq!(back.claim_id, vector.claim_id);
+                    assert_eq!(back.values, vector.values);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_records_without_checksum_still_parse() {
+        let legacy_edge = "G\te1\ta\tb\tsupports\t0.5";
+        match line_to_record(legacy_edge).unwrap() {
+            PersistedRecord::Edge(e) => {
+                assert!(e.reason_codes.is_empty());
+                assert_eq!(e.created_at, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(line_to_record("C\tc1\tt\ttext\t0.9\tnull\t\t").is_ok());
+        assert!(line_to_record("B\tcommit-1\t1\t1700000000000\t2:c1").is_ok());
+    }
+
+    #[test]
+    fn versioned_records_require_a_valid_checksum() {
+        let edge = ClaimEdge {
+            edge_id: "e".into(),
+            from_claim_id: "a".into(),
+            to_claim_id: "b".into(),
+            relation: Relation::Supports,
+            strength: 0.5,
+            reason_codes: vec!["r".into()],
+            created_at: Some(5),
+        };
+        let line = record_to_line(&PersistedRecord::Edge(edge));
+        assert!(line.starts_with("G2\t") && line.contains("\tcrc="));
+        let (body, _) = line.rsplit_once('\t').unwrap();
+        assert!(line_to_record(body).is_err(), "missing checksum must fail");
+        let mut bad = line.clone();
+        bad.truncate(bad.len() - 1);
+        assert!(line_to_record(&bad).is_err());
+        let corrupted = line.replacen("G2\te\t", "G2\tx\t", 1);
+        assert!(line_to_record(&corrupted).is_err());
     }
 }
