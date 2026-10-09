@@ -9,6 +9,10 @@ pub struct EdgeSummary {
     pub total_strength: f32,
 }
 
+/// Raw tally over an arbitrary edge list, ignoring direction. This
+/// counts every edge once regardless of which claim it points at, so it
+/// must NOT be used to score a single claim: use
+/// [`summarize_incoming_edges`] for that (IDX-05).
 pub fn summarize_edges(edges: &[ClaimEdge]) -> EdgeSummary {
     let mut summary = EdgeSummary {
         supports: 0,
@@ -25,6 +29,39 @@ pub fn summarize_edges(edges: &[ClaimEdge]) -> EdgeSummary {
         }
     }
     summary
+}
+
+/// Summarize the edges that point AT a claim (IDX-05).
+///
+/// An edge `from --supports--> to` is evidence for the TARGET claim
+/// `to`, never for its author `from`; contradictions likewise. The
+/// caller passes `(from_claim_id, relation, strength)` for every edge
+/// whose target is the claim being scored, already filtered to edges
+/// whose endpoints exist in the claim's tenant. Each distinct
+/// `from_claim_id` counts at most once per relation, so a single source
+/// cannot inflate the tally by repeating itself.
+pub fn summarize_incoming_edges<'a, I>(incoming: I) -> EdgeSummary
+where
+    I: IntoIterator<Item = (&'a str, &'a Relation, f32)>,
+{
+    let mut supporters: HashSet<&str> = HashSet::new();
+    let mut contradictors: HashSet<&str> = HashSet::new();
+    let mut total_strength = 0.0f32;
+    for (from, relation, strength) in incoming {
+        let counted = match relation {
+            Relation::Supports => supporters.insert(from),
+            Relation::Contradicts => contradictors.insert(from),
+            _ => false,
+        };
+        if counted {
+            total_strength += strength;
+        }
+    }
+    EdgeSummary {
+        supports: supporters.len(),
+        contradicts: contradictors.len(),
+        total_strength,
+    }
 }
 
 pub fn traverse_edges_multi_hop(
@@ -598,5 +635,42 @@ mod tests {
             .expect("c2 should be present in decay result")
             .graph_score;
         assert!(aggressive_decay_score < no_decay_score);
+    }
+
+    fn edge(id: &str, from: &str, to: &str, relation: Relation) -> ClaimEdge {
+        ClaimEdge {
+            edge_id: id.into(),
+            from_claim_id: from.into(),
+            to_claim_id: to.into(),
+            relation,
+            strength: 0.5,
+            reason_codes: vec![],
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn incoming_summary_counts_each_source_once_per_relation() {
+        let edges = [
+            edge("e1", "a", "t", Relation::Supports),
+            edge("e2", "a", "t", Relation::Supports),
+            edge("e3", "b", "t", Relation::Supports),
+            edge("e4", "c", "t", Relation::Contradicts),
+            edge("e5", "d", "t", Relation::Refines),
+        ];
+        let summary = summarize_incoming_edges(
+            edges
+                .iter()
+                .map(|e| (e.from_claim_id.as_str(), &e.relation, e.strength)),
+        );
+        assert_eq!(summary.supports, 2);
+        assert_eq!(summary.contradicts, 1);
+        assert!((summary.total_strength - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn incoming_summary_of_nothing_is_zero() {
+        let summary = summarize_incoming_edges(std::iter::empty());
+        assert_eq!((summary.supports, summary.contradicts), (0, 0));
     }
 }

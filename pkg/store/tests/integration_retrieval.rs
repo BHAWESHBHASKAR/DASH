@@ -390,6 +390,17 @@ fn edge_contradicts_evidence_increments_contradict_count() {
         "evidence supports must be counted, got {}",
         c1.supports
     );
+    // The edge is `c2 contradicts c1`: it counts against the TARGET (c1),
+    // never against its author (c2).
+    assert_eq!(c1.contradicts, 1, "edge target must be contradicted");
+    let results = store.retrieve(&RetrievalRequest {
+        tenant_id: "t1".into(),
+        query: "claim two".into(),
+        top_k: 10,
+        stance_mode: StanceMode::Balanced,
+    });
+    let c2 = results.iter().find(|r| r.claim_id == "c2").unwrap();
+    assert_eq!(c2.contradicts, 0, "edge author must not be penalized");
 }
 
 // ---------------------------------------------------------------------------
