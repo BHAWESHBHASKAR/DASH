@@ -48,6 +48,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY pkg ./pkg
 COPY services ./services
 COPY tests ./tests
+COPY tools ./tools
 RUN cargo build --release --workspace --locked
 
 # Strip debug info from the three service binaries. The image size drops
