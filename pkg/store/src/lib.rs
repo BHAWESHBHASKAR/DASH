@@ -13,6 +13,7 @@ use schema::{
 #[macro_use]
 mod failpoint;
 mod disk;
+mod value_codec;
 pub use disk::{DiskBackedStore, DiskStatus};
 
 #[cfg(feature = "gpu-backend")]

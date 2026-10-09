@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Multi-stage, multi-arch build for the DASH services.
 #
 # One Dockerfile produces one image per service. Every image carries all
@@ -30,10 +30,13 @@
 #       -f deploy/container/Dockerfile --build-arg SERVICE=retrieval \
 #       -t dash-retrieval:local --load .
 
-ARG RUST_VERSION=1.99
-ARG DEBIAN_RELEASE=bookworm
-
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
+# Base images are pinned by digest (tag@sha256:<multi-arch index digest>) so
+# a rebuild of the same commit uses the same bytes; Dependabot
+# (.github/dependabot.yml, docker ecosystem) proposes tag and digest bumps.
+# The rust tag must match the channel in rust-toolchain.toml. Digests were
+# read with `docker buildx imagetools inspect <image>:<tag>`; see
+# docs/operations/supply-chain.md for how to re-resolve them.
+FROM rust:1.99-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS builder
 WORKDIR /build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -70,7 +73,7 @@ FROM builder AS dev
 RUN cargo install cargo-watch --locked
 WORKDIR /build
 
-FROM debian:${DEBIAN_RELEASE}-slim AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 ARG UID=10001
 ARG SERVICE=retrieval
 

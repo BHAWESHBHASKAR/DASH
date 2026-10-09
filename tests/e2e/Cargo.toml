@@ -2,6 +2,7 @@
 name = "dash-e2e"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 
 # Black-box end-to-end tests: they launch the real compiled `ingestion`,
