@@ -351,7 +351,16 @@ pub struct FileWal {
     /// extended to cover.
     replication_group_cap: usize,
     replication_group_too_large_total: u64,
+    /// Set after an fsync failure. Once set, every write path fails closed:
+    /// after a failed fsync the kernel may already have dropped the dirty
+    /// pages, so retrying the fsync could report success for data that never
+    /// reached the disk (fsyncgate). Only a restart, which re-reads the log
+    /// from disk, clears it.
+    poisoned: Option<String>,
 }
+
+/// Prefix of the error returned by every write to a poisoned WAL.
+pub const WAL_POISONED_PREFIX: &str = "wal_poisoned";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalWritePolicy {
@@ -429,7 +438,67 @@ impl FileWal {
             replication_skipped: 0,
             replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
             replication_group_too_large_total: 0,
+            poisoned: None,
         })
+    }
+
+    /// Why this WAL refuses writes, or `None` while it is healthy. Set by the
+    /// first failed fsync and never cleared by this handle.
+    pub fn poisoned_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    fn ensure_writable(&self) -> Result<(), StoreError> {
+        match &self.poisoned {
+            Some(reason) => Err(StoreError::Io(format!(
+                "{WAL_POISONED_PREFIX}: an earlier fsync failed ({reason}); the WAL refuses writes until the service restarts"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, err: &std::io::Error) -> StoreError {
+        let reason = format!("fsync of {} failed: {err}", self.path.display());
+        eprintln!("error: {reason}; the WAL is now poisoned and refuses writes");
+        self.poisoned = Some(reason.clone());
+        StoreError::Io(format!("{WAL_POISONED_PREFIX}: {reason}"))
+    }
+
+    /// Appends `lines` as one unit and applies the write policy once for the
+    /// whole unit (with the default policy: one write and one fsync). This is
+    /// the group-commit entry point: the lines of many requests share a single
+    /// fsync.
+    ///
+    /// On a write error the file is truncated back to where it was, so a
+    /// half-written unit never sits in front of later records, and the error
+    /// is returned. On an fsync error the WAL is poisoned (see
+    /// [`FileWal::poisoned_reason`]) and no rollback is attempted.
+    pub fn append_group_lines(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let rollback_point = self.begin_rollback_point()?;
+        self.append_buffer.extend(lines.iter().cloned());
+        self.wal_records += lines.len();
+        self.unsynced_records += lines.len();
+        let result = self.apply_write_policy();
+        if let Err(err) = result {
+            if self.poisoned.is_none() {
+                if let Err(rollback_err) = self.rollback_to(rollback_point) {
+                    eprintln!(
+                        "group commit rollback failed after WAL append error: {rollback_err:?}"
+                    );
+                }
+                // The unit is not in the log, whether or not the truncation
+                // above could run (it cannot when the file is unreachable).
+                self.append_buffer.clear();
+                self.wal_records = rollback_point.wal_records;
+                self.unsynced_records = 0;
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Persistent identifier of the current WAL lineage. It changes every
@@ -593,6 +662,7 @@ impl FileWal {
     }
 
     pub fn rollback_to(&mut self, point: WalRollbackPoint) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         let discards_records = self.wal_records > point.wal_records;
         self.append_buffer.clear();
         let file = OpenOptions::new()
@@ -601,7 +671,9 @@ impl FileWal {
             .truncate(false)
             .open(&self.path)?;
         file.set_len(point.file_len_bytes)?;
-        file.sync_data()?;
+        if let Err(err) = sync_wal_data(&file) {
+            return Err(self.poison(&err));
+        }
         if discards_records {
             // Rolled-back lines may already have been served to followers.
             self.bump_generation()?;
@@ -737,6 +809,7 @@ impl FileWal {
         &mut self,
         export: &WalReplicationExport,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         self.flush_pending_sync()?;
         for line in export.snapshot_lines.iter().chain(&export.wal_lines) {
             check_replicated_line(line)?;
@@ -757,9 +830,15 @@ impl FileWal {
     }
 
     fn append_raw_record_line_unchecked(&mut self, line: String) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         self.append_buffer.push(line);
         self.wal_records += 1;
         self.unsynced_records += 1;
+        self.apply_write_policy()
+    }
+
+    /// Flushes and/or syncs the pending records as the write policy demands.
+    fn apply_write_policy(&mut self) -> Result<(), StoreError> {
         if self.background_flush_only {
             return Ok(());
         }
@@ -799,13 +878,24 @@ impl FileWal {
         if self.append_buffer.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
+        self.write_append_buffer(&mut file)
+    }
+
+    /// Writes the whole append buffer with a single `write_all` and empties
+    /// it (also on error, as before).
+    fn write_append_buffer(&mut self, file: &mut File) -> Result<(), StoreError> {
+        let bytes: usize = self.append_buffer.iter().map(|line| line.len() + 1).sum();
+        let mut buf = String::with_capacity(bytes);
         for line in self.append_buffer.drain(..) {
-            write_line(&mut file, &line)?;
+            buf.push_str(&line);
+            buf.push('\n');
         }
+        file.write_all(buf.as_bytes())?;
         Ok(())
     }
 
@@ -813,15 +903,16 @@ impl FileWal {
         if self.unsynced_records == 0 && self.append_buffer.is_empty() {
             return Ok(());
         }
+        self.ensure_writable()?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        for line in self.append_buffer.drain(..) {
-            write_line(&mut file, &line)?;
-        }
+        self.write_append_buffer(&mut file)?;
         if self.unsynced_records > 0 {
-            file.sync_data()?;
+            if let Err(err) = sync_wal_data(&file) {
+                return Err(self.poison(&err));
+            }
             self.unsynced_records = 0;
             self.last_sync_at = Instant::now();
         }
@@ -1015,6 +1106,7 @@ impl FileWal {
         &mut self,
         snapshot_records: &[PersistedRecord],
     ) -> Result<WalCheckpointStats, StoreError> {
+        self.ensure_writable()?;
         let truncated_wal_records = self.wal_records;
         self.flush_pending_sync()?;
         self.write_snapshot_records(snapshot_records)?;
@@ -1078,6 +1170,13 @@ fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
         let _ = dir;
     }
     Ok(())
+}
+
+/// `File::sync_data` for WAL appends, with a test-only failpoint (`wal.sync`)
+/// so tests can inject an fsync failure.
+fn sync_wal_data(file: &File) -> std::io::Result<()> {
+    failpoint!("wal.sync");
+    file.sync_data()
 }
 
 /// `File::sync_all` with a test-only trace of the operation order.

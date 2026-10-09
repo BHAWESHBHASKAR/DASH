@@ -17,6 +17,7 @@ pub use disk::{DiskBackedStore, DiskStatus};
 
 #[cfg(feature = "gpu-backend")]
 mod gpu;
+mod group_commit;
 mod metrics;
 pub mod vector_index;
 mod wal;
@@ -32,15 +33,19 @@ pub(crate) struct Bm25Context {
     avg_doc_len: f32,
 }
 
+pub use group_commit::{
+    CommitTicket, GROUP_COMMIT_MAX_WAIT_LIMIT, GroupCommitConfig, GroupCommitError, GroupCommitLog,
+    GroupCommitStats, GroupCommitter,
+};
 pub(crate) use wal::{
     BatchCommitRecord, ClaimVectorRecord, PersistedRecord, ReplayItem, line_to_record,
     record_to_line,
 };
 pub use wal::{
-    CheckpointPolicy, FileWal, ReplayPolicy, WAL_REPLAY_STRICT_ENV, WalCheckpointStats, WalEvent,
-    WalInspection, WalInvalidLine, WalRepairOptions, WalRepairReport, WalReplayBoundary,
-    WalReplayStats, WalReplicationDelta, WalReplicationExport, WalReplicationFrame,
-    WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
+    CheckpointPolicy, FileWal, ReplayPolicy, WAL_POISONED_PREFIX, WAL_REPLAY_STRICT_ENV,
+    WalCheckpointStats, WalEvent, WalInspection, WalInvalidLine, WalRepairOptions, WalRepairReport,
+    WalReplayBoundary, WalReplayStats, WalReplicationDelta, WalReplicationExport,
+    WalReplicationFrame, WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
@@ -54,6 +59,31 @@ pub struct BatchCommitMetadata {
     pub ts_unix_ms: u64,
     pub claim_ids: Vec<String>,
     pub payload_fingerprint: String,
+}
+
+/// A validated single-bundle ingest whose WAL lines are encoded but not yet
+/// written. Produced by [`InMemoryStore::prepare_atomic_ingest`]; the caller
+/// makes [`PreparedIngest::wal_lines`] durable (directly or through a
+/// [`GroupCommitter`]) and only then calls
+/// [`InMemoryStore::apply_prepared_ingest`].
+#[derive(Debug, Clone)]
+pub struct PreparedIngest {
+    claim: Claim,
+    evidence: Vec<Evidence>,
+    edges: Vec<ClaimEdge>,
+    vector: Option<Vec<f32>>,
+    wal_lines: Vec<String>,
+}
+
+impl PreparedIngest {
+    /// The encoded commit group: begin marker, records, closing marker.
+    pub fn wal_lines(&self) -> &[String] {
+        &self.wal_lines
+    }
+
+    pub fn claim_id(&self) -> &str {
+        &self.claim.claim_id
+    }
 }
 
 /// Result of [`InMemoryStore::ingest_atomic_persistent`].
@@ -821,45 +851,88 @@ impl InMemoryStore {
         vector: Option<Vec<f32>>,
         ts_unix_ms: u64,
     ) -> Result<AtomicIngestOutcome, StoreError> {
+        let Some(prepared) =
+            self.prepare_atomic_ingest(claim, evidence, edges, vector, ts_unix_ms)?
+        else {
+            return Ok(AtomicIngestOutcome {
+                applied: false,
+                disk_error: None,
+            });
+        };
+        wal.append_group_lines(prepared.wal_lines())?;
+        self.apply_prepared_ingest(prepared)
+    }
+
+    /// First half of [`InMemoryStore::ingest_atomic_persistent`]: validates
+    /// the bundle against the current state and encodes its WAL commit group
+    /// without writing anything. Returns `None` when the bundle is already
+    /// fully applied (an idempotent retry needs no WAL write).
+    pub fn prepare_atomic_ingest(
+        &self,
+        claim: Claim,
+        evidence: Vec<Evidence>,
+        edges: Vec<ClaimEdge>,
+        vector: Option<Vec<f32>>,
+        ts_unix_ms: u64,
+    ) -> Result<Option<PreparedIngest>, StoreError> {
         self.validate_bundle(&claim, &evidence, &edges)?;
         if let Some(values) = vector.as_deref() {
             self.validate_vector_for_tenant(&claim.tenant_id, values)?;
         }
         if self.bundle_already_applied(&claim, &evidence, &edges, vector.as_deref()) {
-            return Ok(AtomicIngestOutcome {
-                applied: false,
-                disk_error: None,
-            });
+            return Ok(None);
         }
 
         let claim_id = claim.claim_id.clone();
-        let rollback_point = wal.begin_rollback_point()?;
-        let appended = (|| {
-            wal.begin_group(&claim_id, ts_unix_ms)?;
-            wal.append_claim(&claim)?;
-            for evd in &evidence {
-                wal.append_evidence(evd)?;
-            }
-            for edge in &edges {
-                wal.append_edge(edge)?;
-            }
-            if let Some(values) = vector.as_deref() {
-                wal.append_claim_vector(&claim_id, values)?;
-            }
-            wal.append_batch_commit(
-                &format!("{SINGLE_TX_PREFIX}{claim_id}"),
-                1,
-                ts_unix_ms,
-                std::slice::from_ref(&claim_id),
-            )
-        })();
-        if let Err(err) = appended {
-            if let Err(rollback_err) = wal.rollback_to(rollback_point) {
-                eprintln!("ingest rollback failed after WAL append error: {rollback_err:?}");
-            }
-            return Err(err);
+        let mut records = Vec::with_capacity(evidence.len() + edges.len() + 4);
+        records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{GROUP_BEGIN_PREFIX}{claim_id}"),
+            batch_size: 0,
+            ts_unix_ms,
+            claim_ids: Vec::new(),
+        }));
+        records.push(PersistedRecord::Claim(claim.clone()));
+        records.extend(evidence.iter().cloned().map(PersistedRecord::Evidence));
+        records.extend(edges.iter().cloned().map(PersistedRecord::Edge));
+        if let Some(values) = vector.as_ref() {
+            records.push(PersistedRecord::ClaimVector(ClaimVectorRecord {
+                claim_id: claim_id.clone(),
+                values: values.clone(),
+            }));
         }
+        records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{SINGLE_TX_PREFIX}{claim_id}"),
+            batch_size: 1,
+            ts_unix_ms,
+            claim_ids: vec![claim_id],
+        }));
+        let wal_lines = records.iter().map(record_to_line).collect();
+        Ok(Some(PreparedIngest {
+            claim,
+            evidence,
+            edges,
+            vector,
+            wal_lines,
+        }))
+    }
 
+    /// Second half of [`InMemoryStore::ingest_atomic_persistent`]: applies a
+    /// prepared bundle to memory (and redb) after its WAL lines are durable.
+    /// Callers must apply prepared ingests in WAL order and must not let a
+    /// conflicting write (same claim, edge target or a first vector for the
+    /// tenant) reach the store between prepare and apply.
+    pub fn apply_prepared_ingest(
+        &mut self,
+        prepared: PreparedIngest,
+    ) -> Result<AtomicIngestOutcome, StoreError> {
+        let PreparedIngest {
+            claim,
+            evidence,
+            edges,
+            vector,
+            ..
+        } = prepared;
+        let claim_id = claim.claim_id.clone();
         let disk_error = self.apply_with_deferred_disk(|store| {
             store.apply_bundle(claim, evidence, edges)?;
             if let Some(values) = vector {
@@ -871,6 +944,11 @@ impl InMemoryStore {
             applied: true,
             disk_error,
         })
+    }
+
+    /// The vector dimension established for `tenant_id`, if any.
+    pub fn tenant_vector_dim(&self, tenant_id: &str) -> Option<usize> {
+        self.tenant_vector_dims.get(tenant_id).copied()
     }
 
     pub fn ingest_bundle_persistent_with_policy(
