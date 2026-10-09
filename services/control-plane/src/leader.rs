@@ -828,12 +828,16 @@ mod tests {
     fn leader_lease_transfers_after_expiry() {
         let dir = temp_dir("lease-expiry");
         let path = dir.join("lease.txt");
-        let lease_a = LeaderLease::new("node-a", &path, 50, 10);
+        // Injected clock: expiry is driven explicitly, not by sleeping.
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+        let lease_a =
+            LeaderLease::new("node-a", &path, 50, 10).with_test_wall_clock(Arc::clone(&clock));
         assert!(lease_a.try_acquire(1).unwrap());
 
-        // Wait for the lease to expire.
-        std::thread::sleep(Duration::from_millis(60));
-        let lease_b = LeaderLease::new("node-b", &path, 1_000, 100);
+        // Move past the lease and its safety margin.
+        clock.fetch_add(200, Ordering::SeqCst);
+        let lease_b =
+            LeaderLease::new("node-b", &path, 1_000, 100).with_test_wall_clock(Arc::clone(&clock));
         assert!(lease_b.try_acquire(2).unwrap());
         assert!(!lease_a.is_leader().unwrap());
         assert!(lease_b.is_leader().unwrap());
@@ -852,10 +856,14 @@ mod tests {
         let dir = temp_dir("lease-renew-lapsed");
         let path = dir.join("lease.txt");
         let (tx, rx) = mpsc::channel();
+        // Injected clock: the lease lapses when the test says so, not after a
+        // sleep that a slow disk can stretch past the lease length.
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
         std::thread::spawn(move || {
-            let lease = LeaderLease::new("node-a", &path, 300, 10);
+            let lease =
+                LeaderLease::new("node-a", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
             assert!(lease.try_acquire(1).unwrap());
-            std::thread::sleep(Duration::from_millis(350));
+            clock.fetch_add(350, Ordering::SeqCst);
             // Previously: renew() held self.lock and re-entered try_acquire(),
             // which locked the same std Mutex again and hung forever.
             let renewed = lease.renew(1);
