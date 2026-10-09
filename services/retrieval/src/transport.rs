@@ -38,9 +38,9 @@ mod authz_matrix_tests;
 mod debug_render;
 mod http;
 mod payload;
-use audit::{AuditEvent, append_audit_record};
+use audit::{AuditEvent, append_audit_record, audit_gate};
 #[cfg(test)]
-use audit::{audit_chain_states, is_sha256_hex};
+use audit::is_sha256_hex;
 pub use authz::initialize_auth_policy;
 pub(crate) use authz::{
     AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
@@ -1150,14 +1150,41 @@ fn handle_request_with_metrics_and_reload<S: StoreAccess + ?Sized>(
     placement_reload: Option<&PlacementReloadSnapshot>,
 ) -> HttpResponse {
     let auth_policy = shared_auth_policy();
-    handle_request_with_policy(
+    // Audit context (actor fingerprint, request id) for every event emitted
+    // while this request is handled on this thread.
+    let _audit_ctx = dash_common::audit::enter_context(dash_common::audit::context_from_headers(
+        &request.headers,
+    ));
+    let path_only = request.target.split('?').next().unwrap_or_default();
+    if path_only == "/v1/retrieve" {
+        let audit_log_path = env_with_fallback(
+            "DASH_RETRIEVAL_AUDIT_LOG_PATH",
+            "EME_RETRIEVAL_AUDIT_LOG_PATH",
+        );
+        if let Err(err) = audit_gate(audit_log_path.as_deref()) {
+            eprintln!("retrieval audit fail-closed gate rejected request: {err}");
+            return HttpResponse {
+                status: 503,
+                content_type: "application/json",
+                body: "{\"error\":\"audit log unavailable\"}".to_string(),
+                retry_after_secs: None,
+            };
+        }
+    }
+    let mut response = handle_request_with_policy(
         store,
         request,
         metrics,
         placement_routing,
         placement_reload,
         &auth_policy,
-    )
+    );
+    if request.method == "GET" && path_only == "/metrics" && response.status == 200 {
+        response
+            .body
+            .push_str(&dash_common::audit::render_prometheus_counters());
+    }
+    response
 }
 
 fn handle_request_with_policy<S: StoreAccess + ?Sized>(
@@ -3666,10 +3693,6 @@ tenant-a,0,12,node-a,follower,healthy\n",
             nanos
         ));
         let audit_path_str = audit_path.to_string_lossy().to_string();
-        if let Ok(mut states) = audit_chain_states().lock() {
-            states.remove(&audit_path_str);
-        }
-
         append_audit_record(
             &audit_path_str,
             1_700_000_000_001,
