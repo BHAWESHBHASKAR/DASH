@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 
+pub mod policy;
+
+pub use policy::{
+    AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, ServiceAuthEnv, TenantRateLimiter,
+};
+
 pub struct ShutdownSignal {
     flag: Arc<AtomicBool>,
 }
@@ -62,38 +68,64 @@ pub fn wait_for_drain(graceful_deadline: Duration) -> Duration {
     start.elapsed()
 }
 
-const PLACEHOLDER_PATTERNS: &[&str] = &[
+/// Substrings that mark a value as a documentation/template placeholder.
+const PLACEHOLDER_SUBSTRINGS: &[&str] = &[
     "change-me",
+    "change_me",
+    "changeme",
     "placeholder",
     "replace-me",
+    "replace_me",
     "example",
     "sample",
 ];
 
-/// Minimum secret length enforced in strict mode.
+/// Values that are placeholders when they equal, or start with, the pattern.
+const PLACEHOLDER_PREFIXES: &[&str] = &["secret", "password", "passw0rd"];
+
+/// Minimum length for API keys, scoped keys and replication tokens.
 pub const SECRET_MIN_LENGTH: usize = 16;
 
-/// Validate that a secret is non-empty, is not a known placeholder,
-/// and meets a minimum length. Returns an error string describing
-/// the first problem found.
+/// Minimum length for HS256 JWT signing secrets (RFC 7518 recommends a key at
+/// least as long as the hash output, 256 bits).
+pub const JWT_SECRET_MIN_LENGTH: usize = 32;
+
+fn is_placeholder(lower: &str) -> bool {
+    // `<generate-a-32-char-random-string>` style template markers.
+    if lower.starts_with('<') && lower.ends_with('>') {
+        return true;
+    }
+    if lower.contains('<') && lower.contains('>') {
+        return true;
+    }
+    PLACEHOLDER_SUBSTRINGS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+        || PLACEHOLDER_PREFIXES
+            .iter()
+            .any(|pattern| lower.starts_with(pattern))
+}
+
+/// Validate that a secret is non-empty, is not a known placeholder, and meets
+/// the default minimum length ([`SECRET_MIN_LENGTH`]). The error never
+/// contains the secret value.
 pub fn validate_secret(value: &str, name: &str) -> Result<(), String> {
+    validate_secret_min_len(value, name, SECRET_MIN_LENGTH)
+}
+
+/// Like [`validate_secret`] with an explicit minimum length.
+pub fn validate_secret_min_len(value: &str, name: &str, min_len: usize) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(format!("{name} is empty"));
     }
-    let lower = trimmed.to_lowercase();
-    for pattern in PLACEHOLDER_PATTERNS {
-        if lower == *pattern || lower.starts_with(&format!("{pattern}-")) || lower.contains(pattern)
-        {
-            return Err(format!(
-                "{name} appears to be a placeholder value ('{trimmed}')"
-            ));
-        }
+    if is_placeholder(&trimmed.to_lowercase()) {
+        return Err(format!("{name} appears to be a placeholder value"));
     }
-    if trimmed.len() < SECRET_MIN_LENGTH {
+    if trimmed.chars().count() < min_len {
         return Err(format!(
-            "{name} is too short ({len} chars, minimum {SECRET_MIN_LENGTH})",
-            len = trimmed.len(),
+            "{name} is too short ({len} chars, minimum {min_len})",
+            len = trimmed.chars().count(),
         ));
     }
     Ok(())
@@ -101,26 +133,70 @@ pub fn validate_secret(value: &str, name: &str) -> Result<(), String> {
 
 /// Validate a comma-separated list of secrets, skipping empty entries.
 pub fn validate_secret_csv(values: Option<&str>, name: &str) -> Result<(), String> {
+    validate_secret_csv_min_len(values, name, SECRET_MIN_LENGTH)
+}
+
+/// Like [`validate_secret_csv`] with an explicit minimum length.
+pub fn validate_secret_csv_min_len(
+    values: Option<&str>,
+    name: &str,
+    min_len: usize,
+) -> Result<(), String> {
     if let Some(raw) = values {
         for part in raw.split(',') {
             let trimmed = part.trim();
             if !trimmed.is_empty() {
-                validate_secret(trimmed, name)?;
+                validate_secret_min_len(trimmed, name, min_len)?;
             }
         }
     }
     Ok(())
 }
 
-/// Returns true when `DASH_STRICT_SECRETS` is set to `1` or `true`.
-/// In strict mode services should refuse to start with weak or
-/// placeholder secrets; in non-strict mode they should emit a warning
-/// and continue so local development is not blocked.
+fn env_flag(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// True when `DASH_INSECURE_DEV_MODE` is truthy. Dev mode is the only way to
+/// run a service with no authentication configured and the only way to relax
+/// secret validation. It must never be set in production.
+pub fn insecure_dev_mode_enabled() -> bool {
+    env_flag("DASH_INSECURE_DEV_MODE").unwrap_or(false)
+}
+
+/// Strict secret validation is ON by default. It can only be turned off by
+/// setting `DASH_STRICT_SECRETS=0` *and* `DASH_INSECURE_DEV_MODE=1`.
 pub fn strict_secrets_enabled() -> bool {
-    matches!(
-        std::env::var("DASH_STRICT_SECRETS").as_deref(),
-        Ok("1" | "true" | "yes")
-    )
+    strict_secrets_from(env_flag("DASH_STRICT_SECRETS"), insecure_dev_mode_enabled())
+}
+
+fn strict_secrets_from(strict_flag: Option<bool>, dev_mode: bool) -> bool {
+    !(strict_flag == Some(false) && dev_mode)
+}
+
+/// Constant-time byte equality. Runs in time proportional to the longer input
+/// regardless of where (or whether) the inputs differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Read `primary`, falling back to the legacy `fallback` variable.
+pub fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(fallback).ok())
 }
 
 /// Initialize a `tracing` subscriber for the service.
@@ -145,5 +221,38 @@ pub fn init_logging() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .try_init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_secrets_default_on_and_opt_out_requires_dev_mode() {
+        assert!(strict_secrets_from(None, false));
+        assert!(strict_secrets_from(None, true));
+        assert!(strict_secrets_from(Some(true), true));
+        assert!(strict_secrets_from(Some(false), false));
+        assert!(!strict_secrets_from(Some(false), true));
+    }
+
+    #[test]
+    fn placeholders_are_rejected_without_echoing_the_value() {
+        for bad in [
+            "<generate-a-32-char-random-string>",
+            "<your-key-here-please-0123456789>",
+            "change-me-retrieval-key",
+            "changeme-changeme-changeme",
+            "my-example-api-key-0123456789",
+            "secret",
+            "password-password-password",
+        ] {
+            let err = validate_secret(bad, "X").unwrap_err();
+            assert!(!err.contains(bad), "leaked: {err}");
+            assert!(err.contains("placeholder"), "{err}");
+        }
+        assert!(validate_secret("a8f3b1c9d2e47f60", "X").is_ok());
+        assert!(validate_secret_min_len("a8f3b1c9d2e47f60", "X", 32).is_err());
     }
 }
