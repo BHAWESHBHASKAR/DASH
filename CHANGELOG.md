@@ -110,6 +110,20 @@ to [Semantic Versioning](https://semver.org/).
   command) render unchanged. Upgrade note: a release installed into another
   namespace that relied on the old default must set
   `namespace.name=dash-system` on upgrade.
+- **The raw manifests cut every pod off from DNS.** `deploy/k8s` added its
+  owner labels with `includeSelectors: true`, which also wrote
+  `app.kubernetes.io/part-of: dash` and `app.kubernetes.io/managed-by:
+  kustomize` into the NetworkPolicy peer selectors. The `allow-dns` peer then
+  matched no CoreDNS pod, so under any CNI that enforces NetworkPolicy the
+  retrieval followers could not resolve the ingestion service and never
+  became ready (the ingress-nginx peer was broken the same way). The labels
+  now go on metadata and pod templates only; CI fails if a rendered
+  NetworkPolicy differs from `deploy/k8s/50-networkpolicy.yaml`. Upgrade
+  note: the StatefulSet selectors lose those two labels and selectors are
+  immutable, so a cluster that applied the old manifests must run
+  `kubectl -n dash-system delete statefulset dash-ingestion dash-retrieval
+  dash-control-plane --cascade=orphan` before `kubectl apply -k deploy/k8s`
+  (pods and PVCs are kept and adopted).
 
 ### Changed (replication across checkpoints, follower throughput)
 

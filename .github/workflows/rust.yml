@@ -229,6 +229,26 @@ jobs:
           kubeconform -strict -summary -kubernetes-version 1.29.0 deploy/k8s/optional/ollama-egress.yaml
           kubectl kustomize deploy/k8s-tls > k8s-tls.yaml
           kubeconform -strict -summary -kubernetes-version 1.29.0 k8s-tls.yaml
+          # Kustomize must not rewrite the NetworkPolicy specs: label
+          # propagation into selectors once added the owner labels to the
+          # kube-dns peer and cut every pod off from DNS.
+          python3 - deploy/k8s/50-networkpolicy.yaml k8s.yaml k8s-tls.yaml <<'EOF'
+          import sys, yaml
+          def policies(path):
+              return {d["metadata"]["name"]: d["spec"]
+                      for d in yaml.safe_load_all(open(path))
+                      if d and d.get("kind") == "NetworkPolicy"}
+          source = policies(sys.argv[1])
+          bad = 0
+          for rendered in sys.argv[2:]:
+              got = policies(rendered)
+              for name, spec in source.items():
+                  if got.get(name) != spec:
+                      print(f"{rendered}: NetworkPolicy {name} differs from {sys.argv[1]}:\n"
+                            f"  source:   {spec}\n  rendered: {got.get(name)}")
+                      bad += 1
+          sys.exit(1 if bad else 0)
+          EOF
 
       - name: Compose config (generated secrets)
         run: |

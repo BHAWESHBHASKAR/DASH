@@ -16,10 +16,20 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: dash-system
 # `labels:` is the Kustomize 5+ replacement for the deprecated
-# `commonLabels:` key. `includeSelectors: true` propagates the
-# labels into matchLabels/selector fields automatically.
+# `commonLabels:` key. The owner labels go on every object's metadata
+# and on the pod templates, but NOT into selectors:
+# `includeSelectors: true` would also rewrite every `matchLabels` in the
+# NetworkPolicies, including the peers outside this kustomization. The
+# allow-dns egress peer then became
+#   {k8s-app: kube-dns, app.kubernetes.io/part-of: dash,
+#    app.kubernetes.io/managed-by: kustomize}
+# which no CoreDNS pod carries, so every DASH pod lost DNS under any CNI
+# that enforces NetworkPolicy (the ingress-nginx peer broke the same way).
+# The workload selectors already match on app.kubernetes.io/name and
+# app.kubernetes.io/component, which is all they need.
 labels:
-- includeSelectors: true
+- includeSelectors: false
+  includeTemplates: true
   pairs:
     app.kubernetes.io/part-of: dash
     app.kubernetes.io/managed-by: kustomize
