@@ -285,9 +285,7 @@ struct ParsedSample {
 }
 
 fn parse_sample(line: &str) -> Result<ParsedSample, String> {
-    let name_end = line
-        .find(|c: char| c == '{' || c == ' ' || c == '\t')
-        .ok_or("sample has no value")?;
+    let name_end = line.find(['{', ' ', '\t']).ok_or("sample has no value")?;
     let name = &line[..name_end];
     if !valid_metric_name(name) {
         return Err(format!("invalid metric name '{name}'"));
@@ -455,7 +453,7 @@ pub fn validate(text: &str) -> Result<ValidationReport, String> {
         }
         report.samples += 1;
 
-        if kind == MetricKind::Counter && !(sample.value >= 0.0) {
+        if kind == MetricKind::Counter && (sample.value.is_nan() || sample.value < 0.0) {
             return Err(err("counter value must be a non-negative number".into()));
         }
         if kind == MetricKind::Histogram {
