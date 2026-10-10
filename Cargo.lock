@@ -1345,6 +1345,7 @@ dependencies = [
  "dash-common",
  "dash-config",
  "dash-http",
+ "dash-observe",
  "embeddings",
  "indexer",
  "metadata-router",

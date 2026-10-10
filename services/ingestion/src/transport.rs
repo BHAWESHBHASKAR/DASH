@@ -1533,17 +1533,30 @@ dash_ingest_wal_group_commit_enabled 0\n"
     }
 
     fn wal_write_metrics_text(&self) -> String {
-        format!(
-            "# TYPE dash_ingest_wal_write_failure_total counter\n\
+        let wal_size = self
+            .wal
+            .as_ref()
+            .and_then(|wal| lock_wal(wal).wal_size_bytes().ok())
+            .map(|bytes| {
+                format!(
+                    "# HELP dash_wal_size_bytes Size of the WAL file in bytes (records since the last checkpoint).\n\
+# TYPE dash_wal_size_bytes gauge\n\
+dash_wal_size_bytes {bytes}\n"
+                )
+            })
+            .unwrap_or_default();
+        wal_size
+            + &format!(
+                "# TYPE dash_ingest_wal_write_failure_total counter\n\
 dash_ingest_wal_write_failure_total {}\n\
 # TYPE dash_ingest_wal_write_recovered_total counter\n\
 dash_ingest_wal_write_recovered_total {}\n\
 # TYPE dash_ingest_wal_write_failing gauge\n\
 dash_ingest_wal_write_failing {}\n",
-            self.wal_write_failure_total,
-            self.wal_write_recovered_total,
-            self.wal_write_error.is_some() as u8
-        )
+                self.wal_write_failure_total,
+                self.wal_write_recovered_total,
+                self.wal_write_error.is_some() as u8
+            )
     }
 }
 

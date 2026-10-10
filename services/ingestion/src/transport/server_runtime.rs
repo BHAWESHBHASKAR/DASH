@@ -125,6 +125,11 @@ pub(super) fn serve_http_with_workers(
         let handler: dash_http::Handler = Arc::new(move |request| {
             handle_request(&handler_runtime, &HttpRequest::from(request)).into()
         });
+        let handler = dash_observe::http::instrument(
+            super::routes::SERVICE_NAME,
+            super::routes::http_route_label,
+            handler,
+        );
         let mut config = server_config(worker_count, queue_capacity);
         config.tls = tls;
         let result = dash_http::serve(

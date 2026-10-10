@@ -215,6 +215,11 @@ impl Server {
 
     fn metric(&self, name: &str) -> Option<u64> {
         let (_, body) = request(&self.addr, "GET", "/metrics", "", &[]);
+        // Leader and follower bodies (replication families included) must
+        // always be valid exposition.
+        if let Err(err) = dash_observe::validate(&body) {
+            panic!("invalid /metrics exposition: {err}\n{body}");
+        }
         body.lines()
             .find_map(|line| line.strip_prefix(&format!("{name} ")))
             .and_then(|value| value.trim().parse().ok())
