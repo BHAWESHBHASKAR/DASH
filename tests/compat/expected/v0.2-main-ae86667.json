@@ -1,0 +1,40 @@
+{
+  "comment": "Retrieve answers of the current code on the 0.2 fixture that differ BY DESIGN from what the 0.2 build answered (http/retrieve-responses.jsonl). 0.3.0 changed ranking on purpose (CHANGELOG 0.3.0): an edge 'from supports to' credits the target claim instead of its author, support and contradiction bonuses saturate, a re-ingested evidence id is stored once instead of twice, and the 'empty ANN result, scan every vector' fallback is gone. Scores, stance counts and citation multiplicity are therefore not compared for this fixture; claim order is, except for the requests listed here (index into dataset/retrieve.jsonl). Any other difference fails the test.",
+  "scores_comparable": false,
+  "requests": {
+    "1": {
+      "claims": [
+        "a-c02",
+        "a-c06",
+        "a-c09"
+      ],
+      "why": "support_only: in 0.2 a-c02's own outgoing 'contradicts' edge (a-c02 -> a-c01) counted against a-c02; 0.3 credits the target, so a-c02 has one support and one contradiction, passes the stance filter, and a-b1 drops out of the top 3"
+    },
+    "7": {
+      "claims": [
+        "a-c01",
+        "a-c02",
+        "a-c10",
+        "a-c04",
+        "a-c06"
+      ],
+      "why": "text-only query: stance counts changed (a-c04 no longer has a duplicate copy of evidence a-e04-1, a-c02 no longer counts its own outgoing contradicts edge, a-c10 is now credited by the supports edge a-c11 -> a-c10), so a-c02 and a-c10 rank above a-c04"
+    },
+    "8": {
+      "claims": [
+        "a-c09",
+        "a-c04",
+        "a-c10"
+      ],
+      "why": "text-only query on a tenant whose vectors have another dimension than the provider's: 0.2 scanned every vector with the mismatched query vector; 0.3 drops that vector and ranks the lexical match first (a-c09), then the segment candidates by their remaining signals, so a-c10 replaces a-c06"
+    },
+    "9": {
+      "claims": [
+        "a-c04",
+        "a-c10",
+        "a-c12"
+      ],
+      "why": "same as request 8: the lexical match a-c04 first, then segment candidates ranked by the 0.3 signals instead of 0.2's mismatched-vector scan"
+    }
+  }
+}

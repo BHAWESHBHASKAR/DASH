@@ -48,7 +48,7 @@ pub const FIXTURES: &[Fixture] = &[
         has_deletes: false,
     },
     Fixture {
-        label: "v0.3-hardening-f619475",
+        label: "v0.3.0-dev",
         era: Era::V0_3,
         has_deletes: true,
     },

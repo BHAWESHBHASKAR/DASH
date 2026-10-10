@@ -77,12 +77,53 @@ fn result_summary(result: &Value) -> Value {
     })
 }
 
+/// By-design differences between the current answers and the old build's
+/// for one fixture (`tests/compat/expected/<label>.json`, optional).
+struct ExpectedOverrides {
+    scores_comparable: bool,
+    claims: std::collections::BTreeMap<usize, Vec<String>>,
+}
+
+fn expected_overrides(fixture: &Fixture) -> ExpectedOverrides {
+    let path = dash_compat::compat_root()
+        .join("expected")
+        .join(format!("{}.json", fixture.label));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return ExpectedOverrides {
+            scores_comparable: true,
+            claims: Default::default(),
+        };
+    };
+    let value: Value = serde_json::from_str(&text).expect("valid expected file");
+    let mut claims = std::collections::BTreeMap::new();
+    for (index, entry) in value["requests"].as_object().into_iter().flatten() {
+        assert!(
+            entry["why"].as_str().is_some_and(|why| !why.is_empty()),
+            "{}: every by-design difference says why",
+            path.display()
+        );
+        let ids = entry["claims"]
+            .as_array()
+            .expect("claims")
+            .iter()
+            .map(|id| id.as_str().expect("claim id").to_string())
+            .collect();
+        claims.insert(index.parse().expect("request index"), ids);
+    }
+    ExpectedOverrides {
+        scores_comparable: value["scores_comparable"].as_bool().unwrap_or(true),
+        claims,
+    }
+}
+
 /// Compares the current answers with the ones the old build recorded
-/// (`http/retrieve-responses.jsonl`). Returns a description of every
-/// difference (empty when they match).
+/// (`http/retrieve-responses.jsonl`), allowing only the by-design
+/// differences listed in `tests/compat/expected/<label>.json`. Returns a
+/// description of every other difference (empty when there is none).
 pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<String> {
     let recorded = fixture.read_jsonl("http/retrieve-responses.jsonl");
     assert_eq!(recorded.len(), actual.len(), "one answer per dataset request");
+    let overrides = expected_overrides(fixture);
     let mut diffs = Vec::new();
     for (index, (expected, (status, body))) in recorded.iter().zip(actual).enumerate() {
         let expected_status = expected["status"].as_u64().unwrap_or(0);
@@ -97,27 +138,53 @@ pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<
         }
         let old = expected["body"]["results"].as_array().cloned().unwrap_or_default();
         let new = body["results"].as_array().cloned().unwrap_or_default();
-        let old_ids: Vec<&str> = old.iter().map(|r| r["claim_id"].as_str().unwrap_or("")).collect();
-        let new_ids: Vec<&str> = new.iter().map(|r| r["claim_id"].as_str().unwrap_or("")).collect();
-        if old_ids != new_ids {
-            diffs.push(format!("request {index}: claims {new_ids:?}, old build {old_ids:?}"));
-            continue;
-        }
-        for (o, n) in old.iter().zip(&new) {
-            let (os, ns) = (result_summary(o), result_summary(n));
-            if os != ns {
-                diffs.push(format!("request {index}: result {ns}, old build {os}"));
+        let old_ids: Vec<String> = old
+            .iter()
+            .map(|r| r["claim_id"].as_str().unwrap_or("").to_string())
+            .collect();
+        let new_ids: Vec<String> = new
+            .iter()
+            .map(|r| r["claim_id"].as_str().unwrap_or("").to_string())
+            .collect();
+        match overrides.claims.get(&index) {
+            Some(by_design) => {
+                if by_design == &old_ids {
+                    diffs.push(format!(
+                        "request {index}: stale entry in expected/{}.json (same as the old build)",
+                        fixture.label
+                    ));
+                }
+                if &new_ids != by_design {
+                    diffs.push(format!(
+                        "request {index}: claims {new_ids:?}, expected (by design) {by_design:?}"
+                    ));
+                }
             }
-            let (Some(old_score), Some(new_score)) = (o["score"].as_f64(), n["score"].as_f64())
-            else {
-                diffs.push(format!("request {index}: missing score"));
-                continue;
-            };
-            if (old_score - new_score).abs() > SCORE_EPSILON {
-                diffs.push(format!(
-                    "request {index}: {} score {new_score}, old build {old_score}",
-                    n["claim_id"]
-                ));
+            None => {
+                if old_ids != new_ids {
+                    diffs.push(format!("request {index}: claims {new_ids:?}, old build {old_ids:?}"));
+                    continue;
+                }
+                if overrides.scores_comparable {
+                    for (o, n) in old.iter().zip(&new) {
+                        let (os, ns) = (result_summary(o), result_summary(n));
+                        if os != ns {
+                            diffs.push(format!("request {index}: result {ns}, old build {os}"));
+                        }
+                        let (Some(old_score), Some(new_score)) =
+                            (o["score"].as_f64(), n["score"].as_f64())
+                        else {
+                            diffs.push(format!("request {index}: missing score"));
+                            continue;
+                        };
+                        if (old_score - new_score).abs() > SCORE_EPSILON {
+                            diffs.push(format!(
+                                "request {index}: {} score {new_score}, old build {old_score}",
+                                n["claim_id"]
+                            ));
+                        }
+                    }
+                }
             }
         }
         // Every field the old build answered with is still present.
@@ -128,12 +195,12 @@ pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<
                 }
             }
         }
-        for (o, n) in old.iter().zip(&new) {
-            if let (Some(old_obj), Some(new_obj)) = (o.as_object(), n.as_object()) {
-                for key in old_obj.keys() {
-                    if !new_obj.contains_key(key) {
-                        diffs.push(format!("request {index}: result lost field '{key}'"));
-                    }
+        if let (Some(o), Some(n)) = (old.first(), new.first())
+            && let (Some(old_obj), Some(new_obj)) = (o.as_object(), n.as_object())
+        {
+            for key in old_obj.keys() {
+                if !new_obj.contains_key(key) {
+                    diffs.push(format!("request {index}: result lost field '{key}'"));
                 }
             }
         }
