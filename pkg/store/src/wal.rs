@@ -369,6 +369,19 @@ pub fn batch_commit_id_from_wal_line(line: &str) -> Option<String> {
     }
 }
 
+/// The tombstone carried by a WAL line, or `None` for any other (or an
+/// unreadable) line. Lets a replica see which tenants a replicated batch
+/// deleted from, e.g. to refresh derived per-tenant files.
+pub fn tombstone_from_wal_line(line: &str) -> Option<Tombstone> {
+    if !line.starts_with("T2\t") {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::Tombstone(record) => Some(record.tombstone),
+        _ => None,
+    }
+}
+
 pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
     commit_id.starts_with(GROUP_BEGIN_PREFIX) || commit_id.starts_with(SINGLE_TX_PREFIX)
 }

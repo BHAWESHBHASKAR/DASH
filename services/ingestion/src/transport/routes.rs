@@ -8,7 +8,9 @@ pub(super) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
         &request.headers,
     ));
     let (path, _) = split_target(&request.target);
-    if request.method == "POST" && path.starts_with("/v1/ingest") {
+    let mutation = (request.method == "POST" && path.starts_with("/v1/ingest"))
+        || (request.method == "DELETE" && delete_routes::is_delete_path(&path));
+    if mutation {
         // DASH_INGEST_AUDIT_FAIL_CLOSED=1: refuse before any mutation when the
         // audit log is unusable.
         let audit_log_path =
@@ -68,6 +70,17 @@ pub(super) fn handle_request_with_policy(
             auth_policy,
             audit_log_path.as_deref(),
         ),
+        ("DELETE", p) if delete_routes::is_delete_path(p) => delete_routes::handle_delete(
+            runtime,
+            request,
+            &path,
+            &query,
+            auth_policy,
+            audit_log_path.as_deref(),
+        ),
+        (_, p) if delete_routes::is_delete_path(p) => {
+            HttpResponse::method_not_allowed("only DELETE is supported")
+        }
         ("POST", "/internal/replication/ack") => {
             read_routes::handle_replication_ack_post(runtime, request, &query, auth_policy)
         }

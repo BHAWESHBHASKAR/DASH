@@ -13,6 +13,7 @@ mod audit;
 mod authz;
 mod commit_status;
 mod config;
+mod delete_routes;
 mod document_parser_debug;
 mod group_commit;
 mod http;
@@ -154,6 +155,8 @@ pub struct IngestionRuntime {
     /// Saves the vector indexes (persistent mode only); see
     /// `with_vector_index_persistence`.
     vector_index_persistence: Option<Arc<VectorIndexPersistence>>,
+    /// Counters of the delete routes (`delete_routes`).
+    delete_metrics: delete_routes::DeleteMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -269,6 +272,7 @@ impl IngestionRuntime {
             transport_backpressure: None,
             started_at: Instant::now(),
             vector_index_persistence: None,
+            delete_metrics: delete_routes::DeleteMetrics::default(),
         }
     }
 
@@ -346,6 +350,7 @@ impl IngestionRuntime {
             transport_backpressure: None,
             started_at: Instant::now(),
             vector_index_persistence: None,
+            delete_metrics: delete_routes::DeleteMetrics::default(),
         }
     }
 
@@ -1384,6 +1389,7 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
         ) + &self.group_commit_metrics_text()
+            + &self.delete_metrics.render()
     }
 
     fn group_commit_metrics_text(&self) -> String {

@@ -897,7 +897,7 @@ pub(super) fn handle_ingest_document_post(
     }
 }
 
-fn parse_write_consistency(
+pub(super) fn parse_write_consistency(
     query: &HashMap<String, String>,
 ) -> Result<WriteConsistencyPolicy, String> {
     let Some(raw) = query.get("write_consistency") else {
@@ -956,7 +956,7 @@ pub(super) fn observe_auth_success(runtime: &SharedRuntime) {
 /// push arbitrarily large values into denial audit records or logs.
 const MAX_IDENTIFIER_BYTES: usize = dash_common::audit::MAX_AUDIT_FIELD_BYTES;
 
-fn reject_oversized_identifiers(ids: &[&str]) -> Option<HttpResponse> {
+pub(super) fn reject_oversized_identifiers(ids: &[&str]) -> Option<HttpResponse> {
     ids.iter()
         .any(|id| id.len() > MAX_IDENTIFIER_BYTES)
         .then(|| {

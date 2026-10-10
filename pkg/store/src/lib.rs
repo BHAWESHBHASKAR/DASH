@@ -45,7 +45,6 @@ pub use group_commit::{
     CommitTicket, GROUP_COMMIT_MAX_WAIT_LIMIT, GroupCommitConfig, GroupCommitError, GroupCommitLog,
     GroupCommitStats, GroupCommitter,
 };
-pub use wal::Tombstone;
 pub(crate) use wal::{
     BatchCommitRecord, ClaimVectorRecord, PersistedRecord, ReplayItem, line_to_record,
     record_to_line,
@@ -60,6 +59,7 @@ pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
     batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
 };
+pub use wal::{Tombstone, tombstone_from_wal_line};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {

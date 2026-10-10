@@ -822,3 +822,94 @@ fn follower_converges_over_a_leader_wal_with_poisoned_legacy_lines() {
     );
     follower.stop();
 }
+
+fn segment_claim_ids(root: &Path, tenant: &str) -> Vec<String> {
+    let tenant_dir = indexer::resolve_tenant_dir(root, tenant);
+    let mut ids: Vec<String> = indexer::load_current_segments(&tenant_dir)
+        .expect("segments load")
+        .map(|(_, segments)| segments.into_iter().flat_map(|s| s.claim_ids).collect())
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Leader deletes reach an ingestion follower in WAL order: its WAL, its redb
+/// mirror and its segments all end up without the deleted data, including a
+/// tenant erased entirely (whose segments must be refreshed although the
+/// store no longer lists the tenant).
+#[test]
+fn deletes_replicate_to_an_ingestion_follower_wal_redb_and_segments() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(&dir.path().join("leader.wal"), None, no_checkpoint(), None);
+    leader.ingest("x1");
+    leader.ingest("x2");
+    leader.ingest("x3");
+    let follower_wal = dir.path().join("follower.wal");
+    let follower_redb = dir.path().join("follower.redb");
+    let segments = dir.path().join("follower-segments");
+    set_env("DASH_INGEST_SEGMENT_DIR", segments.to_str().unwrap());
+    let mut follower = Server::start_follower(
+        &leader.addr,
+        &follower_wal,
+        Some(&follower_redb),
+        no_checkpoint(),
+    );
+    unset_env("DASH_INGEST_SEGMENT_DIR");
+    let (_, total) = leader.frame();
+    wait_until("follower catches up", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    assert_eq!(segment_claim_ids(&segments, TENANT), ["x1", "x2", "x3"]);
+
+    for path in [
+        format!("/v1/claims/x1?tenant_id={TENANT}"),
+        format!("/v1/evidence/ev-x2?tenant_id={TENANT}"),
+    ] {
+        let (status, body) = request(&leader.addr, "DELETE", &path, "", &[]);
+        assert_eq!(status, 200, "{path}: {body}");
+        assert!(body.contains("\"deleted\":true"), "{body}");
+    }
+    let (_, total) = leader.frame();
+    wait_until("deletes replicated", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    assert_eq!(segment_claim_ids(&segments, TENANT), ["x2", "x3"]);
+
+    let (status, body) = request(
+        &leader.addr,
+        "DELETE",
+        &format!("/v1/tenants/{TENANT}"),
+        "",
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, total) = leader.frame();
+    wait_until("erasure replicated", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    assert!(segment_claim_ids(&segments, TENANT).is_empty());
+    leader.ingest("x9");
+    let (_, total) = leader.frame();
+    wait_until(
+        "post-erasure write replicated",
+        Duration::from_secs(10),
+        || follower.metric("dash_ingest_replication_last_offset") == Some(total as u64),
+    );
+    follower.stop();
+
+    assert_eq!(claim_ids_in_wal(&follower_wal), vec!["x9"]);
+    let mut empty = FileWal::open(dir.path().join("empty.wal")).expect("empty wal");
+    let (from_redb, _) = InMemoryStore::load_from_disk_and_wal(
+        &follower_redb,
+        &mut empty,
+        AnnTuningConfig::default(),
+    )
+    .expect("reload follower redb");
+    let ids: Vec<String> = from_redb
+        .claims_for_tenant(TENANT)
+        .into_iter()
+        .map(|c| c.claim_id)
+        .collect();
+    assert_eq!(ids, vec!["x9"]);
+}

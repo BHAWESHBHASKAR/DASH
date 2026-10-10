@@ -727,7 +727,19 @@ impl IngestionRuntime {
             if let Err(err) = self.store.commit_staged(staged_store) {
                 eprintln!("replication: disk mirror degraded after commit: {err:?}");
             }
-            for tenant_id in self.store.tenant_ids() {
+            // A tenant whose last claim a replicated tombstone removed is no
+            // longer listed by the store, but its segments must be refreshed
+            // too (to an empty claim set).
+            let mut tenants: std::collections::BTreeSet<String> =
+                self.store.tenant_ids().into_iter().collect();
+            tenants.extend(
+                frame
+                    .wal_lines
+                    .iter()
+                    .filter_map(|line| store::tombstone_from_wal_line(line))
+                    .map(|tombstone| tombstone.tenant_id().to_string()),
+            );
+            for tenant_id in tenants {
                 self.publish_segments_for_tenant(&tenant_id);
             }
             self.replication_applied_records_total = self
@@ -771,10 +783,15 @@ impl IngestionRuntime {
         if let Some(wal) = self.wal.as_ref() {
             lock_wal(wal).replace_with_replication_export(&export)?;
         }
+        // Tenants the export no longer holds (erased on the leader) get their
+        // segments refreshed to an empty claim set as well.
+        let mut tenants: std::collections::BTreeSet<String> =
+            self.store.tenant_ids().into_iter().collect();
         if let Err(err) = self.store.replace_state_from(fresh) {
             eprintln!("replication resync: disk rewrite degraded: {err:?}");
         }
-        for tenant_id in self.store.tenant_ids() {
+        tenants.extend(self.store.tenant_ids());
+        for tenant_id in tenants {
             self.publish_segments_for_tenant(&tenant_id);
         }
         self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);

@@ -1341,3 +1341,113 @@ fn durable_follower_saves_its_vector_index_at_the_replicated_wal_position() {
         rebuilt.ann_vector_top_candidates(TENANT, &query, 10)
     );
 }
+
+impl Leader {
+    fn delete(&self, path: &str) -> String {
+        let (status, body) = http(&self.addr, "DELETE", path, &[]);
+        assert_eq!(status, 200, "DELETE {path}: {body}");
+        body
+    }
+}
+
+/// Tombstones written on the leader reach a retrieval follower in WAL order
+/// (a delete followed by a re-ingest of the same id ends with the claim
+/// present), survive a follower restart, are applied by a resync, and correct
+/// a vector index the follower saved before the delete.
+#[test]
+fn deletes_replicate_in_order_through_restart_resync_and_a_saved_vector_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(&dir.path().join("leader.wal"), None, no_checkpoint());
+    leader.ingest("d1", None);
+    leader.ingest("d2", Some(ANCHOR));
+    leader.ingest("d3", None);
+    // Every claim gets an embedding from the leader's default provider, so
+    // the follower's vector index holds all of them.
+    leader.ingest("d4", None);
+    leader.ingest("d5", None);
+    let follower_wal = dir.path().join("follower.wal");
+    let index = dir.path().join("follower.wal.vindex");
+    let persistence = store::VectorIndexPersistence::new(&index, None);
+    let mut node = start_durable(test_config(&leader.addr), &follower_wal);
+    let (_, total) = leader.frame();
+    wait_until("initial sync", Duration::from_secs(10), || {
+        node.status().offset == total
+    });
+    // Saved while d1 and d4 still exist.
+    retrieval::vector_index::save_on_shutdown(&node.store, &persistence, None);
+
+    let body = leader.delete(&format!("/v1/claims/d1?tenant_id={TENANT}"));
+    assert!(body.contains("\"deleted\":true"), "{body}");
+    leader.delete(&format!("/v1/evidence/ev-d2?tenant_id={TENANT}"));
+    leader.delete(&format!("/v1/claims/d4?tenant_id={TENANT}"));
+    leader.delete(&format!("/v1/claims/d3?tenant_id={TENANT}"));
+    leader.ingest("d3", None);
+    let (_, total) = leader.frame();
+    wait_until("deletes replicated", Duration::from_secs(10), || {
+        node.status().offset == total
+    });
+    let expected: Vec<String> = ["d2", "d3", "d5"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(node.claim_ids(), expected);
+    {
+        let guard = node.store.read().unwrap();
+        assert!(guard.evidence_for_claim("d2").is_empty());
+        assert_eq!(guard.edges_for_claim("d2").len(), 1);
+        assert_eq!(
+            guard.evidence_for_claim("d3").len(),
+            1,
+            "re-ingested after its delete"
+        );
+    }
+    assert_eq!(node.status().resyncs_total, 0);
+
+    // Restart: the follower's own WAL replays the tombstones, and the vector
+    // index saved before them is corrected by the catch-up, not rebuilt.
+    node.stop();
+    drop(node);
+    let (loaded, restore) = load_with_index(&follower_wal, &index);
+    match restore {
+        // d2, d3, d5 and the anchor.
+        store::VectorIndexRestore::Loaded { vectors, .. } => assert_eq!(vectors, 4),
+        other => panic!("expected a catch-up load, got {other:?}"),
+    }
+    let dim = loaded
+        .tenant_vector_dim(TENANT)
+        .expect("tenant has vectors");
+    let query: Vec<f32> = (0..dim).map(|d| ((d % 7) as f32 + 1.0) / 7.0).collect();
+    let served = loaded.ann_vector_top_candidates(TENANT, &query, 10);
+    assert_eq!(served.len(), 4, "{served:?}");
+    assert!(
+        !served.iter().any(|id| id == "d1" || id == "d4"),
+        "{served:?}"
+    );
+    let rebuilt = InMemoryStore::load_from_wal(&FileWal::open(&follower_wal).unwrap()).unwrap();
+    assert_eq!(
+        served,
+        rebuilt.ann_vector_top_candidates(TENANT, &query, 10)
+    );
+    drop(loaded);
+    let node = start_durable(test_config(&leader.addr), &follower_wal);
+    assert_eq!(node.claim_ids(), expected);
+    drop(node);
+
+    // A fresh follower resyncs from the export (snapshot plus tombstones).
+    let fresh = start_volatile(test_config(&leader.addr), InMemoryStore::new());
+    wait_until("fresh follower synced", Duration::from_secs(10), || {
+        fresh.claim_ids() == expected
+    });
+
+    // Tenant erasure replicates too.
+    leader.delete(&format!("/v1/tenants/{TENANT}"));
+    wait_until(
+        "tenant erased on the follower",
+        Duration::from_secs(10),
+        || {
+            fresh
+                .store
+                .read()
+                .unwrap()
+                .claims_for_tenant(TENANT)
+                .is_empty()
+        },
+    );
+}

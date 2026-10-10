@@ -2,6 +2,7 @@ use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
 
 mod authz_matrix;
+mod delete;
 mod group_commit;
 mod provider_cache;
 mod ready;
