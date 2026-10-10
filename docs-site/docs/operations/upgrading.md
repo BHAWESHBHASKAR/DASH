@@ -20,8 +20,8 @@ Do these in order. Environment variable meanings are in
    no longer be parsed or validated are moved to `<wal>.quarantine` at
    startup instead of blocking it (set `DASH_WAL_REPLAY_STRICT=1` in
    staging to see them as errors). WAL records written by 0.3.0 use new
-   record kinds (`C2`, `E2`, `G2`, `V2`, `B2`) that 0.2.x is not expected
-   to read (not tested), so keep the backup if you may roll back.
+   record kinds (`C2`, `E2`, `G2`, `V2`, `B2`) that 0.2.x cannot read, so
+   the only rollback is restoring this backup ([upgrade guide](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/upgrades.md)).
 2. **Generate secrets.** For Docker Compose run `scripts/generate-secrets.sh`
    (it writes `deploy/container/.env` with mode 0600: the API keys, JWT
    secrets, the replication token on both sides and the control-plane
@@ -72,15 +72,24 @@ Do these in order. Environment variable meanings are in
    disable. `/v1/retrieve` rejects `top_k` above 1000
    (`DASH_RETRIEVAL_MAX_TOP_K`). Token-id array inputs on `/v1/embeddings`
    are rejected unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`.
-6. **Upgrade ingestion and retrieval together.** Replication frames now
-   carry the WAL generation. A follower that has only an old bare-number
-   offset file does a full resync on its first poll; a retrieval follower
-   without a retrieval WAL always starts with a full resync. Mixed-version
-   replication is not tested.
-7. **Tenant segment directories migrate automatically.** The first time a
-   tenant is touched, an old lossy-named segment directory (for example
-   `acme_corp`) is renamed to its collision-free name. Nothing to do; the
-   segment data is derived and rewritten on the next publish.
+6. **Upgrade the replication leader first, then its followers.**
+   Replication frames now carry the WAL generation. Replication between
+   0.2.x and 0.3.0 is refused in both directions (tested): a 0.3.0 follower
+   rejects a 0.2.x leader's frames and reports `replication_leader_too_old`
+   in `/ready`, and a 0.2.x follower cannot parse 0.3.0 frames; neither
+   applies anything. An upgraded follower without a 0.3.0 cursor does a full
+   resync from the leader's export on its first poll; a retrieval follower
+   without a retrieval WAL always starts with a full resync. Stop all
+   control-plane replicas before upgrading them: 0.2.x cannot read the
+   0.3.0 lease file.
+7. **Tenant segment directories are rebuilt where their name changes.**
+   Tenant directories now have collision-free names (`tenant_b` becomes
+   `tenant_5fb`) and a `segments.tenant` marker. 0.2.x wrote no marker, so
+   a 0.2.x directory whose name changes is ambiguous: it is left untouched
+   (with a warning) and the tenant's segments are written to the new
+   directory on its next write; until then retrieval scans that tenant
+   without the segment prefilter. Nothing to do; delete the old directories
+   once every tenant has been republished.
 8. **Update SDK code.** Remove calls to `delete` in the Java, Kotlin and C#
    SDKs (the server never had that route). Go users change the import path
    to `github.com/BHAWESHBHASKAR/DASH/sdks/go`. SDK versions are 0.2.0.

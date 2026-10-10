@@ -6,6 +6,54 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (P7 upgrade and rollback compatibility)
+
+- **Upgrade compatibility tests** (`tests/compat`, crate `dash-compat`, part
+  of `cargo test --workspace`). Fixtures captured from the 0.2 release
+  (`main` at `ae86667`) and from this 0.3.0 tree hold the state each wrote
+  for a fixed dataset (WAL, snapshot, redb mirror, persisted vector index,
+  segment directories, audit logs, lease and placement files), the answers it
+  gave and the replication frames it served. The current code must replay
+  them strictly, hold exactly the data that was written, serve the recorded
+  retrieve answers before and after a checkpoint (by-design ranking changes
+  are listed with their reason in `tests/compat/expected/`), migrate redb
+  rows and the snapshot forward, continue the audit chain, take over the
+  lease with a higher fencing token, follow recorded 0.3 frames, serve
+  followers from an upgraded leader whose WAL still holds 0.2 records, and
+  accept 0.2 clients' ingest requests with compatible responses. Downgrade
+  rules are checked against oracles of the 0.2 readers.
+- **`scripts/compat/generate_fixtures.sh`**: captures a fixture from any git
+  ref (temporary worktree, its own target directory, both deleted
+  afterwards); part of the release checklist. How fixtures are made:
+  `tests/compat/README.md`.
+- **Operator guide `docs/operations/upgrades.md`**: supported paths, order of
+  operations (single node, leader and followers, control plane), what to
+  back up, rollback procedures, and the format version table (which release
+  writes what, which can read it).
+
+### Fixed (found by the compat tests)
+
+- **Followers followed 0.2 leaders unsafely.** Ingestion and retrieval
+  followers accepted WAL frames without a generation. A 0.2 leader serves a
+  fresh follower only its WAL tail (never the snapshot) and cannot signal a
+  compaction reliably, so a follower could silently miss checkpointed data
+  or skip records. Such frames are now refused: nothing is applied and
+  `/ready` reports `replication_leader_too_old` until the leader is
+  upgraded.
+- **Text-only retrieve answered 400 on tenants with client-supplied
+  vectors.** When the embedding provider's dimension differed from the
+  tenant's (vectors sent by clients), a retrieve without `query_embedding`
+  failed with `query_embedding: query vector dimension mismatch`, although
+  the client sent no vector; 0.2 answered it. The generated vector is now
+  dropped and the query answered from the lexical signals. An explicit
+  `query_embedding` of the wrong dimension is still a 400.
+- **Upgrade notes corrected.** "Mixed-version replication is not tested"
+  and "0.2.x is not expected to read 0.3.0 records (not tested)" are now
+  tested facts (refused both ways; rollback only by restoring the backup),
+  and 0.2 segment directories are not renamed (they carry no tenant
+  marker): the tenant is republished into its new directory.
+
+
 ### Added (P2 crash-consistency, fault-injection and load harness)
 
 - **`tools/crash-test`**: randomized `kill -9` harness for the ingestion
@@ -395,8 +443,8 @@ Do these in order. Environment variable meanings are in
    no longer be parsed or validated are moved to `<wal>.quarantine` at
    startup instead of blocking it (set `DASH_WAL_REPLAY_STRICT=1` in
    staging to see them as errors). WAL records written by 0.3.0 use new
-   record kinds (`C2`, `E2`, `G2`, `V2`, `B2`) that 0.2.x is not expected
-   to read (not tested), so keep the backup if you may roll back.
+   record kinds (`C2`, `E2`, `G2`, `V2`, `B2`) that 0.2.x cannot read, so
+   the only rollback is restoring this backup ([`docs/operations/upgrades.md`](docs/operations/upgrades.md)).
 2. **Generate secrets.** For Docker Compose run `scripts/generate-secrets.sh`
    (it writes `deploy/container/.env` with mode 0600: the API keys, JWT
    secrets, the replication token on both sides and the control-plane
@@ -447,15 +495,24 @@ Do these in order. Environment variable meanings are in
    disable. `/v1/retrieve` rejects `top_k` above 1000
    (`DASH_RETRIEVAL_MAX_TOP_K`). Token-id array inputs on `/v1/embeddings`
    are rejected unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`.
-6. **Upgrade ingestion and retrieval together.** Replication frames now
-   carry the WAL generation. A follower that has only an old bare-number
-   offset file does a full resync on its first poll; a retrieval follower
-   without a retrieval WAL always starts with a full resync. Mixed-version
-   replication is not tested.
-7. **Tenant segment directories migrate automatically.** The first time a
-   tenant is touched, an old lossy-named segment directory (for example
-   `acme_corp`) is renamed to its collision-free name. Nothing to do; the
-   segment data is derived and rewritten on the next publish.
+6. **Upgrade the replication leader first, then its followers.**
+   Replication frames now carry the WAL generation. Replication between
+   0.2.x and 0.3.0 is refused in both directions (tested): a 0.3.0 follower
+   rejects a 0.2.x leader's frames and reports `replication_leader_too_old`
+   in `/ready`, and a 0.2.x follower cannot parse 0.3.0 frames; neither
+   applies anything. An upgraded follower without a 0.3.0 cursor does a full
+   resync from the leader's export on its first poll; a retrieval follower
+   without a retrieval WAL always starts with a full resync. Stop all
+   control-plane replicas before upgrading them: 0.2.x cannot read the
+   0.3.0 lease file.
+7. **Tenant segment directories are rebuilt where their name changes.**
+   Tenant directories now have collision-free names (`tenant_b` becomes
+   `tenant_5fb`) and a `segments.tenant` marker. 0.2.x wrote no marker, so
+   a 0.2.x directory whose name changes is ambiguous: it is left untouched
+   (with a warning) and the tenant's segments are written to the new
+   directory on its next write; until then retrieval scans that tenant
+   without the segment prefilter. Nothing to do; delete the old directories
+   once every tenant has been republished.
 8. **Update SDK code.** Remove calls to `delete` in the Java, Kotlin and C#
    SDKs (the server never had that route). Go users change the import path
    to `github.com/BHAWESHBHASKAR/DASH/sdks/go`. SDK versions are 0.2.0.

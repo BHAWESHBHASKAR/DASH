@@ -90,11 +90,11 @@ Requires role `retrieve` on the request's tenant. Authorization runs before any 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `tenant_id` | string | required | Must be non-empty. |
-| `query` | string | required | Must be non-empty, at most 8 KiB. Embedded with the configured provider unless `query_embedding` is given. |
+| `query` | string | required | Must be non-empty, at most 8 KiB. Embedded with the configured provider unless `query_embedding` is given. When the provider's vector does not fit the tenant (the tenant's vectors were sent by clients with another dimension), the query is answered from the lexical signals only. |
 | `top_k` | positive integer | `5` | Upper bound `DASH_RETRIEVAL_MAX_TOP_K` (default 1000); larger values get 400. |
 | `stance_mode` | `balanced` \| `support_only` | `balanced` | `support_only` drops claims with more contradictions than supports. |
 | `time_range` | `{ "from_unix": i64?, "to_unix": i64? }` | none | Filters on event time and validity window. |
-| `query_embedding` | float array | none | Pre-computed query vector; finite values, at most 8192 entries. A vector that does not match the tenant's dimension returns no results, never an error or NaN scores. |
+| `query_embedding` | float array | none | Pre-computed query vector; finite values, at most 8192 entries. A vector whose dimension differs from the tenant's, or with a zero norm, is rejected with 400 (`query_embedding: ...`); it never reaches another tenant or produces NaN scores. |
 | `entity_filters` | string array | `[]` | At most 256 values. |
 | `embedding_id_filters` | string array | `[]` | At most 256 values. |
 | `return_graph` | boolean | `false` | Include the expanded claim graph. |
@@ -318,7 +318,7 @@ Used by followers; not for clients.
 | `GET /internal/replication/commit-status?commit_id=...` | JSON commit progress; 404 for unknown id. |
 | `POST /internal/replication/ack?commit_id=...&replica_id=...&ack_epoch=N` | Record a replica acknowledgement. |
 
-**0.3.0:** every replication route requires the `x-replication-token` header to equal `DASH_INGEST_REPLICATION_TOKEN` (constant-time comparison); a missing or wrong token, or no token configured (outside dev mode), returns 403. These endpoints export all tenants' data, so never expose them outside the cluster network. A follower persists `(generation, offset)`, resyncs from the export when the generation changes (for example after a leader checkpoint), applies each frame atomically, bounds response sizes, backs off on failure, and reports its state in `/ready` and `/metrics`.
+**0.3.0:** every replication route requires the `x-replication-token` header to equal `DASH_INGEST_REPLICATION_TOKEN` (constant-time comparison); a missing or wrong token, or no token configured (outside dev mode), returns 403. These endpoints export all tenants' data, so never expose them outside the cluster network. A follower persists `(generation, offset)`, resyncs from the export when the generation changes (for example after a leader checkpoint), applies each frame atomically, bounds response sizes, backs off on failure, and reports its state in `/ready` and `/metrics`. A frame without a generation (a 0.2.x leader) is refused: nothing is applied and `/ready` reports `replication_leader_too_old` (see `docs/operations/upgrades.md` for the upgrade order).
 
 ## Control-plane service
 
