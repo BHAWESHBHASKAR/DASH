@@ -116,6 +116,11 @@ impl RecordedLeader {
                             let (status, body) = if target.starts_with("/internal/replication/wal?")
                             {
                                 ("200 OK", wal_frame.as_str())
+                            } else if target.starts_with("/internal/replication/export/") {
+                                // The recorded releases have no chunked export
+                                // (`/export/begin`, `/export/chunk`): followers
+                                // fall back to the single-response export.
+                                ("404 Not Found", "status=not_found\n")
                             } else if target.starts_with("/internal/replication/export") {
                                 ("200 OK", export.as_str())
                             } else {
