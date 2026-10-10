@@ -2,7 +2,8 @@
 name = "crash-test"
 version = "0.1.0"
 edition = "2024"
-publish = false
+license.workspace = true
+publish.workspace = true
 description = "Randomized kill -9 crash-consistency harness for the DASH ingestion service"
 
 [[bin]]
