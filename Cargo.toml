@@ -16,6 +16,7 @@ members = [
   "services/metadata-router",
   "tests/benchmarks",
   "tests/e2e",
+  "tests/tls-fixtures",
   "tools/audit-verify",
   "tools/wal-inspect",
 ]

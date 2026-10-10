@@ -60,9 +60,9 @@ data:
   DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
   DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: "/var/lib/dash/state/retrieval-replication.offset"
   # Replication is plain http inside the cluster. This acknowledges that the
-  # token and the WAL stream cross the pod network unencrypted; remove it once
-  # the source URL is https:// behind a mesh or TLS sidecar. See
-  # docs/operations/replication-security.md.
+  # token and the WAL stream cross the pod network unencrypted. The overlay in
+  # deploy/k8s-tls turns on native TLS (https:// source, mutual TLS) and
+  # removes it. See docs/operations/tls.md.
   DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
 
   # ----- control plane -----

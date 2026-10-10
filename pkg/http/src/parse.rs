@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::{ExpectPolicy, ServerConfig};
 use crate::request::Request;
@@ -50,10 +50,27 @@ fn map_io_error(err: &std::io::Error) -> ReadError {
     }
 }
 
+/// A byte stream the request reader can put timeouts on: a plain socket or a
+/// TLS session over one.
+pub trait Transport: Read + Write {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Transport for TcpStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
 /// Read once from the stream, never waiting past the whole-request deadline
 /// (or the per-read timeout, when configured).
-fn read_with_deadline(
-    stream: &mut TcpStream,
+fn read_with_deadline<S: Transport + ?Sized>(
+    stream: &mut S,
     buf: &mut [u8],
     deadline: Instant,
     cfg: &ServerConfig,
@@ -247,8 +264,8 @@ fn parse_request_line(line: &str) -> Result<(String, String), String> {
 /// Read one request, giving up at `deadline` (measured from accept, so time
 /// spent queued counts). `Ok(None)` means the peer closed without sending
 /// anything.
-pub fn read_request(
-    stream: &mut TcpStream,
+pub fn read_request<S: Transport + ?Sized>(
+    stream: &mut S,
     cfg: &ServerConfig,
     deadline: Instant,
 ) -> Result<Option<Request>, ReadError> {
@@ -290,7 +307,8 @@ pub fn read_request(
     if body.len() < content_length && head.expect_continue {
         let _ = stream
             .set_write_timeout(Some(cfg.write_timeout))
-            .and_then(|_| stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"));
+            .and_then(|_| stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n"))
+            .and_then(|_| stream.flush());
     }
     while body.len() < content_length {
         let want = (content_length - body.len()).min(READ_CHUNK_BYTES);
@@ -307,6 +325,7 @@ pub fn read_request(
         headers: head.headers,
         body,
         peer: None,
+        tls: None,
     }))
 }
 
@@ -333,6 +352,7 @@ pub fn parse_request_bytes(raw: &[u8], cfg: &ServerConfig) -> Result<Request, Re
         headers: head.headers,
         body: body.to_vec(),
         peer: None,
+        tls: None,
     })
 }
 

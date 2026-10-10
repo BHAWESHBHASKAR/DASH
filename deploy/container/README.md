@@ -47,7 +47,7 @@ docker build -f deploy/container/Dockerfile --build-arg SERVICE=ingestion -t das
 - `HEALTHCHECK` runs `dash-healthcheck`, which probes `/v1/ready`
   (`/v1/control-plane/ready` for the control plane) on the service's port.
 - Published ports bind to `127.0.0.1`. Set `DASH_PUBLISH_ADDR=0.0.0.0` only
-  behind a TLS-terminating proxy.
+  with the TLS overlay (see [TLS](#tls)) or behind a TLS-terminating proxy.
 
 ## Quickstart
 
@@ -98,6 +98,24 @@ Ingestion is the only writer. Retrieval follows it over HTTP
 shared bearer token (`DASH_INGEST_REPLICATION_TOKEN` on ingestion,
 `DASH_RETRIEVAL_REPLICATION_TOKEN` on retrieval; `generate-secrets.sh`
 writes the same value to both). Retrieval keeps its own redb store.
+
+### TLS
+
+`docker-compose.tls.yml` turns on native TLS for every service and mutual TLS
+for replication:
+
+```bash
+scripts/generate-dev-tls.sh            # dev CA + certificate in deploy/container/tls
+docker compose -f deploy/container/docker-compose.yml \
+               -f deploy/container/docker-compose.tls.yml up -d --build
+curl --cacert deploy/container/tls/ca.crt https://127.0.0.1:8080/v1/ready
+```
+
+The overlay mounts `deploy/container/tls` read-only at `/etc/dash/tls`,
+switches the retrieval source to `https://ingestion:8081`, withdraws
+`DASH_REPLICATION_ALLOW_INSECURE_HTTP`, and points the healthcheck at the CA.
+Use certificates from your own PKI (same file names) outside development. See
+`docs/operations/tls.md`.
 
 ## Environment variables
 
@@ -216,7 +234,9 @@ reuses the secrets from `.env`; no weak dev secrets are defined.
 ## Healthchecks
 
 Every service has a Docker `HEALTHCHECK`. `dash-healthcheck` probes
-`/v1/ready` (`/v1/control-plane/ready` for the control plane). The
+`/v1/ready` (`/v1/control-plane/ready` for the control plane), over
+`https://` when the service's `DASH_*_TLS_CERT_FILE` is set (verified
+against `DASH_HEALTHCHECK_CA_FILE` when given). The
 `segment-maintenance` daemon has no HTTP endpoint, so its check is
 process presence. `depends_on` uses `condition: service_healthy` so
 retrieval starts only after ingestion is ready.

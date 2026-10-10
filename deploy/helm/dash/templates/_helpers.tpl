@@ -184,3 +184,26 @@ Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
 {{- $over := default (dict) (index $top.Values.resources $key) -}}
 {{- toYaml (mergeOverwrite $base (deepCopy $over)) -}}
 {{- end -}}
+
+{{/* Probe scheme: HTTPS when the listeners serve TLS (kubelet does not verify the certificate). */}}
+{{- define "dash.probeScheme" -}}
+{{- ternary "HTTPS" "HTTP" .Values.tls.enabled -}}
+{{- end -}}
+
+{{/* Read-only mount of the TLS Secret (tls.crt, tls.key, ca.crt). */}}
+{{- define "dash.tlsVolumeMount" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  mountPath: {{ .Values.tls.mountPath }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "dash.tlsVolume" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  secret:
+    secretName: {{ required "tls.secretName is required when tls.enabled=true (a Secret with tls.crt, tls.key and ca.crt)" .Values.tls.secretName }}
+    defaultMode: 0440
+{{- end }}
+{{- end -}}

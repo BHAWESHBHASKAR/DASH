@@ -15,10 +15,13 @@ pub(super) const HEALTH_QUEUE_CAPACITY: usize = 64;
 
 impl From<dash_http::Request> for HttpRequest {
     fn from(request: dash_http::Request) -> Self {
+        let mut headers = request.headers;
+        // Only the TLS layer may vouch for a client certificate.
+        dash_common::tls::stamp_client_cert_header(&mut headers, request.tls.as_ref());
         Self {
             method: request.method,
             target: request.target,
-            headers: request.headers,
+            headers,
             body: request.body,
         }
     }

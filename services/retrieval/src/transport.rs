@@ -958,6 +958,8 @@ pub fn serve_http_with_workers(
     worker_count: usize,
     shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
 ) -> std::io::Result<()> {
+    let tls = dash_common::tls::listener_tls_from_env(&dash_common::tls::RETRIEVAL_TLS_ENV)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -976,9 +978,11 @@ pub fn serve_http_with_workers(
         )
         .into()
     });
+    let mut config = server_config(worker_count, queue_capacity);
+    config.tls = tls;
     dash_http::serve(
         listener,
-        server_config(worker_count, queue_capacity),
+        config,
         handler,
         dash_http::default_health_classifier,
         &|| shutdown.is_triggered(),

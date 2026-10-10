@@ -16,6 +16,7 @@ All of the code below is merged in the tree; nothing is tagged or published. Sco
 - Replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`.
 - Per-tenant rate limiting is enforced (HTTP 429 with `Retry-After`).
 - JWT and OIDC hardening (mandatory `exp`, lifetime cap, `jti` denylist, JWKS cache), SIGHUP reload, HTTPS for the OpenAI provider, one canonical audit-chain encoding with a shared verifier.
+- Optional native TLS on every listener (TLS 1.2/1.3, ALPN `http/1.1`), client-certificate verification, replication and placement over mutual TLS with per-follower certificate pinning, certificate reload without restart; TLS variants of the Helm chart, kustomize manifests and Compose file. Off by default.
 
 **Data integrity**
 
@@ -31,7 +32,7 @@ All of the code below is merged in the tree; nothing is tagged or published. Sco
 
 - New tools `wal-inspect` and `audit-verify`; corrected Compose, Kubernetes, Helm and systemd packaging; Java, Kotlin and C# SDKs fixed and unified at 0.2.0 with `delete()` removed; the Go module path is now `github.com/BHAWESHBHASKAR/DASH/sdks/go`.
 
-**Not in 0.3.0:** HMAC-keyed audit chain, encryption at rest, mTLS, consensus replication and failover, delete and tenant APIs, a real GPU backend, signed images.
+**Not in 0.3.0:** HMAC-keyed audit chain, encryption at rest, TLS on by default, consensus replication and failover, delete and tenant APIs, a real GPU backend, signed images.
 
 ## M11 (in tree, untagged)
 

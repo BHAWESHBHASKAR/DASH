@@ -33,7 +33,7 @@ Notes on how the stack is wired:
 
 - **Ingestion** owns the WAL at `/var/lib/dash/wal/ingestion.wal` and the redb file at `/var/lib/dash/state/ingestion.redb`, and writes an audit log under `/var/lib/dash/audit/`.
 - **Retrieval** follows ingestion by polling `DASH_RETRIEVAL_REPLICATION_SOURCE_URL=http://ingestion:8081` every 250 ms with the replication token, and records its offset in `/var/lib/dash/state/retrieval-replication.offset`. Retrieval reads are therefore slightly behind writes.
-- All services bind `0.0.0.0:<port>` inside the container; the compose file publishes the host ports on `127.0.0.1` by default. To expose the API on other interfaces set `DASH_PUBLISH_ADDR` (for example `0.0.0.0`) and put a reverse proxy with TLS in front; the services speak plain HTTP.
+- All services bind `0.0.0.0:<port>` inside the container; the compose file publishes the host ports on `127.0.0.1` by default. To expose the API on other interfaces set `DASH_PUBLISH_ADDR` (for example `0.0.0.0`) and turn on TLS: add `-f deploy/container/docker-compose.tls.yml` (development certificates from `scripts/generate-dev-tls.sh`), or put a reverse proxy with TLS in front. Without the overlay the services speak plain HTTP.
 - Ports `8081` (ingestion), `8090` (control-plane) and the `/internal/replication/*` routes are not meant for the public internet.
 - The image entrypoint selects the binary from `DASH_BIN` (`ingestion`, `retrieval`, `control-plane`, `segment-maintenance-daemon`; default `retrieval`) and defaults the argument to `--serve`. There is no `DASH_SERVICE` variable. The healthcheck uses the readiness route.
 - The containers run as UID 10001 with `no-new-privileges`, all capabilities dropped, a read-only root filesystem and a small `noexec` tmpfs for `/tmp`.
@@ -76,5 +76,5 @@ helm install dash ./deploy/helm/dash \
 
 - **Single writer.** Ingestion is one process per WAL. Retrieval replicas are read followers that poll; there is no consensus replication or automatic failover (planned, P3).
 - **No encryption at rest.** Nothing DASH writes (WAL, redb, segments, audit log) is encrypted by DASH. Use an encrypted volume. `pkg/encryption` is a library that no service uses yet.
-- **No TLS in the services.** Terminate TLS at a proxy or ingress. Replication and control-plane tokens travel over plain HTTP inside the cluster; keep those routes on a private network.
+- **TLS is opt-in.** The services can serve HTTPS and mutual TLS themselves (Helm `tls.enabled`, the `deploy/k8s-tls` overlay, `docker-compose.tls.yml`; see [TLS and mutual TLS](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/tls.md)). With the defaults, replication and control-plane tokens travel over plain HTTP inside the cluster; keep those routes on a private network.
 - **Backups.** See [Backup](backup.md) and `scripts/backup_state_bundle.sh`.

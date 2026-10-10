@@ -104,8 +104,10 @@ HS256 tokens carry tenants in `tenant_id` (string) or `tenants` / `tenant_ids` (
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_METRICS_PUBLIC` | `off` | bool | Expose `/metrics` without credentials. Without it `/metrics` and `/debug/*` need a credential holding `read_only` or `admin`. | DASH only. |
-| `DASH_REPLICATION_ALLOW_INSECURE_HTTP` | `off` | bool | Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Use an `https://` source URL behind a TLS-terminating sidecar or ingress instead; see `docs/operations/replication-security.md`. | DASH only. Enabled by only the literal `1`. |
-| `DASH_REPLICATION_CA_FILE` | unset | path | PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted. | DASH only. |
+| `DASH_REPLICATION_ALLOW_INSECURE_HTTP` | `off` | bool | Set to exactly `1` to let a replication follower send the replication token over plaintext `http://` to a non-loopback host. Off by default: the follower refuses (an ingestion follower refuses to start). Enable TLS on the leader (`DASH_INGEST_TLS_CERT_FILE`) and use an `https://` source URL instead; see `docs/operations/tls.md`. | DASH only. Enabled by only the literal `1`. |
+| `DASH_REPLICATION_CA_FILE` | unset | path | PEM file with extra CA certificates a replication follower trusts for an `https://` source URL (a private or mesh CA). The public web roots are always trusted. Server certificates are always verified; there is no switch to turn verification off. | DASH only. |
+| `DASH_REPLICATION_CLIENT_CERT_FILE` | unset | path | PEM client certificate chain a replication follower presents to an `https://` source (mutual TLS, for a leader with `DASH_INGEST_TLS_CLIENT_CA_FILE`). Needs `DASH_REPLICATION_CLIENT_KEY_FILE`; one without the other refuses to start an ingestion follower and fails every retrieval poll. Re-read on every poll, so rotation needs no restart. | DASH only. |
+| `DASH_REPLICATION_CLIENT_KEY_FILE` | unset | path | PEM private key of `DASH_REPLICATION_CLIENT_CERT_FILE`. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_TOKEN` | falls back to `DASH_CONTROL_PLANE_TOKEN` | secret | Token the router client sends to the control plane. | DASH only. |
 
 ### Audit log
@@ -156,12 +158,15 @@ Placement routing is enabled when `DASH_ROUTER_PLACEMENT_FILE` or `DASH_ROUTER_C
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_ROUTER_PLACEMENT_FILE` | unset | path | CSV of shard placements. The control plane uses it as its initial state. | Read by ingestion, retrieval, control-plane. |
-| `DASH_ROUTER_CONTROL_PLANE_URL` | unset | URL | Fetch placement from the control plane. If it is configured and unreachable, the placement file is **not** used as a fallback unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT` is set. |  |
+| `DASH_ROUTER_CONTROL_PLANE_URL` | unset | URL | Fetch placement from the control plane (`http://` or `https://`). If it is configured and unreachable, the placement file is **not** used as a fallback unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT` is set. |  |
 | `DASH_ROUTER_ALLOW_STALE_PLACEMENT` | `off` | bool | `1` or `true`: when the control plane is configured but unreachable, fall back to `DASH_ROUTER_PLACEMENT_FILE`. Off by default because a stale file can name a deposed leader (split-brain writes). | DASH only. Enabled by `1`, `true`, `TRUE`. |
 | `DASH_ROUTER_ALLOW_INSECURE_HTTP` | `off` | bool | `1` or `true`: allow the router to send `DASH_ROUTER_CONTROL_PLANE_TOKEN` over plain http to a non-loopback control plane. Off by default, so the token never crosses the network in clear text. | DASH only. Enabled by `1`, `true`, `TRUE`. |
 | `DASH_ROUTER_CONTROL_PLANE_CONNECT_TIMEOUT_MS` | `2000` | milliseconds >= 1 | Connect timeout of the control-plane client. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_READ_TIMEOUT_MS` | `5000` | milliseconds >= 1 | Read timeout of the control-plane client. | DASH only. |
 | `DASH_ROUTER_CONTROL_PLANE_WRITE_TIMEOUT_MS` | `5000` | milliseconds >= 1 | Write timeout of the control-plane client. | DASH only. |
+| `DASH_ROUTER_CONTROL_PLANE_CA_FILE` | unset | path | PEM bundle of extra CAs trusted for an `https://` `DASH_ROUTER_CONTROL_PLANE_URL` (the public web roots are always trusted; verification is never off). | DASH only. |
+| `DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE` | unset | path | PEM client certificate chain presented to an `https://` control plane that verifies client certificates. Needs `DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE`. | DASH only. |
+| `DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE` | unset | path | PEM private key of `DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE`. | DASH only. |
 | `DASH_ROUTER_LOCAL_NODE_ID` | unset | string | This node's id. Falls back to `DASH_NODE_ID`. An ingestion follower also uses it as its replica id in acknowledgements. |  |
 | `DASH_NODE_ID` | unset | string | Fallback for the local node id. |  |
 | `DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` | `off` | milliseconds | Reload placement on this interval (values <= 0 disable). |  |
@@ -206,6 +211,7 @@ Network providers (`ollama`, `openai`) are wrapped in a circuit breaker and a co
 | `DASH_BIN` | `retrieval` | `ingestion` \| `retrieval` \| `control-plane` \| `segment-maintenance-daemon` | Which binary the image entrypoint runs. Read by the shell scripts in `deploy/container/scripts/`, not by the Rust services. |  |
 | `DASH_HOME` | `/opt/dash` | path | Install directory inside the image. Read by the container shell scripts. |  |
 | `DASH_HEALTHCHECK_URL` | unset | URL | URL probed by the container health check. Read by the container shell scripts. |  |
+| `DASH_HEALTHCHECK_CA_FILE` | unset | path | CA bundle the container health check verifies an `https://` service against (the service certificate must name `127.0.0.1`). Without it the loopback probe of a TLS listener skips verification; it sends no credentials. Read by the container shell scripts. |  |
 | `DASH_PUBLISH_ADDR` | `127.0.0.1` | string | Host address the compose file publishes ports on. Read by docker compose, not by the services. |  |
 | `DASH_DEV_UID` | `1000` | integer | User id for the development compose stack. Read by docker compose. |  |
 | `DASH_DEV_GID` | `1000` | integer | Group id for the development compose stack. Read by docker compose. |  |
@@ -219,6 +225,8 @@ Read by the `ingestion` service.
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_INGEST_REPLICATION_TOKEN` | unset | secret | Shared token checked against the `x-replication-token` header on `/internal/replication/*`. Without it the replication endpoints answer 403 (open only in dev mode). An ingestion node configured as a follower (`DASH_INGEST_REPLICATION_SOURCE_URL`) refuses to start without it outside dev mode. With strict secrets it must be a non-placeholder of at least 16 characters. A retrieval follower also falls back to this variable when `DASH_RETRIEVAL_REPLICATION_TOKEN` is unset. | Read by ingestion, retrieval. |
+| `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT` | `off` | bool | Require, on top of the replication token, a client certificate verified against `DASH_INGEST_TLS_CLIENT_CA_FILE` on `/internal/replication/*` (403 otherwise). Other routes are unaffected. Startup is refused when the listener does not verify client certificates. | DASH only. |
+| `DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS` | unset | list (`,`) | Comma-separated SHA-256 fingerprints (64 hex digits, colons allowed) of the follower certificates allowed on `/internal/replication/*`; implies `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT`. Gives each follower its own identity: remove a fingerprint to cut one follower off. Compute one with `openssl x509 -in follower.pem -outform der \| sha256sum`. A malformed entry refuses startup. | DASH only. |
 
 ### Container and compose variables
 
@@ -233,6 +241,10 @@ Read by the `ingestion` service.
 | `DASH_INGEST_BIND` | `127.0.0.1:8081` | host:port | Listen address (`host:port`). |  |
 | `DASH_INGEST_HTTP_WORKERS` | min(CPU count, 32), or 4 if undetectable | integer >= 1 | Worker threads. Must be > 0. |  |
 | `DASH_INGEST_HTTP_QUEUE_CAPACITY` | `workers * 64` | integer >= 1 | Bounded accept queue. When full, the service answers 503. |  |
+| `DASH_INGEST_TLS_CERT_FILE` | unset (plain HTTP) | path | PEM certificate chain (leaf first) for the ingestion listener. With `DASH_INGEST_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`. | DASH only. |
+| `DASH_INGEST_TLS_KEY_FILE` | `unset` | path | PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_INGEST_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate. | DASH only. |
+| `DASH_INGEST_TLS_CLIENT_CA_FILE` | unset (no client certificates) | path | PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_INGEST_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes. To require a client certificate only on `/internal/replication/*`, leave the next setting off and set `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT` or `DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS`. | DASH only. |
+| `DASH_INGEST_TLS_REQUIRE_CLIENT_CERT` | `off` | bool | Refuse every client that presents no certificate chaining to `DASH_INGEST_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead. | DASH only. |
 | `DASH_INGEST_BATCH_MAX_ITEMS` | `128` | integer >= 1 | Maximum items in `POST /v1/ingest/batch`. |  |
 
 ### Persistence and WAL
@@ -334,6 +346,10 @@ Read by the `retrieval` service.
 | `DASH_RETRIEVAL_BIND` | `127.0.0.1:8080` | host:port | Listen address (`host:port`). |  |
 | `DASH_RETRIEVAL_HTTP_WORKERS` | min(CPU count, 32), or 4 if undetectable | integer >= 1 | Worker threads. Must be > 0. |  |
 | `DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY` | `workers * 64` | integer >= 1 | Bounded accept queue. When full, the service answers 503. |  |
+| `DASH_RETRIEVAL_TLS_CERT_FILE` | unset (plain HTTP) | path | PEM certificate chain (leaf first) for the retrieval listener. With `DASH_RETRIEVAL_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`. | DASH only. |
+| `DASH_RETRIEVAL_TLS_KEY_FILE` | `unset` | path | PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_RETRIEVAL_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate. | DASH only. |
+| `DASH_RETRIEVAL_TLS_CLIENT_CA_FILE` | unset (no client certificates) | path | PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes. | DASH only. |
+| `DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT` | `off` | bool | Refuse every client that presents no certificate chaining to `DASH_RETRIEVAL_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead. | DASH only. |
 
 ### Persistence and WAL
 
@@ -349,7 +365,7 @@ Both followers pull WAL frames from an ingestion node, persist `(generation, off
 
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
-| `DASH_RETRIEVAL_REPLICATION_SOURCE_URL` | unset (follower off) | URL | Base URL of the ingestion service, for example `http://ingestion:8081`. |  |
+| `DASH_RETRIEVAL_REPLICATION_SOURCE_URL` | unset (follower off) | URL | Base URL of the ingestion service, for example `https://ingestion:8081` (leader with `DASH_INGEST_TLS_CERT_FILE`) or `http://127.0.0.1:8081`. |  |
 | `DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS` | `1000` | milliseconds >= 1 | Poll interval. |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_RECORDS` | `512` | integer >= 1 | Records per pull (the leader caps a pull at 10000). |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_RESPONSE_BYTES` | 67108864 (64 MiB) | integer >= 1 | Upper bound for one response body. |  |
@@ -403,6 +419,10 @@ Read by the `control-plane` service.
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
 | `DASH_CONTROL_PLANE_BIND` | `127.0.0.1:8090` | host:port | Listen address (`host:port`). |  |
+| `DASH_CONTROL_PLANE_TLS_CERT_FILE` | unset (plain HTTP) | path | PEM certificate chain (leaf first) for the control-plane listener. With `DASH_CONTROL_PLANE_TLS_KEY_FILE` the listener serves HTTPS only (TLS 1.2 and 1.3, ALPN `http/1.1`); setting only one of the two is a startup error. The handshake must finish within `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`. The file is re-read when its content changes (checked at most once per second), so rotation needs no restart; a broken new file keeps the previous certificate. See `docs/operations/tls.md`. | DASH only. |
+| `DASH_CONTROL_PLANE_TLS_KEY_FILE` | `unset` | path | PEM private key (PKCS#8, PKCS#1 or SEC1) for `DASH_CONTROL_PLANE_TLS_CERT_FILE`. Keep it readable by the service user only. Reloaded with the certificate. | DASH only. |
+| `DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE` | unset (no client certificates) | path | PEM bundle of CAs that client certificates must chain to (mutual TLS). Clients without a certificate are still accepted unless `DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT` is on; a certificate that is presented must verify. Needs the certificate and key. Reloaded when it changes. The placement client in ingestion and retrieval presents `DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE`. | DASH only. |
+| `DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT` | `off` | bool | Refuse every client that presents no certificate chaining to `DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE` (the handshake fails). This covers probes too: use exec or TCP probes, or leave it off and require certificates per route instead. | DASH only. |
 | `DASH_CONTROL_PLANE_WORKERS` | `8` | integer >= 1 | Worker threads. | DASH only. |
 | `DASH_CONTROL_PLANE_QUEUE_DEPTH` | `64` | integer >= 1 | Accepted-but-unserved connections buffered before new ones get 503. | DASH only. |
 | `DASH_CONTROL_PLANE_MAX_BODY_BYTES` | 8388608 (8 MiB) | integer >= 1 | Maximum accepted `Content-Length`. The header block is capped at 16 KiB. | DASH only. |

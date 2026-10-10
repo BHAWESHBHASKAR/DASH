@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use crate::response::Response;
+use crate::tls::TlsAcceptor;
 
 /// How the parser treats an `Expect` request header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +58,12 @@ pub struct ServerConfig {
     /// `Expect` handling.
     pub expect: ExpectPolicy,
     /// Response sent when a connection is shed (queue full, per-IP cap).
+    /// Over TLS, a connection shed before its handshake is closed instead.
     pub overload_response: Response,
+    /// Serve HTTPS instead of plain HTTP. The handshake must finish within
+    /// `first_byte_timeout` (and, with a health lane, so must the request
+    /// line).
+    pub tls: Option<TlsAcceptor>,
 }
 
 impl ServerConfig {
@@ -87,6 +93,7 @@ impl ServerConfig {
                 503,
                 &format!("service unavailable: {name} worker queue full"),
             ),
+            tls: None,
         }
     }
 

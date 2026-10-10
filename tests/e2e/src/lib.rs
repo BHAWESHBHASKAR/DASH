@@ -10,11 +10,13 @@ pub mod jwt;
 pub mod leader;
 pub mod proc;
 pub mod stack;
+pub mod tls;
 
 pub use http::{Client, Resp};
 pub use leader::LeaderState;
 pub use proc::{Proc, bin_path, free_port, random_secret};
 pub use stack::{Stack, StackOpts};
+pub use tls::{TlsClient, wait_live_tls};
 
 use serde_json::{Value, json};
 

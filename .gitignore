@@ -78,3 +78,6 @@ sdks/typescript/.tsbuild/
 
 # CycloneDX SBOMs written next to each crate by `cargo cyclonedx` (release.yml)
 *.cdx.json
+
+# Development TLS material from scripts/generate-dev-tls.sh
+/deploy/container/tls/

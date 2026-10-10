@@ -372,10 +372,17 @@ where
 /// explicit dev mode (`DASH_INSECURE_DEV_MODE=1`) with no authentication
 /// configured at all: dev mode never bypasses a configured credential. The
 /// token is compared in constant time.
+///
+/// With a [`ReplicationClientCertPolicy`] in force the request must also have
+/// arrived with a verified client certificate (and, with an allowlist, one of
+/// the listed fingerprints); this check comes on top of the token.
 pub(super) fn is_replication_request_authorized(
     request: &HttpRequest,
     auth_policy: &dash_common::AuthPolicy,
 ) -> bool {
+    if !ReplicationClientCertPolicy::from_env().admits(request) {
+        return false;
+    }
     let Some(expected_token) = replication_token() else {
         return auth_policy.is_open_dev_mode();
     };
@@ -385,6 +392,131 @@ pub(super) fn is_replication_request_authorized(
         .is_some_and(|value| {
             dash_common::constant_time_eq(value.trim().as_bytes(), expected_token.as_bytes())
         })
+}
+
+/// Client-certificate requirement for `/internal/replication/*`:
+/// `DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT` (any certificate that chains
+/// to `DASH_INGEST_TLS_CLIENT_CA_FILE`) and
+/// `DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS` (comma-separated SHA-256
+/// fingerprints of the follower certificates; implies the requirement).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReplicationClientCertPolicy {
+    require: bool,
+    allowed: Vec<String>,
+    /// Set when a value is malformed; startup refuses, requests are denied.
+    pub(crate) invalid: Option<String>,
+}
+
+impl ReplicationClientCertPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self::from_values(
+            std::env::var("DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT")
+                .ok()
+                .as_deref(),
+            std::env::var("DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub(crate) fn from_values(require: Option<&str>, allowed: Option<&str>) -> Self {
+        let mut policy = Self::default();
+        match require.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("" | "0" | "false" | "no" | "off") => {}
+            Some("1" | "true" | "yes" | "on") => policy.require = true,
+            Some(_) => {
+                policy.invalid = Some(
+                    "DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT must be a boolean".to_string(),
+                )
+            }
+        }
+        for item in allowed.unwrap_or("").split(',') {
+            let item = item.trim().replace(':', "").to_ascii_lowercase();
+            if item.is_empty() {
+                continue;
+            }
+            if item.len() != 64 || !item.bytes().all(|b| b.is_ascii_hexdigit()) {
+                policy.invalid = Some(
+                    "DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS must list SHA-256 \
+                     certificate fingerprints (64 hex digits, colons allowed)"
+                        .to_string(),
+                );
+                continue;
+            }
+            policy.allowed.push(item);
+        }
+        policy
+    }
+
+    pub(crate) fn required(&self) -> bool {
+        self.require || !self.allowed.is_empty()
+    }
+
+    fn admits(&self, request: &HttpRequest) -> bool {
+        if self.invalid.is_some() {
+            return false;
+        }
+        if !self.required() {
+            return true;
+        }
+        let Some(fingerprint) = request.headers.get(dash_common::tls::CLIENT_CERT_HEADER) else {
+            return false;
+        };
+        self.allowed.is_empty()
+            || self.allowed.iter().any(|allowed| {
+                dash_common::constant_time_eq(allowed.as_bytes(), fingerprint.as_bytes())
+            })
+    }
+}
+
+#[cfg(test)]
+mod client_cert_policy_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn request(fingerprint: Option<&str>) -> HttpRequest {
+        let mut headers = HashMap::new();
+        if let Some(fp) = fingerprint {
+            headers.insert(
+                dash_common::tls::CLIENT_CERT_HEADER.to_string(),
+                fp.to_string(),
+            );
+        }
+        HttpRequest {
+            method: "GET".into(),
+            target: "/internal/replication/wal".into(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn off_by_default_and_required_needs_a_verified_certificate() {
+        let off = ReplicationClientCertPolicy::from_values(None, None);
+        assert!(off.admits(&request(None)));
+        let required = ReplicationClientCertPolicy::from_values(Some("true"), None);
+        assert!(!required.admits(&request(None)));
+        assert!(required.admits(&request(Some(&"a".repeat(64)))));
+    }
+
+    #[test]
+    fn allowlist_admits_only_listed_fingerprints() {
+        let listed = "AB:".repeat(31) + "AB";
+        let policy = ReplicationClientCertPolicy::from_values(None, Some(&format!(" {listed} ,")));
+        assert!(policy.required());
+        assert!(policy.admits(&request(Some(&"ab".repeat(32)))));
+        assert!(!policy.admits(&request(Some(&"cd".repeat(32)))));
+        assert!(!policy.admits(&request(None)));
+    }
+
+    #[test]
+    fn malformed_values_deny_everything() {
+        let policy = ReplicationClientCertPolicy::from_values(Some("sometimes"), None);
+        assert!(policy.invalid.is_some());
+        assert!(!policy.admits(&request(Some(&"a".repeat(64)))));
+        let policy = ReplicationClientCertPolicy::from_values(None, Some("abc"));
+        assert!(policy.invalid.is_some());
+    }
 }
 
 /// Follower-side replication state kept on the runtime.

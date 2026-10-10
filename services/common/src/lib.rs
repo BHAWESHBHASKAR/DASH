@@ -17,6 +17,7 @@ pub mod audit;
 pub mod conn;
 pub mod policy;
 pub mod replication_client;
+pub mod tls;
 
 pub use policy::{
     AuthDecision, AuthPolicy, PolicyCell, RawAuthConfig, RouteClass, ServiceAuthEnv,

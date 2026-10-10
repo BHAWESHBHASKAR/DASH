@@ -1,0 +1,52 @@
+# Native TLS overlay for the Compose stack (docs/operations/tls.md).
+#
+#   scripts/generate-secrets.sh
+#   scripts/generate-dev-tls.sh        # dev CA + certificate in deploy/container/tls
+#   docker compose -f deploy/container/docker-compose.yml \
+#                  -f deploy/container/docker-compose.tls.yml up -d --build
+#
+# deploy/container/tls must hold tls.crt, tls.key (readable by UID 10001) and
+# ca.crt; it is mounted read-only at /etc/dash/tls. For production use
+# certificates from your own PKI with the same file names. Every listener then
+# serves HTTPS only; retrieval follows ingestion over mutual TLS and ingestion
+# requires a verified client certificate on /internal/replication/*. Clients
+# call https://127.0.0.1:8080 and https://127.0.0.1:8081 with ca.crt as trust
+# anchor. The files are re-read when they change, so replacing them needs no
+# restart.
+
+x-tls-volume: &tls-volume ./tls:/etc/dash/tls:ro
+
+services:
+  ingestion:
+    volumes:
+      - *tls-volume
+    environment:
+      DASH_INGEST_TLS_CERT_FILE: /etc/dash/tls/tls.crt
+      DASH_INGEST_TLS_KEY_FILE: /etc/dash/tls/tls.key
+      DASH_INGEST_TLS_CLIENT_CA_FILE: /etc/dash/tls/ca.crt
+      DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT: "1"
+      # The container healthcheck probes https://127.0.0.1 and verifies it
+      # against the CA (the certificate names 127.0.0.1).
+      DASH_HEALTHCHECK_CA_FILE: /etc/dash/tls/ca.crt
+
+  retrieval:
+    volumes:
+      - *tls-volume
+    environment:
+      DASH_RETRIEVAL_TLS_CERT_FILE: /etc/dash/tls/tls.crt
+      DASH_RETRIEVAL_TLS_KEY_FILE: /etc/dash/tls/tls.key
+      DASH_RETRIEVAL_REPLICATION_SOURCE_URL: https://ingestion:8081
+      DASH_REPLICATION_CA_FILE: /etc/dash/tls/ca.crt
+      DASH_REPLICATION_CLIENT_CERT_FILE: /etc/dash/tls/tls.crt
+      DASH_REPLICATION_CLIENT_KEY_FILE: /etc/dash/tls/tls.key
+      # The source is https:// now: withdraw the plaintext acknowledgement.
+      DASH_REPLICATION_ALLOW_INSECURE_HTTP: "0"
+      DASH_HEALTHCHECK_CA_FILE: /etc/dash/tls/ca.crt
+
+  control-plane:
+    volumes:
+      - *tls-volume
+    environment:
+      DASH_CONTROL_PLANE_TLS_CERT_FILE: /etc/dash/tls/tls.crt
+      DASH_CONTROL_PLANE_TLS_KEY_FILE: /etc/dash/tls/tls.key
+      DASH_HEALTHCHECK_CA_FILE: /etc/dash/tls/ca.crt

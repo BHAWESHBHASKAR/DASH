@@ -53,11 +53,33 @@ data:
   DASH_CONTROL_PLANE_BIND: {{ .Values.config.bind.controlPlane | quote }}
 
   # ----- replication: every retrieval pod follows the single ingestion pod -----
+  {{- if .Values.tls.enabled }}
+  {{- $tls := .Values.tls.mountPath }}
+  DASH_RETRIEVAL_REPLICATION_SOURCE_URL: {{ printf "https://%s.%s.svc.cluster.local:%v" (include "dash.componentName" (list . "ingestion")) $ns .Values.service.ports.http | quote }}
+  DASH_REPLICATION_CA_FILE: {{ printf "%s/ca.crt" $tls | quote }}
+
+  # ----- native TLS on every listener (docs/operations/tls.md) -----
+  DASH_INGEST_TLS_CERT_FILE: {{ printf "%s/tls.crt" $tls | quote }}
+  DASH_INGEST_TLS_KEY_FILE: {{ printf "%s/tls.key" $tls | quote }}
+  DASH_RETRIEVAL_TLS_CERT_FILE: {{ printf "%s/tls.crt" $tls | quote }}
+  DASH_RETRIEVAL_TLS_KEY_FILE: {{ printf "%s/tls.key" $tls | quote }}
+  DASH_CONTROL_PLANE_TLS_CERT_FILE: {{ printf "%s/tls.crt" $tls | quote }}
+  DASH_CONTROL_PLANE_TLS_KEY_FILE: {{ printf "%s/tls.key" $tls | quote }}
+  {{- if .Values.tls.mutual }}
+  # Ingestion verifies client certificates against ca.crt and requires one on
+  # /internal/replication/*; retrieval presents its pod certificate.
+  DASH_INGEST_TLS_CLIENT_CA_FILE: {{ printf "%s/ca.crt" $tls | quote }}
+  DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT: "1"
+  DASH_REPLICATION_CLIENT_CERT_FILE: {{ printf "%s/tls.crt" $tls | quote }}
+  DASH_REPLICATION_CLIENT_KEY_FILE: {{ printf "%s/tls.key" $tls | quote }}
+  {{- end }}
+  {{- else }}
   DASH_RETRIEVAL_REPLICATION_SOURCE_URL: {{ printf "http://%s.%s.svc.cluster.local:%v" (include "dash.componentName" (list . "ingestion")) $ns .Values.service.ports.http | quote }}
-  # Replication is plain http inside the cluster; this acknowledges that the
-  # token and WAL stream cross the pod network unencrypted
-  # (docs/operations/replication-security.md).
+  # TLS is off (tls.enabled=false): replication is plain http inside the
+  # cluster, and this acknowledges that the token and WAL stream cross the pod
+  # network unencrypted. Set tls.enabled=true instead (docs/operations/tls.md).
   DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
+  {{- end }}
   DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | quote }}
   DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: {{ printf "%s/state/retrieval-replication.offset" $p | quote }}
 

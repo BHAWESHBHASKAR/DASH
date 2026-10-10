@@ -110,14 +110,28 @@ fn accept_error_backoff(streak: u32) -> Duration {
     Duration::from_millis(millis.min(100))
 }
 
-fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
+fn write_response<W: Write + ?Sized>(stream: &mut W, response: &Response) -> std::io::Result<()> {
     stream.write_all(render_response(response).as_bytes())?;
     stream.flush()
 }
 
+/// Shed a connection refused at admission. Over TLS no handshake has
+/// happened yet, so it is closed without an answer.
 fn write_overload(mut stream: TcpStream, cfg: &ServerConfig) -> std::io::Result<()> {
+    if cfg.tls.is_some() {
+        return Ok(());
+    }
     stream.set_write_timeout(Some(cfg.reject_write_timeout))?;
     stream.write_all(render_response(&cfg.overload_response).as_bytes())
+}
+
+/// Shed an admitted connection (queue full), encrypting the answer when the
+/// connection speaks TLS.
+fn write_overload_conn(conn: Conn, cfg: &ServerConfig) {
+    conn.write_and_close(
+        render_response(&cfg.overload_response).as_bytes(),
+        cfg.reject_write_timeout,
+    );
 }
 
 fn handle_connection(
@@ -128,9 +142,10 @@ fn handle_connection(
 ) -> std::io::Result<()> {
     let deadline = conn.deadline(cfg.request_deadline);
     let peer = conn.peer;
-    let stream = &mut conn.stream;
-    stream.set_nonblocking(false)?;
-    stream.set_write_timeout(Some(cfg.write_timeout))?;
+    let tls = conn.tls_info();
+    conn.stream.set_nonblocking(false)?;
+    conn.stream.set_write_timeout(Some(cfg.write_timeout))?;
+    let stream = &mut conn.io();
 
     // The read deadline covers the whole request (headers and body), not
     // each individual read, so slow-trickle clients are dropped. It is
@@ -141,11 +156,13 @@ fn handle_connection(
         Err(err) => {
             hooks.on_read_error(err.status);
             let result = write_response(stream, &Response::error(err.status, &err.message));
-            linger_close(stream, cfg.linger_max_bytes, cfg.linger_max_time);
+            stream.finish();
+            linger_close(stream.socket(), cfg.linger_max_bytes, cfg.linger_max_time);
             return result;
         }
     };
     request.peer = Some(peer);
+    request.tls = tls;
 
     let response = match catch_unwind(AssertUnwindSafe(|| handler(request))) {
         Ok(response) => response,
@@ -155,7 +172,7 @@ fn handle_connection(
         }
     };
     write_response(stream, &response)?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    stream.finish();
     Ok(())
 }
 
@@ -172,6 +189,11 @@ pub fn serve_once<A: Acceptor>(
     let Some(mut conn) = Conn::unmanaged(stream) else {
         return Ok(());
     };
+    if let Some(acceptor) = cfg.tls.as_ref()
+        && !conn.handshake_blocking(acceptor, cfg.first_byte_timeout.min(cfg.request_deadline))
+    {
+        return Ok(());
+    }
     handle_connection(&mut conn, cfg, handler, hooks)
 }
 
@@ -206,9 +228,10 @@ pub fn serve<A: Acceptor>(
         mpsc::sync_channel::<Conn>(queue_capacity.min(cfg.health_queue_capacity).max(1));
     let health_rx: SharedRx = Arc::new(Mutex::new(health_rx));
     let peek = cfg.health_workers > 0;
-    // Polling is needed to interleave shutdown checks and pending-connection
-    // classification with accept; otherwise block in accept.
-    let polling = peek || !shutdown.is_inert();
+    // Polling is needed to interleave shutdown checks, pending-connection
+    // classification and TLS handshakes with accept; otherwise block in
+    // accept.
+    let polling = peek || cfg.tls.is_some() || !shutdown.is_inert();
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         let lanes = std::iter::repeat_n(&rx, workers)
@@ -264,9 +287,7 @@ pub fn serve<A: Acceptor>(
                     Err(mpsc::TrySendError::Full(conn)) => {
                         hooks.on_dequeued();
                         hooks.on_reject(RejectReason::QueueFull);
-                        if let Err(err) = write_overload(conn.stream, cfg) {
-                            eprintln!("{} transport backpressure response failed: {err}", cfg.name);
-                        }
+                        write_overload_conn(conn, cfg);
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => {
                         hooks.on_dequeued();

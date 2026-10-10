@@ -79,6 +79,28 @@ Set `controlPlane.enabled=false` to skip the control plane and its token.
 `/internal/*` and `/metrics` are never routed by the ingress. Set
 `ingress.exposeIngestion=false` to keep the write API cluster-internal.
 
+## TLS inside the cluster
+
+By default the pods speak plain HTTP to each other and the ConfigMap sets
+`DASH_REPLICATION_ALLOW_INSECURE_HTTP=1` to acknowledge it. Set
+`tls.enabled=true` and `tls.secretName=<secret>` to serve HTTPS from every
+listener instead:
+
+```bash
+helm upgrade --install dash ./deploy/helm/dash -n dash-system \
+  --set tls.enabled=true --set tls.secretName=dash-internal-tls ...
+```
+
+The Secret must hold `tls.crt`, `tls.key` and `ca.crt` (a cert-manager
+`Certificate` secret has this shape; `deploy/k8s-tls/certificate.example.yaml`
+is a template). The certificate must name the service DNS names and carry the
+`server auth` and `client auth` usages. With `tls.mutual=true` (default)
+ingestion verifies client certificates against `ca.crt` and requires one on
+`/internal/replication/*`; retrieval follows `https://` and presents the pod
+certificate. Probes switch to `HTTPS`, Services to `appProtocol: https`, and
+the ingress gets `backend-protocol: HTTPS`. Renewed files are picked up
+without a restart. See `docs/operations/tls.md`.
+
 ## Persistence layout (per pod, mounted at `config.persistencePath`)
 
 ```

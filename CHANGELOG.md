@@ -134,6 +134,55 @@ to [Semantic Versioning](https://semver.org/).
   and caveats: [`docs/operations/wal-durability.md`](docs/operations/wal-durability.md);
   reproduce with `scripts/benchmark_ingest_group_commit.sh`.
 
+### Added (native TLS and mutual TLS; register SEC-08)
+
+- **Every listener can serve HTTPS itself.** The shared server (`pkg/http`)
+  terminates TLS with rustls (ring provider, TLS 1.2 and 1.3 safe defaults,
+  ALPN `http/1.1`) from a PEM certificate chain and key:
+  `DASH_INGEST_TLS_CERT_FILE` / `_KEY_FILE`, `DASH_RETRIEVAL_TLS_*`,
+  `DASH_CONTROL_PLANE_TLS_*`. TLS is off by default; a half-set or unusable
+  configuration stops the service at startup (exit 2).
+- **Client certificates.** `DASH_<SVC>_TLS_CLIENT_CA_FILE` verifies client
+  certificates (a presented certificate must chain to the CA);
+  `DASH_<SVC>_TLS_REQUIRE_CLIENT_CERT` makes one mandatory. The SHA-256
+  fingerprint of a verified certificate reaches handlers (`Request::tls`).
+- **Replication over mutual TLS.** Followers present
+  `DASH_REPLICATION_CLIENT_CERT_FILE` / `_KEY_FILE` to an `https://` source and
+  always verify the leader (web roots plus `DASH_REPLICATION_CA_FILE`; no way
+  to disable verification). Ingestion can require a verified client
+  certificate on `/internal/replication/*` only
+  (`DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT`) and pin followers by
+  fingerprint (`DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS`), on top of the
+  token. The leader's plaintext-exposure warning no longer fires when its
+  listener serves TLS.
+- **Placement client over HTTPS.** `DASH_ROUTER_CONTROL_PLANE_URL` accepts
+  `https://` with `DASH_ROUTER_CONTROL_PLANE_CA_FILE` and an optional client
+  certificate (`DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE` / `_KEY_FILE`); the
+  router's refusal to send its token over plain `http://` to a remote host
+  does not apply to `https://`.
+- **Handshakes cannot tie up workers.** The accept thread drives handshakes
+  non-blocking, bounded by `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`, the per-IP cap
+  and the pending bound; the health lane still classifies on the decrypted
+  request line. A plaintext request to a TLS port gets a plaintext 400.
+- **Certificate rotation without restart.** Certificate, key and client CA
+  files are re-read when their content changes (checked at most once per
+  second); a broken new file keeps the previous certificate.
+- **Deployment.** Helm `tls.enabled` / `tls.secretName` / `tls.mutual`, the
+  `deploy/k8s-tls` kustomize overlay (with an example cert-manager
+  `Certificate`), `deploy/container/docker-compose.tls.yml` with
+  `scripts/generate-dev-tls.sh` for development certificates, a TLS-aware
+  container healthcheck, and commented TLS blocks in the systemd env examples.
+  CI renders and validates the TLS variants.
+- **Docs.** New `docs/operations/tls.md`; `docs/operations/replication-security.md`,
+  the threat model, the SOC 2 readiness map and the security pages updated.
+- **Tests.** `pkg/http/tests/tls.rs` (handshake, TLS 1.2-only client, mTLS
+  accept and reject, plaintext refusal, stalled handshakes never reach a
+  worker, per-IP cap before the handshake, rotation, one-shot server),
+  replication-client and placement-client mTLS tests, and the end-to-end
+  scenario `tests/e2e/tests/s10_tls_replication.rs` (real binaries, retrieval
+  following ingestion over mutual TLS). Test PKI is generated per run by the
+  new `tests/tls-fixtures` crate.
+
 ### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
 
 - **Semantic retrieval now finds the true nearest neighbours.** The in-repo

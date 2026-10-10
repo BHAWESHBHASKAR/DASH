@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -314,6 +314,13 @@ pub struct PlacementSourceOptions {
     /// control plane. Off by default: the token would cross the network in
     /// clear text.
     pub allow_insecure_http: bool,
+    /// Extra CA bundle trusted for an `https://` control-plane URL (the
+    /// public web roots are always trusted; verification is never off).
+    pub ca_file: Option<PathBuf>,
+    /// Client certificate chain and key presented to an `https://` control
+    /// plane that requires client certificates.
+    pub client_cert_file: Option<PathBuf>,
+    pub client_key_file: Option<PathBuf>,
 }
 
 impl Default for PlacementSourceOptions {
@@ -326,6 +333,9 @@ impl Default for PlacementSourceOptions {
             max_response_bytes: 8 * 1024 * 1024,
             bearer_token: None,
             allow_insecure_http: false,
+            ca_file: None,
+            client_cert_file: None,
+            client_key_file: None,
         }
     }
 }
@@ -333,8 +343,10 @@ impl Default for PlacementSourceOptions {
 impl PlacementSourceOptions {
     /// Defaults plus environment overrides:
     /// `DASH_ROUTER_CONTROL_PLANE_TOKEN` (fallback `DASH_CONTROL_PLANE_TOKEN`),
-    /// `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`, `DASH_ROUTER_ALLOW_INSECURE_HTTP=1`, and
-    /// `DASH_ROUTER_CONTROL_PLANE_{CONNECT,READ,WRITE}_TIMEOUT_MS`.
+    /// `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`, `DASH_ROUTER_ALLOW_INSECURE_HTTP=1`,
+    /// `DASH_ROUTER_CONTROL_PLANE_{CONNECT,READ,WRITE}_TIMEOUT_MS` and, for an
+    /// `https://` URL, `DASH_ROUTER_CONTROL_PLANE_CA_FILE` and
+    /// `DASH_ROUTER_CONTROL_PLANE_CLIENT_{CERT,KEY}_FILE`.
     pub fn from_env() -> Self {
         let mut options = Self {
             bearer_token: env_non_empty("DASH_ROUTER_CONTROL_PLANE_TOKEN")
@@ -347,6 +359,11 @@ impl PlacementSourceOptions {
                 env_non_empty("DASH_ROUTER_ALLOW_INSECURE_HTTP").as_deref(),
                 Some("1") | Some("true") | Some("TRUE")
             ),
+            ca_file: env_non_empty("DASH_ROUTER_CONTROL_PLANE_CA_FILE").map(PathBuf::from),
+            client_cert_file: env_non_empty("DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE")
+                .map(PathBuf::from),
+            client_key_file: env_non_empty("DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE")
+                .map(PathBuf::from),
             ..Self::default()
         };
         if let Some(value) = env_millis("DASH_ROUTER_CONTROL_PLANE_CONNECT_TIMEOUT_MS") {
@@ -473,8 +490,8 @@ pub fn load_shard_placements_from_control_plane_with_options(
         return Err("control-plane base URL must not be empty".to_string());
     }
     let url = format!("{base_url}/v1/control-plane/placement?format=csv");
-    let (authority, path) = parse_http_url(&url)?;
-    let response = http_get(&authority, &path, options)?;
+    let target = parse_http_url(&url)?;
+    let response = http_get(&target, options)?;
     if response.status != 200 {
         return Err(format!(
             "control-plane placement request failed with HTTP status {}",
@@ -527,19 +544,101 @@ fn is_loopback_authority(authority: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn http_get(
+/// A plaintext or TLS connection to the control plane.
+enum ClientStream {
+    Plain(TcpStream),
+    Tls(Box<dash_http::rustls::StreamOwned<dash_http::rustls::ClientConnection, TcpStream>>),
+}
+
+impl ClientStream {
+    fn socket(&self) -> &TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => &stream.sock,
+        }
+    }
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+/// Host part of `host:port` / `[v6]:port`, for TLS server-name checks.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    }
+}
+
+fn wrap_tls(
+    socket: TcpStream,
     authority: &str,
-    path: &str,
+    options: &PlacementSourceOptions,
+) -> Result<ClientStream, String> {
+    let identity = match (
+        options.client_cert_file.as_deref(),
+        options.client_key_file.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => {
+            return Err("DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE and \
+                 DASH_ROUTER_CONTROL_PLANE_CLIENT_KEY_FILE must be set together"
+                .to_string());
+        }
+    };
+    let config = dash_http::client_config(options.ca_file.as_deref(), identity)
+        .map_err(|err| format!("control-plane TLS configuration rejected: {err}"))?;
+    let host = authority_host(authority).to_string();
+    let name = dash_http::rustls::pki_types::ServerName::try_from(host)
+        .map_err(|_| format!("control-plane URL host '{authority}' is not a valid TLS name"))?;
+    let conn = dash_http::rustls::ClientConnection::new(config, name)
+        .map_err(|err| format!("control-plane TLS setup failed: {err}"))?;
+    Ok(ClientStream::Tls(Box::new(
+        dash_http::rustls::StreamOwned::new(conn, socket),
+    )))
+}
+
+fn http_get(
+    target: &ControlPlaneUrl,
     options: &PlacementSourceOptions,
 ) -> Result<HttpClientResponse, String> {
+    let authority = target.authority.as_str();
+    let path = target.path.as_str();
     if options.bearer_token.is_some()
+        && !target.tls
         && !options.allow_insecure_http
         && !is_loopback_authority(authority)
     {
         return Err(format!(
             "refusing to send the control-plane token over plain http to non-loopback host \
-             '{authority}'; keep the control plane on a trusted local link or set \
-             DASH_ROUTER_ALLOW_INSECURE_HTTP=1 to accept the exposure"
+             '{authority}'; use an https:// control-plane URL, keep the control plane on a \
+             trusted local link, or set DASH_ROUTER_ALLOW_INSECURE_HTTP=1 to accept the exposure"
         ));
     }
     let addrs: Vec<_> = authority
@@ -557,11 +656,16 @@ fn http_get(
             Err(err) => last_err = format!("failed connecting control-plane '{authority}': {err}"),
         }
     }
-    let mut stream = stream.ok_or(last_err)?;
-    stream
+    let socket = stream.ok_or(last_err)?;
+    socket
         .set_read_timeout(Some(options.read_timeout))
-        .and_then(|_| stream.set_write_timeout(Some(options.write_timeout)))
+        .and_then(|_| socket.set_write_timeout(Some(options.write_timeout)))
         .map_err(|err| format!("failed configuring control-plane socket: {err}"))?;
+    let mut stream = if target.tls {
+        wrap_tls(socket, authority, options)?
+    } else {
+        ClientStream::Plain(socket)
+    };
 
     let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
     if let Some(token) = options.bearer_token.as_deref() {
@@ -667,7 +771,7 @@ fn http_get(
 }
 
 fn read_with_deadline(
-    stream: &mut TcpStream,
+    stream: &mut ClientStream,
     buf: &mut [u8],
     deadline: Instant,
 ) -> Result<usize, String> {
@@ -676,6 +780,7 @@ fn read_with_deadline(
         return Err("control-plane response timed out".to_string());
     }
     stream
+        .socket()
         .set_read_timeout(Some(remaining))
         .map_err(|err| format!("failed configuring control-plane socket: {err}"))?;
     loop {
@@ -891,10 +996,22 @@ fn hash_key(value: &str) -> u64 {
     hash
 }
 
-fn parse_http_url(url: &str) -> Result<(String, String), String> {
-    let without_scheme = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "control-plane URL must start with http://".to_string())?;
+/// A parsed control-plane URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlPlaneUrl {
+    tls: bool,
+    authority: String,
+    path: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ControlPlaneUrl, String> {
+    let (tls, without_scheme) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        return Err("control-plane URL must start with http:// or https://".to_string());
+    };
     let (authority, path_and_query) = match without_scheme.split_once('/') {
         Some((authority, suffix)) => (authority, format!("/{}", suffix)),
         None => (without_scheme, "/".to_string()),
@@ -902,7 +1019,11 @@ fn parse_http_url(url: &str) -> Result<(String, String), String> {
     if authority.trim().is_empty() {
         return Err("control-plane URL missing host:port authority".to_string());
     }
-    Ok((authority.to_string(), path_and_query))
+    Ok(ControlPlaneUrl {
+        tls,
+        authority: authority.to_string(),
+        path: path_and_query,
+    })
 }
 
 #[cfg(test)]
@@ -1102,18 +1223,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_http_url_requires_http_scheme() {
-        let err = parse_http_url("https://127.0.0.1:8090/path").expect_err("scheme should fail");
-        assert!(err.contains("must start with http://"));
+    fn parse_http_url_requires_http_or_https_scheme() {
+        for bad in ["ftp://127.0.0.1:8090/path", "127.0.0.1:8090", "https://"] {
+            let err = parse_http_url(bad).expect_err("must fail");
+            assert!(
+                err.contains("http:// or https://") || err.contains("authority"),
+                "{bad}: {err}"
+            );
+        }
+        let tls = parse_http_url("https://cp.internal:8443/x").expect("https parses");
+        assert!(tls.tls);
+        assert_eq!(tls.authority, "cp.internal:8443");
     }
 
     #[test]
     fn parse_http_url_extracts_authority_and_path() {
-        let (authority, path) =
-            parse_http_url("http://127.0.0.1:8090/v1/control-plane/placement?format=csv")
-                .expect("url should parse");
-        assert_eq!(authority, "127.0.0.1:8090");
-        assert_eq!(path, "/v1/control-plane/placement?format=csv");
+        let url = parse_http_url("http://127.0.0.1:8090/v1/control-plane/placement?format=csv")
+            .expect("url should parse");
+        assert!(!url.tls);
+        assert_eq!(url.authority, "127.0.0.1:8090");
+        assert_eq!(url.path, "/v1/control-plane/placement?format=csv");
+    }
+
+    #[test]
+    fn tls_server_name_is_the_host_without_port() {
+        assert_eq!(authority_host("cp.internal:8443"), "cp.internal");
+        assert_eq!(authority_host("cp.internal"), "cp.internal");
+        assert_eq!(authority_host("[::1]:8443"), "::1");
+        assert_eq!(authority_host("127.0.0.1:8090"), "127.0.0.1");
     }
 }
 
@@ -1226,10 +1363,18 @@ mod hardening_tests {
             bearer_token: Some("s3cret".to_string()),
             ..quick_options()
         };
-        let err = http_get("192.0.2.10:9", "/v1/placement", &options)
+        let plain = parse_http_url("http://192.0.2.10:9/v1/placement").unwrap();
+        let err = http_get(&plain, &options)
             .expect_err("plain http token to a remote host must be refused");
         assert!(
             err.contains("refusing to send the control-plane token"),
+            "{err}"
+        );
+        // Over https the token is allowed to leave (here the connect fails).
+        let tls = parse_http_url("https://192.0.2.10:9/v1/placement").unwrap();
+        let err = http_get(&tls, &options).expect_err("nothing listens there");
+        assert!(
+            !err.contains("refusing to send the control-plane token"),
             "{err}"
         );
         for local in ["127.0.0.1:80", "localhost:80", "[::1]:80", "LOCALHOST"] {

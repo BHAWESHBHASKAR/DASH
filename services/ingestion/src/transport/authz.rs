@@ -25,6 +25,7 @@ static POLICY: PolicyCell = PolicyCell::new();
 /// start; an error means the service must not start.
 pub fn initialize_auth_policy() -> Result<(), String> {
     POLICY.pin(&SERVICE_AUTH)?;
+    dash_common::tls::check_listener_tls(&dash_common::tls::INGEST_TLS_ENV)?;
     validate_replication_config()?;
     dash_common::audit::warn_if_fail_open("INGEST");
     // On unix the policy is rebuilt on SIGHUP (see `PolicyCell::reload`).
@@ -59,7 +60,14 @@ fn validate_replication_config() -> Result<(), String> {
             token.is_some(),
             dash_common::replication_client::insecure_http_allowed_from_env(),
         )?;
+        dash_common::replication_client::ClientOptions::from_env().validate()?;
     }
+    validate_replication_client_cert_policy(
+        &super::replication::ReplicationClientCertPolicy::from_env(),
+        dash_common::tls::RawListenerTls::from_env(&dash_common::tls::INGEST_TLS_ENV)
+            .client_ca_file
+            .is_some(),
+    )?;
     match token {
         Some(token) => {
             if dash_common::strict_secrets_enabled() {
@@ -86,6 +94,26 @@ fn validate_replication_config() -> Result<(), String> {
     Ok(())
 }
 
+/// Requiring client certificates on the replication routes only works when
+/// the listener verifies them.
+fn validate_replication_client_cert_policy(
+    policy: &super::replication::ReplicationClientCertPolicy,
+    listener_verifies_client_certs: bool,
+) -> Result<(), String> {
+    if let Some(err) = &policy.invalid {
+        return Err(err.clone());
+    }
+    if policy.required() && !listener_verifies_client_certs {
+        return Err(
+            "DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT / DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS \
+             need TLS with client certificate verification on the ingestion listener \
+             (DASH_INGEST_TLS_CERT_FILE, DASH_INGEST_TLS_KEY_FILE, DASH_INGEST_TLS_CLIENT_CA_FILE)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A follower must not send the replication token over plain http to a
 /// non-loopback host unless the operator acknowledged it.
 fn check_follower_token_transport(
@@ -104,6 +132,7 @@ pub(crate) fn replication_transport_warnings(
     token_set: bool,
     source_url: Option<&str>,
     bind_addr: &str,
+    listener_tls: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(source) = source_url
@@ -112,7 +141,7 @@ pub(crate) fn replication_transport_warnings(
         out.push(message);
     }
     if let Some(message) =
-        dash_common::replication_client::leader_exposure_warning(bind_addr, token_set)
+        dash_common::replication_client::leader_exposure_warning(bind_addr, token_set, listener_tls)
     {
         out.push(message);
     }
@@ -132,7 +161,10 @@ pub fn warn_replication_transport(bind_addr: &str) {
         "EME_INGEST_REPLICATION_SOURCE_URL",
     )
     .filter(|value| !value.trim().is_empty());
-    for message in replication_transport_warnings(token_set, source.as_deref(), bind_addr) {
+    let listener_tls = dash_common::tls::listener_tls_enabled(&dash_common::tls::INGEST_TLS_ENV);
+    for message in
+        replication_transport_warnings(token_set, source.as_deref(), bind_addr, listener_tls)
+    {
         tracing::warn!("{message}");
     }
 }
@@ -215,24 +247,49 @@ mod replication_transport_tests {
             true,
             Some("http://leader.internal:8081"),
             "127.0.0.1:8081",
+            false,
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("plain http://"), "{warnings:?}");
         assert!(warnings[0].contains("replication-security.md"));
         // Leader side.
-        let warnings = replication_transport_warnings(true, None, "0.0.0.0:8081");
+        let warnings = replication_transport_warnings(true, None, "0.0.0.0:8081", false);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("not loopback"), "{warnings:?}");
+        assert!(
+            warnings[0].contains("DASH_INGEST_TLS_CERT_FILE"),
+            "{warnings:?}"
+        );
         // Quiet cases.
-        assert!(replication_transport_warnings(true, None, "127.0.0.1:8081").is_empty());
-        assert!(replication_transport_warnings(false, None, "0.0.0.0:8081").is_empty());
+        assert!(replication_transport_warnings(true, None, "127.0.0.1:8081", false).is_empty());
+        assert!(replication_transport_warnings(false, None, "0.0.0.0:8081", false).is_empty());
+        // A leader serving TLS itself is not exposed.
+        assert!(replication_transport_warnings(true, None, "0.0.0.0:8081", true).is_empty());
         assert!(
             replication_transport_warnings(
                 true,
                 Some("https://leader.internal:8443"),
-                "127.0.0.1:8081"
+                "127.0.0.1:8081",
+                false,
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn replication_client_cert_policy_needs_a_verifying_listener() {
+        use super::super::replication::ReplicationClientCertPolicy;
+        let off = ReplicationClientCertPolicy::from_values(None, None);
+        assert!(validate_replication_client_cert_policy(&off, false).is_ok());
+        let required = ReplicationClientCertPolicy::from_values(Some("1"), None);
+        let err = validate_replication_client_cert_policy(&required, false).unwrap_err();
+        assert!(err.contains("DASH_INGEST_TLS_CLIENT_CA_FILE"), "{err}");
+        assert!(validate_replication_client_cert_policy(&required, true).is_ok());
+        let bad = ReplicationClientCertPolicy::from_values(None, Some("not-a-fingerprint"));
+        let err = validate_replication_client_cert_policy(&bad, true).unwrap_err();
+        assert!(
+            err.contains("DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS"),
+            "{err}"
         );
     }
 }

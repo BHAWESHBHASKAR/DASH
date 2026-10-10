@@ -536,6 +536,11 @@ pub(crate) fn source_transport_findings(
     {
         out.push(format!("every replication poll will fail: {message}"));
     }
+    if config.source_base_url.trim_start().starts_with("https://")
+        && let Err(message) = client::ClientOptions::from_env().validate()
+    {
+        out.push(format!("every replication poll will fail: {message}"));
+    }
     out
 }
 

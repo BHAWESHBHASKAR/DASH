@@ -674,6 +674,8 @@ name = "dash-common"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "dash-http",
+ "dash-tls-fixtures",
  "rand 0.8.7",
  "rcgen",
  "rustls",
@@ -685,7 +687,6 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -702,7 +703,9 @@ name = "dash-e2e"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dash-tls-fixtures",
  "rand 0.8.7",
+ "rustls",
  "serde_json",
  "sha2",
  "tempfile",
@@ -711,6 +714,20 @@ dependencies = [
 [[package]]
 name = "dash-http"
 version = "0.1.0"
+dependencies = [
+ "dash-tls-fixtures",
+ "rustls",
+ "sha2",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "dash-tls-fixtures"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "tempfile",
+]
 
 [[package]]
 name = "data-encoding"
@@ -1456,6 +1473,8 @@ name = "metadata-router"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dash-http",
+ "dash-tls-fixtures",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
