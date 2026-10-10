@@ -628,6 +628,48 @@ fn http_get(
     target: &ControlPlaneUrl,
     options: &PlacementSourceOptions,
 ) -> Result<HttpClientResponse, String> {
+    http_request("GET", target, options)
+}
+
+/// Answer of [`control_plane_post`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneResponse {
+    pub status: u16,
+    /// `X-Dash-Leader` was `false`: the node is a control-plane follower.
+    pub from_follower: bool,
+    pub body: String,
+}
+
+/// `POST <base_url><path_and_query>` (empty body) to the control plane with
+/// the same token, TLS, timeout and size rules as the placement fetch.
+pub fn control_plane_post(
+    base_url: &str,
+    path_and_query: &str,
+    options: &PlacementSourceOptions,
+) -> Result<ControlPlaneResponse, String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("control-plane base URL must not be empty".to_string());
+    }
+    let target = parse_http_url(&format!("{base_url}{path_and_query}"))?;
+    let response = http_request("POST", &target, options)?;
+    let from_follower = response
+        .header("x-dash-leader")
+        .is_some_and(|value| value.eq_ignore_ascii_case("false"));
+    let body = String::from_utf8(response.body)
+        .map_err(|_| "control-plane response is not valid UTF-8".to_string())?;
+    Ok(ControlPlaneResponse {
+        status: response.status,
+        from_follower,
+        body,
+    })
+}
+
+fn http_request(
+    method: &str,
+    target: &ControlPlaneUrl,
+    options: &PlacementSourceOptions,
+) -> Result<HttpClientResponse, String> {
     let authority = target.authority.as_str();
     let path = target.path.as_str();
     if options.bearer_token.is_some()
@@ -667,7 +709,11 @@ fn http_get(
         ClientStream::Plain(socket)
     };
 
-    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+    if method != "GET" {
+        request.push_str("Content-Length: 0\r\n");
+    }
     if let Some(token) = options.bearer_token.as_deref() {
         request.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }

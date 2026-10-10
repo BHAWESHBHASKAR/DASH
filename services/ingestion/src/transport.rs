@@ -15,6 +15,7 @@ mod commit_status;
 mod config;
 mod delete_routes;
 mod document_parser_debug;
+mod failover;
 mod group_commit;
 mod http;
 mod ingest_routes;
@@ -29,6 +30,7 @@ mod request;
 mod routes;
 mod segment_runtime;
 mod server_runtime;
+mod sync_replication;
 
 use audit::{AuditEvent, emit_audit_event};
 pub(crate) use authz::{
@@ -59,8 +61,9 @@ use placement_routing::{
     refresh_placement, write_entity_key_for_claim,
 };
 use replication::{
-    ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
-    render_replication_export_frame, run_replication_pull_tick,
+    ReplicationPullConfig, is_replication_request_authorized,
+    render_replication_delta_frame_with_term, render_replication_export_frame,
+    run_replication_pull_tick,
 };
 use request::{parse_query_usize, query_encoding_is_invalid, split_target};
 use schema::Claim;
@@ -167,6 +170,14 @@ pub struct IngestionRuntime {
     replication_exports: Option<Arc<store::ReplicationExportStore>>,
     /// Counters of the delete routes (`delete_routes`).
     delete_metrics: delete_routes::DeleteMetrics,
+    /// Leader failover membership (ADR 0006); disabled by default.
+    failover: failover::FailoverState,
+    /// Followers' durable positions (long polls, synchronous replication),
+    /// shared outside the runtime lock.
+    replica_progress: Arc<failover::ReplicaProgress>,
+    /// `DASH_INGEST_MIN_SYNC_REPLICAS` and its timeout behaviour.
+    sync_replication: failover::SyncReplicationConfig,
+    sync_metrics: Arc<sync_replication::SyncReplicationMetrics>,
 }
 
 #[derive(Debug, Default)]
@@ -287,6 +298,10 @@ impl IngestionRuntime {
             vector_index_persistence: None,
             replication_exports: None,
             delete_metrics: delete_routes::DeleteMetrics::default(),
+            failover: failover::FailoverState::default(),
+            replica_progress: Arc::new(failover::ReplicaProgress::default()),
+            sync_replication: failover::SyncReplicationConfig::default(),
+            sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
         }
     }
 
@@ -371,6 +386,10 @@ impl IngestionRuntime {
             vector_index_persistence: None,
             replication_exports,
             delete_metrics: delete_routes::DeleteMetrics::default(),
+            failover: failover::FailoverState::default(),
+            replica_progress: Arc::new(failover::ReplicaProgress::default()),
+            sync_replication: failover::SyncReplicationConfig::default(),
+            sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
         }
     }
 
@@ -410,11 +429,24 @@ impl IngestionRuntime {
         self
     }
 
+    /// Make the next write or `/metrics` reload the placement at once (a
+    /// promoted node must not wait out the reload interval).
+    pub(crate) fn request_placement_reload(&mut self) {
+        if let Ok(Some(state)) = self.placement_routing.as_mut() {
+            state.request_reload();
+        }
+    }
+
     fn ensure_local_write_route_for_claim(
         &mut self,
         claim: &Claim,
         write_consistency: WriteConsistencyPolicy,
     ) -> Result<WriteRouteResolution, WriteRouteError> {
+        // Checked under the runtime lock, right before the append: a write
+        // that queued behind a demotion is refused too.
+        self.failover
+            .check_write(Instant::now())
+            .map_err(WriteRouteError::NotLeader)?;
         let Some(routing_state) = self
             .placement_routing
             .as_mut()

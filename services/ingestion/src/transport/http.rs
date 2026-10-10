@@ -22,6 +22,8 @@ pub(crate) struct HttpResponse {
     pub(crate) body: String,
     /// Emitted as a `Retry-After` header (429 responses).
     pub(crate) retry_after_secs: Option<u64>,
+    /// Extra response headers (leader hints on a non-leader's 503).
+    pub(crate) headers: Vec<(&'static str, String)>,
 }
 
 impl HttpResponse {
@@ -31,6 +33,7 @@ impl HttpResponse {
             content_type: "application/json",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -40,6 +43,7 @@ impl HttpResponse {
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -49,6 +53,7 @@ impl HttpResponse {
             content_type: "text/plain; charset=utf-8",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -58,6 +63,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -67,6 +73,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -76,6 +83,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -85,6 +93,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -94,6 +103,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -103,6 +113,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -112,6 +123,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -121,6 +133,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -130,6 +143,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: Some(retry_after_secs),
+            headers: Vec::new(),
         }
     }
 
@@ -145,6 +159,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -165,11 +180,15 @@ impl From<dash_http::Request> for HttpRequest {
 
 impl From<HttpResponse> for dash_http::Response {
     fn from(response: HttpResponse) -> Self {
-        let out = dash_http::Response::new(response.status, response.content_type, response.body);
-        match response.retry_after_secs {
-            Some(secs) => out.with_header("Retry-After", secs.to_string()),
-            None => out,
+        let mut out =
+            dash_http::Response::new(response.status, response.content_type, response.body);
+        if let Some(secs) = response.retry_after_secs {
+            out = out.with_header("Retry-After", secs.to_string());
         }
+        for (name, value) in response.headers {
+            out = out.with_header(name, value);
+        }
+        out
     }
 }
 

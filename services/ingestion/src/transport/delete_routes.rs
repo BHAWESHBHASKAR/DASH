@@ -411,6 +411,9 @@ impl IngestionRuntime {
         tombstone: &Tombstone,
         write_consistency: WriteConsistencyPolicy,
     ) -> Result<(), WriteRouteError> {
+        self.failover
+            .check_write(Instant::now())
+            .map_err(WriteRouteError::NotLeader)?;
         let routing_enabled = match self.placement_routing.as_ref() {
             Ok(state) => state.is_some(),
             Err(reason) => return Err(WriteRouteError::Config(reason.clone())),

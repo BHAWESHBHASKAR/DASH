@@ -20,7 +20,22 @@ pub(super) fn handle_request(runtime: &SharedRuntime, request: &HttpRequest) -> 
             return HttpResponse::service_unavailable("audit log unavailable");
         }
     }
+    if mutation {
+        // Leader failover: only the leader with a valid lease writes.
+        // Refused here with the leader hint headers; checked again under
+        // the runtime lock right before the append.
+        let refused = match runtime.lock() {
+            Ok(rt) => rt.failover.check_write(Instant::now()).err(),
+            Err(_) => None,
+        };
+        if let Some(not_leader) = refused {
+            return not_leader.response();
+        }
+    }
     let mut response = handle_request_with_policy(runtime, request, &auth_policy);
+    if mutation && (200..300).contains(&response.status) {
+        response = super::sync_replication::after_mutation(runtime, response);
+    }
     if request.method == "GET" && path == "/metrics" && response.status == 200 {
         append_shared_metrics(&mut response.body);
     }
@@ -54,6 +69,7 @@ pub(crate) fn http_route_label(_method: &str, path: &str) -> &'static str {
         "/health" | "/v1/health" => "health",
         "/live" | "/v1/live" => "live",
         "/ready" | "/v1/ready" => "ready",
+        "/ready/leader" | "/v1/ready/leader" => "ready_leader",
         "/metrics" => "metrics",
         "/internal/replication/wal" => "replication_wal",
         "/internal/replication/export"

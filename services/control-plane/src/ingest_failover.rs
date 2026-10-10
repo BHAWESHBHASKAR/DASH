@@ -375,7 +375,24 @@ impl IngestFailover {
         self.forget_stale_members(now_ms);
 
         let is_leader_instance = self.is_leader_instance(&report);
-        if is_leader_instance && report.term <= self.term && !self.revoked {
+        let lapsed = self.leader_lease_lapsed(now_ms);
+        if is_leader_instance
+            && report.term <= self.term
+            && !self.revoked
+            && report.role != ReportedRole::Leader
+            && !lapsed
+        {
+            // Named leader, but it has not taken over yet (it learns from
+            // this answer): tell it again, without renewing its lease. A
+            // node that cannot take over keeps reporting so and is
+            // replaced once the lease lapses.
+            return Ok((self.reply_for(&report), None));
+        }
+        if is_leader_instance
+            && report.term <= self.term
+            && !self.revoked
+            && report.role == ReportedRole::Leader
+        {
             let url_changed = self
                 .leader
                 .as_ref()
@@ -395,7 +412,7 @@ impl IngestFailover {
             self.persist()?;
         }
 
-        let promotion = if self.leader_lease_lapsed(now_ms) {
+        let promotion = if lapsed {
             self.try_elect(now_ms)?
         } else {
             None
@@ -691,7 +708,7 @@ impl IngestFailover {
                     .position
                     .map(|p| {
                         format!(
-                            "{{\"generation\":\"{:016x}\",\"records\":{}}}",
+                            "{{\"generation\":{},\"records\":{}}}",
                             p.generation, p.records
                         )
                     })
@@ -843,9 +860,10 @@ pub fn parse_heartbeat_query(
     let parse_gen = |key: &str| -> Result<Option<u64>, String> {
         match get(key).filter(|value| !value.is_empty()) {
             None => Ok(None),
-            Some(raw) => u64::from_str_radix(&raw, 16)
+            Some(raw) => raw
+                .parse::<u64>()
                 .map(Some)
-                .map_err(|_| format!("{key} must be a hexadecimal generation")),
+                .map_err(|_| format!("{key} must be a WAL generation (unsigned integer)")),
         }
     };
     let flag = |key: &str| matches!(get(key).as_deref(), Some("1") | Some("true"));

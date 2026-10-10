@@ -18,7 +18,34 @@ pub(super) fn serve_http_with_workers(
     let segment_maintenance_interval = runtime.segment_maintenance_interval();
     let vector_index_persistence = runtime.vector_index_persistence();
     let replication_exports = runtime.replication_exports();
-    let replication_pull = ReplicationPullConfig::from_env();
+    let invalid = |reason: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason);
+    let failover_config = super::failover::FailoverConfig::from_env().map_err(invalid)?;
+    let mut runtime = runtime;
+    runtime.sync_replication =
+        super::failover::SyncReplicationConfig::from_env().map_err(invalid)?;
+    // A failover member always runs the pull loop: it follows whichever
+    // node the control plane names (and pauses while it is the leader).
+    let replication_pull = match failover_config.as_ref() {
+        Some(_) => Some(ReplicationPullConfig::from_env_with_source(
+            env_with_fallback(
+                "DASH_INGEST_REPLICATION_SOURCE_URL",
+                "EME_INGEST_REPLICATION_SOURCE_URL",
+            )
+            .unwrap_or_default(),
+        )),
+        None => ReplicationPullConfig::from_env(),
+    };
+    if let Some(config) = failover_config.as_ref() {
+        let state_path = runtime
+            .wal
+            .as_ref()
+            .map(|wal| super::failover::state_path_for_wal(lock_wal(wal).path()));
+        runtime.failover = super::failover::FailoverState::member(config, state_path);
+        eprintln!(
+            "ingestion failover: member '{}' (advertised as {}), control plane {}, term {}; no writes until the control plane names a leader",
+            config.node_id, config.advertise_url, config.control_plane_url, runtime.failover.term
+        );
+    }
     let runtime = Arc::new(Mutex::new(runtime));
     if let Some(config) = replication_pull.as_ref()
         && let Ok(mut guard) = runtime.lock()
@@ -33,6 +60,7 @@ pub(super) fn serve_http_with_workers(
     let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
     let (replication_shutdown_tx, replication_shutdown_rx) = mpsc::channel::<()>();
     let (exports_shutdown_tx, exports_shutdown_rx) = mpsc::channel::<()>();
+    let (failover_shutdown_tx, failover_shutdown_rx) = mpsc::channel::<()>();
 
     let result = std::thread::scope(|scope| {
         if let Some(async_interval) = wal_async_flush_interval {
@@ -105,8 +133,48 @@ pub(super) fn serve_http_with_workers(
                         Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    let failures = run_replication_pull_tick(&runtime, &replication_pull);
-                    delay = replication_pull.backoff_delay(failures);
+                    let config = match runtime.lock() {
+                        Ok(guard) => guard.pull_config_for_tick(&replication_pull),
+                        Err(_) => break,
+                    };
+                    let Some(config) = config else {
+                        // Leader, or no leader known yet: nothing to pull.
+                        delay = replication_pull.poll_interval;
+                        continue;
+                    };
+                    let failures = run_replication_pull_tick(&runtime, &config);
+                    delay = match runtime.lock() {
+                        // A long-polling leader holds caught-up polls open
+                        // itself, and a frame with records means more may
+                        // be waiting: poll again at once.
+                        Ok(guard)
+                            if failures == 0
+                                && config.long_poll.is_some()
+                                && (guard.replication_follower.leader_long_polls
+                                    || guard.replication_follower.last_frame_records > 0) =>
+                        {
+                            std::time::Duration::from_millis(1)
+                        }
+                        _ => config.backoff_delay(failures),
+                    };
+                }
+            });
+        }
+        if let Some(failover) = failover_config.clone() {
+            let runtime = Arc::clone(&runtime);
+            let pull = replication_pull
+                .clone()
+                .unwrap_or_else(|| ReplicationPullConfig::from_env_with_source(String::new()));
+            scope.spawn(move || {
+                let options = metadata_router::PlacementSourceOptions::from_env();
+                let mut delay = std::time::Duration::ZERO;
+                loop {
+                    match failover_shutdown_rx.recv_timeout(delay) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    super::failover::heartbeat_tick(&runtime, &failover, &pull, &options);
+                    delay = failover.heartbeat_interval;
                 }
             });
         }
@@ -118,6 +186,7 @@ pub(super) fn serve_http_with_workers(
                 segment_shutdown_tx.clone(),
                 replication_shutdown_tx.clone(),
                 exports_shutdown_tx.clone(),
+                failover_shutdown_tx.clone(),
             ],
             vector_index_persistence: vector_index_persistence.clone(),
         });
@@ -145,6 +214,7 @@ pub(super) fn serve_http_with_workers(
         let _ = segment_shutdown_tx.send(());
         let _ = replication_shutdown_tx.send(());
         let _ = exports_shutdown_tx.send(());
+        let _ = failover_shutdown_tx.send(());
         if let Some(persistence) = vector_index_persistence.as_ref() {
             persistence.stop();
         }

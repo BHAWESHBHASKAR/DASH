@@ -382,7 +382,15 @@ pub fn linger_close(stream: &mut TcpStream, max_bytes: usize, max_time: Duration
 pub fn is_health_class_path(path: &str) -> bool {
     matches!(
         path,
-        "/health" | "/live" | "/ready" | "/v1/health" | "/v1/live" | "/v1/ready" | "/metrics"
+        "/health"
+            | "/live"
+            | "/ready"
+            | "/ready/leader"
+            | "/v1/health"
+            | "/v1/live"
+            | "/v1/ready"
+            | "/v1/ready/leader"
+            | "/metrics"
     )
 }
 

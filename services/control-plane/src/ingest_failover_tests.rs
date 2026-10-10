@@ -534,9 +534,9 @@ fn heartbeat_query_is_validated() {
         ("instance", "x"),
         ("term", "3"),
         ("role", "leader"),
-        ("generation", "00000000000000ff"),
+        ("generation", "255"),
         ("records", "7"),
-        ("prev_generation", "ee"),
+        ("prev_generation", "238"),
         ("prev_records", "2"),
         ("synced", "1"),
     ]))
