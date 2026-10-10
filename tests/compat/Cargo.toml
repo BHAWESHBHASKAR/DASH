@@ -1,0 +1,22 @@
+[package]
+name = "dash-compat"
+description = "Upgrade/downgrade compatibility tests against fixtures captured from earlier releases"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2 = "1.1"
+serde_json = { workspace = true }
+store = { path = "../../pkg/store" }
+tempfile = "3"
+
+[dev-dependencies]
+control-plane = { path = "../../services/control-plane" }
+dash-common = { path = "../../services/common" }
+indexer = { path = "../../services/indexer" }
+ingestion = { path = "../../services/ingestion" }
+redb = { workspace = true }
+retrieval = { path = "../../services/retrieval" }
+schema = { path = "../../pkg/schema" }

@@ -701,6 +701,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-compat"
+version = "0.1.0"
+dependencies = [
+ "control-plane",
+ "dash-common",
+ "flate2",
+ "indexer",
+ "ingestion",
+ "redb",
+ "retrieval",
+ "schema",
+ "serde_json",
+ "store",
+ "tempfile",
+]
+
+[[package]]
 name = "dash-config"
 version = "0.1.0"
 dependencies = [
