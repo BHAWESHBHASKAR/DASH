@@ -50,17 +50,131 @@ pub const MAX_TERM_CHARS: usize = 64;
 
 /// English stop words removed from queries (not from documents).
 const STOP_WORDS: &[&str] = &[
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
-    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
-    "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for",
-    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
-    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just",
-    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
-    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
-    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them",
-    "themselves", "then", "there", "these", "they", "this", "those", "through", "to", "too",
-    "under", "until", "up", "very", "was", "we", "were", "what", "when", "where", "which",
-    "while", "who", "whom", "why", "will", "with", "would", "you", "your", "yours", "yourself",
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "me",
+    "more",
+    "most",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
     "yourselves",
 ];
 
@@ -220,7 +334,10 @@ impl TenantTextIndex {
     /// Index `claim_id` with `text`. A document already indexed under
     /// `claim_id` must be removed first ([`Self::remove`] with its text).
     pub fn insert(&mut self, claim_id: &str, text: &str) {
-        debug_assert!(!self.slots.contains_key(claim_id), "insert of an indexed id");
+        debug_assert!(
+            !self.slots.contains_key(claim_id),
+            "insert of an indexed id"
+        );
         if self.slots.contains_key(claim_id) {
             self.remove_by_scan(claim_id);
         }
@@ -271,7 +388,10 @@ impl TenantTextIndex {
         let Some(&slot) = self.slots.get(claim_id) else {
             return false;
         };
-        let expected_len = self.docs[slot as usize].as_ref().map(|d| d.len).unwrap_or(0);
+        let expected_len = self.docs[slot as usize]
+            .as_ref()
+            .map(|d| d.len)
+            .unwrap_or(0);
         let mut terms = analyze(text);
         if terms.len() as u32 != expected_len {
             return self.remove_by_scan(claim_id);
@@ -449,7 +569,8 @@ impl TenantTextIndex {
                 Some((acc[slot as usize], id))
             })
             .collect();
-        let order = |a: &(f64, &str), b: &(f64, &str)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
+        let order =
+            |a: &(f64, &str), b: &(f64, &str)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
         if hits.len() > top_n {
             hits.select_nth_unstable_by(top_n - 1, order);
             hits.truncate(top_n);
@@ -506,19 +627,30 @@ mod tests {
     fn analyzer_lowercases_strips_punctuation_and_stems() {
         assert_eq!(
             analyze("Company X ACQUIRED Company-Y, acquiring its rivals."),
-            vec!["compani", "x", "acquir", "compani", "y", "acquir", "it", "rival"]
+            vec![
+                "compani", "x", "acquir", "compani", "y", "acquir", "it", "rival"
+            ]
         );
-        assert_eq!(analyze("The company's pumps"), vec!["the", "compani", "pump"]);
+        assert_eq!(
+            analyze("The company's pumps"),
+            vec!["the", "compani", "pump"]
+        );
         assert_eq!(analyze("the company\u{2019}s"), analyze("the company's"));
         assert_eq!(analyze("   ...!!! ---  "), Vec::<String>::new());
     }
 
     #[test]
     fn analyzer_keeps_unicode_words_and_numbers() {
-        assert_eq!(analyze("Café RÉSUMÉ naïve"), vec!["café", "résumé", "naïve"]);
+        assert_eq!(
+            analyze("Café RÉSUMÉ naïve"),
+            vec!["café", "résumé", "naïve"]
+        );
         assert_eq!(analyze("ΩMEGA Straße"), vec!["ωmega", "straße"]);
         assert_eq!(analyze("Москва Moscow"), vec!["москва", "moscow"]);
-        assert_eq!(analyze("revenue rose 3.5% in 2025"), vec!["revenu", "rose", "3.5", "in", "2025"]);
+        assert_eq!(
+            analyze("revenue rose 3.5% in 2025"),
+            vec!["revenu", "rose", "3.5", "in", "2025"]
+        );
         // Emoji are not words.
         assert_eq!(analyze("emoji 😀 here"), vec!["emoji", "here"]);
     }
@@ -548,7 +680,10 @@ mod tests {
 
     #[test]
     fn query_drops_stop_words_unless_nothing_else_remains() {
-        assert_eq!(analyze_query("What did the merger do?").terms, vec!["merger"]);
+        assert_eq!(
+            analyze_query("What did the merger do?").terms,
+            vec!["merger"]
+        );
         assert_eq!(analyze_query("the who").terms, vec!["the", "who"]);
         assert_eq!(analyze_query("Pump pumps PUMPING").terms, vec!["pump"]);
         assert!(analyze_query("?!").is_empty());
@@ -653,10 +788,18 @@ mod tests {
             texts.insert(id, text);
         };
         for i in 0..50 {
-            set(&mut churned, format!("c{i}"), format!("word{} common text {}", i % 7, i % 3));
+            set(
+                &mut churned,
+                format!("c{i}"),
+                format!("word{} common text {}", i % 7, i % 3),
+            );
         }
         for i in (1..50).step_by(5) {
-            set(&mut churned, format!("c{i}"), format!("updated word{} text", i % 4));
+            set(
+                &mut churned,
+                format!("c{i}"),
+                format!("updated word{} text", i % 4),
+            );
         }
         let mut live = texts.clone();
         for i in (0..50).step_by(3) {
@@ -674,7 +817,11 @@ mod tests {
         assert_eq!(churned.term_count(), fresh.term_count());
         for query in ["word1 text", "common", "updated word3", "text 2"] {
             let q = analyze_query(query);
-            assert_eq!(churned.search(&q, 100, None), fresh.search(&q, 100, None), "{query}");
+            assert_eq!(
+                churned.search(&q, 100, None),
+                fresh.search(&q, 100, None),
+                "{query}"
+            );
         }
     }
 }

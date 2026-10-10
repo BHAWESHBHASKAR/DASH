@@ -29,8 +29,8 @@ mod vector_persist;
 mod wal;
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
-pub use vector_index::AnnTuningConfig;
 use text_index::{QueryTerms, TenantTextIndex, analyze_query};
+pub use vector_index::AnnTuningConfig;
 use vector_index::{TenantVectorIndex, exact_top_k};
 pub use vector_persist::{
     VECTOR_INDEX_FORMAT_VERSION, VectorIndexPersistence, VectorIndexRestore, VectorIndexSaveStats,
@@ -1824,7 +1824,7 @@ impl InMemoryStore {
             (None, None),
             None,
         )
-            .len()
+        .len()
     }
 
     pub fn ann_vector_top_candidates(
@@ -2034,12 +2034,11 @@ impl InMemoryStore {
                 candidates.extend(ids.iter().filter(|id| passes(id)).cloned());
             }
         } else if let Some(index) = self.text_indexes.get(tenant_id) {
-            let filter: Option<&dyn Fn(&str) -> bool> =
-                if has_time || allowed_claim_ids.is_some() {
-                    Some(&passes)
-                } else {
-                    None
-                };
+            let filter: Option<&dyn Fn(&str) -> bool> = if has_time || allowed_claim_ids.is_some() {
+                Some(&passes)
+            } else {
+                None
+            };
             candidates.extend(
                 index
                     .search(&query_terms, top_n, filter)

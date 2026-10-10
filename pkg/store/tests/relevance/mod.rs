@@ -33,37 +33,344 @@ pub struct Topic {
 }
 
 pub const TOPICS: &[Topic] = &[
-    Topic { entities: ["Helios", "Nova"], nouns: ["merger", "shareholder", "acquisition", "board"], verbs: [("acquire", "acquired", "acquiring"), ("approve", "approved", "approving")], aspects: [["antitrust", "regulator"], ["valuation", "premium"], ["layoffs", "integration"]] },
-    Topic { entities: ["Corvane", "Ridgeport"], nouns: ["reactor", "coolant", "pump", "turbine"], verbs: [("inspect", "inspected", "inspecting"), ("shut", "shut", "shutting")], aspects: [["leak", "valve"], ["outage", "grid"], ["radiation", "monitor"]] },
-    Topic { entities: ["Lisbon", "Porto"], nouns: ["rainfall", "storm", "flood", "forecast"], verbs: [("warn", "warned", "warning"), ("evacuate", "evacuated", "evacuating")], aspects: [["river", "levee"], ["wind", "gust"], ["drought", "reservoir"]] },
-    Topic { entities: ["Aldermoor", "Quayside"], nouns: ["bridge", "toll", "highway", "traffic"], verbs: [("build", "built", "building"), ("raise", "raised", "raising")], aspects: [["congestion", "commuter"], ["steel", "cable"], ["budget", "contractor"]] },
-    Topic { entities: ["Vireo", "Calder"], nouns: ["vaccine", "trial", "dose", "patient"], verbs: [("test", "tested", "testing"), ("enroll", "enrolled", "enrolling")], aspects: [["efficacy", "placebo"], ["adverse", "fever"], ["booster", "elderly"]] },
-    Topic { entities: ["Brightwater", "Okafor"], nouns: ["bond", "yield", "inflation", "rate"], verbs: [("cut", "cut", "cutting"), ("hike", "hiked", "hiking")], aspects: [["treasury", "auction"], ["mortgage", "housing"], ["currency", "exchange"]] },
-    Topic { entities: ["Stellan", "Mirabel"], nouns: ["satellite", "rocket", "orbit", "launch"], verbs: [("launch", "launched", "launching"), ("deploy", "deployed", "deploying")], aspects: [["booster", "landing"], ["antenna", "signal"], ["debris", "collision"]] },
-    Topic { entities: ["Granfield", "Tessaro"], nouns: ["harvest", "wheat", "crop", "farmer"], verbs: [("plant", "planted", "planting"), ("export", "exported", "exporting")], aspects: [["fertilizer", "soil"], ["locust", "pest"], ["subsidy", "tariff"]] },
-    Topic { entities: ["Kestrel", "Umbra"], nouns: ["malware", "breach", "firewall", "server"], verbs: [("patch", "patched", "patching"), ("encrypt", "encrypted", "encrypting")], aspects: [["ransom", "bitcoin"], ["phishing", "password"], ["botnet", "traffic"]] },
-    Topic { entities: ["Marisol", "Dunmore"], nouns: ["election", "ballot", "voter", "candidate"], verbs: [("vote", "voted", "voting"), ("campaign", "campaigned", "campaigning")], aspects: [["turnout", "precinct"], ["debate", "televised"], ["recount", "margin"]] },
-    Topic { entities: ["Ashgrove", "Pellucid"], nouns: ["museum", "painting", "exhibition", "gallery"], verbs: [("restore", "restored", "restoring"), ("exhibit", "exhibited", "exhibiting")], aspects: [["forgery", "authenticity"], ["auction", "collector"], ["sculpture", "bronze"]] },
-    Topic { entities: ["Thornbury", "Velasco"], nouns: ["railway", "train", "station", "passenger"], verbs: [("derail", "derailed", "derailing"), ("electrify", "electrified", "electrifying")], aspects: [["signal", "fault"], ["fare", "ticket"], ["tunnel", "excavation"]] },
-    Topic { entities: ["Okoro", "Lindqvist"], nouns: ["glacier", "ice", "climate", "temperature"], verbs: [("melt", "melted", "melting"), ("measure", "measured", "measuring")], aspects: [["sea", "level"], ["permafrost", "methane"], ["snowfall", "alpine"]] },
-    Topic { entities: ["Harrowgate", "Sunbeam"], nouns: ["factory", "battery", "lithium", "cell"], verbs: [("manufacture", "manufactured", "manufacturing"), ("recycle", "recycled", "recycling")], aspects: [["cobalt", "mine"], ["charging", "capacity"], ["fire", "thermal"]] },
-    Topic { entities: ["Penhallow", "Rook"], nouns: ["hospital", "nurse", "surgery", "ward"], verbs: [("treat", "treated", "treating"), ("admit", "admitted", "admitting")], aspects: [["waiting", "backlog"], ["strike", "wages"], ["infection", "sterile"]] },
-    Topic { entities: ["Calloway", "Ibsen"], nouns: ["football", "striker", "league", "goal"], verbs: [("score", "scored", "scoring"), ("transfer", "transferred", "transferring")], aspects: [["injury", "hamstring"], ["referee", "penalty"], ["stadium", "fans"]] },
-    Topic { entities: ["Westmarch", "Delacroix"], nouns: ["tax", "deficit", "spending", "parliament"], verbs: [("legislate", "legislated", "legislating"), ("reform", "reformed", "reforming")], aspects: [["pension", "retirement"], ["corporate", "loophole"], ["austerity", "welfare"]] },
-    Topic { entities: ["Quillon", "Marrak"], nouns: ["earthquake", "tremor", "fault", "seismic"], verbs: [("strike", "struck", "striking"), ("collapse", "collapsed", "collapsing")], aspects: [["tsunami", "coast"], ["aftershock", "magnitude"], ["rubble", "rescue"]] },
-    Topic { entities: ["Bramble", "Sorensen"], nouns: ["smartphone", "chip", "processor", "display"], verbs: [("release", "released", "releasing"), ("unveil", "unveiled", "unveiling")], aspects: [["camera", "sensor"], ["benchmark", "performance"], ["recall", "overheating"]] },
-    Topic { entities: ["Elmstead", "Naranjo"], nouns: ["coffee", "cafe", "roaster", "bean"], verbs: [("roast", "roasted", "roasting"), ("brew", "brewed", "brewing")], aspects: [["espresso", "barista"], ["arabica", "plantation"], ["price", "shortage"]] },
-    Topic { entities: ["Fairhaven", "Kuroda"], nouns: ["shipping", "port", "container", "vessel"], verbs: [("dock", "docked", "docking"), ("reroute", "rerouted", "rerouting")], aspects: [["canal", "blockage"], ["freight", "costs"], ["piracy", "escort"]] },
-    Topic { entities: ["Glenrock", "Abernathy"], nouns: ["school", "teacher", "student", "curriculum"], verbs: [("teach", "taught", "teaching"), ("graduate", "graduated", "graduating")], aspects: [["exam", "grades"], ["funding", "classroom"], ["literacy", "reading"]] },
-    Topic { entities: ["Starling", "Moravec"], nouns: ["robot", "warehouse", "automation", "drone"], verbs: [("automate", "automated", "automating"), ("deliver", "delivered", "delivering")], aspects: [["parcel", "delivery"], ["safety", "collision"], ["jobs", "workers"]] },
-    Topic { entities: ["Copperfield", "Yusuf"], nouns: ["wildfire", "forest", "firefighter", "smoke"], verbs: [("burn", "burned", "burning"), ("contain", "contained", "containing")], aspects: [["evacuation", "homes"], ["air", "quality"], ["arson", "investigation"]] },
+    Topic {
+        entities: ["Helios", "Nova"],
+        nouns: ["merger", "shareholder", "acquisition", "board"],
+        verbs: [
+            ("acquire", "acquired", "acquiring"),
+            ("approve", "approved", "approving"),
+        ],
+        aspects: [
+            ["antitrust", "regulator"],
+            ["valuation", "premium"],
+            ["layoffs", "integration"],
+        ],
+    },
+    Topic {
+        entities: ["Corvane", "Ridgeport"],
+        nouns: ["reactor", "coolant", "pump", "turbine"],
+        verbs: [
+            ("inspect", "inspected", "inspecting"),
+            ("shut", "shut", "shutting"),
+        ],
+        aspects: [
+            ["leak", "valve"],
+            ["outage", "grid"],
+            ["radiation", "monitor"],
+        ],
+    },
+    Topic {
+        entities: ["Lisbon", "Porto"],
+        nouns: ["rainfall", "storm", "flood", "forecast"],
+        verbs: [
+            ("warn", "warned", "warning"),
+            ("evacuate", "evacuated", "evacuating"),
+        ],
+        aspects: [
+            ["river", "levee"],
+            ["wind", "gust"],
+            ["drought", "reservoir"],
+        ],
+    },
+    Topic {
+        entities: ["Aldermoor", "Quayside"],
+        nouns: ["bridge", "toll", "highway", "traffic"],
+        verbs: [
+            ("build", "built", "building"),
+            ("raise", "raised", "raising"),
+        ],
+        aspects: [
+            ["congestion", "commuter"],
+            ["steel", "cable"],
+            ["budget", "contractor"],
+        ],
+    },
+    Topic {
+        entities: ["Vireo", "Calder"],
+        nouns: ["vaccine", "trial", "dose", "patient"],
+        verbs: [
+            ("test", "tested", "testing"),
+            ("enroll", "enrolled", "enrolling"),
+        ],
+        aspects: [
+            ["efficacy", "placebo"],
+            ["adverse", "fever"],
+            ["booster", "elderly"],
+        ],
+    },
+    Topic {
+        entities: ["Brightwater", "Okafor"],
+        nouns: ["bond", "yield", "inflation", "rate"],
+        verbs: [("cut", "cut", "cutting"), ("hike", "hiked", "hiking")],
+        aspects: [
+            ["treasury", "auction"],
+            ["mortgage", "housing"],
+            ["currency", "exchange"],
+        ],
+    },
+    Topic {
+        entities: ["Stellan", "Mirabel"],
+        nouns: ["satellite", "rocket", "orbit", "launch"],
+        verbs: [
+            ("launch", "launched", "launching"),
+            ("deploy", "deployed", "deploying"),
+        ],
+        aspects: [
+            ["booster", "landing"],
+            ["antenna", "signal"],
+            ["debris", "collision"],
+        ],
+    },
+    Topic {
+        entities: ["Granfield", "Tessaro"],
+        nouns: ["harvest", "wheat", "crop", "farmer"],
+        verbs: [
+            ("plant", "planted", "planting"),
+            ("export", "exported", "exporting"),
+        ],
+        aspects: [
+            ["fertilizer", "soil"],
+            ["locust", "pest"],
+            ["subsidy", "tariff"],
+        ],
+    },
+    Topic {
+        entities: ["Kestrel", "Umbra"],
+        nouns: ["malware", "breach", "firewall", "server"],
+        verbs: [
+            ("patch", "patched", "patching"),
+            ("encrypt", "encrypted", "encrypting"),
+        ],
+        aspects: [
+            ["ransom", "bitcoin"],
+            ["phishing", "password"],
+            ["botnet", "traffic"],
+        ],
+    },
+    Topic {
+        entities: ["Marisol", "Dunmore"],
+        nouns: ["election", "ballot", "voter", "candidate"],
+        verbs: [
+            ("vote", "voted", "voting"),
+            ("campaign", "campaigned", "campaigning"),
+        ],
+        aspects: [
+            ["turnout", "precinct"],
+            ["debate", "televised"],
+            ["recount", "margin"],
+        ],
+    },
+    Topic {
+        entities: ["Ashgrove", "Pellucid"],
+        nouns: ["museum", "painting", "exhibition", "gallery"],
+        verbs: [
+            ("restore", "restored", "restoring"),
+            ("exhibit", "exhibited", "exhibiting"),
+        ],
+        aspects: [
+            ["forgery", "authenticity"],
+            ["auction", "collector"],
+            ["sculpture", "bronze"],
+        ],
+    },
+    Topic {
+        entities: ["Thornbury", "Velasco"],
+        nouns: ["railway", "train", "station", "passenger"],
+        verbs: [
+            ("derail", "derailed", "derailing"),
+            ("electrify", "electrified", "electrifying"),
+        ],
+        aspects: [
+            ["signal", "fault"],
+            ["fare", "ticket"],
+            ["tunnel", "excavation"],
+        ],
+    },
+    Topic {
+        entities: ["Okoro", "Lindqvist"],
+        nouns: ["glacier", "ice", "climate", "temperature"],
+        verbs: [
+            ("melt", "melted", "melting"),
+            ("measure", "measured", "measuring"),
+        ],
+        aspects: [
+            ["sea", "level"],
+            ["permafrost", "methane"],
+            ["snowfall", "alpine"],
+        ],
+    },
+    Topic {
+        entities: ["Harrowgate", "Sunbeam"],
+        nouns: ["factory", "battery", "lithium", "cell"],
+        verbs: [
+            ("manufacture", "manufactured", "manufacturing"),
+            ("recycle", "recycled", "recycling"),
+        ],
+        aspects: [
+            ["cobalt", "mine"],
+            ["charging", "capacity"],
+            ["fire", "thermal"],
+        ],
+    },
+    Topic {
+        entities: ["Penhallow", "Rook"],
+        nouns: ["hospital", "nurse", "surgery", "ward"],
+        verbs: [
+            ("treat", "treated", "treating"),
+            ("admit", "admitted", "admitting"),
+        ],
+        aspects: [
+            ["waiting", "backlog"],
+            ["strike", "wages"],
+            ["infection", "sterile"],
+        ],
+    },
+    Topic {
+        entities: ["Calloway", "Ibsen"],
+        nouns: ["football", "striker", "league", "goal"],
+        verbs: [
+            ("score", "scored", "scoring"),
+            ("transfer", "transferred", "transferring"),
+        ],
+        aspects: [
+            ["injury", "hamstring"],
+            ["referee", "penalty"],
+            ["stadium", "fans"],
+        ],
+    },
+    Topic {
+        entities: ["Westmarch", "Delacroix"],
+        nouns: ["tax", "deficit", "spending", "parliament"],
+        verbs: [
+            ("legislate", "legislated", "legislating"),
+            ("reform", "reformed", "reforming"),
+        ],
+        aspects: [
+            ["pension", "retirement"],
+            ["corporate", "loophole"],
+            ["austerity", "welfare"],
+        ],
+    },
+    Topic {
+        entities: ["Quillon", "Marrak"],
+        nouns: ["earthquake", "tremor", "fault", "seismic"],
+        verbs: [
+            ("strike", "struck", "striking"),
+            ("collapse", "collapsed", "collapsing"),
+        ],
+        aspects: [
+            ["tsunami", "coast"],
+            ["aftershock", "magnitude"],
+            ["rubble", "rescue"],
+        ],
+    },
+    Topic {
+        entities: ["Bramble", "Sorensen"],
+        nouns: ["smartphone", "chip", "processor", "display"],
+        verbs: [
+            ("release", "released", "releasing"),
+            ("unveil", "unveiled", "unveiling"),
+        ],
+        aspects: [
+            ["camera", "sensor"],
+            ["benchmark", "performance"],
+            ["recall", "overheating"],
+        ],
+    },
+    Topic {
+        entities: ["Elmstead", "Naranjo"],
+        nouns: ["coffee", "cafe", "roaster", "bean"],
+        verbs: [
+            ("roast", "roasted", "roasting"),
+            ("brew", "brewed", "brewing"),
+        ],
+        aspects: [
+            ["espresso", "barista"],
+            ["arabica", "plantation"],
+            ["price", "shortage"],
+        ],
+    },
+    Topic {
+        entities: ["Fairhaven", "Kuroda"],
+        nouns: ["shipping", "port", "container", "vessel"],
+        verbs: [
+            ("dock", "docked", "docking"),
+            ("reroute", "rerouted", "rerouting"),
+        ],
+        aspects: [
+            ["canal", "blockage"],
+            ["freight", "costs"],
+            ["piracy", "escort"],
+        ],
+    },
+    Topic {
+        entities: ["Glenrock", "Abernathy"],
+        nouns: ["school", "teacher", "student", "curriculum"],
+        verbs: [
+            ("teach", "taught", "teaching"),
+            ("graduate", "graduated", "graduating"),
+        ],
+        aspects: [
+            ["exam", "grades"],
+            ["funding", "classroom"],
+            ["literacy", "reading"],
+        ],
+    },
+    Topic {
+        entities: ["Starling", "Moravec"],
+        nouns: ["robot", "warehouse", "automation", "drone"],
+        verbs: [
+            ("automate", "automated", "automating"),
+            ("deliver", "delivered", "delivering"),
+        ],
+        aspects: [
+            ["parcel", "delivery"],
+            ["safety", "collision"],
+            ["jobs", "workers"],
+        ],
+    },
+    Topic {
+        entities: ["Copperfield", "Yusuf"],
+        nouns: ["wildfire", "forest", "firefighter", "smoke"],
+        verbs: [
+            ("burn", "burned", "burning"),
+            ("contain", "contained", "containing"),
+        ],
+        aspects: [
+            ["evacuation", "homes"],
+            ["air", "quality"],
+            ["arson", "investigation"],
+        ],
+    },
 ];
 
 /// Words every topic uses.
 const COMMON: &[&str] = &[
-    "officials", "said", "report", "new", "plan", "year", "according", "statement", "week",
-    "data", "group", "Tuesday", "local", "national", "announced", "expected", "people",
-    "government", "company", "today", "major", "first", "after", "recent", "update",
+    "officials",
+    "said",
+    "report",
+    "new",
+    "plan",
+    "year",
+    "according",
+    "statement",
+    "week",
+    "data",
+    "group",
+    "Tuesday",
+    "local",
+    "national",
+    "announced",
+    "expected",
+    "people",
+    "government",
+    "company",
+    "today",
+    "major",
+    "first",
+    "after",
+    "recent",
+    "update",
 ];
 
 struct SplitMix64(u64);
@@ -133,9 +440,15 @@ pub fn relevance_set() -> RelevanceSet {
             let c3 = *rng.pick(COMMON);
             let mut text = match rng.below(4) {
                 0 => format!("{ent} {past} the {noun} after {a1} concerns, {c1} {c2} said."),
-                1 => format!("{} {c1}: {ent}'s {noun} {a2} {gerund} {noun2} {c2} {c3}", capitalise(c3)),
+                1 => format!(
+                    "{} {c1}: {ent}'s {noun} {a2} {gerund} {noun2} {c2} {c3}",
+                    capitalise(c3)
+                ),
                 2 => format!("The {noun} {a1} and {a2} {c1} by {ent} ({c2} {c3})."),
-                _ => format!("{} {ent} is {gerund} {noun2}s; {a2} {c1} {c2}.", capitalise(c1)),
+                _ => format!(
+                    "{} {ent} is {gerund} {noun2}s; {a2} {c1} {c2}.",
+                    capitalise(c1)
+                ),
             };
             if rng.chance(33) {
                 let other = &TOPICS[(t + 1 + rng.below(TOPICS.len() - 1)) % TOPICS.len()];
@@ -237,7 +550,15 @@ pub fn ndcg_at(k: usize, ranked: &[String], relevant: &HashMap<String, u8>) -> f
 /// Recall@k capped at k: relevant claims in the top k divided by
 /// `min(k, number of relevant claims)`.
 pub fn recall_at(k: usize, ranked: &[String], relevant: &HashMap<String, u8>) -> f64 {
-    let hits = ranked.iter().take(k).filter(|id| relevant.contains_key(*id)).count();
+    let hits = ranked
+        .iter()
+        .take(k)
+        .filter(|id| relevant.contains_key(*id))
+        .count();
     let denom = relevant.len().min(k);
-    if denom == 0 { 0.0 } else { hits as f64 / denom as f64 }
+    if denom == 0 {
+        0.0
+    } else {
+        hits as f64 / denom as f64
+    }
 }

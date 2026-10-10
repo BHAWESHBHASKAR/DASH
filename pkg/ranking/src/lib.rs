@@ -129,7 +129,10 @@ pub const HYBRID_TEXT_WEIGHT: f32 = 1.0 / 3.0;
 /// normalised BM25 ([`lexical_relevance`]). In `[0, 1]`. See
 /// [`HYBRID_DENSE_WEIGHT`] for the calibration.
 pub fn hybrid_relevance(cosine: Option<f32>, bm25_fraction: f32) -> f32 {
-    let cosine = cosine.filter(|c| c.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0);
+    let cosine = cosine
+        .filter(|c| c.is_finite())
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0);
     let dense = (cosine + 1.0) * 0.5;
     HYBRID_DENSE_WEIGHT * dense + HYBRID_TEXT_WEIGHT * lexical_relevance(bm25_fraction)
 }

@@ -258,7 +258,10 @@ fn retrieval_quality_does_not_regress() {
     }
     for (name, ndcg_floor, recall_floor) in FLOORS {
         let (ndcg, recall) = measured[name];
-        assert!(ndcg >= *ndcg_floor, "{name}: nDCG@10 {ndcg:.4} < floor {ndcg_floor}");
+        assert!(
+            ndcg >= *ndcg_floor,
+            "{name}: nDCG@10 {ndcg:.4} < floor {ndcg_floor}"
+        );
         assert!(
             recall >= *recall_floor,
             "{name}: recall@10 {recall:.4} < floor {recall_floor}"
@@ -269,4 +272,3 @@ fn retrieval_quality_does_not_regress() {
     assert!(measured["store_lexical"].0 > measured["old_shared_word"].0);
     assert!(measured["store_hybrid"].0 > measured["old_hybrid"].0);
 }
-
