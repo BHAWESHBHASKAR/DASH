@@ -132,6 +132,15 @@ impl ReplicationIndex {
         self.read_bytes = AtomicU64::new(read_bytes);
     }
 
+    /// Moves the index out (its file was renamed, see the closed generation
+    /// in `FileWal`) and leaves an empty one that keeps the read counter.
+    pub(super) fn take_for_renamed_file(&mut self) -> Self {
+        let read_bytes = self.read_bytes();
+        let taken = std::mem::take(self);
+        self.read_bytes = AtomicU64::new(read_bytes);
+        taken
+    }
+
     /// Bytes read from the file for the replication view so far.
     pub(super) fn read_bytes(&self) -> u64 {
         self.read_bytes.load(Ordering::Relaxed)

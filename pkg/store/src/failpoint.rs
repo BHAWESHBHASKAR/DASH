@@ -94,12 +94,13 @@ mod tests {
     /// Every failpoint in checkpoint order. Note the generation is bumped
     /// before the WAL is truncated so that a crash between the two only causes
     /// a spurious follower resync, never a silent skip.
-    const POINTS: [&str; 7] = [
+    const POINTS: [&str; 8] = [
         "snapshot.tmp_written",
         "snapshot.fsynced",
         "snapshot.renamed",
         "snapshot.dir_synced",
         "wal.generation_bumped",
+        "wal.closed_renamed",
         "wal.truncated",
         "wal.before_transition_recorded",
     ];
@@ -164,7 +165,10 @@ mod tests {
                 "rename",
                 "fsync_dir",
                 "wal.generation_bumped",
-                // only then is the WAL truncated and made durable
+                // only then is the old WAL renamed to the closed-generation
+                // file and a new, empty WAL made durable
+                "rename",
+                "wal.closed_renamed",
                 "fsync_file",
                 "fsync_dir",
                 "wal.truncated",
@@ -212,7 +216,10 @@ mod tests {
 
             let bumped_already = matches!(
                 point,
-                "wal.generation_bumped" | "wal.truncated" | "wal.before_transition_recorded"
+                "wal.generation_bumped"
+                    | "wal.closed_renamed"
+                    | "wal.truncated"
+                    | "wal.before_transition_recorded"
             );
             if bumped_already {
                 assert_ne!(

@@ -268,6 +268,22 @@ pub struct GenerationTransition {
 /// Transitions kept in `<wal>.gen.transitions` (newest last).
 pub const GENERATION_TRANSITIONS_KEPT: usize = 16;
 
+/// The WAL file of the generation the latest checkpoint closed, kept as
+/// `<wal>.closed.<generation>` until the next checkpoint. A checkpoint runs
+/// right after the write that triggered it, under the same lock, so a
+/// follower is practically never at the exact end of the closed generation:
+/// serving it the rest of that generation from this file brings it to the
+/// end, where it switches to the new generation instead of resyncing.
+struct ClosedGeneration {
+    generation: u64,
+    /// Replication view length of the closed generation (its transition's
+    /// `from_records`).
+    records: usize,
+    path: PathBuf,
+    /// Index of the closed file, built on first use after a restart.
+    index: ReplicationIndex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalReplicationExport {
     pub snapshot_lines: Vec<String>,
@@ -575,6 +591,8 @@ pub struct FileWal {
     /// Recent checkpoint transitions, oldest first (see
     /// [`GenerationTransition`]).
     transitions: Vec<GenerationTransition>,
+    /// The generation the latest checkpoint closed, if its file is kept.
+    closed: Option<ClosedGeneration>,
     /// Set after an fsync failure. Once set, every write path fails closed:
     /// after a failed fsync the kernel may already have dropped the dirty
     /// pages, so retrying the fsync could report success for data that never
@@ -648,6 +666,7 @@ impl FileWal {
         let wal_records = count_non_empty_lines(&path)?;
         let generation = load_or_create_generation(&generation_path_for(&path))?;
         let transitions = load_transitions(&transitions_path_for(&path));
+        let closed = load_closed_generation(&path, transitions.last());
         Ok(Self {
             path,
             wal_records,
@@ -665,6 +684,7 @@ impl FileWal {
             replication_group_too_large_total: 0,
             replication_index: ReplicationIndex::default(),
             transitions,
+            closed,
             poisoned: None,
         })
     }
@@ -1026,7 +1046,83 @@ impl FileWal {
             }
             return Ok(frame);
         }
+        if let Some(generation) = from_generation
+            && let Some(frame) =
+                self.closed_generation_frame(generation, from_offset, max_records)?
+        {
+            return Ok(frame);
+        }
         self.replication_frame_inner(from_generation, from_offset, max_records, true)
+    }
+
+    /// A frame of the retained closed generation for a follower still inside
+    /// it (`from_offset` before its end), or `None` when that generation is
+    /// not retained, does not lead to the current one, or cannot be read.
+    fn closed_generation_frame(
+        &mut self,
+        generation: u64,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<Option<WalReplicationFrame>, StoreError> {
+        let Some((closed_generation, closed_records)) =
+            self.closed.as_ref().map(|c| (c.generation, c.records))
+        else {
+            return Ok(None);
+        };
+        if closed_generation != generation
+            || from_offset >= closed_records
+            || !self.resolve_transition(closed_generation, closed_records)
+        {
+            return Ok(None);
+        }
+        // `total_records` of a closed-generation frame counts what is left in
+        // both generations, so the follower's lag and its "more available"
+        // decision cover the records waiting after the switch too.
+        self.flush_pending_sync()?;
+        let current_len = self.replication_view_len()?;
+        let cap = self.replication_group_cap;
+        let Some(closed) = self.closed.as_mut() else {
+            return Ok(None);
+        };
+        if !closed.path.exists()
+            || !closed.index.refresh(&closed.path)?
+            || closed.index.total() != closed.records
+        {
+            return Ok(None);
+        }
+        let lines = closed.index.lines_from(&closed.path, from_offset)?;
+        match cut_frame(lines, from_offset, max_records, closed_records, cap)? {
+            FrameCut::Lines { next_offset, lines } => Ok(Some(WalReplicationFrame {
+                generation,
+                from_offset,
+                next_offset,
+                total_records: closed_records + current_len,
+                needs_resync: false,
+                wal_lines: lines,
+                switched_from: None,
+            })),
+            FrameCut::GroupTooLarge(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )))
+            }
+        }
+    }
+
+    /// Deletes the retained closed generation (a follower that serves no
+    /// one of its own does not need it).
+    pub fn discard_closed_generation(&mut self) {
+        if let Some(closed) = self.closed.take() {
+            let _ = std::fs::remove_file(&closed.path);
+        }
+    }
+
+    /// The retained closed generation and its view length, if any.
+    pub fn closed_generation(&self) -> Option<(u64, usize)> {
+        self.closed.as_ref().map(|c| (c.generation, c.records))
     }
 
     /// `true` when the recorded transitions lead from the end position
@@ -1289,6 +1385,7 @@ impl FileWal {
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
         self.bump_generation()?;
+        self.discard_closed_generation();
         self.replication_index.reset();
         self.write_wal_lines_raw(&export.wal_lines)?;
         self.wal_records = export.wal_lines.len();
@@ -1340,6 +1437,7 @@ impl FileWal {
         failpoint!("export_apply.snapshot_replaced");
 
         self.bump_generation()?;
+        self.discard_closed_generation();
         self.replication_index.reset();
         {
             let mut file = OpenOptions::new()
@@ -1667,13 +1765,22 @@ impl FileWal {
         Ok(())
     }
 
+    /// Starts a new, empty WAL under a new generation. The old file is
+    /// renamed to `<wal>.closed.<old generation>` (replacing the previously
+    /// closed one), so followers still inside that generation can be served
+    /// its remaining lines (see [`ClosedGeneration`]).
     fn truncate_wal(&mut self) -> Result<(), StoreError> {
         self.append_buffer.clear();
+        let closed_generation = self.generation;
         // New lineage first: a crash between the bump and the truncation
         // only causes a spurious resync, never a silent skip.
         self.bump_generation()?;
         failpoint!("wal.generation_bumped");
-        self.replication_index.reset();
+        let previous = self.closed.take();
+        let index = self.replication_index.take_for_renamed_file();
+        let closed_path = closed_path_for(&self.path, closed_generation);
+        rename_file(&self.path, &closed_path)?;
+        failpoint!("wal.closed_renamed");
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -1683,6 +1790,17 @@ impl FileWal {
         drop(file);
         sync_parent_dir(&self.path)?;
         failpoint!("wal.truncated");
+        if let Some(previous) = previous
+            && previous.path != closed_path
+        {
+            let _ = std::fs::remove_file(&previous.path);
+        }
+        self.closed = Some(ClosedGeneration {
+            generation: closed_generation,
+            records: index.total(),
+            path: closed_path,
+            index,
+        });
         self.wal_records = 0;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
@@ -1710,13 +1828,19 @@ impl FileWal {
         // Recorded only after the truncation is durable: a crash before this
         // point leaves no transition, so followers resync instead of
         // switching into a WAL that may still hold the old lines.
-        if let Some((from_generation, from_records)) = closed {
-            failpoint!("wal.before_transition_recorded");
-            self.record_transition(GenerationTransition {
-                from_generation,
-                from_records,
-                to_generation: self.generation,
-            });
+        match closed {
+            Some((from_generation, from_records)) => {
+                failpoint!("wal.before_transition_recorded");
+                if let Some(retained) = self.closed.as_mut() {
+                    retained.records = from_records;
+                }
+                self.record_transition(GenerationTransition {
+                    from_generation,
+                    from_records,
+                    to_generation: self.generation,
+                });
+            }
+            None => self.discard_closed_generation(),
         }
         Ok(WalCheckpointStats {
             snapshot_records: snapshot_records.len(),
@@ -1741,6 +1865,50 @@ impl FileWal {
             ),
         }
     }
+}
+
+fn closed_path_for(wal_path: &Path, generation: u64) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(format!(".closed.{generation:016x}"));
+    PathBuf::from(path)
+}
+
+/// The closed generation file that matches the newest transition. Closed
+/// files of other generations (left by a crash, or by a checkpoint whose
+/// transition could not be recorded) are deleted.
+fn load_closed_generation(
+    wal_path: &Path,
+    newest: Option<&GenerationTransition>,
+) -> Option<ClosedGeneration> {
+    let keep = newest.map(|t| closed_path_for(wal_path, t.from_generation));
+    let keep_name = keep
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().to_string());
+    if let (Some(dir), Some(name)) = (wal_path.parent(), wal_path.file_name()) {
+        let prefix = format!("{}.closed.", name.to_string_lossy());
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with(&prefix) && Some(&file_name) != keep_name.as_ref() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let newest = newest?;
+    let path = keep?;
+    path.exists().then(|| ClosedGeneration {
+        generation: newest.from_generation,
+        records: newest.from_records,
+        path,
+        index: ReplicationIndex::default(),
+    })
 }
 
 fn transitions_path_for(wal_path: &Path) -> PathBuf {

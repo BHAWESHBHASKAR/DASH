@@ -642,7 +642,7 @@ fn a_checkpoint_during_the_download_does_not_change_the_export() {
     follower.assert_matches(&leader, "export then switch");
 
     // Writes between the freeze and the checkpoint: the follower is behind
-    // the closed generation's end and must resync again.
+    // the closed generation's end and catches up from the closed file.
     let manifest = leader.exports.begin(&leader.wal, None).unwrap();
     let mut late = Follower::open(&dir.path().join("late"));
     let lpaths = late.paths();
@@ -660,8 +660,14 @@ fn a_checkpoint_during_the_download_does_not_change_the_export() {
     late.apply(&download);
     lpaths.remove();
     late.sync(&leader);
-    assert_eq!(late.resyncs, 2, "behind the closed generation: resync");
-    assert_eq!(late.switches, 0);
+    // Nothing was written after the checkpoint, so the closed generation's
+    // last frame reported "caught up"; the next poll switches.
+    assert!(!late.poll(&leader));
+    assert_eq!(
+        (late.resyncs, late.switches),
+        (1, 1),
+        "behind the closed generation's end: served from its file, no second resync"
+    );
     late.assert_matches(&leader, "late follower");
 }
 
@@ -813,48 +819,111 @@ fn a_follower_at_the_end_of_the_closed_generation_switches_without_a_resync() {
 }
 
 #[test]
-fn followers_behind_or_ahead_of_the_closed_generation_resync() {
+fn followers_inside_the_closed_generation_catch_up_from_its_file_then_switch() {
     let dir = TempDir::new().unwrap();
     let mut leader = Leader::open(dir.path());
     leader.write_n(10);
     let (closed_generation, closed_len) = leader.position();
+    // A follower that saw part of the generation (a checkpoint runs right
+    // after the write that triggers it, so this is the usual case).
+    let mut behind = Follower::open(&dir.path().join("behind"));
+    behind.max_records = 9;
+    behind.poll(&leader);
+    assert!(
+        behind.offset > 0 && behind.offset < closed_len,
+        "test premise"
+    );
     leader.checkpoint();
-    leader.write_n(2);
-    for (what, offset) in [
-        ("behind", closed_len - 1),
-        ("far behind", 0),
-        ("ahead", closed_len + 1),
+    assert_eq!(
+        leader.wal().closed_generation(),
+        Some((closed_generation, closed_len))
+    );
+    leader.write_n(4);
+
+    // Frames of the closed generation, then the switch.
+    let frame = leader
+        .wal()
+        .replication_frame_with_switch(Some(closed_generation), behind.offset, 9)
+        .unwrap();
+    assert!(!frame.needs_resync);
+    assert_eq!(frame.generation, closed_generation);
+    let current_len = leader.position().1;
+    assert_eq!(
+        frame.total_records,
+        closed_len + current_len,
+        "what is left in both generations"
+    );
+    assert!(!frame.wal_lines.is_empty());
+    behind.sync(&leader);
+    assert_eq!((behind.resyncs, behind.switches), (0, 1));
+    behind.assert_matches(&leader, "behind follower");
+
+    // Old followers (no switch support) are still sent to a resync.
+    let frame = leader
+        .wal()
+        .replication_frame_from(Some(closed_generation), 3, 10)
+        .unwrap();
+    assert!(frame.needs_resync);
+
+    // Ahead of the closed generation's end, an unknown generation, no
+    // generation: resync.
+    for (what, generation, offset) in [
+        ("ahead", Some(closed_generation), closed_len + 1),
+        ("unknown", Some(12345), 0),
+        ("fresh", None, 0),
     ] {
         let frame = leader
             .wal()
-            .replication_frame_with_switch(Some(closed_generation), offset, 10)
+            .replication_frame_with_switch(generation, offset, 10)
             .unwrap();
         assert!(frame.needs_resync, "{what}");
         assert!(frame.switched_from.is_none(), "{what}");
         assert!(frame.wal_lines.is_empty(), "{what}");
     }
-    // Unknown generation and no generation at all.
+
+    // After a restart the closed file is still served.
+    drop(leader);
+    let mut leader = Leader::open(dir.path());
+    let mut late = Follower::open(&dir.path().join("late"));
+    late.generation = Some(closed_generation);
+    // The late follower holds the closed generation's first lines.
+    let first = leader
+        .wal()
+        .replication_frame_with_switch(Some(closed_generation), 0, 7)
+        .unwrap();
+    assert_eq!(first.generation, closed_generation);
+    let keep = complete_group_prefix_len(&first.wal_lines);
+    late.wal
+        .append_replicated_lines(&first.wal_lines[..keep])
+        .unwrap();
+    late.store
+        .apply_replicated_lines(&first.wal_lines[..keep], true)
+        .unwrap();
+    late.offset = keep;
+    late.sync(&leader);
+    assert_eq!((late.resyncs, late.switches), (0, 1));
+    late.assert_matches(&leader, "late follower after a leader restart");
+
+    // The next checkpoint replaces the closed file: a follower still in the
+    // older generation resyncs.
+    leader.write_n(1);
+    leader.checkpoint();
     let frame = leader
         .wal()
-        .replication_frame_with_switch(Some(12345), closed_len, 10)
+        .replication_frame_with_switch(Some(closed_generation), 2, 10)
         .unwrap();
     assert!(frame.needs_resync);
-    let frame = leader
-        .wal()
-        .replication_frame_with_switch(None, 0, 10)
-        .unwrap();
-    assert!(
-        frame.needs_resync,
-        "a snapshot exists: a fresh follower resyncs"
-    );
-
-    // A follower that was behind converges through a resync, never by
-    // skipping records.
-    let mut follower = Follower::open(&dir.path().join("f"));
-    leader.checkpoint();
-    follower.sync(&leader);
-    follower.assert_matches(&leader, "behind follower");
-    assert_eq!(follower.resyncs, 1);
+    let closed_files = fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".closed.")
+        })
+        .count();
+    assert_eq!(closed_files, 1, "only the newest closed generation is kept");
 }
 
 #[test]
