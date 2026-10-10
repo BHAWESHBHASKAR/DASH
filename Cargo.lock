@@ -2381,6 +2381,7 @@ dependencies = [
  "chrono",
  "dash-observe",
  "embeddings",
+ "encryption",
  "graph",
  "hex",
  "rand 0.8.7",

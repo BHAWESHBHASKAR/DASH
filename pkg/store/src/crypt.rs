@@ -383,3 +383,134 @@ impl PlainFile {
         }
     }
 }
+
+/// The data a service keeps on disk, for [`check_encryption_state`].
+#[derive(Debug, Clone, Default)]
+pub struct EncryptionStatePaths {
+    /// The WAL; its siblings (`<wal>.*`) and `<wal>.exports/` are checked
+    /// too.
+    pub wal: Option<std::path::PathBuf>,
+    /// The redb mirror.
+    pub redb: Option<std::path::PathBuf>,
+    /// The persisted vector index.
+    pub vector_index: Option<std::path::PathBuf>,
+    /// Segment roots (checked two levels deep).
+    pub segment_dirs: Vec<std::path::PathBuf>,
+}
+
+fn collect_files(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 {
+                collect_files(&path, depth - 1, out);
+            }
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Fails (fail closed) when a data file is encrypted and `keyring` cannot
+/// decrypt it: no keyring configured, or a KEK id the keyring does not hold.
+/// Runs before anything is opened, so the error names the file and its key
+/// id instead of surfacing later as a replay error or a silent fallback.
+/// Returns the number of encrypted files found.
+pub fn check_encryption_state(
+    keyring: Option<&Arc<Keyring>>,
+    paths: &EncryptionStatePaths,
+) -> Result<usize, String> {
+    let mut files = Vec::new();
+    if let Some(wal) = &paths.wal {
+        if wal.is_file() {
+            files.push(wal.clone());
+        }
+        if let (Some(name), Some(dir)) = (wal.file_name(), wal.parent()) {
+            let prefix = format!("{}.", name.to_string_lossy());
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with(&prefix) {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            collect_files(&path, 0, &mut files);
+                        } else {
+                            files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(path) = &paths.vector_index
+        && path.is_file()
+    {
+        files.push(path.clone());
+    }
+    for dir in &paths.segment_dirs {
+        collect_files(dir, 2, &mut files);
+    }
+    let mut encrypted = 0usize;
+    for path in files {
+        let name = path.to_string_lossy();
+        if name.ends_with(".tmp") || name.ends_with(".gen") || name.ends_with(".transitions") {
+            continue;
+        }
+        // A file that cannot be classified (for example a torn header of a
+        // WAL being created) is left to the code that opens it.
+        let Ok(format) = encryption::sniff_file(&path) else {
+            continue;
+        };
+        let Some(key_id) = format.key_id() else {
+            continue;
+        };
+        encrypted += 1;
+        let what = path.display().to_string();
+        match keyring {
+            None => {
+                return Err(EncryptionError::NotConfigured {
+                    what,
+                    key_id: key_id.to_string(),
+                }
+                .to_string());
+            }
+            Some(keyring) if !keyring.key_ids().iter().any(|id| id == key_id) => {
+                return Err(EncryptionError::UnknownKey {
+                    what,
+                    key_id: key_id.to_string(),
+                    configured: keyring.key_ids().join(", "),
+                }
+                .to_string());
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(path) = &paths.redb
+        && path.is_file()
+    {
+        let disk = crate::DiskBackedStore::new_with_keyring(path, keyring.cloned())?;
+        if disk.encryption_key_id().is_some() {
+            encrypted += 1;
+        }
+    }
+    Ok(encrypted)
+}
+
+/// Reads the keyring from `DASH_ENCRYPTION_KEY_FILE` /
+/// `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, installs it for the process and
+/// checks the existing files with [`check_encryption_state`]. Services call
+/// this at startup before opening any data file and exit on `Err`.
+pub fn init_encryption_from_env(paths: &EncryptionStatePaths) -> Result<KeyringRef, String> {
+    let keyring = encryption::keyring_from_env().map_err(|e| e.to_string())?;
+    encryption::install(keyring.clone());
+    check_encryption_state(keyring.as_ref(), paths)?;
+    Ok(keyring)
+}
