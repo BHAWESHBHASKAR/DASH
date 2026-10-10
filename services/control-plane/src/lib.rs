@@ -17,6 +17,7 @@ use metadata_router::{
     promote_replica_to_leader, render_shard_placements_csv,
 };
 
+pub mod ingest_failover;
 pub mod leader;
 pub mod server;
 
@@ -315,6 +316,8 @@ pub struct ControlPlanePlacementState {
     synced_lease_epoch: Option<u64>,
     /// Failed-token throttle shared by every request served from this state.
     auth_throttle: Arc<AuthFailureThrottle>,
+    /// Automatic failover of the ingestion leader (ADR 0006), when enabled.
+    ingest_failover: Option<ingest_failover::IngestFailover>,
 }
 
 impl std::fmt::Debug for ControlPlanePlacementState {
@@ -357,6 +360,87 @@ impl ControlPlanePlacementState {
     pub fn with_auth(mut self, auth: AuthMode) -> Self {
         self.auth = auth;
         self
+    }
+
+    pub fn with_ingest_failover(mut self, failover: ingest_failover::IngestFailover) -> Self {
+        self.ingest_failover = Some(failover);
+        self
+    }
+
+    pub fn ingest_failover(&self) -> Option<&ingest_failover::IngestFailover> {
+        self.ingest_failover.as_ref()
+    }
+
+    /// Handle an ingestion heartbeat: run the failover state machine and
+    /// move the placements of the old leader to the new one. Placement is
+    /// reconciled on every heartbeat, so a crash between persisting the
+    /// failover record and the placement is repaired by the next one.
+    pub fn ingest_heartbeat(
+        &mut self,
+        report: ingest_failover::HeartbeatReport,
+    ) -> Result<ingest_failover::HeartbeatReply, String> {
+        let failover = self
+            .ingest_failover
+            .as_mut()
+            .ok_or_else(|| "ingest failover is disabled".to_string())?;
+        let now = failover.now_ms();
+        let (reply, promotion) = failover.heartbeat(report, now)?;
+        if let Some(promotion) = promotion {
+            eprintln!(
+                "control-plane: ingestion leader {} promoted at term {} (previous leader: {}{})",
+                promotion.new_leader,
+                promotion.term,
+                promotion.old_leader.as_deref().unwrap_or("none"),
+                promotion
+                    .after_lapse_ms
+                    .map(|ms| format!(", {ms} ms after its lease lapsed"))
+                    .unwrap_or_default()
+            );
+        }
+        self.reconcile_ingest_placements()?;
+        Ok(reply)
+    }
+
+    /// Make the failover leader the leader of every placement it is a
+    /// replica of (bumping those placement epochs). Idempotent.
+    pub fn reconcile_ingest_placements(&mut self) -> Result<bool, String> {
+        let Some(leader) = self
+            .ingest_failover
+            .as_ref()
+            .and_then(|failover| failover.leader_node_id())
+            .map(str::to_string)
+        else {
+            return Ok(false);
+        };
+        let previous = self.placements.clone();
+        let mut changed = false;
+        for placement in &mut self.placements {
+            let has_leader_replica = placement
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == leader);
+            let already = placement
+                .replicas
+                .iter()
+                .any(|replica| replica.node_id == leader && replica.role == ReplicaRole::Leader);
+            if !has_leader_replica || already {
+                continue;
+            }
+            // The failover leader is evidently alive.
+            let _ = metadata_router::set_replica_health(
+                placement,
+                &leader,
+                metadata_router::ReplicaHealth::Healthy,
+            );
+            if promote_replica_to_leader(placement, &leader).is_ok() {
+                changed = true;
+            }
+        }
+        if changed && let Err(err) = self.persist_if_configured() {
+            self.placements = previous;
+            return Err(format!("failed persisting placement after failover: {err}"));
+        }
+        Ok(changed)
     }
 
     pub fn with_auth_token(self, token: impl Into<String>) -> Self {
@@ -532,6 +616,11 @@ impl ControlPlanePlacementState {
             self.synced_lease_epoch = None;
             self.reload_from_disk()
                 .map_err(|err| format!("failed syncing placements after acquiring lease: {err}"))?;
+            if let Some(failover) = self.ingest_failover.as_mut() {
+                failover.reload().map_err(|err| {
+                    format!("failed syncing ingest failover state after acquiring lease: {err}")
+                })?;
+            }
             self.synced_lease_epoch = Some(token);
         }
         Ok(())
@@ -1041,6 +1130,9 @@ pub fn http_route_label(_method: &str, path: &str) -> &'static str {
         "/v1/control-plane/placement" => "placement",
         "/v1/control-plane/replica-lag" => "replica_lag",
         "/v1/control-plane/failover/promote" => "failover_promote",
+        "/v1/control-plane/ingest" => "ingest_failover",
+        "/v1/control-plane/ingest/heartbeat" => "ingest_heartbeat",
+        "/v1/control-plane/ingest/step-down" => "ingest_step_down",
         _ => "other",
     }
 }
@@ -1097,6 +1189,40 @@ fn render_metrics(guard: &ControlPlanePlacementState) -> String {
         "Shard placements known to this node.",
         guard.placements().len() as f64,
     );
+    if let Some(failover) = guard.ingest_failover() {
+        w.gauge(
+            "dash_control_plane_ingest_term",
+            "Current term (fencing token) of the ingestion leader.",
+            failover.term() as f64,
+        );
+        w.gauge(
+            "dash_control_plane_ingest_leader_known",
+            "1 when an ingestion leader is assigned.",
+            f64::from(u8::from(failover.leader_node_id().is_some())),
+        );
+        w.gauge(
+            "dash_control_plane_ingest_members",
+            "Ingestion nodes heard from recently.",
+            failover.member_count() as f64,
+        );
+        w.counter(
+            "dash_control_plane_ingest_promotions_total",
+            "Ingestion leader promotions performed by this process.",
+            failover.promotions_total() as f64,
+        );
+        w.gauge(
+            "dash_control_plane_ingest_failover_blocked",
+            "1 when the ingestion leader lease lapsed and no member can be promoted yet.",
+            f64::from(u8::from(failover.blocked().is_some())),
+        );
+        if let Some(ms) = failover.last_failover_ms() {
+            w.gauge(
+                "dash_control_plane_ingest_last_failover_seconds",
+                "Time between the old leader's lease lapsing and the last promotion.",
+                ms as f64 / 1000.0,
+            );
+        }
+    }
     let mut body = w.finish();
     body.push_str(&dash_observe::http::render_service_metrics(
         SERVICE_NAME,
@@ -1331,6 +1457,82 @@ fn handle_request(
                 Err(reason) => HttpResponse::error(409, &reason),
             }
         }
+        ("POST", "/v1/control-plane/ingest/heartbeat") => {
+            let report = match ingest_failover::parse_heartbeat_query(&query) {
+                Ok(report) => report,
+                Err(reason) => return HttpResponse::bad_request(&reason),
+            };
+            let mut guard = match lock_state(state) {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            };
+            if guard.ingest_failover().is_none() {
+                return HttpResponse::not_found("ingest failover is disabled");
+            }
+            let token =
+                match require_leader(&mut guard, "only the leader coordinates ingest failover") {
+                    Ok(token) => token,
+                    Err(response) => return response,
+                };
+            match guard.ingest_heartbeat(report) {
+                Ok(reply) => HttpResponse::ok_json(reply.to_json()).marked_leader(token),
+                Err(reason) if reason.starts_with("failed") => HttpResponse::error(500, &reason),
+                Err(reason) => HttpResponse::bad_request(&reason),
+            }
+        }
+        ("GET", "/v1/control-plane/ingest") => {
+            let mut guard = match lock_state(state) {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            };
+            if guard.ingest_failover().is_none() {
+                return HttpResponse::not_found("ingest failover is disabled");
+            }
+            let token = match require_leader(&mut guard, "query the control-plane leader") {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
+            let Some(failover) = guard.ingest_failover() else {
+                return HttpResponse::not_found("ingest failover is disabled");
+            };
+            HttpResponse::ok_json(failover.status_json(failover.now_ms())).marked_leader(token)
+        }
+        ("POST", "/v1/control-plane/ingest/step-down") => {
+            let prefer = query
+                .get("prefer")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let mut guard = match lock_state(state) {
+                Ok(guard) => guard,
+                Err(response) => return response,
+            };
+            if guard.ingest_failover().is_none() {
+                return HttpResponse::not_found("ingest failover is disabled");
+            }
+            let token =
+                match require_leader(&mut guard, "only the leader coordinates ingest failover") {
+                    Ok(token) => token,
+                    Err(response) => return response,
+                };
+            let Some(failover) = guard.ingest_failover.as_mut() else {
+                return HttpResponse::not_found("ingest failover is disabled");
+            };
+            match failover.step_down(prefer) {
+                Ok(deposed) => HttpResponse::ok_json(format!(
+                    "{{\"status\":\"ok\",\"stepping_down\":\"{}\",\"term\":{}}}",
+                    json_escape(&deposed),
+                    failover.term()
+                ))
+                .marked_leader(token),
+                Err(reason) => HttpResponse::error(409, &reason),
+            }
+        }
+        (_, "/v1/control-plane/ingest") => {
+            HttpResponse::method_not_allowed("only GET is supported")
+        }
+        (_, "/v1/control-plane/ingest/heartbeat") | (_, "/v1/control-plane/ingest/step-down") => {
+            HttpResponse::method_not_allowed("only POST is supported")
+        }
         ("POST", "/v1/control-plane/replica-lag") => {
             let tenant_id = match query.get("tenant_id") {
                 Some(value) if !value.trim().is_empty() => value.trim(),
@@ -1422,7 +1624,7 @@ fn parse_optional_u64(value: Option<&String>) -> Result<Option<u64>, String> {
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Durable atomic replace: temp file, fsync, rename, fsync of the directory.
-fn persist_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn persist_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),

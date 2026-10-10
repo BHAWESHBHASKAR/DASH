@@ -119,6 +119,67 @@ fn main() {
         }
     }
 
+    // Automatic failover of the ingestion leader (ADR 0006).
+    if matches!(
+        std::env::var("DASH_CONTROL_PLANE_INGEST_FAILOVER")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true")
+    ) {
+        let parse_ms = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        let ingest_state_path = std::env::var("DASH_CONTROL_PLANE_INGEST_STATE_PATH")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                state.persistence_state_path().map(|path| {
+                    let mut derived = path.as_os_str().to_owned();
+                    derived.push(".ingest-failover");
+                    std::path::PathBuf::from(derived)
+                })
+            });
+        if ingest_state_path.is_none() {
+            eprintln!(
+                "WARNING: ingest failover runs without DASH_CONTROL_PLANE_INGEST_STATE_PATH or \
+                 DASH_CONTROL_PLANE_STATE_PATH: the ingestion term is kept in memory only"
+            );
+        }
+        let config = control_plane::ingest_failover::IngestFailoverConfig {
+            lease_ms: parse_ms(
+                "DASH_CONTROL_PLANE_INGEST_LEASE_MS",
+                control_plane::ingest_failover::DEFAULT_LEASE_MS,
+            ),
+            grace_ms: parse_ms(
+                "DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS",
+                control_plane::ingest_failover::DEFAULT_GRACE_MS,
+            ),
+            state_path: ingest_state_path,
+        };
+        let failover = control_plane::ingest_failover::IngestFailover::new(
+            config.clone(),
+            control_plane::ingest_failover::monotonic_clock(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("control-plane failed loading ingest failover state: {err}");
+            std::process::exit(2);
+        });
+        eprintln!(
+            "control-plane: ingest failover enabled (lease {} ms, grace {} ms, term {})",
+            config.lease_ms,
+            config.grace_ms,
+            failover.term()
+        );
+        state = state.with_ingest_failover(failover);
+    }
+
     // Configure leader election when a lease path is provided. Without a lease
     // path the control-plane is standalone and always behaves as leader.
     let state = if let Some(lease_path) = lease_path {
