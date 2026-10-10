@@ -30,6 +30,8 @@ use crate::StoreError;
 
 mod replication_export;
 mod replication_index;
+#[cfg(test)]
+mod replication_tests;
 
 pub(crate) use replication_export::ExportFreeze;
 pub use replication_export::{

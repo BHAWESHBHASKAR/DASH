@@ -358,6 +358,18 @@ impl ReplicationExportStore {
         wal: &Mutex<FileWal>,
         avoid: Option<&str>,
     ) -> Result<ReplicationExportManifest, StoreError> {
+        self.begin_with_hook(wal, avoid, &mut || {})
+    }
+
+    /// [`Self::begin`] that runs `after_freeze` once the view is frozen and
+    /// the WAL lock released, before the export file is written (tests use
+    /// it to checkpoint the leader in between).
+    pub(crate) fn begin_with_hook(
+        &self,
+        wal: &Mutex<FileWal>,
+        avoid: Option<&str>,
+        after_freeze: &mut dyn FnMut(),
+    ) -> Result<ReplicationExportManifest, StoreError> {
         let _build = self.build.lock().unwrap_or_else(|e| e.into_inner());
         self.prune();
         fs::create_dir_all(&self.dir)?;
@@ -394,6 +406,7 @@ impl ReplicationExportStore {
                 }
             }
         };
+        after_freeze();
         let built = self.build_export(&id, frozen, &wal_tmp);
         let _ = fs::remove_file(&wal_tmp);
         let manifest = match built {
