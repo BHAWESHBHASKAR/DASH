@@ -1,10 +1,12 @@
 use schema::Claim;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions, create_dir_all, read_dir, remove_file, rename},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use store::{InMemoryStore, StoreIndexStats};
@@ -77,11 +79,24 @@ pub struct SegmentMaintenanceStats {
     pub tenant_dirs_scanned: usize,
     pub tenant_manifests_found: usize,
     pub pruned_file_count: usize,
+    pub tmp_files_removed: usize,
+    pub tenant_error_count: usize,
+}
+
+/// Outcome of one maintenance pass: aggregate stats plus the per-tenant
+/// failures that were isolated (one tenant failing never aborts the pass).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SegmentMaintenanceReport {
+    pub stats: SegmentMaintenanceStats,
+    pub tenant_errors: Vec<(String, SegmentStoreError)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentStoreError {
     Io(String),
+    /// A segment file referenced by a manifest no longer exists (typically
+    /// pruned after a newer manifest was published).
+    MissingFile(String),
     Parse(String),
     Integrity(String),
 }
@@ -94,8 +109,207 @@ impl From<std::io::Error> for SegmentStoreError {
 
 const MANIFEST_FILE_NAME: &str = "segments.manifest";
 const MANIFEST_HEADER: &str = "DASHSEG-MANIFEST\t1";
+/// Names the tenant that owns a segment directory (see [`write_tenant_marker`]).
+const TENANT_MARKER_FILE_NAME: &str = "segments.tenant";
+const TENANT_MARKER_HEADER: &str = "DASHSEG-TENANT\t1";
 const SEGMENT_FILE_SUFFIX: &str = ".seg";
 const SEGMENT_HEADER: &str = "DASHSEG\t1";
+const FINGERPRINT_FILE_NAME: &str = "segments.fingerprint";
+const FINGERPRINT_HEADER: &str = "DASHSEG-FP\t1";
+const TMP_SUFFIX: &str = ".tmp";
+/// Default grace period before an unreferenced segment file may be deleted.
+pub const DEFAULT_PRUNE_GRACE: Duration = Duration::from_secs(60);
+/// How many times a reader re-reads the manifest when a segment file vanishes
+/// underneath it (a newer manifest was published and the old files pruned).
+const MANIFEST_RELOAD_ATTEMPTS: usize = 3;
+const MAX_PLAIN_DIR_NAME_LEN: usize = 96;
+const HASHED_DIR_PREFIX_LEN: usize = 48;
+const HASHED_DIR_HASH_HEX_LEN: usize = 32;
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Maps a tenant id to a single, traversal-safe, collision-free directory name.
+///
+/// Every byte outside `[a-z0-9-]` (including upper-case letters, so the mapping
+/// stays injective on case-insensitive file systems, and `_`, `.`, `/`) becomes
+/// `_xx` (lower-case hex). Because the escape introducer `_` is itself escaped,
+/// the mapping is injective. Names longer than 96 characters are replaced by a
+/// readable prefix plus `~` plus 128 bits of SHA-256 of the full id; `~` never
+/// appears in escaped names so the two forms cannot collide. The empty id maps
+/// to `_`, which no escaped name can equal.
+pub fn tenant_dir_name(tenant_id: &str) -> String {
+    let mut tokens: Vec<String> = Vec::with_capacity(tenant_id.len());
+    for byte in tenant_id.bytes() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'-' => tokens.push((byte as char).to_string()),
+            _ => tokens.push(format!("_{byte:02x}")),
+        }
+    }
+    let total: usize = tokens.iter().map(String::len).sum();
+    if total == 0 {
+        return "_".to_string();
+    }
+    if total <= MAX_PLAIN_DIR_NAME_LEN {
+        return tokens.concat();
+    }
+    let mut prefix = String::new();
+    for token in &tokens {
+        if prefix.len() + token.len() > HASHED_DIR_PREFIX_LEN {
+            break;
+        }
+        prefix.push_str(token);
+    }
+    let digest = Sha256::digest(tenant_id.as_bytes());
+    let mut hex = String::with_capacity(HASHED_DIR_HASH_HEX_LEN);
+    for byte in digest.iter().take(HASHED_DIR_HASH_HEX_LEN / 2) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("{prefix}~{hex}")
+}
+
+/// The lossy sanitizer used before `tenant_dir_name` existed. Only kept to find
+/// and migrate legacy directories.
+pub fn legacy_tenant_dir_name(tenant_id: &str) -> String {
+    let mut out: String = tenant_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// Returns `<root>/<tenant_dir_name>`, first migrating (renaming, atomically)
+/// a legacy sanitized directory into place when the new one does not exist.
+/// Safe to call concurrently from several threads or processes: `rename` is
+/// atomic and losers of the race simply observe the migrated directory.
+///
+/// Legacy names were ambiguous (`acme.corp` and `acme_corp` shared one
+/// directory), so a legacy directory is only migrated when it carries a tenant
+/// marker (`segments.tenant`) naming exactly this tenant. Directories written
+/// by older versions have no marker: they are left untouched with a warning
+/// and the tenant starts with a fresh directory. Segment data is derived and is
+/// rewritten wholesale on the next publish, so nothing is lost.
+pub fn resolve_tenant_dir(root_dir: &Path, tenant_id: &str) -> PathBuf {
+    let new_dir = root_dir.join(tenant_dir_name(tenant_id));
+    let legacy_name = legacy_tenant_dir_name(tenant_id);
+    if legacy_name == tenant_dir_name(tenant_id) {
+        return new_dir;
+    }
+    let legacy_dir = root_dir.join(&legacy_name);
+    if legacy_dir.is_dir() && !new_dir.exists() {
+        match read_tenant_marker(&legacy_dir) {
+            Ok(Some(owner)) if owner == tenant_id => {}
+            Ok(Some(_)) => return new_dir,
+            Ok(None) => {
+                warn_legacy_dir_not_migrated(&legacy_dir);
+                return new_dir;
+            }
+            Err(err) => {
+                eprintln!(
+                    "indexer: legacy segment dir '{}' has an unreadable tenant marker ({err:?}); \
+                     not migrating it",
+                    legacy_dir.display()
+                );
+                return new_dir;
+            }
+        }
+        match rename(&legacy_dir, &new_dir) {
+            Ok(()) => {
+                let _ = sync_dir(root_dir);
+                eprintln!(
+                    "indexer: migrated legacy segment dir '{}' -> '{}'",
+                    legacy_dir.display(),
+                    new_dir.display()
+                );
+            }
+            Err(err) if legacy_dir.exists() && !new_dir.exists() => {
+                eprintln!(
+                    "indexer: failed to migrate legacy segment dir '{}' -> '{}': {err}",
+                    legacy_dir.display(),
+                    new_dir.display()
+                );
+            }
+            Err(_) => {}
+        }
+    }
+    new_dir
+}
+
+fn warn_legacy_dir_not_migrated(legacy_dir: &Path) {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first = WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut warned| warned.insert(legacy_dir.to_path_buf()))
+        .unwrap_or(true);
+    if first {
+        eprintln!(
+            "indexer: legacy segment dir '{}' has no tenant marker, so its owner is ambiguous; \
+             leaving it untouched and rebuilding the tenant's segments in a new directory",
+            legacy_dir.display()
+        );
+    }
+}
+
+/// Records which tenant owns `tenant_dir` (`segments.tenant`), creating the
+/// directory when needed. Idempotent for the same tenant; fails when the
+/// directory already belongs to a different tenant.
+pub fn write_tenant_marker(tenant_dir: &Path, tenant_id: &str) -> Result<(), SegmentStoreError> {
+    create_dir_all(tenant_dir)?;
+    if let Some(existing) = read_tenant_marker(tenant_dir)? {
+        return if existing == tenant_id {
+            Ok(())
+        } else {
+            Err(SegmentStoreError::Integrity(format!(
+                "segment directory '{}' belongs to a different tenant",
+                tenant_dir.display()
+            )))
+        };
+    }
+    let path = tenant_dir.join(TENANT_MARKER_FILE_NAME);
+    let tmp_path = temp_path(&path);
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        let body = format!("{TENANT_MARKER_HEADER}\n{}\n", escape_field(tenant_id));
+        write_body(&mut file, &body)?;
+        file.sync_all()?;
+    }
+    rename(tmp_path, path)?;
+    sync_dir(tenant_dir)?;
+    Ok(())
+}
+
+/// The tenant recorded by [`write_tenant_marker`], or `None` for directories
+/// written before markers existed.
+pub fn read_tenant_marker(tenant_dir: &Path) -> Result<Option<String>, SegmentStoreError> {
+    let raw = match read_body(&tenant_dir.join(TENANT_MARKER_FILE_NAME)) {
+        Ok(raw) => raw,
+        Err(SegmentStoreError::MissingFile(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut lines = raw.lines();
+    if lines.next() != Some(TENANT_MARKER_HEADER) {
+        return Err(SegmentStoreError::Parse(
+            "tenant marker header is invalid".to_string(),
+        ));
+    }
+    let Some(tenant) = lines.next() else {
+        return Err(SegmentStoreError::Parse(
+            "tenant marker has no tenant id".to_string(),
+        ));
+    };
+    unescape_field(tenant).map(Some)
+}
 
 pub fn classify_claim_tier(claim: &Claim) -> Tier {
     if claim.confidence >= 0.85 {
@@ -142,7 +356,11 @@ pub fn build_segments(claims: &[Claim], max_segment_size: usize) -> Vec<Segment>
 
     let mut out = Vec::new();
     for tier in [Tier::Hot, Tier::Warm, Tier::Cold] {
-        let ids = buckets.remove(&tier).unwrap_or_default();
+        let mut ids = buckets.remove(&tier).unwrap_or_default();
+        // Deterministic membership: identical claim sets must produce
+        // byte-identical segments regardless of store iteration order.
+        ids.sort_unstable();
+        ids.dedup();
         for (idx, chunk) in ids.chunks(max_segment_size).enumerate() {
             out.push(Segment {
                 segment_id: format!("{:?}-{}", tier, idx).to_ascii_lowercase(),
@@ -175,6 +393,8 @@ pub fn plan_tier_compaction(
     for segment in &selected {
         merged_ids.extend(segment.claim_ids.iter().cloned());
     }
+    merged_ids.sort_unstable();
+    merged_ids.dedup();
 
     Some(CompactionPlan {
         tier: tier.clone(),
@@ -230,16 +450,25 @@ pub fn persist_segments_atomic(
     segments: &[Segment],
 ) -> Result<SegmentManifest, SegmentStoreError> {
     create_dir_all(root_dir)?;
+    let previous_manifest = load_manifest(root_dir).ok().flatten();
     let mut entries = Vec::with_capacity(segments.len());
     for segment in segments {
         let checksum = segment_checksum(&segment.tier, &segment.claim_ids);
-        let file_name = format!(
-            "{}-{:016x}{}",
-            sanitize_segment_id(&segment.segment_id),
-            stable_hash64(&segment.segment_id),
-            SEGMENT_FILE_SUFFIX
-        );
-        let path = root_dir.join(&file_name);
+        // Every publish writes brand-new files; a file a live reader may hold
+        // open is never overwritten.
+        let (file_name, path) = loop {
+            let file_name = format!(
+                "{}-{:016x}-{:016x}{}",
+                sanitize_segment_id(&segment.segment_id),
+                stable_hash64(&segment.segment_id),
+                next_generation(),
+                SEGMENT_FILE_SUFFIX
+            );
+            let path = root_dir.join(&file_name);
+            if !path.exists() {
+                break (file_name, path);
+            }
+        };
         write_segment_file_atomic(&path, segment, checksum)?;
         entries.push(SegmentManifestEntry {
             segment_id: segment.segment_id.clone(),
@@ -249,8 +478,24 @@ pub fn persist_segments_atomic(
             checksum,
         });
     }
+    sync_dir(root_dir)?;
     let manifest = SegmentManifest { entries };
     write_manifest_atomic(root_dir, &manifest)?;
+
+    // Files dropped by this publish become stale now: stamp them so the
+    // pruning grace period counts from the swap, not from file creation.
+    if let Some(previous) = previous_manifest {
+        let live: HashSet<&str> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.file_name.as_str())
+            .collect();
+        for entry in &previous.entries {
+            if !live.contains(entry.file_name.as_str()) {
+                touch_file(&root_dir.join(&entry.file_name));
+            }
+        }
+    }
     Ok(manifest)
 }
 
@@ -263,7 +508,7 @@ pub fn prune_unreferenced_segment_files(
         root_dir,
         active_manifest,
         previous_manifest,
-        Duration::ZERO,
+        DEFAULT_PRUNE_GRACE,
     )
 }
 
@@ -273,6 +518,9 @@ pub fn prune_unreferenced_segment_files_with_min_stale_age(
     previous_manifest: Option<&SegmentManifest>,
     min_stale_age: Duration,
 ) -> Result<usize, SegmentStoreError> {
+    // Re-read the on-disk manifest: a publish may have swapped it after the
+    // caller loaded `active_manifest`, and its files must never be pruned.
+    let current_on_disk = load_manifest(root_dir).ok().flatten();
     let mut keep_files: HashSet<&str> = active_manifest
         .entries
         .iter()
@@ -285,6 +533,9 @@ pub fn prune_unreferenced_segment_files_with_min_stale_age(
                 .iter()
                 .map(|entry| entry.file_name.as_str()),
         );
+    }
+    if let Some(current) = current_on_disk.as_ref() {
+        keep_files.extend(current.entries.iter().map(|entry| entry.file_name.as_str()));
     }
 
     let mut removed_total = 0usize;
@@ -323,35 +574,259 @@ pub fn prune_unreferenced_segment_files_with_min_stale_age(
     Ok(removed_total)
 }
 
-pub fn maintain_segment_root(
+/// Removes `*.tmp` files left behind by crashed publishes. Only files whose
+/// last modification is at least `min_age` old are removed so a publish that
+/// is running right now (possibly in another process) is not disturbed.
+pub fn cleanup_stale_tmp_files(dir: &Path, min_age: Duration) -> Result<usize, SegmentStoreError> {
+    let mut removed = 0usize;
+    for entry in read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(TMP_SUFFIX) || !path.is_file() {
+            continue;
+        }
+        if min_age > Duration::ZERO
+            && let Ok(modified) = entry.metadata()?.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed < min_age
+        {
+            continue;
+        }
+        match remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(SegmentStoreError::Io(err.to_string())),
+        }
+    }
+    Ok(removed)
+}
+
+/// Maintenance pass over every tenant directory. A failure in one tenant is
+/// recorded in the report and does not stop the other tenants; only a failure
+/// to enumerate the root itself is returned as `Err`.
+pub fn maintain_segment_root_report(
     root_dir: &Path,
     min_stale_age: Duration,
-) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
+) -> Result<SegmentMaintenanceReport, SegmentStoreError> {
     create_dir_all(root_dir)?;
-    let mut stats = SegmentMaintenanceStats::default();
+    let mut report = SegmentMaintenanceReport::default();
     for entry in read_dir(root_dir)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                report
+                    .tenant_errors
+                    .push(("<unreadable-entry>".to_string(), err.into()));
+                continue;
+            }
+        };
         let tenant_dir = entry.path();
         if !tenant_dir.is_dir() {
             continue;
         }
-        stats.tenant_dirs_scanned += 1;
-
-        let manifest = match load_manifest(&tenant_dir)? {
-            Some(manifest) => manifest,
-            None => continue,
-        };
-        let _ = load_segments_from_manifest(&tenant_dir, &manifest)?;
-        stats.tenant_manifests_found += 1;
-        let pruned = prune_unreferenced_segment_files_with_min_stale_age(
-            &tenant_dir,
-            &manifest,
-            None,
-            min_stale_age,
-        )?;
-        stats.pruned_file_count += pruned;
+        let tenant_name = entry.file_name().to_string_lossy().to_string();
+        report.stats.tenant_dirs_scanned += 1;
+        if let Err(err) = maintain_tenant_dir(&tenant_dir, min_stale_age, &mut report.stats) {
+            report.tenant_errors.push((tenant_name, err));
+        }
     }
-    Ok(stats)
+    report.stats.tenant_error_count = report.tenant_errors.len();
+    Ok(report)
+}
+
+fn maintain_tenant_dir(
+    tenant_dir: &Path,
+    min_stale_age: Duration,
+    stats: &mut SegmentMaintenanceStats,
+) -> Result<(), SegmentStoreError> {
+    stats.tmp_files_removed += cleanup_stale_tmp_files(tenant_dir, min_stale_age)?;
+    let Some((manifest, _segments)) = load_current_segments(tenant_dir)? else {
+        return Ok(());
+    };
+    stats.tenant_manifests_found += 1;
+    stats.pruned_file_count += prune_unreferenced_segment_files_with_min_stale_age(
+        tenant_dir,
+        &manifest,
+        None,
+        min_stale_age,
+    )?;
+    Ok(())
+}
+
+/// Backwards-compatible wrapper: per-tenant failures are isolated and counted
+/// in `tenant_error_count` rather than aborting the pass.
+pub fn maintain_segment_root(
+    root_dir: &Path,
+    min_stale_age: Duration,
+) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
+    Ok(maintain_segment_root_report(root_dir, min_stale_age)?.stats)
+}
+
+/// Strict variant: runs the full pass, then fails if any tenant failed.
+pub fn maintain_segment_root_strict(
+    root_dir: &Path,
+    min_stale_age: Duration,
+) -> Result<SegmentMaintenanceStats, SegmentStoreError> {
+    let report = maintain_segment_root_report(root_dir, min_stale_age)?;
+    if let Some((tenant, err)) = report.tenant_errors.first() {
+        return Err(SegmentStoreError::Integrity(format!(
+            "{} tenant(s) failed maintenance, first: '{tenant}': {err:?}",
+            report.tenant_errors.len()
+        )));
+    }
+    Ok(report.stats)
+}
+
+/// Loads the current manifest and its segments. If a segment file disappears
+/// mid-read (a newer manifest was published and the old files were pruned) the
+/// manifest is reloaded and the read retried.
+pub fn load_current_segments(
+    root_dir: &Path,
+) -> Result<Option<(SegmentManifest, Vec<Segment>)>, SegmentStoreError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let Some(manifest) = load_manifest(root_dir)? else {
+            return Ok(None);
+        };
+        match load_segments_from_manifest(root_dir, &manifest) {
+            Ok(segments) => return Ok(Some((manifest, segments))),
+            Err(SegmentStoreError::MissingFile(_)) if attempt < MANIFEST_RELOAD_ATTEMPTS => {
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Cheap, order-independent fingerprint of everything that determines segment
+/// contents (claim ids and their tiers) plus the publish settings that shape them (`config_key`). Change detection
+/// only; this is not a cryptographic hash.
+pub fn claim_set_fingerprint(claims: &[Claim], config_key: &str) -> u64 {
+    let mut sum = 0u64;
+    let mut xor = 0u64;
+    for claim in claims {
+        let mut h = stable_hash64(&claim.claim_id);
+        h = fnv1a_update(h, b"|");
+        h = fnv1a_update(h, format_tier(&classify_claim_tier(claim)).as_bytes());
+        let h = mix64(h);
+        sum = sum.wrapping_add(h);
+        xor ^= h.rotate_left(17);
+    }
+    let mut state = stable_hash64(config_key);
+    for word in [claims.len() as u64, sum, xor] {
+        state = fnv1a_update(state, &word.to_le_bytes());
+    }
+    mix64(state)
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentPublishOptions {
+    pub max_segment_size: usize,
+    pub scheduler: CompactionSchedulerConfig,
+    pub prune_grace: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentPublishResult {
+    pub claim_count: usize,
+    pub segment_count: usize,
+    pub compaction_plan_count: usize,
+    pub stale_file_pruned_count: usize,
+    /// True when the claim-set fingerprint was unchanged and no files were
+    /// rebuilt or fsynced.
+    pub skipped_unchanged: bool,
+}
+
+/// Publishes the segments for one tenant directory. Skips the rebuild and all
+/// fsyncs when the claim-set fingerprint matches the last successful publish.
+pub fn publish_claims_to_dir(
+    tenant_dir: &Path,
+    claims: &[Claim],
+    options: &SegmentPublishOptions,
+) -> Result<SegmentPublishResult, SegmentStoreError> {
+    // The storage format is part of the key: turning encryption at rest on,
+    // or rotating its key, republishes the tenant's files sealed under the
+    // active key (ADR 0005) even when its claims did not change.
+    // (Plaintext keeps the key it always had.)
+    let mut config_key = format!(
+        "{}|{}|{}",
+        options.max_segment_size,
+        options.scheduler.max_segments_per_tier,
+        options.scheduler.max_compaction_input_segments
+    );
+    if let Some(keyring) = store::encryption::current() {
+        config_key.push_str("|sealed:");
+        config_key.push_str(keyring.active_key_id());
+    }
+    let fingerprint = claim_set_fingerprint(claims, &config_key);
+    if read_fingerprint(tenant_dir) == Some(fingerprint)
+        && let Ok(Some(manifest)) = load_manifest(tenant_dir)
+        && manifest
+            .entries
+            .iter()
+            .all(|entry| tenant_dir.join(&entry.file_name).is_file())
+    {
+        return Ok(SegmentPublishResult {
+            claim_count: claims.len(),
+            segment_count: manifest.entries.len(),
+            compaction_plan_count: 0,
+            stale_file_pruned_count: 0,
+            skipped_unchanged: true,
+        });
+    }
+
+    let mut segments = build_segments(claims, options.max_segment_size);
+    let plans = plan_compaction_round(&segments, &options.scheduler);
+    for plan in &plans {
+        segments = apply_compaction_plan(&segments, plan);
+    }
+    let previous_manifest = load_manifest(tenant_dir).ok().flatten();
+    let manifest = persist_segments_atomic(tenant_dir, &segments)?;
+    write_fingerprint(tenant_dir, fingerprint)?;
+    let stale_file_pruned_count = prune_unreferenced_segment_files_with_min_stale_age(
+        tenant_dir,
+        &manifest,
+        previous_manifest.as_ref(),
+        options.prune_grace,
+    )?;
+    Ok(SegmentPublishResult {
+        claim_count: claims.len(),
+        segment_count: manifest.entries.len(),
+        compaction_plan_count: plans.len(),
+        stale_file_pruned_count,
+        skipped_unchanged: false,
+    })
+}
+
+fn read_fingerprint(dir: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(dir.join(FINGERPRINT_FILE_NAME)).ok()?;
+    let mut parts = raw.trim_end().split('\t');
+    let header = format!("{}\t{}", parts.next()?, parts.next()?);
+    if header != FINGERPRINT_HEADER {
+        return None;
+    }
+    u64::from_str_radix(parts.next()?, 16).ok()
+}
+
+fn write_fingerprint(dir: &Path, fingerprint: u64) -> Result<(), SegmentStoreError> {
+    let path = dir.join(FINGERPRINT_FILE_NAME);
+    let tmp_path = temp_path(&path);
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        writeln!(file, "{FINGERPRINT_HEADER}\t{fingerprint:016x}")?;
+        file.sync_all()?;
+    }
+    rename(tmp_path, path)?;
+    sync_dir(dir)?;
+    Ok(())
 }
 
 pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, SegmentStoreError> {
@@ -359,15 +834,17 @@ pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, Segment
     if !manifest_path.exists() {
         return Ok(None);
     }
-    let file = File::open(manifest_path)?;
-    let mut reader = BufReader::new(file);
-    let mut header = String::new();
-    let header_bytes = reader.read_line(&mut header)?;
-    if header_bytes == 0 {
+    let raw = match read_body(&manifest_path) {
+        Ok(raw) => raw,
+        Err(SegmentStoreError::MissingFile(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut lines = raw.split_inclusive('\n');
+    let Some(header) = lines.next() else {
         return Err(SegmentStoreError::Parse(
             "segment manifest is empty".to_string(),
         ));
-    }
+    };
     if header.trim_end() != MANIFEST_HEADER {
         return Err(SegmentStoreError::Parse(
             "segment manifest header is invalid".to_string(),
@@ -375,8 +852,8 @@ pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, Segment
     }
 
     let mut entries = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    for line in lines {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
@@ -461,21 +938,22 @@ fn write_manifest_atomic(
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        writeln!(file, "{MANIFEST_HEADER}")?;
+        let mut body = format!("{MANIFEST_HEADER}\n");
         for entry in &manifest.entries {
-            writeln!(
-                file,
-                "{}\t{}\t{}\t{}\t{}",
+            body.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
                 escape_field(&entry.segment_id),
                 format_tier(&entry.tier),
                 escape_field(&entry.file_name),
                 entry.claim_count,
                 entry.checksum
-            )?;
+            ));
         }
+        write_body(&mut file, &body)?;
         file.sync_all()?;
     }
     rename(tmp_path, manifest_path)?;
+    sync_dir(root_dir)?;
     Ok(())
 }
 
@@ -491,17 +969,18 @@ fn write_segment_file_atomic(
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        writeln!(
-            file,
-            "{SEGMENT_HEADER}\t{}\t{}\t{}\t{}",
+        let mut body = format!(
+            "{SEGMENT_HEADER}\t{}\t{}\t{}\t{}\n",
             escape_field(&segment.segment_id),
             format_tier(&segment.tier),
             segment.claim_ids.len(),
             checksum
-        )?;
+        );
         for claim_id in &segment.claim_ids {
-            writeln!(file, "{}", escape_field(claim_id))?;
+            body.push_str(&escape_field(claim_id));
+            body.push('\n');
         }
+        write_body(&mut file, &body)?;
         file.sync_all()?;
     }
     rename(tmp_path, path)?;
@@ -509,16 +988,14 @@ fn write_segment_file_atomic(
 }
 
 fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut header = String::new();
-    let header_bytes = reader.read_line(&mut header)?;
-    if header_bytes == 0 {
+    let raw = read_body(path)?;
+    let mut lines = raw.split_inclusive('\n');
+    let Some(header) = lines.next() else {
         return Err(SegmentStoreError::Parse(format!(
             "segment file '{}' is empty",
             path.display()
         )));
-    }
+    };
     let header = header.trim_end();
     let parts: Vec<&str> = header.split('\t').collect();
     if parts.len() != 6 || parts[0] != "DASHSEG" || parts[1] != "1" {
@@ -538,12 +1015,12 @@ fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
         .map_err(|_| SegmentStoreError::Parse("segment checksum is invalid".to_string()))?;
 
     let mut claim_ids = Vec::with_capacity(claim_count);
-    for line in reader.lines() {
-        let line = line?;
+    for line in lines {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
-        claim_ids.push(unescape_field(&line)?);
+        claim_ids.push(unescape_field(line)?);
     }
     if claim_ids.len() != claim_count {
         return Err(SegmentStoreError::Integrity(format!(
@@ -568,10 +1045,98 @@ fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
     })
 }
 
+/// Writes the text `body` of a segment, manifest or tenant marker file:
+/// sealed (format B, ADR 0005) when a keyring is in effect, plain
+/// otherwise.
+fn write_body(file: &mut File, body: &str) -> Result<(), SegmentStoreError> {
+    match store::encryption::current() {
+        Some(keyring) => {
+            let sealed = store::encryption::seal_bytes(&keyring, body.as_bytes())
+                .map_err(|e| SegmentStoreError::Io(e.to_string()))?;
+            file.write_all(&sealed)?;
+        }
+        None => file.write_all(body.as_bytes())?,
+    }
+    Ok(())
+}
+
+/// Reads the text of a file written by [`write_body`], decrypting a sealed
+/// file (which fails closed without the key). A missing file is
+/// [`SegmentStoreError::MissingFile`].
+fn read_body(path: &Path) -> Result<String, SegmentStoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SegmentStoreError::MissingFile(path.display().to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let bytes = if bytes.starts_with(store::encryption::SEAL_MAGIC) {
+        let keyring = store::encryption::current();
+        store::encryption::open_sealed_bytes(
+            keyring.as_deref(),
+            &bytes,
+            &path.display().to_string(),
+        )
+        .map_err(|e| SegmentStoreError::Integrity(e.to_string()))?
+    } else {
+        bytes
+    };
+    String::from_utf8(bytes)
+        .map_err(|_| SegmentStoreError::Parse(format!("'{}' is not UTF-8", path.display())))
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let mut tmp = path.to_path_buf().into_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".{}.{}{TMP_SUFFIX}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     PathBuf::from(tmp)
+}
+
+fn next_generation() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut last = LAST_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let candidate = now.max(last.saturating_add(1));
+        match LAST_GENERATION.compare_exchange_weak(
+            last,
+            candidate,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return candidate,
+            Err(observed) => last = observed,
+        }
+    }
+}
+
+fn touch_file(path: &Path) {
+    if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), SegmentStoreError> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<(), SegmentStoreError> {
+    Ok(())
+}
+
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 fn format_tier(tier: &Tier) -> &'static str {
@@ -855,9 +1420,13 @@ mod tests {
         let active_manifest =
             persist_segments_atomic(&root, &second_segments).expect("second persist should work");
 
-        let removed =
-            prune_unreferenced_segment_files(&root, &active_manifest, Some(&previous_manifest))
-                .expect("prune should succeed");
+        let removed = prune_unreferenced_segment_files_with_min_stale_age(
+            &root,
+            &active_manifest,
+            Some(&previous_manifest),
+            Duration::ZERO,
+        )
+        .expect("prune should succeed");
         assert_eq!(removed, 0);
         let old_only_file = previous_manifest
             .entries
@@ -880,10 +1449,16 @@ mod tests {
         }];
         let latest_manifest =
             persist_segments_atomic(&root, &third_segments).expect("third persist should work");
-        let removed =
-            prune_unreferenced_segment_files(&root, &latest_manifest, Some(&active_manifest))
-                .expect("prune should remove stale files");
-        assert_eq!(removed, 1);
+        let removed = prune_unreferenced_segment_files_with_min_stale_age(
+            &root,
+            &latest_manifest,
+            Some(&active_manifest),
+            Duration::ZERO,
+        )
+        .expect("prune should remove stale files");
+        // Publishes now write unique files, so both files of the first
+        // manifest (hot-0 and warm-0) are stale at this point.
+        assert_eq!(removed, 2);
         let old_only_exists = previous_manifest
             .entries
             .iter()
@@ -929,5 +1504,591 @@ mod tests {
         assert!(!orphan_path.exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- SEC-19: tenant directory mapping ----------------------------------
+
+    #[test]
+    fn tenant_dir_name_is_injective_for_legacy_collision_pairs() {
+        let ids = [
+            "a.b", "a_b", "a-b", "a b", "a/b", "a\\b", "A", "a", "a:b", "ab", "", "_", "..", ".",
+            "../x", "x", "..%2fx", "é", "e", "e\u{301}", "日本", "tenant-a", "Tenant-A", "a\0b",
+            "a\nb",
+        ];
+        let mut seen: HashMap<String, &str> = HashMap::new();
+        for id in ids {
+            let name = tenant_dir_name(id);
+            if let Some(previous) = seen.insert(name.clone(), id) {
+                panic!("'{previous}' and '{id}' both map to '{name}'");
+            }
+        }
+    }
+
+    #[test]
+    fn tenant_dir_name_is_a_single_safe_path_component() {
+        for id in [
+            "../x",
+            "../../etc/passwd",
+            "/abs/path",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "",
+            "\0",
+            "日本語",
+            &"x".repeat(10_000),
+            &"/".repeat(500),
+        ] {
+            let name = tenant_dir_name(id);
+            assert!(!name.is_empty());
+            assert!(name.len() < 255, "name too long for '{id:.20}'");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_~".contains(&b)),
+                "unsafe byte in '{name}'"
+            );
+            assert_ne!(name, ".");
+            assert_ne!(name, "..");
+            let joined = Path::new("/root").join(&name);
+            assert_eq!(joined.parent(), Some(Path::new("/root")));
+            assert_eq!(joined.components().count(), 3);
+        }
+    }
+
+    #[test]
+    fn tenant_dir_name_long_ids_stay_distinct_and_bounded() {
+        let base = "t".repeat(300);
+        let a = format!("{base}a");
+        let b = format!("{base}b");
+        let (na, nb) = (tenant_dir_name(&a), tenant_dir_name(&b));
+        assert_ne!(na, nb);
+        assert!(na.len() <= 96 && nb.len() <= 96);
+        assert!(na.starts_with("ttttt") && na.contains('~'));
+        // Escaped (short) names can never contain '~', so no cross-form clash.
+        assert!(!tenant_dir_name("a~b").is_empty());
+        assert!(!tenant_dir_name("a~b").contains("~b"));
+        assert_eq!(tenant_dir_name("tenant-a"), "tenant-a");
+    }
+
+    #[test]
+    fn resolve_tenant_dir_migrates_legacy_directory_once() {
+        let root = temp_dir("migrate");
+        let legacy = root.join(legacy_tenant_dir_name("acme.corp"));
+        assert_eq!(legacy.file_name().unwrap(), "acme_corp");
+        persist_segments_atomic(
+            &legacy,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["c1".into()],
+            }],
+        )
+        .unwrap();
+        write_tenant_marker(&legacy, "acme.corp").unwrap();
+
+        let resolved = resolve_tenant_dir(&root, "acme.corp");
+        assert_eq!(resolved, root.join(tenant_dir_name("acme.corp")));
+        assert!(!legacy.exists(), "legacy dir must have been renamed");
+        let (_, segments) = load_current_segments(&resolved).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids, vec!["c1".to_string()]);
+
+        // Second call is a no-op; a different tenant colliding on the legacy
+        // name gets its own, empty directory.
+        assert_eq!(resolve_tenant_dir(&root, "acme.corp"), resolved);
+        let other = resolve_tenant_dir(&root, "acme_corp");
+        assert_ne!(other, resolved);
+        assert!(!other.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_tenant_dir_concurrent_first_use_is_safe() {
+        let root = temp_dir("migrate-race");
+        let legacy = root.join("a_b");
+        persist_segments_atomic(
+            &legacy,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["c1".into()],
+            }],
+        )
+        .unwrap();
+        write_tenant_marker(&legacy, "a.b").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_tenant_dir(&root, "a.b")
+                })
+            })
+            .collect();
+        let expected = root.join(tenant_dir_name("a.b"));
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), expected);
+        }
+        assert!(!legacy.exists());
+        let (_, segments) = load_current_segments(&expected).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids, vec!["c1".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn colliding_tenants_no_longer_share_segment_directories() {
+        let root = temp_dir("collide");
+        let dir_a = resolve_tenant_dir(&root, "a.b");
+        let dir_b = resolve_tenant_dir(&root, "a_b");
+        assert_ne!(dir_a, dir_b);
+        let one = |id: &str| {
+            vec![Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec![id.into()],
+            }]
+        };
+        persist_segments_atomic(&dir_a, &one("claim-a")).unwrap();
+        persist_segments_atomic(&dir_b, &one("claim-b")).unwrap();
+        let (_, a) = load_current_segments(&dir_a).unwrap().unwrap();
+        let (_, b) = load_current_segments(&dir_b).unwrap().unwrap();
+        assert_eq!(a[0].claim_ids, vec!["claim-a".to_string()]);
+        assert_eq!(b[0].claim_ids, vec!["claim-b".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- review finding 10: legacy directory adoption --------------------------
+
+    fn legacy_dir_with_segments(root: &Path, legacy_name: &str, claim: &str) -> PathBuf {
+        let legacy = root.join(legacy_name);
+        persist_segments_atomic(
+            &legacy,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec![claim.into()],
+            }],
+        )
+        .unwrap();
+        legacy
+    }
+
+    /// Old-format directories (no tenant marker) are ambiguous: neither
+    /// colliding tenant may adopt them, whichever touches them first.
+    #[test]
+    fn old_format_legacy_dir_is_adopted_by_no_colliding_tenant() {
+        let root = temp_dir("legacy-old-format");
+        let legacy = legacy_dir_with_segments(&root, "acme_corp", "belongs-to-someone");
+        let manifest_before = fs::read(legacy.join(MANIFEST_FILE_NAME)).unwrap();
+
+        for tenant in ["acme.corp", "acme_corp", "acme corp"] {
+            let resolved = resolve_tenant_dir(&root, tenant);
+            assert_eq!(resolved, root.join(tenant_dir_name(tenant)));
+            assert!(!resolved.exists(), "{tenant} must start with an empty dir");
+        }
+        // The legacy directory is untouched, still holding the old data.
+        assert!(legacy.is_dir());
+        assert_eq!(
+            fs::read(legacy.join(MANIFEST_FILE_NAME)).unwrap(),
+            manifest_before
+        );
+        let (_, segments) = load_current_segments(&legacy).unwrap().unwrap();
+        assert_eq!(
+            segments[0].claim_ids,
+            vec!["belongs-to-someone".to_string()]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_dir_is_migrated_only_by_the_tenant_its_marker_names() {
+        let root = temp_dir("legacy-marker");
+        let legacy = legacy_dir_with_segments(&root, "acme_corp", "c-dot");
+        write_tenant_marker(&legacy, "acme.corp").unwrap();
+        assert_eq!(
+            read_tenant_marker(&legacy).unwrap().as_deref(),
+            Some("acme.corp")
+        );
+
+        // The colliding tenant does not get it, and does not disturb it.
+        let other = resolve_tenant_dir(&root, "acme_corp");
+        assert_eq!(other, root.join(tenant_dir_name("acme_corp")));
+        assert!(legacy.is_dir() && !other.exists());
+
+        // The named tenant migrates it.
+        let owner = resolve_tenant_dir(&root, "acme.corp");
+        assert_eq!(owner, root.join(tenant_dir_name("acme.corp")));
+        assert!(!legacy.exists());
+        let (_, segments) = load_current_segments(&owner).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids, vec!["c-dot".to_string()]);
+        assert_eq!(
+            read_tenant_marker(&owner).unwrap().as_deref(),
+            Some("acme.corp")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tenant_marker_round_trips_awkward_ids_and_is_never_rewritten() {
+        let root = temp_dir("marker-roundtrip");
+        let dir = root.join("t");
+        assert_eq!(read_tenant_marker(&dir).unwrap(), None);
+        write_tenant_marker(&dir, "tab\there\nnewline\\").unwrap();
+        assert_eq!(
+            read_tenant_marker(&dir).unwrap().as_deref(),
+            Some("tab\there\nnewline\\")
+        );
+        // A second tenant cannot overwrite the first claim on the directory.
+        assert!(write_tenant_marker(&dir, "someone-else").is_err());
+        write_tenant_marker(&dir, "tab\there\nnewline\\").unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- IDX-07: publish safety ---------------------------------------------
+
+    fn single_segment(ids: &[&str]) -> Vec<Segment> {
+        vec![Segment {
+            segment_id: "hot-0".into(),
+            tier: Tier::Hot,
+            claim_ids: ids.iter().map(|id| (*id).to_string()).collect(),
+        }]
+    }
+
+    #[test]
+    fn publish_never_overwrites_existing_segment_files() {
+        let root = temp_dir("no-overwrite");
+        let first = persist_segments_atomic(&root, &single_segment(&["c1"])).unwrap();
+        let first_path = root.join(&first.entries[0].file_name);
+        let first_bytes = fs::read(&first_path).unwrap();
+
+        let second = persist_segments_atomic(&root, &single_segment(&["c1", "c2"])).unwrap();
+        assert_ne!(first.entries[0].file_name, second.entries[0].file_name);
+        assert_eq!(fs::read(&first_path).unwrap(), first_bytes);
+
+        // Identical content still gets a fresh generation, never the same name.
+        let third = persist_segments_atomic(&root, &single_segment(&["c1", "c2"])).unwrap();
+        assert_ne!(second.entries[0].file_name, third.entries[0].file_name);
+        assert_eq!(second.entries[0].checksum, third.entries[0].checksum);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_respects_grace_period_and_current_manifest() {
+        let root = temp_dir("grace");
+        let first = persist_segments_atomic(&root, &single_segment(&["c1"])).unwrap();
+        let second = persist_segments_atomic(&root, &single_segment(&["c2"])).unwrap();
+        let old = root.join(&first.entries[0].file_name);
+
+        let removed = prune_unreferenced_segment_files_with_min_stale_age(
+            &root,
+            &second,
+            None,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(old.exists(), "file inside the grace period must survive");
+
+        // Passing a stale manifest must never delete files of the current one.
+        let removed = prune_unreferenced_segment_files_with_min_stale_age(
+            &root,
+            &first,
+            None,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(removed, 0);
+        assert!(root.join(&second.entries[0].file_name).exists());
+        let removed = prune_unreferenced_segment_files_with_min_stale_age(
+            &root,
+            &second,
+            None,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(removed, 1, "only the superseded file is removed");
+        assert!(!old.exists());
+        assert!(root.join(&second.entries[0].file_name).exists());
+        assert!(load_current_segments(&root).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_prune_has_a_grace_period() {
+        let root = temp_dir("default-grace");
+        let first = persist_segments_atomic(&root, &single_segment(&["c1"])).unwrap();
+        let second = persist_segments_atomic(&root, &single_segment(&["c2"])).unwrap();
+        assert_eq!(
+            prune_unreferenced_segment_files(&root, &second, None).unwrap(),
+            0
+        );
+        assert!(root.join(&first.entries[0].file_name).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_cleans_stale_tmp_files_but_not_fresh_ones() {
+        let root = temp_dir("tmp-clean");
+        let tenant = root.join("t1");
+        persist_segments_atomic(&tenant, &single_segment(&["c1"])).unwrap();
+        let crashed = tenant.join("hot-0-0000.seg.4242.0.tmp");
+        fs::write(&crashed, "partial").unwrap();
+
+        let stats = maintain_segment_root(&root, Duration::from_secs(3600)).unwrap();
+        assert_eq!(stats.tmp_files_removed, 0, "fresh tmp may be in flight");
+        assert!(crashed.exists());
+
+        let stats = maintain_segment_root(&root, Duration::ZERO).unwrap();
+        assert_eq!(stats.tmp_files_removed, 1);
+        assert!(!crashed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn maintenance_isolates_per_tenant_failures() {
+        let root = temp_dir("isolate");
+        let bad = root.join("a-bad");
+        let good = root.join("z-good");
+        persist_segments_atomic(&bad, &single_segment(&["c1"])).unwrap();
+        persist_segments_atomic(&good, &single_segment(&["c1"])).unwrap();
+        // Corrupt the bad tenant's manifest so loading it fails.
+        fs::write(bad.join(MANIFEST_FILE_NAME), "garbage\n").unwrap();
+        let orphan = good.join("orphan.seg");
+        fs::write(&orphan, "stale").unwrap();
+
+        let report = maintain_segment_root_report(&root, Duration::ZERO).unwrap();
+        assert_eq!(report.stats.tenant_dirs_scanned, 2);
+        assert_eq!(report.tenant_errors.len(), 1);
+        assert_eq!(report.tenant_errors[0].0, "a-bad");
+        assert_eq!(report.stats.tenant_error_count, 1);
+        assert!(
+            !orphan.exists(),
+            "tenant after the failing one must still be maintained"
+        );
+
+        // Compat wrapper does not abort either; strict mode reports failure.
+        assert!(maintain_segment_root(&root, Duration::ZERO).is_ok());
+        assert!(maintain_segment_root_strict(&root, Duration::ZERO).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_current_segments_reloads_manifest_when_file_vanishes() {
+        let root = temp_dir("reload");
+        let first = persist_segments_atomic(&root, &single_segment(&["c1"])).unwrap();
+        // A reader holding the old manifest sees a missing file...
+        persist_segments_atomic(&root, &single_segment(&["c2"])).unwrap();
+        fs::remove_file(root.join(&first.entries[0].file_name)).unwrap();
+        assert!(matches!(
+            load_segments_from_manifest(&root, &first),
+            Err(SegmentStoreError::MissingFile(_))
+        ));
+        // ...while the reload-aware loader lands on the new manifest.
+        let (_, segments) = load_current_segments(&root).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids, vec!["c2".to_string()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reader_survives_200_concurrent_publishes_with_aggressive_pruning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let root = temp_dir("race");
+        persist_segments_atomic(&root, &single_segment(&["seed"])).unwrap();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let (root, done) = (root.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !done.load(Ordering::Relaxed) {
+                    match load_current_segments(&root) {
+                        Ok(Some((_, segments))) => assert_eq!(segments.len(), 1),
+                        Ok(None) => panic!("manifest disappeared"),
+                        Err(err) => panic!("reader saw unrecovered error: {err:?}"),
+                    }
+                    reads += 1;
+                }
+                reads
+            })
+        };
+
+        for generation in 0..200 {
+            let ids: Vec<String> = (0..=generation).map(|i| format!("claim-{i:04}")).collect();
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let manifest = persist_segments_atomic(&root, &single_segment(&refs)).unwrap();
+            prune_unreferenced_segment_files_with_min_stale_age(
+                &root,
+                &manifest,
+                None,
+                Duration::from_millis(30),
+            )
+            .unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader must never fail");
+        assert!(reads > 0);
+        let (_, segments) = load_current_segments(&root).unwrap().unwrap();
+        assert_eq!(segments[0].claim_ids.len(), 200);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // ---- determinism and skip-unchanged -------------------------------------
+
+    #[test]
+    fn segment_membership_is_deterministic_regardless_of_input_order() {
+        let forward = vec![claim("c3", 0.9), claim("c1", 0.9), claim("c2", 0.9)];
+        let mut reversed = forward.clone();
+        reversed.reverse();
+        let a = build_segments(&forward, 10);
+        let b = build_segments(&reversed, 10);
+        assert_eq!(a, b);
+        assert_eq!(a[0].claim_ids, vec!["c1", "c2", "c3"]);
+        assert_eq!(
+            segment_checksum(&a[0].tier, &a[0].claim_ids),
+            segment_checksum(&b[0].tier, &b[0].claim_ids)
+        );
+        assert_eq!(
+            claim_set_fingerprint(&forward, "s"),
+            claim_set_fingerprint(&reversed, "s")
+        );
+    }
+
+    fn publish_options() -> SegmentPublishOptions {
+        SegmentPublishOptions {
+            max_segment_size: 10,
+            scheduler: CompactionSchedulerConfig::default(),
+            prune_grace: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn republishing_unchanged_claims_skips_rebuild_and_keeps_manifest_bytes() {
+        let root = temp_dir("skip");
+        let claims = vec![claim("c2", 0.9), claim("c1", 0.7), claim("c3", 0.2)];
+        let first = publish_claims_to_dir(&root, &claims, &publish_options()).unwrap();
+        assert!(!first.skipped_unchanged);
+        let manifest_bytes = fs::read(root.join(MANIFEST_FILE_NAME)).unwrap();
+        let files_before = list_seg_files(&root);
+
+        let mut shuffled = claims.clone();
+        shuffled.reverse();
+        let second = publish_claims_to_dir(&root, &shuffled, &publish_options()).unwrap();
+        assert!(second.skipped_unchanged);
+        assert_eq!(second.segment_count, first.segment_count);
+        assert_eq!(
+            fs::read(root.join(MANIFEST_FILE_NAME)).unwrap(),
+            manifest_bytes
+        );
+        assert_eq!(list_seg_files(&root), files_before);
+
+        // A real change (new claim, or tier change) republishes.
+        let mut changed = claims.clone();
+        changed.push(claim("c4", 0.9));
+        assert!(
+            !publish_claims_to_dir(&root, &changed, &publish_options())
+                .unwrap()
+                .skipped_unchanged
+        );
+        let mut retiered = changed.clone();
+        retiered[0].confidence = 0.1;
+        assert!(
+            !publish_claims_to_dir(&root, &retiered, &publish_options())
+                .unwrap()
+                .skipped_unchanged
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skip_is_not_taken_when_segment_files_are_missing() {
+        let root = temp_dir("skip-missing");
+        let claims = vec![claim("c1", 0.9)];
+        publish_claims_to_dir(&root, &claims, &publish_options()).unwrap();
+        for file in list_seg_files(&root) {
+            fs::remove_file(root.join(file)).unwrap();
+        }
+        let again = publish_claims_to_dir(&root, &claims, &publish_options()).unwrap();
+        assert!(!again.skipped_unchanged);
+        assert!(load_current_segments(&root).unwrap().is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn list_seg_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".seg"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn segment_files_are_sealed_with_a_keyring_and_fail_closed_without_it() {
+        use std::sync::Arc;
+        use store::encryption::{self, Keyring};
+        let root = temp_dir("segment-encrypted");
+        let keyring = Arc::new(Keyring::local([0x33; 32], &[]).unwrap());
+        let marker = "claim-secret-marker";
+        let segments = vec![Segment {
+            segment_id: "hot-0".into(),
+            tier: Tier::Hot,
+            claim_ids: vec![marker.into(), "claim-2".into()],
+        }];
+        encryption::with_keyring(Some(keyring.clone()), || {
+            write_tenant_marker(&root, "tenant-secret").unwrap();
+            let manifest = persist_segments_atomic(&root, &segments).unwrap();
+            let loaded = load_manifest(&root).unwrap().unwrap();
+            assert_eq!(loaded, manifest);
+            assert_eq!(
+                load_segments_from_manifest(&root, &loaded).unwrap(),
+                segments
+            );
+            assert_eq!(
+                read_tenant_marker(&root).unwrap().as_deref(),
+                Some("tenant-secret")
+            );
+        });
+        for entry in fs::read_dir(&root).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(marker), "{}", path.display());
+            assert!(!text.contains("tenant-secret"), "{}", path.display());
+            if !path.to_string_lossy().ends_with(FINGERPRINT_FILE_NAME) {
+                assert!(
+                    bytes.starts_with(encryption::SEAL_MAGIC),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+        // Damage is an integrity error, not garbage.
+        let manifest = encryption::with_keyring(Some(keyring.clone()), || {
+            load_manifest(&root).unwrap().unwrap()
+        });
+        let segment_path = root.join(&manifest.entries[0].file_name);
+        let mut bytes = fs::read(&segment_path).unwrap();
+        let at = bytes.len() - 5;
+        bytes[at] ^= 1;
+        fs::write(&segment_path, &bytes).unwrap();
+        encryption::with_keyring(Some(keyring), || {
+            let err = load_segments_from_manifest(&root, &manifest).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("authentication failed"),
+                "{err:?}"
+            );
+        });
+        // No key configured: fail closed with the key id named.
+        encryption::with_keyring(None, || {
+            let err = load_manifest(&root).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("DASH_ENCRYPTION_KEY_FILE"),
+                "{err:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -1,5 +1,8 @@
 # rust.yml
-# CI for the DASH Rust workspace: fmt, clippy, tests, release build.
+# CI for the DASH Rust workspace: fmt, clippy, tests, release build, plus
+# deploy-artifact validation (helm lint/template, kustomize, kubeconform,
+# compose config, shellcheck, env-var check), observability checks (promtool
+# rule tests, dashboards, runbooks) and a container image build.
 # Runs on every push/PR to main across Ubuntu and macOS.
 # Expected runtime: ~8-15 minutes per matrix leg.
 name: Rust CI
@@ -22,6 +25,8 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -29,15 +34,19 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain (stable + rustfmt + clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
         with:
-          components: [rustfmt, clippy]
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
@@ -52,7 +61,7 @@ jobs:
       - name: Run tests (all features)
         # Single-threaded: retrieval tests rely on process-global env
         # variables/locks that are not safe under the default runner.
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: cargo test --workspace --exclude dash-e2e --all-features -- --test-threads=1
 
       - name: Release build
         run: cargo build --workspace --release
@@ -62,15 +71,420 @@ jobs:
     runs-on: ubuntu-latest
     needs: rust
     if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Set up Docker Compose
         run: docker compose version
 
+      - name: Generate secrets for the compose stack
+        run: scripts/generate-secrets.sh --force
+
       - name: Run backup/restore drill
         run: bash scripts/backup_restore_drill.sh
+
+  deploy-manifests:
+    name: Deploy artifacts (helm, kustomize, compose, systemd)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check deploy env vars against the code
+        run: scripts/check_deploy_env.sh
+
+      - name: shellcheck deploy scripts
+        run: |
+          shellcheck -S warning \
+            scripts/generate-secrets.sh \
+            scripts/generate-dev-tls.sh \
+            scripts/check_deploy_env.sh \
+            scripts/deploy_systemd.sh \
+            scripts/deploy_container.sh \
+            scripts/backup_restore_drill.sh \
+            scripts/check_observability.sh \
+            scripts/kind_e2e.sh \
+            scripts/k8s_backup_restore.sh \
+            deploy/container/scripts/entrypoint.sh \
+            deploy/container/scripts/healthcheck.sh
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.2
+
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          version=v0.6.7
+          curl -fsSL -o kubeconform.tgz \
+            "https://github.com/yannh/kubeconform/releases/download/${version}/kubeconform-linux-amd64.tar.gz"
+          echo "95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73  kubeconform.tgz" | sha256sum -c -
+          tar -xzf kubeconform.tgz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+
+      - name: Helm chart must refuse to render without secrets
+        run: |
+          if helm template dash deploy/helm/dash >/dev/null 2>&1; then
+            echo "helm template succeeded without secrets" >&2
+            exit 1
+          fi
+
+      - name: Helm lint and template (generated secrets)
+        run: |
+          set -euo pipefail
+          gen() { openssl rand -hex 32; }
+          args=(
+            --set "secret.retrieval.apiKey=$(gen)"
+            --set "secret.retrieval.hs256Secret=$(gen)"
+            --set "secret.ingestion.apiKey=$(gen)"
+            --set "secret.ingestion.hs256Secret=$(gen)"
+            --set "secret.replicationToken=$(gen)"
+            --set "secret.controlPlane.token=$(gen)"
+          )
+          helm lint deploy/helm/dash --strict "${args[@]}"
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" > helm-default.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set config.embeddingProvider=ollama \
+            --set networkPolicy.ollama.enabled=true \
+            --set ingress.exposeIngestion=false > helm-ollama.yaml
+          # Existing-Secret mode needs no secret values.
+          helm template dash deploy/helm/dash --namespace dash-system \
+            --set secret.existingSecret.retrieval=r \
+            --set secret.existingSecret.ingestion=i \
+            --set secret.existingSecret.controlPlane=c > helm-existing.yaml
+          # Native TLS on every listener (docs/operations/tls.md).
+          helm lint deploy/helm/dash --strict "${args[@]}" \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls > helm-tls.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set tls.enabled=true >/dev/null 2>&1; then
+            echo "helm template with tls.enabled succeeded without tls.secretName" >&2
+            exit 1
+          fi
+          # Encryption at rest: the key Secret is mounted and the key file
+          # settings are rendered (docs/operations/encryption.md).
+          helm lint deploy/helm/dash --strict "${args[@]}" \
+            --set encryption.enabled=true --set encryption.secretName=dash-encryption-key
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set encryption.enabled=true --set encryption.secretName=dash-encryption-key \
+            --set 'encryption.previousKeyNames={old.key}' > helm-encryption.yaml
+          grep -q 'DASH_ENCRYPTION_KEY_FILE: "/etc/dash/encryption/active.key"' helm-encryption.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set encryption.enabled=true >/dev/null 2>&1; then
+            echo "helm template with encryption.enabled succeeded without encryption.secretName" >&2
+            exit 1
+          fi
+          # Ingestion leader failover (docs/operations/failover.md): several
+          # ingestion pods, leader-only readiness, peers Service, PDB.
+          helm lint deploy/helm/dash --strict "${args[@]}" --set failover.enabled=true
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true > helm-failover.yaml
+          grep -q 'path: /v1/ready/leader' helm-failover.yaml
+          grep -q 'DASH_CONTROL_PLANE_INGEST_FAILOVER: "1"' helm-failover.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true --set tls.enabled=true \
+            --set tls.secretName=dash-internal-tls > helm-failover-tls.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true --set controlPlane.enabled=false >/dev/null 2>&1; then
+            echo "helm template with failover.enabled succeeded without the control plane" >&2
+            exit 1
+          fi
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            helm-failover.yaml helm-failover-tls.yaml
+          # Monitoring: ServiceMonitors, PrometheusRule, Grafana dashboards and
+          # the scrape NetworkPolicy (deploy/observability/).
+          monitoring=(
+            --set metrics.serviceMonitor.enabled=true
+            --set metrics.serviceMonitor.authorization.retrieval.secretName=dash-scrape
+            --set metrics.serviceMonitor.authorization.retrieval.key=retrieval
+            --set metrics.serviceMonitor.authorization.ingestion.secretName=dash-scrape
+            --set metrics.serviceMonitor.authorization.ingestion.key=ingestion
+            --set metrics.prometheusRule.enabled=true
+            --set metrics.grafanaDashboards.enabled=true
+          )
+          helm lint deploy/helm/dash --strict "${args[@]}" "${monitoring[@]}"
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" "${monitoring[@]}" \
+            > helm-monitoring.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set metrics.public=true --set metrics.serviceMonitor.enabled=true \
+            --set metrics.prometheusRule.enabled=true \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls > helm-monitoring-tls.yaml
+          # A ServiceMonitor needs a scrape credential unless /metrics is public.
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set metrics.serviceMonitor.enabled=true >/dev/null 2>&1; then
+            echo "helm template rendered a ServiceMonitor without a scrape credential" >&2
+            exit 1
+          fi
+          # The Prometheus Operator kinds have no built-in schema; their rule
+          # content is checked by scripts/check_observability.sh.
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            -skip ServiceMonitor,PrometheusRule helm-monitoring.yaml helm-monitoring-tls.yaml
+          # Values used by the kind end-to-end test (kind-e2e.yml), rendered
+          # into another namespace: every object must follow the release.
+          helm lint deploy/helm/dash --strict "${args[@]}" -f deploy/helm/dash/ci/kind-values.yaml
+          helm template dash deploy/helm/dash --namespace dash-e2e "${args[@]}" \
+            -f deploy/helm/dash/ci/kind-values.yaml > helm-kind.yaml
+          if grep -E '^  namespace: ' helm-kind.yaml | grep -qv 'namespace: dash-e2e'; then
+            echo "helm template --namespace dash-e2e rendered objects in another namespace" >&2
+            exit 1
+          fi
+          # Integers must not be rendered in exponent form (5.24288e+07).
+          if grep -qE '"[0-9.]+e\+[0-9]+"' helm-default.yaml; then
+            echo "helm template rendered a number in exponent form" >&2
+            exit 1
+          fi
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml helm-kind.yaml \
+            helm-encryption.yaml
+
+      - name: Kustomize build and kubeconform
+        run: |
+          set -euo pipefail
+          kubectl kustomize deploy/k8s > k8s.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 k8s.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 deploy/k8s/optional/ollama-egress.yaml
+          kubectl kustomize deploy/k8s-tls > k8s-tls.yaml
+          kubeconform -strict -summary -kubernetes-version 1.29.0 k8s-tls.yaml
+          # Kustomize must not rewrite the NetworkPolicy specs: label
+          # propagation into selectors once added the owner labels to the
+          # kube-dns peer and cut every pod off from DNS.
+          python3 - deploy/k8s/50-networkpolicy.yaml k8s.yaml k8s-tls.yaml <<'EOF'
+          import sys, yaml
+          def policies(path):
+              return {d["metadata"]["name"]: d["spec"]
+                      for d in yaml.safe_load_all(open(path))
+                      if d and d.get("kind") == "NetworkPolicy"}
+          source = policies(sys.argv[1])
+          bad = 0
+          for rendered in sys.argv[2:]:
+              got = policies(rendered)
+              for name, spec in source.items():
+                  if got.get(name) != spec:
+                      print(f"{rendered}: NetworkPolicy {name} differs from {sys.argv[1]}:\n"
+                            f"  source:   {spec}\n  rendered: {got.get(name)}")
+                      bad += 1
+          sys.exit(1 if bad else 0)
+          EOF
+
+      - name: Compose config (generated secrets)
+        run: |
+          set -euo pipefail
+          scripts/generate-secrets.sh --force
+          docker compose -f deploy/container/docker-compose.yml config -q
+          docker compose -f deploy/container/docker-compose.yml --profile control-plane config -q
+          docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.dev.yml config -q
+          docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.tls.yml \
+            --profile control-plane config -q
+          docker compose -f deploy/container/docker-compose.yml \
+            -f deploy/container/docker-compose.encryption.yml config -q
+
+      - name: Compose must refuse to start without secrets
+        run: |
+          rm -f deploy/container/.env
+          if docker compose -f deploy/container/docker-compose.yml config -q >/dev/null 2>&1; then
+            echo "compose config succeeded without secrets" >&2
+            exit 1
+          fi
+
+      - name: Verify systemd units
+        run: |
+          set -euo pipefail
+          # The service binaries do not exist on the runner, so "is not
+          # executable" is expected; any other finding is fatal.
+          out="$(systemd-analyze verify --man=no deploy/systemd/*.service 2>&1 || true)"
+          echo "${out}"
+          if echo "${out}" | grep -v 'is not executable' | grep -q .; then
+            exit 1
+          fi
+
+  observability:
+    name: Observability (promtool rules and alert tests, runbooks, dashboards)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.2
+
+      # Downloads a pinned Prometheus release (checksum verified against the
+      # release's sha256sums.txt and a pinned hash), then runs promtool check
+      # rules, promtool test rules, the runbook/metric-name/dashboard checks
+      # and the rendered PrometheusRule check.
+      - name: Check alert rules, rule tests, runbooks, dashboards and chart copies
+        run: scripts/check_observability.sh
+
+  docker-build:
+    name: Docker image build (no push)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build retrieval image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          target: runtime
+          build-args: |
+            SERVICE=retrieval
+          load: true
+          push: false
+          tags: dash-retrieval:ci
+          cache-from: type=gha,scope=dash-image
+          cache-to: type=gha,mode=max,scope=dash-image
+
+      - name: Build control-plane image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          target: runtime
+          build-args: |
+            SERVICE=control-plane
+          load: true
+          push: false
+          tags: dash-control-plane:ci
+          cache-from: type=gha,scope=dash-image
+
+      - name: Check image contents
+        run: |
+          set -euo pipefail
+          for svc in retrieval control-plane; do
+            img="dash-${svc}:ci"
+            test "$(docker run --rm --entrypoint sh "${img}" -c 'echo "${DASH_BIN}"')" = "${svc}"
+            # Binaries are root-owned and not writable by the runtime user.
+            docker run --rm --entrypoint sh "${img}" -c '
+              set -eu
+              for f in /opt/dash/bin/*; do
+                [ "$(stat -c %U "$f")" = root ] || { echo "$f not root-owned" >&2; exit 1; }
+                [ ! -w "$f" ] || { echo "$f writable by $(id -un)" >&2; exit 1; }
+              done
+              [ "$(id -u)" != 0 ]'
+          done
+
+  e2e:
+    name: End-to-end (real binaries)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build service binaries
+        run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect
+
+      - name: Run end-to-end suite
+        # Launches the compiled binaries as child processes on loopback with
+        # ephemeral ports and generated secrets (see scripts/e2e.sh).
+        env:
+          E2E_CRASH_CYCLES: "100"
+        run: cargo test -p dash-e2e
+
+  crash-test:
+    name: Crash consistency (kill -9, short)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build ingestion, wal-inspect and crash-test
+        run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
+
+      - name: Run 25 randomized kill -9 cycles
+        # The seed is printed first; on failure the state directory is kept
+        # and the reproduce command is printed (docs/operations/testing-durability.md).
+        env:
+          DASH_E2E_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: target/debug/crash-test --cycles 25 --writers 4 --json-out crash-test.json
+
+      - name: Upload crash-test summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crash-test-pr
+          path: crash-test.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  doc-consistency:
+    name: Doc consistency (deploy env, config docs, claims ledger)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Check deploy env vars against the code
+        run: scripts/check_deploy_env.sh
+
+      - name: Check configuration reference against the code
+        run: scripts/check_config_docs.sh
+
+      - name: Check claims ledger (also compares the README test count via cargo test --list)
+        run: scripts/check_claims_ledger.sh

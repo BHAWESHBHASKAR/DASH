@@ -8,7 +8,7 @@ mod segment_storage;
 #[cfg(test)]
 use result_projection::TemporalAnnotation;
 use result_projection::evidence_node_from_parts;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
@@ -191,7 +191,53 @@ pub fn execute_api_query_with_storage_snapshot(
     store: &InMemoryStore,
     req: RetrieveApiRequest,
 ) -> (RetrieveApiResponse, RetrieveStorageMergeSnapshot) {
-    let planner = build_planner_context(store, &req);
+    let segment_base = resolve_segment_prefilter(&req.tenant_id);
+    execute_api_query_with_segment_prefilter(store, req, segment_base)
+}
+
+/// Resolve the segment-prefilter claim-id set for `tenant_id`. This may read
+/// segment files from disk (single-flight cached), so callers holding a
+/// shared store lock must call it BEFORE taking the lock and pass the result
+/// to [`execute_api_query_with_segment_prefilter`].
+pub fn resolve_segment_prefilter(tenant_id: &str) -> Option<HashSet<String>> {
+    build_segment_prefilter_claim_ids(tenant_id)
+}
+
+/// Test hook: slow every segment refresh for `tenant_dir` by `delay`.
+#[cfg(test)]
+pub(crate) fn set_segment_load_delay_for_tests(tenant_dir: &std::path::Path, delay: Duration) {
+    segment_storage::set_segment_load_delay_for_tests(tenant_dir, delay);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Candidate-generation passes performed by this thread.
+    static CANDIDATE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_candidate_scans_for_tests() {
+    CANDIDATE_SCANS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_scans_for_tests() -> usize {
+    CANDIDATE_SCANS.with(|c| c.get())
+}
+
+fn note_candidate_scan() {
+    #[cfg(test)]
+    CANDIDATE_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+/// Run the retrieval with an already-resolved segment prefilter. Only
+/// in-memory work happens here, so it is safe under a store read lock.
+pub fn execute_api_query_with_segment_prefilter(
+    store: &InMemoryStore,
+    req: RetrieveApiRequest,
+    segment_base: Option<HashSet<String>>,
+) -> (RetrieveApiResponse, RetrieveStorageMergeSnapshot) {
+    let planner = build_planner_context(store, &req, segment_base);
     let mut merge_snapshot =
         build_storage_merge_snapshot(&planner, &[], STORAGE_EXECUTION_MODE_MEMORY_INDEX, 0);
     if planner.short_circuit_empty {
@@ -227,6 +273,7 @@ pub fn execute_api_query_with_storage_snapshot(
                 .clone()
                 .unwrap_or_default();
             let candidate_count = candidate_claim_ids.len();
+            note_candidate_scan();
             (
                 store.retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
                     &retrieval_request,
@@ -240,31 +287,31 @@ pub fn execute_api_query_with_storage_snapshot(
                 candidate_count,
             )
         } else {
-            let candidate_count = store.candidate_count_with_query_vector_and_allowed_claim_ids(
-                &retrieval_request,
-                req.query_embedding.as_deref(),
-                (planner.from_unix, planner.to_unix),
-                planner.allowed_claim_ids.as_ref(),
-            );
-            (
-                store.retrieve_with_time_range_query_vector_and_allowed_claim_ids(
+            // One candidate scan yields both the results and the count.
+            note_candidate_scan();
+            let (results, candidate_count) = store
+                .retrieve_with_candidate_count_query_vector_and_allowed_claim_ids(
                     &retrieval_request,
                     planner.from_unix,
                     planner.to_unix,
                     req.query_embedding.as_deref(),
                     planner.allowed_claim_ids.as_ref(),
-                ),
+                );
+            (
+                results,
                 STORAGE_EXECUTION_MODE_MEMORY_INDEX,
                 candidate_count,
             )
         };
 
-    let tenant_claims = store.claims_for_tenant(&planner.tenant_id);
-    let tenant_claim_by_id: HashMap<String, Claim> = tenant_claims
-        .iter()
-        .cloned()
-        .map(|claim| (claim.claim_id.clone(), claim))
-        .collect();
+    // Per-claim lookups instead of cloning every claim of the tenant. A claim
+    // owned by another tenant is never surfaced.
+    let tenant_id = planner.tenant_id.as_str();
+    let claim_in_tenant = |claim_id: &str| -> Option<&Claim> {
+        store
+            .claim_by_id(claim_id)
+            .filter(|claim| claim.tenant_id == tenant_id)
+    };
 
     let mut nodes: Vec<EvidenceNode> = results
         .iter()
@@ -293,7 +340,7 @@ pub fn execute_api_query_with_storage_snapshot(
                         })
                         .collect(),
                 },
-                tenant_claim_by_id.get(&r.claim_id),
+                claim_in_tenant(&r.claim_id),
                 planner.from_unix,
                 planner.to_unix,
             )
@@ -306,13 +353,17 @@ pub fn execute_api_query_with_storage_snapshot(
             nodes.iter().map(|n| n.claim_id.clone()).collect();
         let start_ids: Vec<String> = selected.iter().cloned().collect();
 
-        let mut all_edges = Vec::new();
-        for claim in &tenant_claims {
-            all_edges.extend(store.edges_for_claim(&claim.claim_id));
-        }
-
-        let traversed =
-            traverse_edges_multi_hop(&start_ids, &all_edges, graph_reasoning_config.max_hops);
+        let reachable_edges = collect_reachable_edges(
+            store,
+            tenant_id,
+            &start_ids,
+            graph_reasoning_config.max_hops,
+        );
+        let traversed = traverse_edges_multi_hop(
+            &start_ids,
+            &reachable_edges,
+            graph_reasoning_config.max_hops,
+        );
         let reasoning_by_claim =
             compute_node_reasoning_with_config(&start_ids, &traversed, graph_reasoning_config);
         for node in &mut nodes {
@@ -325,7 +376,7 @@ pub fn execute_api_query_with_storage_snapshot(
             .collect();
         let mut edges = Vec::new();
         for edge in traversed {
-            if let Some(claim) = tenant_claim_by_id.get(&edge.from_claim_id)
+            if let Some(claim) = claim_in_tenant(&edge.from_claim_id)
                 && !node_map.contains_key(&edge.from_claim_id)
             {
                 node_map.insert(
@@ -345,7 +396,7 @@ pub fn execute_api_query_with_storage_snapshot(
                     ),
                 );
             }
-            if let Some(claim) = tenant_claim_by_id.get(&edge.to_claim_id)
+            if let Some(claim) = claim_in_tenant(&edge.to_claim_id)
                 && !node_map.contains_key(&edge.to_claim_id)
             {
                 node_map.insert(
@@ -398,6 +449,49 @@ pub fn execute_api_query_with_storage_snapshot(
     )
 }
 
+/// Edges reachable from `start_ids` within `max_hops`, found with per-claim
+/// lookups (no tenant-wide edge clone). Edges leaving the tenant are dropped.
+fn collect_reachable_edges(
+    store: &InMemoryStore,
+    tenant_id: &str,
+    start_ids: &[String],
+    max_hops: usize,
+) -> Vec<schema::ClaimEdge> {
+    let mut edges = Vec::new();
+    // Keyed like the store: (from, to, relation), never by edge id alone.
+    let mut seen_edges: HashSet<(String, String, schema::Relation)> = HashSet::new();
+    let mut visited: HashSet<String> = start_ids.iter().cloned().collect();
+    let mut frontier: Vec<String> = visited.iter().cloned().collect();
+    for _ in 0..max_hops {
+        let mut next = Vec::new();
+        for claim_id in &frontier {
+            for edge in store.edges_for_claim(claim_id) {
+                let to_in_tenant = store
+                    .claim_by_id(&edge.to_claim_id)
+                    .is_some_and(|claim| claim.tenant_id == tenant_id);
+                if !to_in_tenant {
+                    continue;
+                }
+                if visited.insert(edge.to_claim_id.clone()) {
+                    next.push(edge.to_claim_id.clone());
+                }
+                if seen_edges.insert((
+                    edge.from_claim_id.clone(),
+                    edge.to_claim_id.clone(),
+                    edge.relation.clone(),
+                )) {
+                    edges.push(edge);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    edges
+}
+
 fn apply_graph_reasoning(node: &mut EvidenceNode, reasoning: Option<&NodeReasoningSignals>) {
     if let Some(reasoning) = reasoning {
         node.graph_score = Some(reasoning.graph_score);
@@ -410,7 +504,7 @@ pub fn build_retrieve_planner_debug_snapshot(
     store: &InMemoryStore,
     req: &RetrieveApiRequest,
 ) -> RetrievePlannerDebugSnapshot {
-    let planner = build_planner_context(store, req);
+    let planner = build_planner_context(store, req, resolve_segment_prefilter(&req.tenant_id));
     let diagnostics_req = RetrievalRequest {
         tenant_id: planner.tenant_id.clone(),
         query: req.query.clone(),
@@ -488,7 +582,11 @@ fn contradiction_risk_for_counts(supports: usize, contradicts: usize) -> Option<
     result_projection::contradiction_risk_for_counts(supports, contradicts)
 }
 
-fn build_planner_context(store: &InMemoryStore, req: &RetrieveApiRequest) -> PlannerContext {
+fn build_planner_context(
+    store: &InMemoryStore,
+    req: &RetrieveApiRequest,
+    segment_base_claim_ids: Option<HashSet<String>>,
+) -> PlannerContext {
     let tenant_id = req.tenant_id.clone();
     let (from_unix, to_unix) = req
         .time_range
@@ -513,7 +611,6 @@ fn build_planner_context(store: &InMemoryStore, req: &RetrieveApiRequest) -> Pla
         .collect();
     let metadata_allowed_claim_ids =
         build_metadata_prefilter_claim_ids(store, &tenant_id, &entity_filters, &embedding_filters);
-    let segment_base_claim_ids = build_segment_prefilter_claim_ids(&tenant_id);
     let wal_delta_claim_ids =
         build_wal_delta_claim_ids(store, &tenant_id, segment_base_claim_ids.as_ref());
     let storage_visible_claim_ids = merge_segment_base_with_wal_delta_claim_ids(
@@ -794,6 +891,40 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn reachable_edges_are_keyed_by_endpoints_and_relation_not_edge_id() {
+        let mut store = InMemoryStore::new();
+        for id in ["a", "b", "c"] {
+            store
+                .ingest_bundle(schema::claim_builder(id, "t", id, 0.5), vec![], vec![])
+                .expect("claim");
+        }
+        for (to, relation) in [
+            ("b", Relation::Supports),
+            ("c", Relation::Supports),
+            ("b", Relation::Contradicts),
+        ] {
+            store
+                .ingest_bundle(
+                    schema::claim_builder("a", "t", "a", 0.5),
+                    vec![],
+                    vec![ClaimEdge {
+                        edge_id: "dup".to_string(),
+                        from_claim_id: "a".to_string(),
+                        to_claim_id: to.to_string(),
+                        relation,
+                        strength: 0.5,
+                        reason_codes: vec![],
+                        created_at: None,
+                    }],
+                )
+                .expect("edge");
+        }
+        assert_eq!(store.edges_for_claim("a").len(), 3);
+        let edges = collect_reachable_edges(&store, "t", &["a".to_string()], 1);
+        assert_eq!(edges.len(), 3, "{edges:?}");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let mut out = std::env::temp_dir();
@@ -1682,6 +1813,159 @@ mod tests {
         clear_segment_cache_for_tests();
     }
 
+    /// Same data, same query, with and without a segment directory: the
+    /// answer must not depend on the storage execution mode. A text-only
+    /// query returns only claims that match a query term (no padding of
+    /// `top_k` with non-matching claims scored by their priors); vector and
+    /// hybrid queries rank the same claims in the same order.
+    #[test]
+    fn answers_do_not_depend_on_the_segment_directory() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let tenant = "tenant-relevance";
+        let claims = [
+            (
+                "c-helios-1",
+                "Project Helios acquired Startup Nova",
+                0.6,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "c-helios-2",
+                "Helios board approved the merger",
+                0.5,
+                [0.9, 0.1, 0.0, 0.0],
+            ),
+            (
+                "c-weather",
+                "Heavy rain expected in Lisbon",
+                0.99,
+                [0.0, 1.0, 0.0, 0.0],
+            ),
+            (
+                "c-sports",
+                "The local team won the final",
+                0.98,
+                [0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                "c-market",
+                "Bond yields fell on Tuesday",
+                0.97,
+                [0.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "c-food",
+                "The bakery opened a second shop",
+                0.96,
+                [0.1, 0.0, 0.9, 0.1],
+            ),
+        ];
+        let mut store = InMemoryStore::new();
+        for (claim_id, text, confidence, _) in &claims {
+            store
+                .ingest_bundle(
+                    schema::claim_builder(claim_id, tenant, text, *confidence),
+                    vec![],
+                    vec![],
+                )
+                .expect("ingest should succeed");
+        }
+        for (claim_id, _, _, vector) in &claims {
+            store
+                .upsert_claim_vector(claim_id, vector.to_vec())
+                .expect("vector upsert should succeed");
+        }
+        let root = temp_dir("relevance-parity");
+        persist_segments_atomic(
+            &root.join(tenant),
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: claims.iter().map(|(id, ..)| id.to_string()).collect(),
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let request = |query: &str, query_embedding: Option<Vec<f32>>| RetrieveApiRequest {
+            tenant_id: tenant.into(),
+            query: query.into(),
+            query_embedding,
+            entity_filters: vec![],
+            embedding_id_filters: vec![],
+            top_k: 5,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        };
+        let ids = |response: &RetrieveApiResponse| -> Vec<String> {
+            response
+                .results
+                .iter()
+                .map(|node| node.claim_id.clone())
+                .collect()
+        };
+        let cases = [
+            ("helios merger", None),
+            ("zebra quantum", None),
+            ("helios", Some(vec![1.0, 0.0, 0.0, 0.0])),
+            ("unrelated words", Some(vec![0.0, 0.0, 1.0, 0.0])),
+        ];
+
+        let mut without = Vec::new();
+        for (query, vector) in &cases {
+            let (response, snapshot) = execute_api_query_with_segment_prefilter(
+                &store,
+                request(query, vector.clone()),
+                None,
+            );
+            assert_eq!(snapshot.execution_mode, STORAGE_EXECUTION_MODE_MEMORY_INDEX);
+            without.push(response);
+        }
+        let mut with = Vec::new();
+        {
+            let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+            for (query, vector) in &cases {
+                let (response, snapshot) =
+                    execute_api_query_with_storage_snapshot(&store, request(query, vector.clone()));
+                assert_eq!(
+                    snapshot.execution_mode,
+                    STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE
+                );
+                with.push(response);
+            }
+        }
+
+        // Text-only: the lexical matches only, whatever the storage mode.
+        for (mode, responses) in [("segments", &with), ("memory index", &without)] {
+            assert_eq!(
+                ids(&responses[0]),
+                vec!["c-helios-2", "c-helios-1"],
+                "{mode}"
+            );
+            assert!(
+                ids(&responses[1]).is_empty(),
+                "{mode}: {:?}",
+                ids(&responses[1])
+            );
+        }
+        // Vector and hybrid: the nearest claims, same answer in both modes.
+        assert_eq!(ids(&without[2])[..2], ["c-helios-1", "c-helios-2"]);
+        assert_eq!(ids(&without[3])[0], "c-sports");
+        for (index, (a, b)) in without.iter().zip(&with).enumerate() {
+            assert_eq!(ids(a), ids(b), "case {index}");
+            for (x, y) in a.results.iter().zip(&b.results) {
+                assert!((x.score - y.score).abs() < 1e-6, "case {index}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
     #[test]
     fn execute_api_query_storage_merge_snapshot_tracks_result_sources() {
         let _env_lock = env_lock().lock().expect("env lock should be available");
@@ -2518,5 +2802,129 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         clear_segment_cache_for_tests();
+    }
+
+    fn simple_claim(id: &str, tenant: &str, text: &str) -> Claim {
+        Claim {
+            claim_id: id.into(),
+            tenant_id: tenant.into(),
+            canonical_text: text.into(),
+            confidence: 0.9,
+            event_time_unix: None,
+            entities: vec![],
+            embedding_ids: vec![],
+            claim_type: None,
+            valid_from: None,
+            valid_to: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn simple_edge(id: &str, from: &str, to: &str) -> ClaimEdge {
+        ClaimEdge {
+            edge_id: id.into(),
+            from_claim_id: from.into(),
+            to_claim_id: to.into(),
+            relation: Relation::Supports,
+            strength: 0.8,
+            reason_codes: vec![],
+            created_at: None,
+        }
+    }
+
+    fn simple_request(tenant: &str, query: &str, top_k: usize, graph: bool) -> RetrieveApiRequest {
+        RetrieveApiRequest {
+            tenant_id: tenant.into(),
+            query: query.into(),
+            query_embedding: None,
+            entity_filters: vec![],
+            embedding_id_filters: vec![],
+            top_k,
+            stance_mode: StanceMode::Balanced,
+            return_graph: graph,
+            time_range: None,
+        }
+    }
+
+    #[test]
+    fn memory_path_runs_one_candidate_scan_per_request() {
+        let _guard = segment_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut store = InMemoryStore::new();
+        for i in 0..20 {
+            store
+                .ingest_bundle(
+                    simple_claim(&format!("c{i}"), "tenant-a", "alpha beta gamma"),
+                    vec![],
+                    vec![],
+                )
+                .unwrap();
+        }
+        reset_candidate_scans_for_tests();
+        let (response, snapshot) = execute_api_query_with_storage_snapshot(
+            &store,
+            simple_request("tenant-a", "alpha beta", 5, false),
+        );
+        assert_eq!(
+            candidate_scans_for_tests(),
+            1,
+            "candidate generation must run once per request"
+        );
+        assert_eq!(response.results.len(), 5);
+        assert!(response.graph.is_none());
+        assert!(snapshot.execution_candidate_count >= 5);
+    }
+
+    #[test]
+    fn graph_mode_follows_multi_hop_edges_within_tenant_only() {
+        let _guard = segment_cache_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut store = InMemoryStore::new();
+        store
+            .ingest_bundle(
+                simple_claim("g1", "tenant-a", "zebra quartz uniquetoken"),
+                vec![],
+                vec![
+                    simple_edge("ge1", "g1", "g2"),
+                    simple_edge("ge-foreign", "g1", "x1"),
+                ],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(
+                simple_claim("g2", "tenant-a", "second hop"),
+                vec![],
+                vec![simple_edge("ge2", "g2", "g3")],
+            )
+            .unwrap();
+        store
+            .ingest_bundle(simple_claim("g3", "tenant-a", "third hop"), vec![], vec![])
+            .unwrap();
+        store
+            .ingest_bundle(
+                simple_claim("x1", "tenant-b", "other tenant"),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+
+        let response =
+            execute_api_query(&store, simple_request("tenant-a", "uniquetoken", 1, true));
+        let graph = response.graph.expect("graph requested");
+        let mut edge_ids: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .map(|e| (e.from_claim_id.clone(), e.to_claim_id.clone()))
+            .collect();
+        edge_ids.sort();
+        assert_eq!(
+            edge_ids,
+            vec![("g1".into(), "g2".into()), ("g2".into(), "g3".into())]
+        );
+        let node_ids: Vec<&str> = graph.nodes.iter().map(|n| n.claim_id.as_str()).collect();
+        assert_eq!(node_ids, vec!["g1", "g2", "g3"]);
     }
 }

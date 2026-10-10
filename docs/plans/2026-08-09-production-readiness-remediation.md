@@ -1,5 +1,22 @@
 # DASH Production-Readiness Remediation Plan
 
+> **Superseded (2026-10-09):** several items marked done/fixed here were found broken in the
+> 2026-10-09 deep review. See [`2026-10-09-production-readiness-master-plan.md`](./2026-10-09-production-readiness-master-plan.md)
+> and [`2026-10-09-issue-register.md`](./2026-10-09-issue-register.md) for the current status.
+
+> **Verification status of the "DONE" / "Fixed" items below (2026-10-09, register item DOC-07).** None of these
+> status lines linked a test, CI job or drill record, and each was found defective or unproven in the review:
+>
+> | Item | Status line said | 2026-10-09 finding |
+> |---|---|---|
+> | End-to-end data path | DONE | Works in Compose, but replication endpoints are open unless a token is set (SEC-08) and evidence is duplicated on re-apply (DATA-01). |
+> | Embedding provider selection | DONE | OpenAI provider has no TLS (SEC-23); Ollama endpoint variable naming was inconsistent across docs and deploy files. |
+> | Non-placeholder secrets | DONE | k8s/Helm use wrong variable names and well-known defaults (SEC-03, SEC-04); `.env.example` placeholders pass validation (SEC-05). |
+> | Backup / restore / RPO / RTO | DONE | Scripts and a CI drill exist; no RPO/RTO was measured; consistency of live copies is not guaranteed (DATA-10). |
+> | Structured logging and alerting hooks | DONE | Alert rules exist but are untested; `/metrics` is unauthenticated (SEC-10). |
+>
+> The original text is left unchanged below as a historical record.
+
 Date: 2026-08-09  
 Status: in progress — M1 e2e data path and M2 embedding provider selection implemented  
 Target: make the DASH vector/RAG engine safe to run in a production environment.

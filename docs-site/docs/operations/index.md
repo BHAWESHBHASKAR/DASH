@@ -8,6 +8,10 @@ The operations pages describe how to run DASH in production. They assume the rea
 - [**Observability**](observability.md) — the `/metrics` endpoint, Prometheus scrape config, OpenTelemetry tracing (future), and structured logging.
 - [**Scaling**](scaling.md) — horizontal scaling, `redb` PR 3 replication, and ANN index sharding.
 - [**Backup**](backup.md) — `redb` snapshots, WAL archiving, and cross-region replication.
+- [**Authentication**](auth.md) — deny-by-default authentication, roles, JWT and OIDC settings, rate limiting and SIGHUP reload.
+- [**WAL recovery**](wal-recovery.md) — record formats, torn tails, quarantine, and the `wal-inspect` tool.
+- [**Audit chain**](audit-chain.md) — canonical encoding, verifier, fail-closed behavior.
+- [**Upgrading**](upgrading.md) — steps for moving from 0.2.x to 0.3.0.
 - [**Security & audit**](security-audit.md) — `cargo audit`, `trivy`, `codeql`, and the threat model link.
 
 ## How to read this section

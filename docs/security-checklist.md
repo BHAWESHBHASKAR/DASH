@@ -1,5 +1,14 @@
 # Security Checklist (Pre-Release)
 
+> **Status (2026-10-09): a template, not a record.** No box below has been ticked with evidence, and several items
+> reference things that do not exist: `docs/adr/ADR-006-redb-encryption.md` (there is no `docs/adr/` directory and no
+> ADR-006; DASH has no application-level encryption at rest), `--rate-limit-rps` and per-IP connection caps (neither
+> exists; per-tenant rate limiting is configured with `DASH_*_RATE_LIMIT_PER_TENANT_RPS` and is enforced as of 0.3.0),
+> a `/version` endpoint (not implemented), `bench_transport_concurrency.sh` (the script is
+> `scripts/benchmark_transport_concurrency.sh`), `dash.redb` as a single shared file, and container image names under
+> `ghcr.io/dash-project/`. Treat the list as a goal; correct each item before using it as a release gate, and link
+> evidence for every ticked box (see CONTRIBUTING.md).
+
 This checklist is the gate that the release captain works through before
 cutting a DASH release. Every box must be checked (or explicitly waived with a
 linked rationale comment) for the release to be tagged.
@@ -44,12 +53,14 @@ regression.
       the documented RPS without dropping legitimate traffic. Worst-case
       per-tenant RPS is recorded in the runbook.
       Evidence: <paste bench summary>
-- [ ] **redb encryption-at-rest decision recorded** — currently **no** in-app
-      encryption; see `docs/adr/ADR-006-redb-encryption.md`. This decision
-      has been re-confirmed for this release, and the operator-facing
-      runbook still requires an encrypted block device underneath the
-      `dash.redb` file.
-      Evidence: <link to re-confirmation comment>
+- [ ] **Encryption at rest decision recorded** — DASH can encrypt its data
+      files (`DASH_ENCRYPTION_KEY_FILE`, off by default; see
+      `docs/adr/0005-encryption-at-rest.md` and
+      `docs/operations/encryption.md`). For this release either encryption
+      is enabled with the key stored outside the data volumes and backups
+      (and `wal-inspect keys` shows no plaintext data file), or the decision
+      to rely on an encrypted block device instead is recorded.
+      Evidence: <link to the decision and the `wal-inspect keys` output>
 - [ ] **Dependency licenses reviewed** — `cargo deny check licenses` is
       green and the resulting license list has been diffed against the
       previous release. Any new license appears in `THIRD_PARTY_LICENSES.md`.

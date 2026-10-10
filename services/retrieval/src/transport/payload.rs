@@ -1,5 +1,19 @@
 use super::*;
 
+/// Longest accepted tenant id. Requests are parsed before authentication, so
+/// the bound keeps anonymous callers from pushing large values into denial
+/// audit records and logs.
+const MAX_TENANT_ID_BYTES: usize = dash_common::audit::MAX_AUDIT_FIELD_BYTES;
+
+fn check_tenant_id_length(tenant_id: &str) -> Result<(), String> {
+    if tenant_id.len() > MAX_TENANT_ID_BYTES {
+        return Err(format!(
+            "tenant_id must be at most {MAX_TENANT_ID_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn build_retrieve_transport_request_from_query(
     query: &HashMap<String, String>,
 ) -> Result<RetrieveTransportRequest, String> {
@@ -11,6 +25,7 @@ pub(super) fn build_retrieve_transport_request_from_query(
     if tenant_id.is_empty() {
         return Err("tenant_id cannot be empty".to_string());
     }
+    check_tenant_id_length(&tenant_id)?;
 
     let request_query = query
         .get("query")
@@ -77,18 +92,20 @@ pub(super) fn build_retrieve_transport_request_from_query(
         return Err("time range is invalid: from_unix must be <= to_unix".to_string());
     }
 
+    let request = RetrieveApiRequest {
+        tenant_id,
+        query: request_query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    };
+    validate_retrieve_limits(&request)?;
     Ok(RetrieveTransportRequest {
-        request: RetrieveApiRequest {
-            tenant_id,
-            query: request_query,
-            query_embedding,
-            entity_filters,
-            embedding_id_filters,
-            top_k,
-            stance_mode,
-            return_graph,
-            time_range,
-        },
+        request,
         read_consistency,
     })
 }
@@ -112,6 +129,7 @@ pub(super) fn build_retrieve_transport_request_from_json(
     if tenant_id.trim().is_empty() {
         return Err("tenant_id cannot be empty".to_string());
     }
+    check_tenant_id_length(&tenant_id)?;
 
     let query = require_string(&object, "query")?;
     if query.trim().is_empty() {
@@ -185,18 +203,20 @@ pub(super) fn build_retrieve_transport_request_from_json(
         return Err("time range is invalid: from_unix must be <= to_unix".to_string());
     }
 
+    let request = RetrieveApiRequest {
+        tenant_id,
+        query,
+        query_embedding,
+        entity_filters,
+        embedding_id_filters,
+        top_k,
+        stance_mode,
+        return_graph,
+        time_range,
+    };
+    validate_retrieve_limits(&request)?;
     Ok(RetrieveTransportRequest {
-        request: RetrieveApiRequest {
-            tenant_id,
-            query,
-            query_embedding,
-            entity_filters,
-            embedding_id_filters,
-            top_k,
-            stance_mode,
-            return_graph,
-            time_range,
-        },
+        request,
         read_consistency,
     })
 }
@@ -204,6 +224,50 @@ pub(super) fn build_retrieve_transport_request_from_json(
 #[cfg(test)]
 pub(super) fn build_retrieve_request_from_json(body: &str) -> Result<RetrieveApiRequest, String> {
     build_retrieve_transport_request_from_json(body).map(|value| value.request)
+}
+
+/// Default upper bound for `top_k` (override with `DASH_RETRIEVAL_MAX_TOP_K`).
+const DEFAULT_MAX_TOP_K: usize = 1000;
+const MAX_FILTER_VALUES: usize = 256;
+const MAX_QUERY_BYTES: usize = 8 * 1024;
+const MAX_QUERY_VECTOR_LEN: usize = 8192;
+
+fn max_top_k() -> usize {
+    std::env::var("DASH_RETRIEVAL_MAX_TOP_K")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TOP_K)
+}
+
+/// Bounds on request size and fan-out, applied to both the GET and POST
+/// forms. Messages are short and name the offending field only.
+fn validate_retrieve_limits(req: &RetrieveApiRequest) -> Result<(), String> {
+    let max = max_top_k();
+    if req.top_k > max {
+        return Err(format!("top_k must be <= {max}"));
+    }
+    if req.query.len() > MAX_QUERY_BYTES {
+        return Err(format!("query must be <= {MAX_QUERY_BYTES} bytes"));
+    }
+    if req.entity_filters.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "entity_filters must contain <= {MAX_FILTER_VALUES} values"
+        ));
+    }
+    if req.embedding_id_filters.len() > MAX_FILTER_VALUES {
+        return Err(format!(
+            "embedding_id_filters must contain <= {MAX_FILTER_VALUES} values"
+        ));
+    }
+    if let Some(vector) = &req.query_embedding
+        && vector.len() > MAX_QUERY_VECTOR_LEN
+    {
+        return Err(format!(
+            "query_embedding must have <= {MAX_QUERY_VECTOR_LEN} values"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_stance_mode(raw: &str) -> Result<StanceMode, String> {
@@ -343,255 +407,147 @@ pub(super) enum JsonValue {
     Null,
 }
 
+/// Maximum container nesting accepted in request bodies.
+pub(super) const MAX_JSON_NESTING_DEPTH: usize = 64;
+
+/// Parse a JSON document using serde_json with an explicit nesting limit.
+///
+/// The depth is checked with a linear pre-scan before any recursive work
+/// happens, so hostile inputs such as a megabyte of `[` are rejected without
+/// risk of exhausting the stack.
 pub(super) fn parse_json(input: &str) -> Result<JsonValue, String> {
-    let mut parser = JsonParser::new(input);
-    let value = parser.parse_value()?;
-    parser.skip_whitespace();
-    if !parser.is_eof() {
-        return Err("unexpected trailing JSON content".to_string());
+    if input.trim().is_empty() {
+        return Err("empty JSON payload".to_string());
     }
-    Ok(value)
+    check_json_nesting_depth(input)?;
+    let StrictValue(value) =
+        serde_json::from_str(input).map_err(|err| format!("invalid JSON: {err}"))?;
+    Ok(JsonValue::from_serde(value))
 }
 
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
+/// A `serde_json::Value` that fails to deserialize when an object repeats a
+/// key, instead of silently keeping the last value. Parsing is still done by
+/// serde_json; this only supplies the object visitor.
+struct StrictValue(serde_json::Value);
 
-impl<'a> JsonParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
-            bytes: input.as_bytes(),
-            pos: 0,
-        }
-    }
+impl<'de> serde::Deserialize<'de> for StrictValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictValue;
 
-    fn parse_value(&mut self) -> Result<JsonValue, String> {
-        self.skip_whitespace();
-        match self.peek_byte() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b't') => {
-                self.expect_literal("true")?;
-                Ok(JsonValue::Bool(true))
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any valid JSON value")
             }
-            Some(b'f') => {
-                self.expect_literal("false")?;
-                Ok(JsonValue::Bool(false))
+
+            fn visit_bool<E>(self, v: bool) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Bool(v)))
             }
-            Some(b'n') => {
-                self.expect_literal("null")?;
-                Ok(JsonValue::Null)
+
+            fn visit_i64<E>(self, v: i64) -> Result<StrictValue, E> {
+                Ok(StrictValue(v.into()))
             }
-            Some(b'-' | b'0'..=b'9') => self.parse_number().map(JsonValue::Number),
-            Some(_) => Err("unsupported JSON token".to_string()),
-            None => Err("empty JSON payload".to_string()),
-        }
-    }
 
-    fn parse_object(&mut self) -> Result<JsonValue, String> {
-        self.expect_byte(b'{')?;
-        self.skip_whitespace();
+            fn visit_u64<E>(self, v: u64) -> Result<StrictValue, E> {
+                Ok(StrictValue(v.into()))
+            }
 
-        let mut map = HashMap::new();
-        if self.peek_byte() == Some(b'}') {
-            self.pos += 1;
-            return Ok(JsonValue::Object(map));
-        }
+            fn visit_f64<E>(self, v: f64) -> Result<StrictValue, E> {
+                Ok(StrictValue(
+                    serde_json::Number::from_f64(v).map_or(serde_json::Value::Null, Into::into),
+                ))
+            }
 
-        loop {
-            self.skip_whitespace();
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            self.expect_byte(b':')?;
-            let value = self.parse_value()?;
-            map.insert(key, value);
-            self.skip_whitespace();
+            fn visit_str<E>(self, v: &str) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v.to_string())))
+            }
 
-            match self.peek_byte() {
-                Some(b',') => {
-                    self.pos += 1;
+            fn visit_string<E>(self, v: String) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::String(v)))
+            }
+
+            fn visit_unit<E>(self) -> Result<StrictValue, E> {
+                Ok(StrictValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<StrictValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(StrictValue(item)) = seq.next_element()? {
+                    items.push(item);
                 }
-                Some(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err("invalid JSON object".to_string()),
+                Ok(StrictValue(serde_json::Value::Array(items)))
             }
-        }
 
-        Ok(JsonValue::Object(map))
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, String> {
-        self.expect_byte(b'[')?;
-        self.skip_whitespace();
-
-        let mut items = Vec::new();
-        if self.peek_byte() == Some(b']') {
-            self.pos += 1;
-            return Ok(JsonValue::Array(items));
-        }
-
-        loop {
-            let value = self.parse_value()?;
-            items.push(value);
-            self.skip_whitespace();
-            match self.peek_byte() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err("invalid JSON array".to_string()),
-            }
-        }
-
-        Ok(JsonValue::Array(items))
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        self.expect_byte(b'"')?;
-        let mut out = String::new();
-
-        while let Some(byte) = self.next_byte() {
-            match byte {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let escaped = self
-                        .next_byte()
-                        .ok_or_else(|| "unterminated JSON escape".to_string())?;
-                    match escaped {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let code = self.parse_hex4()?;
-                            let ch = char::from_u32(code)
-                                .ok_or_else(|| "invalid unicode escape".to_string())?;
-                            out.push(ch);
-                        }
-                        _ => return Err("invalid JSON escape sequence".to_string()),
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<StrictValue, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let StrictValue(value) = map.next_value()?;
+                    if object.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate key '{key}'")));
                     }
+                    object.insert(key, value);
                 }
-                b if b.is_ascii_control() => {
-                    return Err("unescaped control character in JSON string".to_string());
+                Ok(StrictValue(serde_json::Value::Object(object)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn check_json_nesting_depth(input: &str) -> Result<(), String> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in input.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > MAX_JSON_NESTING_DEPTH {
+                    return Err(format!(
+                        "JSON nesting exceeds maximum depth of {MAX_JSON_NESTING_DEPTH}"
+                    ));
                 }
-                b => out.push(b as char),
             }
-        }
-
-        Err("unterminated JSON string".to_string())
-    }
-
-    fn parse_number(&mut self) -> Result<String, String> {
-        let start = self.pos;
-
-        if self.peek_byte() == Some(b'-') {
-            self.pos += 1;
-        }
-
-        match self.peek_byte() {
-            Some(b'0') => {
-                self.pos += 1;
-            }
-            Some(b'1'..=b'9') => {
-                self.pos += 1;
-                while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                    self.pos += 1;
-                }
-            }
-            _ => return Err("invalid JSON number".to_string()),
-        }
-
-        if self.peek_byte() == Some(b'.') {
-            self.pos += 1;
-            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                return Err("invalid JSON number".to_string());
-            }
-            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-
-        if matches!(self.peek_byte(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek_byte(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            if !matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                return Err("invalid JSON number".to_string());
-            }
-            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-
-        let raw = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| "invalid JSON number".to_string())?;
-        Ok(raw.to_string())
-    }
-
-    fn parse_hex4(&mut self) -> Result<u32, String> {
-        let mut value: u32 = 0;
-        for _ in 0..4 {
-            let byte = self
-                .next_byte()
-                .ok_or_else(|| "incomplete unicode escape".to_string())?;
-            value = (value << 4)
-                + match byte {
-                    b'0'..=b'9' => (byte - b'0') as u32,
-                    b'a'..=b'f' => (byte - b'a' + 10) as u32,
-                    b'A'..=b'F' => (byte - b'A' + 10) as u32,
-                    _ => return Err("invalid unicode escape".to_string()),
-                };
-        }
-        Ok(value)
-    }
-
-    fn expect_literal(&mut self, literal: &str) -> Result<(), String> {
-        let bytes = literal.as_bytes();
-        if self.bytes.get(self.pos..self.pos + bytes.len()) == Some(bytes) {
-            self.pos += bytes.len();
-            Ok(())
-        } else {
-            Err("invalid JSON literal".to_string())
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
+    Ok(())
+}
 
-    fn expect_byte(&mut self, expected: u8) -> Result<(), String> {
-        match self.next_byte() {
-            Some(byte) if byte == expected => Ok(()),
-            _ => Err("invalid JSON syntax".to_string()),
+impl JsonValue {
+    fn from_serde(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => JsonValue::Null,
+            serde_json::Value::Bool(flag) => JsonValue::Bool(flag),
+            serde_json::Value::Number(number) => JsonValue::Number(number.to_string()),
+            serde_json::Value::String(text) => JsonValue::String(text),
+            serde_json::Value::Array(items) => {
+                JsonValue::Array(items.into_iter().map(JsonValue::from_serde).collect())
+            }
+            serde_json::Value::Object(map) => JsonValue::Object(
+                map.into_iter()
+                    .map(|(key, value)| (key, JsonValue::from_serde(value)))
+                    .collect(),
+            ),
         }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(self.peek_byte(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
-            self.pos += 1;
-        }
-    }
-
-    fn is_eof(&self) -> bool {
-        self.pos >= self.bytes.len()
-    }
-
-    fn peek_byte(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn next_byte(&mut self) -> Option<u8> {
-        let out = self.peek_byte()?;
-        self.pos += 1;
-        Some(out)
     }
 }
 
@@ -797,8 +753,149 @@ pub(super) fn json_escape(raw: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
             _ => out.push(ch),
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_json_rejects_duplicate_keys_at_any_depth() {
+        for bad in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"a":{"b":1,"b":2}}"#,
+            r#"{"a":[{"b":1,"b":1}]}"#,
+        ] {
+            let err = parse_json(bad).err().unwrap_or_default();
+            assert!(err.contains("duplicate key"), "{bad}: {err}");
+        }
+        assert!(parse_json(r#"{"a":1,"b":[1,2.5,"x",null,true],"c":{"a":1}}"#).is_ok());
+    }
+
+    #[test]
+    fn json_strings_decode_utf8_and_surrogate_pairs() {
+        let req = build_retrieve_request_from_json(
+            "{\"tenant_id\":\"t\",\"query\":\"caf\u{e9} \\ud83d\\ude00 \\u00e9\"}",
+        )
+        .expect("valid request");
+        assert_eq!(req.query, "caf\u{e9} \u{1F600} \u{e9}");
+    }
+
+    #[test]
+    fn lone_surrogate_escape_is_rejected_without_panic() {
+        assert!(parse_json("{\"a\":\"\\ud83d\"}").is_err());
+    }
+
+    #[test]
+    fn nesting_beyond_limit_is_rejected_and_within_limit_is_accepted() {
+        let too_deep = "[".repeat(1_000_000);
+        let err = parse_json(&too_deep).expect_err("must reject");
+        assert!(err.contains("nesting"), "{err}");
+
+        let at_limit = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH),
+            "]".repeat(MAX_JSON_NESTING_DEPTH)
+        );
+        assert!(parse_json(&at_limit).is_ok());
+        let over = format!(
+            "{}{}",
+            "[".repeat(MAX_JSON_NESTING_DEPTH + 1),
+            "]".repeat(MAX_JSON_NESTING_DEPTH + 1)
+        );
+        assert!(parse_json(&over).is_err());
+    }
+
+    #[test]
+    fn brackets_inside_strings_do_not_count_toward_depth() {
+        let body = format!("{{\"q\":\"{}\\\"{}\"}}", "[".repeat(500), "{".repeat(500));
+        assert!(parse_json(&body).is_ok());
+    }
+
+    #[test]
+    fn json_escape_escapes_all_control_characters() {
+        let escaped = json_escape("a\u{0}b\u{1f}c\u{8}\n");
+        assert_eq!(escaped, "a\\u0000b\\u001fc\\u0008\\n");
+        let wrapped = format!("\"{escaped}\"");
+        assert!(serde_json::from_str::<String>(&wrapped).is_ok());
+    }
+
+    fn base_json(extra: &str) -> String {
+        format!(r#"{{"tenant_id":"t","query":"q"{extra}}}"#)
+    }
+
+    #[test]
+    fn retrieve_limits_are_enforced() {
+        let top_k_default = build_retrieve_request_from_json(&base_json(r#","top_k":1000"#));
+        assert!(top_k_default.is_ok());
+        let err = build_retrieve_request_from_json(&base_json(r#","top_k":1001"#)).unwrap_err();
+        assert!(err.contains("top_k must be <= 1000"), "{err}");
+
+        let filters = |n: usize| vec!["\"e\""; n].join(",");
+        assert!(
+            build_retrieve_request_from_json(&base_json(&format!(
+                r#","entity_filters":[{}]"#,
+                filters(256)
+            )))
+            .is_ok()
+        );
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","entity_filters":[{}]"#,
+            filters(257)
+        )))
+        .unwrap_err();
+        assert!(err.contains("entity_filters"), "{err}");
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","embedding_id_filters":[{}]"#,
+            filters(257)
+        )))
+        .unwrap_err();
+        assert!(err.contains("embedding_id_filters"), "{err}");
+
+        let long_query = format!(r#"{{"tenant_id":"t","query":"{}"}}"#, "a".repeat(8193));
+        let err = build_retrieve_request_from_json(&long_query).unwrap_err();
+        assert!(err.contains("query must be <="), "{err}");
+        let max_query = format!(r#"{{"tenant_id":"t","query":"{}"}}"#, "a".repeat(8192));
+        assert!(build_retrieve_request_from_json(&max_query).is_ok());
+
+        let vector = |n: usize| vec!["0.5"; n].join(",");
+        assert!(
+            build_retrieve_request_from_json(&base_json(&format!(
+                r#","query_embedding":[{}]"#,
+                vector(8192)
+            )))
+            .is_ok()
+        );
+        let err = build_retrieve_request_from_json(&base_json(&format!(
+            r#","query_embedding":[{}]"#,
+            vector(8193)
+        )))
+        .unwrap_err();
+        assert!(err.contains("query_embedding must have <= 8192"), "{err}");
+    }
+
+    #[test]
+    fn get_form_enforces_the_same_limits() {
+        let mut params = HashMap::new();
+        params.insert("tenant_id".to_string(), "t".to_string());
+        params.insert("query".to_string(), "q".to_string());
+        params.insert("top_k".to_string(), "5000".to_string());
+        let err = build_retrieve_request_from_query(&params).unwrap_err();
+        assert!(err.contains("top_k must be <="), "{err}");
+        params.insert("top_k".to_string(), "5".to_string());
+        params.insert(
+            "entity_filters".to_string(),
+            (0..257)
+                .map(|i| format!("e{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let err = build_retrieve_request_from_query(&params).unwrap_err();
+        assert!(err.contains("entity_filters"), "{err}");
+    }
 }

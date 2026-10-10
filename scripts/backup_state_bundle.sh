@@ -134,6 +134,34 @@ if [[ -f "${SNAPSHOT_PATH}" ]]; then
   printf "artifact\t%s\t%s\n" "${SNAPSHOT_PATH}" "data/wal/${SNAPSHOT_BASENAME}" >> "${MANIFEST_PATH}"
 fi
 
+# A checkpoint whose snapshot was not published yet (the service stopped or
+# crashed while writing it) leaves a pending marker at <wal>.snapshot. Replay
+# then reads the base snapshot and the closed WAL files the marker lists, so
+# they go into the bundle too (under data/wal/pending/). See
+# docs/operations/wal-durability.md, "Checkpoints".
+if [[ -f "${SNAPSHOT_PATH}" && "$(head -n 1 "${SNAPSHOT_PATH}")" == $'SNAP_PENDING\t1' ]]; then
+  mkdir -p "${DATA_ROOT}/wal/pending"
+  PENDING_FILES=()
+  if grep -qx $'base\t1' "${SNAPSHOT_PATH}"; then
+    PENDING_FILES+=("${WAL_PATH}.snapshot.base")
+  fi
+  while IFS=$'\t' read -r key value; do
+    if [[ "${key}" == "replay" ]]; then
+      PENDING_FILES+=("${WAL_PATH}.closed.${value}")
+    fi
+  done < "${SNAPSHOT_PATH}"
+  for pending_file in "${PENDING_FILES[@]}"; do
+    if [[ ! -f "${pending_file}" ]]; then
+      # Only the newest entry can legitimately be missing (a crash before
+      # the WAL was renamed); the service checks the rest at startup.
+      echo "[backup] warning: pending checkpoint file not found: ${pending_file}" >&2
+      continue
+    fi
+    cp -p "${pending_file}" "${DATA_ROOT}/wal/pending/$(basename "${pending_file}")"
+    printf "artifact\t%s\t%s\n" "${pending_file}" "data/wal/pending/$(basename "${pending_file}")" >> "${MANIFEST_PATH}"
+  done
+fi
+
 if [[ -n "${SEGMENT_DIR}" ]]; then
   mkdir -p "${DATA_ROOT}/segments"
   cp -Rp "${SEGMENT_DIR}/." "${DATA_ROOT}/segments/"

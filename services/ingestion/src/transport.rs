@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -11,8 +11,12 @@ use std::{
 
 mod audit;
 mod authz;
+mod commit_status;
 mod config;
+mod delete_routes;
 mod document_parser_debug;
+mod failover;
+mod group_commit;
 mod http;
 mod ingest_routes;
 mod json;
@@ -26,17 +30,20 @@ mod request;
 mod routes;
 mod segment_runtime;
 mod server_runtime;
+mod sync_replication;
 
 use audit::{AuditEvent, emit_audit_event};
-pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
+pub(crate) use authz::{
+    AuthDecision, Role, authorize_request_for_tenant, authorize_request_ops, shared_auth_policy,
+};
+pub use authz::{initialize_auth_policy, warn_replication_transport};
 use config::{
-    env_with_fallback, generate_batch_commit_id, parse_env_first_usize,
+    env_with_fallback, generate_batch_commit_id, parse_env_first_u64, parse_env_first_usize,
     resolve_ingest_batch_max_items, resolve_wal_async_flush_interval, unix_timestamp_millis,
 };
+use dash_common::AuthPolicy;
 use document_parser_debug::render_document_parser_debug_json;
-use http::{
-    HttpRequest, HttpResponse, render_response_text, write_backpressure_response, write_response,
-};
+use http::{HttpRequest, HttpResponse, render_response_text, server_config};
 use metadata_router::{
     PlacementRouteError, ReplicaHealth, ReplicaRole, RoutedReplica, route_write_with_placement,
 };
@@ -46,22 +53,24 @@ use payload::{
     render_ingest_batch_response_json, render_ingest_document_response_json,
     render_ingest_raw_response_json, render_ingest_response_json,
 };
+pub use persistence::{DEFAULT_CHECKPOINT_MAX_WAL_BYTES, checkpoint_policy_from_values};
 use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
     PlacementRoutingState, WriteRouteError, WriteRouteResolution, map_write_route_error,
-    write_entity_key_for_claim,
+    refresh_placement, write_entity_key_for_claim,
 };
 use replication::{
-    ReplicationPullConfig, is_replication_request_authorized, render_replication_delta_frame,
-    render_replication_export_frame, run_replication_pull_tick,
+    ReplicationPullConfig, is_replication_request_authorized,
+    render_replication_delta_frame_with_term, render_replication_export_frame,
+    run_replication_pull_tick,
 };
-use request::{parse_query_usize, parse_request_line, read_http_request, split_target};
+use request::{parse_query_usize, query_encoding_is_invalid, split_target};
 use schema::Claim;
 use segment_runtime::SegmentRuntime;
 use store::{
-    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, WalReplicationDelta,
-    WalReplicationExport, batch_commit_payload_fingerprint,
+    CheckpointPolicy, DiskStatus, FileWal, InMemoryStore, StoreError, VectorIndexPersistence,
+    VectorIndexSaveStats, VectorIndexSnapshot, WalReplicationExport, WalReplicationFrame,
 };
 
 use crate::{
@@ -71,7 +80,7 @@ use crate::{
         IngestDocumentApiResponse, IngestRawApiResponse, WriteConsistencyPolicy,
     },
     extraction::{build_ingest_batch_from_document_request, build_ingest_raw_output_from_request},
-    ingest_document, ingest_document_persistent_with_policy,
+    ingest_document,
 };
 
 #[cfg(test)]
@@ -83,9 +92,20 @@ use metadata_router::{RouterConfig, ShardPlacement};
 #[cfg(test)]
 use placement_routing::PlacementRoutingRuntime;
 
+/// The WAL, shared between the runtime and the group committer thread. Its
+/// mutex serializes every write; the runtime lock is always taken first.
+pub(crate) type SharedWal = Arc<Mutex<FileWal>>;
+
+/// Locks the WAL. A panic while holding it cannot leave the file half
+/// written in a way the WAL does not already handle, so poisoning is ignored.
+pub(crate) fn lock_wal(wal: &SharedWal) -> std::sync::MutexGuard<'_, FileWal> {
+    wal.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct IngestionRuntime {
     store: InMemoryStore,
-    wal: Option<FileWal>,
+    wal: Option<SharedWal>,
+    group_commit: Option<group_commit::GroupCommitPipeline>,
     wal_async_flush_interval: Option<Duration>,
     checkpoint_policy: CheckpointPolicy,
     segment_runtime: Option<SegmentRuntime>,
@@ -126,15 +146,74 @@ pub struct IngestionRuntime {
     wal_flush_last_synced_records: u64,
     wal_flush_last_sync_latency_micros: u64,
     wal_async_flush_tick_total: u64,
+    /// Set when a write could not be persisted (WAL append, fsync or
+    /// interval flush failed with an I/O error, for example a full disk).
+    /// While set, `/ready` reports `wal_write_failed`; it clears after a
+    /// persisted write or a successful space probe.
+    wal_write_error: Option<String>,
+    wal_write_failure_total: u64,
+    wal_write_recovered_total: u64,
     replication_pull_success_total: u64,
     replication_pull_failure_total: u64,
     replication_applied_records_total: u64,
     replication_resync_total: u64,
     replication_last_offset: usize,
     replication_last_error: Option<String>,
-    replication_commit_status: HashMap<String, ReplicationCommitStatus>,
+    replication_follower: replication::ReplicationFollowerState,
+    replication_commit_status: commit_status::CommitStatusTable,
     transport_backpressure: Option<Arc<TransportBackpressureMetrics>>,
     started_at: Instant,
+    /// Saves the vector indexes (persistent mode only); see
+    /// `with_vector_index_persistence`.
+    vector_index_persistence: Option<Arc<VectorIndexPersistence>>,
+    /// Chunked exports served to followers that resync (`<wal>.exports`).
+    replication_exports: Option<Arc<store::ReplicationExportStore>>,
+    /// Counters of the delete routes (`delete_routes`).
+    delete_metrics: delete_routes::DeleteMetrics,
+    /// Leader failover membership (ADR 0006); disabled by default.
+    failover: failover::FailoverState,
+    /// Followers' durable positions (long polls, synchronous replication),
+    /// shared outside the runtime lock.
+    replica_progress: Arc<failover::ReplicaProgress>,
+    /// `DASH_INGEST_MIN_SYNC_REPLICAS` and its timeout behaviour.
+    sync_replication: failover::SyncReplicationConfig,
+    sync_metrics: Arc<sync_replication::SyncReplicationMetrics>,
+    /// The thread writing the snapshot of the checkpoint in flight (see
+    /// `checkpoint_after_commit`). Joined before the next checkpoint starts
+    /// and when the runtime is dropped.
+    checkpoint_worker: Option<std::thread::JoinHandle<()>>,
+    /// Test hook: the checkpoint thread calls it before writing the
+    /// snapshot (a test holds it there to make the write slow on demand).
+    checkpoint_gate: Option<CheckpointGate>,
+    /// A checkpoint whose snapshot write failed, kept (with its frozen
+    /// state) to be written again instead of rotating once more, and when
+    /// it failed. While it is held the WAL refuses new checkpoints, so a
+    /// disk that keeps failing makes the WAL grow (and its writes fail) as
+    /// before, instead of piling up closed generations.
+    failed_checkpoint: FailedCheckpoint,
+    /// Least time between two attempts to write a failed checkpoint's
+    /// snapshot ([`CHECKPOINT_RETRY_INTERVAL`]; tests lower it).
+    checkpoint_retry_interval: Duration,
+}
+
+/// See `IngestionRuntime::failed_checkpoint`.
+type FailedCheckpoint = Arc<Mutex<Option<(store::CheckpointJob, Instant)>>>;
+
+/// Least time between two attempts to write a failed checkpoint's snapshot.
+const CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// See `IngestionRuntime::set_checkpoint_gate_for_tests`.
+pub type CheckpointGate = Arc<dyn Fn() + Send + Sync>;
+
+impl Drop for IngestionRuntime {
+    /// Waits for a checkpoint whose snapshot is still being written, so a
+    /// clean shutdown (or a test that reopens the WAL) never races it. The
+    /// worker only takes the WAL lock, never the runtime lock.
+    fn drop(&mut self) {
+        if let Some(worker) = self.checkpoint_worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -142,15 +221,9 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReplicationCommitStatus {
-    commit_epoch: Option<u64>,
-    ack_count: usize,
-    required_acks: usize,
-    commit_status: String,
-    acknowledged_replicas: HashSet<String>,
+    /// Requests that failed while being read (408/413/431/400/...), by status class.
+    pub(crate) read_error_4xx_total: AtomicU64,
+    pub(crate) read_error_5xx_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +241,8 @@ impl TransportBackpressureMetrics {
             queue_depth: AtomicUsize::new(0),
             queue_capacity,
             queue_full_reject_total: AtomicU64::new(0),
+            read_error_4xx_total: AtomicU64::new(0),
+            read_error_5xx_total: AtomicU64::new(0),
         }
     }
 
@@ -178,13 +253,22 @@ impl TransportBackpressureMetrics {
     pub(crate) fn observe_dequeued(&self) {
         let _ = self
             .queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(1))
             });
     }
 
     pub(crate) fn observe_rejected(&self) {
         self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_read_error(&self, status: u16) {
+        let counter = if status >= 500 {
+            &self.read_error_5xx_total
+        } else {
+            &self.read_error_4xx_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -193,6 +277,7 @@ impl IngestionRuntime {
         Self {
             store,
             wal: None,
+            group_commit: None,
             wal_async_flush_interval: None,
             checkpoint_policy: CheckpointPolicy::default(),
             segment_runtime: SegmentRuntime::from_env(),
@@ -233,15 +318,30 @@ impl IngestionRuntime {
             wal_flush_last_synced_records: 0,
             wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
+            wal_write_error: None,
+            wal_write_failure_total: 0,
+            wal_write_recovered_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
             replication_applied_records_total: 0,
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
-            replication_commit_status: HashMap::new(),
+            replication_follower: replication::ReplicationFollowerState::default(),
+            replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
+            vector_index_persistence: None,
+            replication_exports: None,
+            delete_metrics: delete_routes::DeleteMetrics::default(),
+            failover: failover::FailoverState::default(),
+            replica_progress: Arc::new(failover::ReplicaProgress::default()),
+            sync_replication: failover::SyncReplicationConfig::default(),
+            sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
+            checkpoint_worker: None,
+            checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
         }
     }
 
@@ -252,9 +352,24 @@ impl IngestionRuntime {
     ) -> Self {
         let wal_async_flush_interval =
             resolve_wal_async_flush_interval(Some(&wal), DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS);
-        Self {
+        let replication_exports =
+            Some(Arc::new(store::ReplicationExportStore::for_wal(wal.path())));
+        let wal = Arc::new(Mutex::new(wal));
+        let group_commit = group_commit::resolve_group_commit_config().and_then(|config| {
+            match store::GroupCommitter::start(Arc::clone(&wal), config) {
+                Ok(committer) => Some(group_commit::GroupCommitPipeline::new(committer)),
+                Err(err) => {
+                    eprintln!(
+                        "ingestion could not start the WAL group committer ({err}); single ingests fsync one by one"
+                    );
+                    None
+                }
+            }
+        });
+        let mut runtime = Self {
             store,
             wal: Some(wal),
+            group_commit,
             wal_async_flush_interval,
             checkpoint_policy,
             segment_runtime: SegmentRuntime::from_env(),
@@ -295,16 +410,34 @@ impl IngestionRuntime {
             wal_flush_last_synced_records: 0,
             wal_flush_last_sync_latency_micros: 0,
             wal_async_flush_tick_total: 0,
+            wal_write_error: None,
+            wal_write_failure_total: 0,
+            wal_write_recovered_total: 0,
             replication_pull_success_total: 0,
             replication_pull_failure_total: 0,
             replication_applied_records_total: 0,
             replication_resync_total: 0,
             replication_last_offset: 0,
             replication_last_error: None,
-            replication_commit_status: HashMap::new(),
+            replication_follower: replication::ReplicationFollowerState::default(),
+            replication_commit_status: commit_status::CommitStatusTable::from_env(),
             transport_backpressure: None,
             started_at: Instant::now(),
-        }
+            vector_index_persistence: None,
+            replication_exports,
+            delete_metrics: delete_routes::DeleteMetrics::default(),
+            failover: failover::FailoverState::default(),
+            replica_progress: Arc::new(failover::ReplicaProgress::default()),
+            sync_replication: failover::SyncReplicationConfig::default(),
+            sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
+            checkpoint_worker: None,
+            checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
+        };
+        runtime.warm_replication_index();
+        runtime.resume_pending_checkpoint();
+        runtime
     }
 
     pub fn claims_len(&self) -> usize {
@@ -343,11 +476,24 @@ impl IngestionRuntime {
         self
     }
 
+    /// Make the next write or `/metrics` reload the placement at once (a
+    /// promoted node must not wait out the reload interval).
+    pub(crate) fn request_placement_reload(&mut self) {
+        if let Ok(Some(state)) = self.placement_routing.as_mut() {
+            state.request_reload();
+        }
+    }
+
     fn ensure_local_write_route_for_claim(
         &mut self,
         claim: &Claim,
         write_consistency: WriteConsistencyPolicy,
     ) -> Result<WriteRouteResolution, WriteRouteError> {
+        // Checked under the runtime lock, right before the append: a write
+        // that queued behind a demotion is refused too.
+        self.failover
+            .check_write(Instant::now())
+            .map_err(WriteRouteError::NotLeader)?;
         let Some(routing_state) = self
             .placement_routing
             .as_mut()
@@ -363,13 +509,14 @@ impl IngestionRuntime {
                 total_replicas: 1,
             });
         };
-        routing_state.maybe_refresh();
+        routing_state.check_fresh()?;
         let routing = routing_state.runtime();
         let entity_key = write_entity_key_for_claim(claim);
+        let tenant_router_config = routing.router_config_for_tenant(&claim.tenant_id);
         let routed = route_write_with_placement(
             &claim.tenant_id,
             entity_key,
-            &routing.router_config,
+            &tenant_router_config,
             &routing.placements,
         )
         .map_err(WriteRouteError::Placement)?;
@@ -423,6 +570,18 @@ impl IngestionRuntime {
     }
 
     fn ingest(&mut self, request: IngestApiRequest) -> Result<IngestApiResponse, StoreError> {
+        let result = self.ingest_unobserved(request);
+        // An unchanged replay writes nothing, so it says nothing about the disk.
+        let wrote = matches!(&result, Ok((_, true)));
+        self.observe_write_outcome(result.as_ref().map(|_| wrote));
+        result.map(|(resp, _)| resp)
+    }
+
+    /// The write and whether it appended to the WAL.
+    fn ingest_unobserved(
+        &mut self,
+        request: IngestApiRequest,
+    ) -> Result<(IngestApiResponse, bool), StoreError> {
         let tenant_id = request.claim.tenant_id.clone();
         let ingested_claim_id = request.claim.claim_id.clone();
         let input = IngestInput {
@@ -431,11 +590,39 @@ impl IngestionRuntime {
             evidence: request.evidence,
             edges: request.edges,
         };
-        let checkpoint_stats = self.ingest_input_internal(input)?;
+        crate::api::validate_ingest_bundles(
+            &self.store,
+            &[(
+                &input.claim,
+                input.claim_embedding.as_deref(),
+                input.edges.as_slice(),
+            )],
+        )?;
+        let (checkpoint_stats, checkpoint_deferred, applied) = self.ingest_input_internal(input)?;
 
         self.successful_ingests += 1;
-        self.publish_segments_for_tenant(&tenant_id);
-        Ok(IngestApiResponse {
+        // A retry that changed nothing must not re-scan the tenant's claims
+        // to rebuild segments.
+        if applied {
+            self.publish_segments_for_tenant(&tenant_id);
+        }
+        let response = self.ingest_response(
+            ingested_claim_id,
+            Some((checkpoint_stats, checkpoint_deferred)),
+        );
+        Ok((response, applied))
+    }
+
+    /// Response of a committed single ingest. `checkpoint` is the outcome of
+    /// [`IngestionRuntime::checkpoint_after_commit`], `None` when no
+    /// checkpoint was considered.
+    fn ingest_response(
+        &self,
+        ingested_claim_id: String,
+        checkpoint: Option<(Option<store::WalCheckpointStats>, bool)>,
+    ) -> IngestApiResponse {
+        let (checkpoint_stats, checkpoint_deferred) = checkpoint.unwrap_or((None, false));
+        IngestApiResponse {
             ingested_claim_id,
             claims_total: self.store.claims_len(),
             commit_epoch: None,
@@ -447,10 +634,44 @@ impl IngestionRuntime {
             checkpoint_truncated_wal_records: checkpoint_stats
                 .as_ref()
                 .map(|s| s.truncated_wal_records),
-        })
+            checkpoint_deferred,
+        }
+    }
+
+    /// `true` when single ingests go through the group committer.
+    pub(crate) fn group_commit_active(&self) -> bool {
+        self.group_commit.is_some()
+    }
+
+    /// One-line description of the group-commit settings for the startup
+    /// log, or `None` when group commit is off.
+    pub fn group_commit_summary(&self) -> Option<String> {
+        let config = self.group_commit.as_ref()?.committer().config();
+        Some(format!(
+            "max_wait_us={}, max_batch_bytes={}, queue_capacity={}",
+            config.max_wait.as_micros(),
+            config.max_batch_bytes,
+            config.queue_capacity
+        ))
+    }
+
+    /// Why the WAL refuses writes (after an fsync failure), if it does.
+    pub fn wal_poisoned_reason(&self) -> Option<String> {
+        let wal = self.wal.as_ref()?;
+        lock_wal(wal).poisoned_reason().map(str::to_string)
     }
 
     fn ingest_batch(
+        &mut self,
+        request: IngestBatchApiRequest,
+    ) -> Result<IngestBatchApiResponse, StoreError> {
+        let result = self.ingest_batch_unobserved(request);
+        let wrote = matches!(&result, Ok(resp) if !resp.idempotent_replay);
+        self.observe_write_outcome(result.as_ref().map(|_| wrote));
+        result
+    }
+
+    fn ingest_batch_unobserved(
         &mut self,
         request: IngestBatchApiRequest,
     ) -> Result<IngestBatchApiResponse, StoreError> {
@@ -472,22 +693,39 @@ impl IngestionRuntime {
             ingested_claim_ids.push(claim_id);
         }
 
-        if let Some(existing) = self.store.batch_commit_metadata(&commit_id) {
-            let incoming_fingerprint =
-                batch_commit_payload_fingerprint(ingested_claim_ids.len(), &ingested_claim_ids);
-            if existing.payload_fingerprint != incoming_fingerprint {
-                return Err(StoreError::Conflict(format!(
-                    "batch commit_id '{}' already exists with different payload (existing_fingerprint={}, incoming_fingerprint={})",
-                    commit_id, existing.payload_fingerprint, incoming_fingerprint
-                )));
-            }
+        let bundles: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                (
+                    &input.claim,
+                    input.claim_embedding.as_deref(),
+                    input.edges.as_slice(),
+                )
+            })
+            .collect();
+        crate::api::validate_ingest_bundles(&self.store, &bundles)?;
 
+        // Idempotency is decided on CONTENT, not on claim ids (DATA-12): a
+        // known commit id whose every bundle is already stored verbatim is a
+        // replay; a known commit id with different content is an update that
+        // upserts over the previous version.
+        let existing = self.store.batch_commit_metadata(&commit_id).cloned();
+        let content_unchanged = inputs.iter().all(|input| {
+            self.store.bundle_already_applied(
+                &input.claim,
+                &input.evidence,
+                &input.edges,
+                input.claim_embedding.as_deref(),
+            )
+        });
+        if existing.is_some() && content_unchanged {
             self.batch_success_total = self.batch_success_total.saturating_add(1);
             self.batch_last_size = ingested_claim_ids.len();
             self.batch_idempotent_hit_total = self.batch_idempotent_hit_total.saturating_add(1);
             return Ok(IngestBatchApiResponse {
                 commit_id,
                 idempotent_replay: true,
+                updated: false,
                 batch_size: ingested_claim_ids.len(),
                 ingested_claim_ids,
                 claims_total: self.store.claims_len(),
@@ -498,23 +736,49 @@ impl IngestionRuntime {
                 checkpoint_triggered: false,
                 checkpoint_snapshot_records: None,
                 checkpoint_truncated_wal_records: None,
+                checkpoint_deferred: false,
             });
         }
+        let updated = existing.is_some();
+        // The commit metadata is keyed by claim-id set; an update that
+        // changes the set is recorded under a versioned id so the original
+        // record is never rewritten (and replay never sees a conflict).
+        let wal_commit_id = match existing.as_ref() {
+            Some(meta) if meta.claim_ids != ingested_claim_ids => format!(
+                "{commit_id}@{}",
+                store::batch_commit_payload_fingerprint(
+                    ingested_claim_ids.len(),
+                    &ingested_claim_ids
+                )
+            ),
+            _ => commit_id.clone(),
+        };
 
-        let mut staged_store = self.store.clone();
+        // Stage on a detached clone: nothing reaches redb until the WAL
+        // append succeeded (DATA-09).
+        let commit_ts_unix_ms = unix_timestamp_millis();
+        let mut staged_store = self.store.clone_detached();
         for input in &inputs {
             ingest_document(&mut staged_store, input.clone())?;
         }
+        staged_store.observe_batch_commit(
+            &wal_commit_id,
+            ingested_claim_ids.len(),
+            commit_ts_unix_ms,
+            &ingested_claim_ids,
+        )?;
 
-        let commit_ts_unix_ms = unix_timestamp_millis();
-        if let Some(wal) = self.wal.as_mut() {
+        if let Some(wal) = self.wal.as_ref() {
+            let mut wal = lock_wal(wal);
+            let wal = &mut *wal;
             let rollback_point = wal.begin_rollback_point()?;
             let append_result = (|| {
+                wal.begin_group(&wal_commit_id, commit_ts_unix_ms)?;
                 for input in &inputs {
                     append_input_to_wal(wal, input)?;
                 }
                 wal.append_batch_commit(
-                    &commit_id,
+                    &wal_commit_id,
                     ingested_claim_ids.len(),
                     commit_ts_unix_ms,
                     &ingested_claim_ids,
@@ -530,28 +794,16 @@ impl IngestionRuntime {
             self.batch_commit_total = self.batch_commit_total.saturating_add(1);
         }
 
-        self.store = staged_store;
+        // The WAL is durable: the commit stands even if redb mirroring
+        // fails (the store detaches redb and reports `Unavailable`).
+        if let Err(err) = self.store.commit_staged(staged_store) {
+            eprintln!("ingestion batch commit: redb mirror failed after WAL commit: {err:?}");
+        }
         self.successful_ingests = self
             .successful_ingests
             .saturating_add(ingested_claim_ids.len() as u64);
 
-        let mut checkpoint_stats = None;
-        self.store.observe_batch_commit(
-            &commit_id,
-            ingested_claim_ids.len(),
-            commit_ts_unix_ms,
-            &ingested_claim_ids,
-        )?;
-        if let Some(wal) = self.wal.as_mut()
-            && should_checkpoint_now(&self.checkpoint_policy, wal)?
-        {
-            match self.store.checkpoint_and_compact(wal) {
-                Ok(stats) => checkpoint_stats = Some(stats),
-                Err(err) => {
-                    eprintln!("ingestion batch checkpoint failed after commit: {err:?}");
-                }
-            }
-        }
+        let (checkpoint_stats, checkpoint_deferred) = self.checkpoint_after_commit("batch");
 
         for tenant_id in touched_tenants {
             self.publish_segments_for_tenant(&tenant_id);
@@ -562,6 +814,7 @@ impl IngestionRuntime {
         Ok(IngestBatchApiResponse {
             commit_id,
             idempotent_replay: false,
+            updated,
             batch_size: ingested_claim_ids.len(),
             ingested_claim_ids,
             claims_total: self.store.claims_len(),
@@ -574,25 +827,274 @@ impl IngestionRuntime {
             checkpoint_truncated_wal_records: checkpoint_stats
                 .as_ref()
                 .map(|s| s.truncated_wal_records),
+            checkpoint_deferred,
         })
+    }
+
+    /// Checkpoint after a committed write. A failure never invalidates the
+    /// commit: the write is durable in the WAL, so the caller is told the
+    /// checkpoint was deferred and a later write retries it (DATA-10).
+    ///
+    /// Only the rotation and a copy-on-write copy of the state happen here,
+    /// under the runtime and WAL locks (milliseconds); the snapshot is
+    /// written and published by a background thread while writes continue
+    /// in the new WAL (see `store::CheckpointJob`). The returned stats
+    /// describe the checkpoint that started. While one is still being
+    /// written no other starts.
+    fn checkpoint_after_commit(
+        &mut self,
+        label: &str,
+    ) -> (Option<store::WalCheckpointStats>, bool) {
+        let Some(shared) = self.wal.as_ref() else {
+            return (None, false);
+        };
+        let mut wal = lock_wal(shared);
+        if wal.checkpoint_in_flight() {
+            // A failed snapshot write is retried (same frozen state, no new
+            // rotation) once the WAL is past the threshold again.
+            let retry = if matches!(
+                should_checkpoint_now(&self.checkpoint_policy, &wal),
+                Ok(true)
+            ) {
+                self.take_failed_checkpoint_due()
+            } else {
+                None
+            };
+            drop(wal);
+            if let Some(job) = retry {
+                eprintln!("ingestion {label}: retrying the failed checkpoint snapshot write");
+                self.spawn_checkpoint_writer(job, label);
+            }
+            return (None, false);
+        }
+        match should_checkpoint_now(&self.checkpoint_policy, &wal) {
+            Ok(false) => (None, false),
+            Ok(true) => match self.store.begin_checkpoint(&mut wal) {
+                Ok(job) => {
+                    drop(wal);
+                    let stats = job.stats().clone();
+                    tracing::info!(
+                        "ingestion checkpoint started after {label}: pause_ms={:.3}, snapshot_records={}, closed_wal_records={}",
+                        job.pause().as_secs_f64() * 1000.0,
+                        stats.snapshot_records,
+                        stats.truncated_wal_records
+                    );
+                    self.spawn_checkpoint_writer(job, label);
+                    // The checkpoint started a new WAL generation, which the
+                    // saved vector index no longer matches: save it again.
+                    if let Some(persistence) = self.vector_index_persistence.as_ref() {
+                        persistence.request_save();
+                    }
+                    (Some(stats), false)
+                }
+                Err(err) => {
+                    eprintln!("ingestion {label} checkpoint failed after commit: {err:?}");
+                    (None, true)
+                }
+            },
+            Err(err) => {
+                eprintln!("ingestion {label} checkpoint check failed after commit: {err:?}");
+                (None, true)
+            }
+        }
+    }
+
+    /// Writes and publishes the snapshot of `job` on a background thread
+    /// (on this thread if none can be started).
+    fn spawn_checkpoint_writer(&mut self, job: store::CheckpointJob, label: &str) {
+        if let Some(previous) = self.checkpoint_worker.take() {
+            // It finished: the WAL refuses a checkpoint while one is in
+            // flight. Joining only reaps the thread.
+            let _ = previous.join();
+        }
+        let Some(wal) = self.wal.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let label = label.to_string();
+        let gate = self.checkpoint_gate.clone();
+        let failed = Arc::clone(&self.failed_checkpoint);
+        let run = move |job: store::CheckpointJob, wal: &SharedWal| {
+            if let Some(gate) = gate.as_ref() {
+                gate();
+            }
+            let started = std::time::Instant::now();
+            let written = job.write_catching_panics();
+            let write_secs = started.elapsed().as_secs_f64();
+            if let Err(err) = written {
+                // Kept for a retry; the files keep the pending state
+                // (replayed correctly at startup) meanwhile.
+                eprintln!("ingestion {label} background checkpoint failed: {err:?}");
+                *failed.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((job, std::time::Instant::now()));
+                return;
+            }
+            let mut guard = lock_wal(wal);
+            let result = job.finish(&mut guard);
+            drop(guard);
+            // Retired files (the old snapshot, closed WAL files) are
+            // deleted here, without the WAL lock.
+            let result = result.map(|done| {
+                tracing::info!(
+                    "ingestion checkpoint published: snapshot_records={}, write_secs={write_secs:.3}",
+                    done.stats.snapshot_records
+                );
+            });
+            if let Err(err) = result {
+                // The WAL keeps the pending state (base snapshot plus closed
+                // WAL files, replayed at startup); the next checkpoint
+                // supersedes it.
+                eprintln!("ingestion {label} background checkpoint failed: {err:?}");
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<store::CheckpointJob>();
+        let worker_wal = Arc::clone(&wal);
+        let worker_run = run.clone();
+        let spawned = std::thread::Builder::new()
+            .name("dash-ingest-checkpoint".to_string())
+            .spawn(move || {
+                if let Ok(job) = rx.recv() {
+                    worker_run(job, &worker_wal);
+                }
+            });
+        match spawned {
+            Ok(handle) => match tx.send(job) {
+                Ok(()) => self.checkpoint_worker = Some(handle),
+                Err(std::sync::mpsc::SendError(job)) => run(job, &wal),
+            },
+            Err(err) => {
+                eprintln!(
+                    "ingestion could not start the checkpoint thread ({err}); writing the snapshot inline"
+                );
+                run(job, &wal);
+            }
+        }
+    }
+
+    /// Indexes the WAL read at startup once, before serving. Appends keep
+    /// the replication index current from then on, so neither a follower's
+    /// first poll nor a checkpoint (which needs the closed generation's view
+    /// length) reads the whole WAL under the lock.
+    fn warm_replication_index(&mut self) {
+        if let Some(wal) = self.wal.as_ref()
+            && let Err(err) = lock_wal(wal).replication_position()
+        {
+            eprintln!("ingestion could not index the WAL for replication at startup: {err:?}");
+        }
+    }
+
+    /// A checkpoint whose snapshot was never published (a crash, or a failed
+    /// write before the last shutdown) left the pending state behind:
+    /// replay reads the base snapshot and the closed WAL files. Start a new
+    /// checkpoint right away, which supersedes them, instead of keeping them
+    /// until the WAL reaches the threshold again. Only when the store was
+    /// loaded from this WAL (its position matches), so the snapshot is the
+    /// WAL's state.
+    fn resume_pending_checkpoint(&mut self) {
+        let Some(shared) = self.wal.as_ref() else {
+            return;
+        };
+        let mut wal = lock_wal(shared);
+        if !wal.checkpoint_pending()
+            || wal.checkpoint_in_flight()
+            || self.store.wal_position() != Some(wal.position())
+        {
+            return;
+        }
+        match self.store.begin_checkpoint(&mut wal) {
+            Ok(job) => {
+                drop(wal);
+                tracing::info!(
+                    "ingestion found an unpublished checkpoint; checkpoint started: snapshot_records={}",
+                    job.stats().snapshot_records
+                );
+                self.spawn_checkpoint_writer(job, "startup");
+            }
+            Err(err) => {
+                eprintln!("ingestion could not supersede the unpublished checkpoint: {err:?}");
+            }
+        }
+    }
+
+    /// The failed checkpoint held for a retry, if its retry is due.
+    fn take_failed_checkpoint_due(&self) -> Option<store::CheckpointJob> {
+        let mut held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match held.as_ref() {
+            Some((_, failed_at)) if failed_at.elapsed() >= self.checkpoint_retry_interval => {
+                held.take().map(|(job, _)| job)
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits for a running checkpoint thread and gives up a failed
+    /// checkpoint held for a retry (its pending files stay; the next
+    /// checkpoint or a resync supersedes them). Followers call it before
+    /// they compact or replace their WAL.
+    pub(crate) fn settle_checkpoint(&mut self) {
+        self.wait_for_checkpoint();
+        let held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let (Some((job, _)), Some(wal)) = (held, self.wal.as_ref()) {
+            job.abort(&mut lock_wal(wal));
+        }
+    }
+
+    /// Waits until the checkpoint whose snapshot is being written (if any)
+    /// is published or has failed.
+    pub fn wait_for_checkpoint(&mut self) {
+        if let Some(worker) = self.checkpoint_worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    /// Takes the handle of the checkpoint thread, so a caller can wait for it
+    /// without holding the runtime lock.
+    pub(crate) fn take_checkpoint_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.checkpoint_worker.take()
+    }
+
+    /// Test hook: retry a failed checkpoint snapshot write after `interval`
+    /// instead of [`CHECKPOINT_RETRY_INTERVAL`].
+    #[doc(hidden)]
+    pub fn set_checkpoint_retry_interval_for_tests(&mut self, interval: Duration) {
+        self.checkpoint_retry_interval = interval;
+    }
+
+    /// Test hook: `gate` runs on the checkpoint thread before it writes the
+    /// snapshot. A test blocks in it to hold a checkpoint "in the middle of
+    /// a slow snapshot write" deterministically.
+    #[doc(hidden)]
+    pub fn set_checkpoint_gate_for_tests(&mut self, gate: Option<CheckpointGate>) {
+        self.checkpoint_gate = gate;
     }
 
     fn ingest_input_internal(
         &mut self,
         input: IngestInput,
-    ) -> Result<Option<store::WalCheckpointStats>, StoreError> {
-        let checkpoint_stats = if let Some(wal) = self.wal.as_mut() {
-            ingest_document_persistent_with_policy(
-                &mut self.store,
-                wal,
-                &self.checkpoint_policy,
-                input,
-            )?
-        } else {
+    ) -> Result<(Option<store::WalCheckpointStats>, bool, bool), StoreError> {
+        let Some(wal) = self.wal.as_ref() else {
             ingest_document(&mut self.store, input)?;
-            None
+            return Ok((None, false, true));
         };
-        Ok(checkpoint_stats)
+        let outcome = self.store.ingest_atomic_persistent(
+            &mut lock_wal(wal),
+            input.claim,
+            input.evidence,
+            input.edges,
+            input.claim_embedding,
+            unix_timestamp_millis(),
+        )?;
+        if let Some(reason) = outcome.disk_error {
+            eprintln!("ingestion redb mirror failed after WAL commit: {reason}");
+        }
+        let (stats, deferred) = self.checkpoint_after_commit("ingest");
+        Ok((stats, deferred, outcome.applied))
     }
 
     fn publish_segments_for_tenant(&mut self, tenant_id: &str) {
@@ -631,20 +1133,15 @@ impl IngestionRuntime {
         if let Some(local_replica_id) = self.local_replica_ack_seed() {
             acknowledged_replicas.insert(local_replica_id);
         }
-        let commit_status = if ack_count >= required_acks {
-            "replication_quorum_met"
-        } else {
-            "replication_pending"
-        };
         self.replication_commit_status.insert(
             commit_id.to_string(),
-            ReplicationCommitStatus {
+            commit_status::ReplicationCommitStatus::new(
                 commit_epoch,
                 ack_count,
                 required_acks,
-                commit_status: commit_status.to_string(),
                 acknowledged_replicas,
-            },
+            ),
+            Instant::now(),
         );
     }
 
@@ -679,22 +1176,8 @@ impl IngestionRuntime {
     ) -> Result<ReplicationCommitStatusSnapshot, String> {
         let status = self
             .replication_commit_status
-            .get_mut(commit_id)
+            .ack(commit_id, replica_id, ack_epoch, Instant::now())
             .ok_or_else(|| format!("unknown commit_id '{}'", commit_id))?;
-        if status
-            .acknowledged_replicas
-            .insert(replica_id.trim().to_string())
-        {
-            status.ack_count = status.ack_count.saturating_add(1);
-        }
-        if let Some(epoch) = ack_epoch {
-            status.commit_epoch = Some(status.commit_epoch.unwrap_or(epoch).max(epoch));
-        }
-        if status.ack_count >= status.required_acks {
-            status.commit_status = "replication_quorum_met".to_string();
-        } else {
-            status.commit_status = "replication_pending".to_string();
-        }
         Ok(ReplicationCommitStatusSnapshot {
             commit_id: commit_id.to_string(),
             commit_epoch: status.commit_epoch,
@@ -753,16 +1236,72 @@ impl IngestionRuntime {
         }
     }
 
+    /// Track whether writes can be persisted. `Ok(true)` is a write that
+    /// reached the WAL; `Ok(false)` wrote nothing (an idempotent replay); an
+    /// I/O error means the WAL could not be appended or synced.
+    pub(super) fn observe_write_outcome(&mut self, outcome: Result<bool, &StoreError>) {
+        match outcome {
+            Ok(true) => {
+                if self.wal.is_some() && self.wal_write_error.take().is_some() {
+                    self.wal_write_recovered_total += 1;
+                    eprintln!("ingestion: WAL writes succeed again; ready");
+                }
+            }
+            Ok(false) => {}
+            Err(StoreError::Io(reason)) => self.observe_wal_write_failure(reason),
+            Err(_) => {}
+        }
+    }
+
+    fn observe_wal_write_failure(&mut self, reason: &str) {
+        if self.wal.is_none() {
+            return;
+        }
+        self.wal_write_failure_total += 1;
+        if self.wal_write_error.is_none() {
+            eprintln!("ingestion: write could not be persisted, not ready: {reason}");
+        }
+        self.wal_write_error = Some(reason.to_string());
+    }
+
+    /// Readiness of the write path. After a failed write the WAL file must
+    /// exist and the WAL directory is probed with a scratch file of
+    /// [`WAL_SPACE_PROBE_BYTES`] (written, synced and removed); the service
+    /// is ready again once that succeeds.
+    pub(crate) fn wal_write_readiness(&mut self) -> Result<(), &'static str> {
+        if self.wal_write_error.is_none() {
+            return Ok(());
+        }
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(());
+        };
+        let path = lock_wal(wal).path().to_path_buf();
+        let probe =
+            std::fs::metadata(&path).and_then(|_| probe_wal_space(&path, WAL_SPACE_PROBE_BYTES));
+        match probe {
+            Ok(()) => {
+                self.wal_write_error = None;
+                self.wal_write_recovered_total += 1;
+                eprintln!("ingestion: WAL space probe succeeded; ready");
+                Ok(())
+            }
+            Err(_) => Err("wal_write_failed"),
+        }
+    }
+
     fn flush_wal_if_due(&mut self) {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             return;
         };
+        let mut wal = lock_wal(wal);
         if wal.background_flush_only() {
             return;
         }
         let unsynced_before = wal.unsynced_record_count() as u64;
         let started = Instant::now();
-        match wal.flush_pending_sync_if_interval_elapsed() {
+        let result = wal.flush_pending_sync_if_interval_elapsed();
+        drop(wal);
+        match result {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
@@ -773,18 +1312,24 @@ impl IngestionRuntime {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_failure_total += 1;
                 eprintln!("ingestion WAL interval flush failed: {err:?}");
+                if let StoreError::Io(reason) = &err {
+                    self.observe_wal_write_failure(reason);
+                }
             }
         }
     }
 
     pub(crate) fn flush_wal_for_async_tick(&mut self) {
-        let Some(wal) = self.wal.as_mut() else {
+        let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        self.wal_async_flush_tick_total += 1;
+        let mut wal = lock_wal(wal);
         let unsynced_before = wal.unsynced_record_count() as u64;
         let started = Instant::now();
-        match wal.flush_pending_sync_if_unsynced() {
+        let result = wal.flush_pending_sync_if_unsynced();
+        drop(wal);
+        self.wal_async_flush_tick_total += 1;
+        match result {
             Ok(true) => {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_success_total += 1;
@@ -795,12 +1340,56 @@ impl IngestionRuntime {
                 self.wal_flush_due_total += 1;
                 self.wal_flush_failure_total += 1;
                 eprintln!("ingestion WAL async flush failed: {err:?}");
+                if let StoreError::Io(reason) = &err {
+                    self.observe_wal_write_failure(reason);
+                }
             }
         }
     }
 
     pub(crate) fn wal_async_flush_interval(&self) -> Option<Duration> {
         self.wal_async_flush_interval
+    }
+
+    /// Save the vector indexes through `persistence`: periodically, after
+    /// every WAL checkpoint and once more at a clean shutdown (see
+    /// `serve_http_with_workers`). Ignored without a WAL.
+    pub fn with_vector_index_persistence(
+        mut self,
+        persistence: Arc<VectorIndexPersistence>,
+    ) -> Self {
+        if let Some(wal) = self.wal.as_ref() {
+            // A checkpoint started at construction changed the generation.
+            if lock_wal(wal).checkpoint_in_flight() {
+                persistence.request_save();
+            }
+            self.vector_index_persistence = Some(persistence);
+        }
+        self
+    }
+
+    pub(crate) fn vector_index_persistence(&self) -> Option<Arc<VectorIndexPersistence>> {
+        self.vector_index_persistence.clone()
+    }
+
+    /// A copy of the vector indexes stamped with the WAL position they
+    /// reflect. The WAL is flushed first so that position is durable; on a
+    /// flush failure there is nothing safe to save and `None` is returned.
+    /// Cheap (copy-on-write); the caller saves it after releasing the lock.
+    pub fn vector_index_snapshot(&mut self) -> Option<VectorIndexSnapshot> {
+        // A group-committed record that is durable but not yet applied would
+        // be inside the stamped WAL position yet missing from the snapshot.
+        // Skip; the next interval, checkpoint or shutdown saves instead.
+        if group_commit::has_unapplied(self) {
+            return None;
+        }
+        let wal = self.wal.as_ref()?;
+        let mut wal = lock_wal(wal);
+        if let Err(err) = wal.flush_pending_sync() {
+            tracing::warn!("ingestion vector index save skipped: WAL flush failed: {err:?}");
+            return None;
+        }
+        Some(self.store.vector_index_snapshot(wal.position()))
     }
 
     fn observe_wal_flush_success(&mut self, synced_records: u64, latency: Duration) {
@@ -822,9 +1411,19 @@ impl IngestionRuntime {
         self.transport_backpressure = Some(metrics);
     }
 
-    pub(crate) fn refresh_placement_if_due(&mut self) {
+    fn begin_placement_refresh(&mut self) -> Option<placement_routing::PlacementRefreshJob> {
+        match self.placement_routing.as_mut() {
+            Ok(Some(state)) => state.begin_refresh(),
+            _ => None,
+        }
+    }
+
+    fn finish_placement_refresh(
+        &mut self,
+        result: Result<placement_routing::PlacementRoutingRuntime, String>,
+    ) {
         if let Ok(Some(state)) = self.placement_routing.as_mut() {
-            state.maybe_refresh();
+            state.finish_refresh(result);
         }
     }
 
@@ -853,97 +1452,57 @@ impl IngestionRuntime {
         }
     }
 
+    /// A delta frame for a follower. With `allow_switch` (the follower sent
+    /// `gen_switch=1`) a follower at the exact end of a generation a
+    /// checkpoint closed is moved to offset 0 of the current generation
+    /// instead of being sent to a resync.
     fn replication_delta_for_followers(
         &mut self,
+        from_generation: Option<u64>,
         from_offset: usize,
         max_records: usize,
-    ) -> Result<WalReplicationDelta, StoreError> {
-        let wal = self.wal.as_mut().ok_or_else(|| {
+        allow_switch: bool,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        let wal = self.wal.as_ref().ok_or_else(|| {
             StoreError::Io("replication source requires persistent WAL mode".to_string())
         })?;
-        wal.replication_delta_from(from_offset, max_records)
+        let mut wal = lock_wal(wal);
+        if allow_switch {
+            wal.replication_frame_with_switch(from_generation, from_offset, max_records)
+        } else {
+            wal.replication_frame_from(from_generation, from_offset, max_records)
+        }
     }
 
-    fn replication_export_for_followers(&mut self) -> Result<WalReplicationExport, StoreError> {
-        let wal = self.wal.as_mut().ok_or_else(|| {
-            StoreError::Io("replication source requires persistent WAL mode".to_string())
-        })?;
-        wal.replication_export()
+    /// The export store (persistent mode only), for the pruning thread.
+    pub(super) fn replication_exports(&self) -> Option<Arc<store::ReplicationExportStore>> {
+        self.replication_exports.clone()
     }
 
-    fn apply_replication_delta_lines(
+    /// The export store and the WAL it exports, for serving a chunked
+    /// export without holding the runtime lock.
+    fn replication_export_handles(
+        &self,
+    ) -> Result<(Arc<store::ReplicationExportStore>, SharedWal), StoreError> {
+        match (self.replication_exports.as_ref(), self.wal.as_ref()) {
+            (Some(exports), Some(wal)) => Ok((Arc::clone(exports), Arc::clone(wal))),
+            _ => Err(StoreError::Io(
+                "replication source requires persistent WAL mode".to_string(),
+            )),
+        }
+    }
+
+    /// Full export plus the WAL generation it was taken at (read under the
+    /// same runtime lock, so the pair is consistent).
+    fn replication_export_for_followers(
         &mut self,
-        wal_lines: &[String],
-        next_offset: usize,
-    ) -> Result<(), StoreError> {
-        if wal_lines.is_empty() {
-            self.replication_pull_success_total =
-                self.replication_pull_success_total.saturating_add(1);
-            self.replication_last_offset = next_offset;
-            self.replication_last_error = None;
-            return Ok(());
-        }
-
-        let mut staged_store = self.store.clone();
-        for line in wal_lines {
-            staged_store.apply_persisted_record_line(line)?;
-        }
-
-        if let Some(wal) = self.wal.as_mut() {
-            let rollback_point = wal.begin_rollback_point()?;
-            let append_result = (|| {
-                for line in wal_lines {
-                    wal.append_raw_record_line(line)?;
-                }
-                Ok::<(), StoreError>(())
-            })();
-            if let Err(err) = append_result {
-                if let Err(rollback_err) = wal.rollback_to(rollback_point) {
-                    eprintln!(
-                        "replication rollback failed after WAL append error: {rollback_err:?}"
-                    );
-                }
-                return Err(err);
-            }
-        }
-
-        self.store = staged_store;
-        for tenant_id in self.store.tenant_ids() {
-            self.publish_segments_for_tenant(&tenant_id);
-        }
-        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
-        self.replication_applied_records_total = self
-            .replication_applied_records_total
-            .saturating_add(wal_lines.len() as u64);
-        self.replication_last_offset = next_offset;
-        self.replication_last_error = None;
-        Ok(())
-    }
-
-    fn apply_replication_export(&mut self, export: WalReplicationExport) -> Result<(), StoreError> {
-        let ann_tuning = self.store.ann_tuning().clone();
-        let mut rebuilt_store = InMemoryStore::new_with_ann_tuning(ann_tuning);
-        for line in &export.snapshot_lines {
-            rebuilt_store.apply_persisted_record_line(line)?;
-        }
-        for line in &export.wal_lines {
-            rebuilt_store.apply_persisted_record_line(line)?;
-        }
-        if let Some(wal) = self.wal.as_mut() {
-            wal.replace_with_replication_export(&export)?;
-        }
-        self.store = rebuilt_store;
-        for tenant_id in self.store.tenant_ids() {
-            self.publish_segments_for_tenant(&tenant_id);
-        }
-        self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
-        self.replication_applied_records_total = self
-            .replication_applied_records_total
-            .saturating_add(export.wal_lines.len() as u64);
-        self.replication_resync_total = self.replication_resync_total.saturating_add(1);
-        self.replication_last_offset = export.wal_lines.len();
-        self.replication_last_error = None;
-        Ok(())
+    ) -> Result<(WalReplicationExport, u64), StoreError> {
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            StoreError::Io("replication source requires persistent WAL mode".to_string())
+        })?;
+        let mut wal = lock_wal(wal);
+        let export = wal.replication_export()?;
+        Ok((export, wal.generation()))
     }
 
     fn observe_replication_pull_failure(&mut self, error: String) {
@@ -989,26 +1548,26 @@ impl IngestionRuntime {
             Some(ReplicaRole::Follower) => 2,
             None => 0,
         };
-        let wal_unsynced_records = self
-            .wal
-            .as_ref()
-            .map(FileWal::unsynced_record_count)
-            .unwrap_or(0);
-        let wal_buffered_records = self
-            .wal
-            .as_ref()
-            .map(FileWal::buffered_record_count)
-            .unwrap_or(0);
+        let (wal_unsynced_records, wal_buffered_records, wal_background_flush_only, wal_poisoned) =
+            self.wal
+                .as_ref()
+                .map(|wal| {
+                    let wal = lock_wal(wal);
+                    (
+                        wal.unsynced_record_count(),
+                        wal.buffered_record_count(),
+                        wal.background_flush_only(),
+                        wal.poisoned_reason().is_some(),
+                    )
+                })
+                .unwrap_or((0, 0, false, false));
+        let wal_background_flush_only = wal_background_flush_only as usize;
+        let wal_poisoned = wal_poisoned as usize;
         let wal_async_flush_enabled = self.wal_async_flush_interval.is_some() as usize;
         let wal_async_flush_interval_ms = self
             .wal_async_flush_interval
             .map(|value| value.as_millis() as u64)
             .unwrap_or(0);
-        let wal_background_flush_only = self
-            .wal
-            .as_ref()
-            .map(FileWal::background_flush_only)
-            .unwrap_or(false) as usize;
         let wal_flush_avg_synced_records = if self.wal_flush_success_total > 0 {
             self.wal_flush_synced_records_total as f64 / self.wal_flush_success_total as f64
         } else {
@@ -1034,6 +1593,16 @@ impl IngestionRuntime {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (read_error_4xx, read_error_5xx) = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| {
+                (
+                    metrics.read_error_4xx_total.load(Ordering::Relaxed),
+                    metrics.read_error_5xx_total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         format!(
             "# TYPE dash_ingest_success_total counter\n\
 dash_ingest_success_total {}\n\
@@ -1145,12 +1714,17 @@ dash_ingest_wal_async_flush_interval_ms {}\n\
 dash_ingest_wal_async_flush_tick_total {}\n\
 # TYPE dash_ingest_wal_background_flush_only gauge\n\
 dash_ingest_wal_background_flush_only {}\n\
+# TYPE dash_ingest_wal_poisoned gauge\n\
+dash_ingest_wal_poisoned {}\n\
 # TYPE dash_ingest_transport_queue_capacity gauge\n\
 dash_ingest_transport_queue_capacity {}\n\
 # TYPE dash_ingest_transport_queue_depth gauge\n\
 dash_ingest_transport_queue_depth {}\n\
 # TYPE dash_ingest_transport_queue_full_reject_total counter\n\
 dash_ingest_transport_queue_full_reject_total {}\n\
+# TYPE dash_ingest_transport_read_error_total counter\n\
+dash_ingest_transport_read_error_total{{status_class=\"4xx\"}} {}\n\
+dash_ingest_transport_read_error_total{{status_class=\"5xx\"}} {}\n\
 # TYPE dash_ingest_replication_pull_success_total counter\n\
 dash_ingest_replication_pull_success_total {}\n\
 # TYPE dash_ingest_replication_pull_failure_total counter\n\
@@ -1222,9 +1796,12 @@ dash_ingest_uptime_seconds {:.4}\n",
             wal_async_flush_interval_ms,
             self.wal_async_flush_tick_total,
             wal_background_flush_only,
+            wal_poisoned,
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            read_error_4xx,
+            read_error_5xx,
             self.replication_pull_success_total,
             self.replication_pull_failure_total,
             self.replication_applied_records_total,
@@ -1233,13 +1810,78 @@ dash_ingest_uptime_seconds {:.4}\n",
             self.replication_last_error.is_some() as usize,
             self.store.claims_len(),
             self.started_at.elapsed().as_secs_f64()
-        )
+        ) + &self.group_commit_metrics_text()
+            + &self.wal_write_metrics_text()
+            + &self.delete_metrics.render()
+    }
+
+    fn group_commit_metrics_text(&self) -> String {
+        match self.group_commit.as_ref() {
+            Some(pipeline) => pipeline.metrics_text(),
+            None => "# TYPE dash_ingest_wal_group_commit_enabled gauge\n\
+dash_ingest_wal_group_commit_enabled 0\n"
+                .to_string(),
+        }
+    }
+
+    fn wal_write_metrics_text(&self) -> String {
+        let wal_size = self
+            .wal
+            .as_ref()
+            .and_then(|wal| lock_wal(wal).wal_size_bytes().ok())
+            .map(|bytes| {
+                format!(
+                    "# HELP dash_wal_size_bytes Size of the WAL file in bytes (records since the last checkpoint).\n\
+# TYPE dash_wal_size_bytes gauge\n\
+dash_wal_size_bytes {bytes}\n"
+                )
+            })
+            .unwrap_or_default();
+        wal_size
+            + &format!(
+                "# TYPE dash_ingest_wal_write_failure_total counter\n\
+dash_ingest_wal_write_failure_total {}\n\
+# TYPE dash_ingest_wal_write_recovered_total counter\n\
+dash_ingest_wal_write_recovered_total {}\n\
+# TYPE dash_ingest_wal_write_failing gauge\n\
+dash_ingest_wal_write_failing {}\n",
+                self.wal_write_failure_total,
+                self.wal_write_recovered_total,
+                self.wal_write_error.is_some() as u8
+            )
     }
 }
 
+/// Size of the scratch file written to decide that a full WAL volume has
+/// space again (see [`IngestionRuntime::wal_write_readiness`]).
+pub(crate) const WAL_SPACE_PROBE_BYTES: usize = 1024 * 1024;
+
+/// Write `bytes` zeros to `<wal>.space-probe`, sync it and remove it.
+pub(crate) fn probe_wal_space(wal_path: &std::path::Path, bytes: usize) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut probe = wal_path.as_os_str().to_owned();
+    probe.push(".space-probe");
+    let probe = std::path::PathBuf::from(probe);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&probe)?;
+        let chunk = [0u8; 64 * 1024];
+        let mut left = bytes;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            file.write_all(&chunk[..n])?;
+            left -= n;
+        }
+        file.sync_data()
+    })();
+    let _ = std::fs::remove_file(&probe);
+    result
+}
+
 pub(crate) type SharedRuntime = Arc<Mutex<IngestionRuntime>>;
-const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
-const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS: u64 = 250;
@@ -1247,6 +1889,7 @@ const DEFAULT_SEGMENT_MAINTENANCE_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_SEGMENT_GC_MIN_STALE_AGE_MS: u64 = 60_000;
 const DEFAULT_INGEST_BATCH_MAX_ITEMS: usize = 128;
 const DEFAULT_REPLICATION_PULL_MAX_RECORDS: usize = 512;
+const MAX_REPLICATION_PULL_MAX_RECORDS: usize = 10_000;
 
 pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     let default_capacity = worker_count
@@ -1265,6 +1908,22 @@ pub fn serve_http(runtime: IngestionRuntime, bind_addr: &str) -> std::io::Result
     serve_http_with_workers(runtime, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
 }
 
+pub(crate) fn log_vector_index_save(outcome: Result<Option<VectorIndexSaveStats>, StoreError>) {
+    match outcome {
+        Ok(Some(stats)) => tracing::info!(
+            "ingestion vector index saved: vectors={}, tenants={}, bytes={}, wal_generation={:016x}, wal_records={}, elapsed_ms={}",
+            stats.vectors,
+            stats.tenants,
+            stats.bytes,
+            stats.position.generation,
+            stats.position.records,
+            stats.elapsed.as_millis()
+        ),
+        Ok(None) => {}
+        Err(err) => tracing::warn!("ingestion vector index save failed: {err:?}"),
+    }
+}
+
 pub fn serve_http_with_workers(
     runtime: IngestionRuntime,
     bind_addr: &str,
@@ -1278,51 +1937,9 @@ pub fn handle_http_request_bytes(
     runtime: &Arc<Mutex<IngestionRuntime>>,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let request_text =
-        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
-    let (header_block, body) = request_text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
-    let (method, target) = parse_request_line(request_line)?;
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
-    };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
-        ));
-    }
-    if content_length != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-
-    let request = HttpRequest {
-        method,
-        target,
-        headers,
-        body: body.as_bytes().to_vec(),
-    };
-    let response = handle_request(runtime, &request);
+    let request = dash_http::parse_request_bytes(raw_request, &server_config(1, 1))
+        .map_err(|err| err.message)?;
+    let response = handle_request(runtime, &HttpRequest::from(request));
     Ok(render_response_text(&response).into_bytes())
 }
 

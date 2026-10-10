@@ -16,8 +16,9 @@
 //! etc.) that the rest of the crate consumes via re-exports from
 //! `lib.rs`.
 
-use std::fs::{OpenOptions, create_dir_all, rename};
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{File, OpenOptions, create_dir_all, rename};
+use std::io::{BufRead, BufReader, Read, Write};
 
 const SNAPSHOT_HEADER: &str = "SNAP\t1";
 use std::path::{Path, PathBuf};
@@ -26,6 +27,27 @@ use std::time::{Duration, Instant};
 use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::StoreError;
+use crate::crypt::{self, Detected, KeyringRef, LineCodec};
+
+mod checkpoint;
+mod failover;
+mod replication_export;
+mod replication_index;
+#[cfg(test)]
+mod replication_tests;
+
+pub use checkpoint::{CHECKPOINT_IN_PROGRESS, CheckpointTicket, RetiredFiles};
+
+use checkpoint::{PendingCheckpoint, recover_pending_checkpoint};
+pub(crate) use replication_export::ExportFreeze;
+pub use replication_export::{
+    ChunkFetch, ChunkRead, DownloadOutcome, DownloadPaths, DownloadedExport,
+    EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
+    EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, HttpExportSource,
+    LocalExportSource, ReplicationExportChunk, ReplicationExportFile, ReplicationExportManifest,
+    ReplicationExportStats, ReplicationExportStore, download_export, hash_file, valid_export_id,
+};
+use replication_index::{ReplicationFilter, ReplicationIndex};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEvent {
@@ -34,6 +56,9 @@ pub enum WalEvent {
     EdgeUpsert(String),
     ClaimVectorUpsert(String),
     BatchCommit(String),
+    /// A tombstone was applied; carries the tombstone's target (claim id,
+    /// evidence id or tenant id).
+    Tombstone(String),
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +68,76 @@ pub(crate) enum PersistedRecord {
     Edge(ClaimEdge),
     ClaimVector(ClaimVectorRecord),
     BatchCommit(BatchCommitRecord),
+    Tombstone(TombstoneRecord),
+}
+
+/// What a delete removes. Encoded in the WAL as a checksummed `T2` record
+/// (see [`record_to_line`]); readers that predate tombstones reject the
+/// unknown kind instead of skipping it, so a deleted claim can never be
+/// resurrected by an old binary replaying a newer log.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Tombstone {
+    /// The claim, its vector, its evidence and every edge from or to it.
+    Claim { tenant_id: String, claim_id: String },
+    /// Every evidence row with this id on the tenant's claims.
+    Evidence {
+        tenant_id: String,
+        evidence_id: String,
+    },
+    /// Every claim of the tenant (with vectors, evidence and edges), the
+    /// tenant's vector dimension and index, and the batch-commit metadata
+    /// that names any of its claims.
+    Tenant { tenant_id: String },
+}
+
+impl Tombstone {
+    pub fn tenant_id(&self) -> &str {
+        match self {
+            Self::Claim { tenant_id, .. }
+            | Self::Evidence { tenant_id, .. }
+            | Self::Tenant { tenant_id } => tenant_id,
+        }
+    }
+
+    /// The deleted object's id (the tenant id for a tenant tombstone).
+    pub fn target_id(&self) -> &str {
+        match self {
+            Self::Claim { claim_id, .. } => claim_id,
+            Self::Evidence { evidence_id, .. } => evidence_id,
+            Self::Tenant { tenant_id } => tenant_id,
+        }
+    }
+
+    /// `claim`, `evidence` or `tenant`.
+    pub fn scope(&self) -> &'static str {
+        match self {
+            Self::Claim { .. } => "claim",
+            Self::Evidence { .. } => "evidence",
+            Self::Tenant { .. } => "tenant",
+        }
+    }
+
+    /// Rejects empty or whitespace-only identifiers.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.tenant_id().trim().is_empty() {
+            return Err(StoreError::Parse(
+                "tombstone tenant_id must not be empty".to_string(),
+            ));
+        }
+        if self.target_id().trim().is_empty() {
+            return Err(StoreError::Parse(format!(
+                "tombstone {}_id must not be empty",
+                self.scope()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TombstoneRecord {
+    pub(crate) tombstone: Tombstone,
+    pub(crate) ts_unix_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +170,45 @@ pub struct CheckpointPolicy {
 pub struct WalReplayStats {
     pub snapshot_records: usize,
     pub wal_records: usize,
+    /// Number of torn (incomplete or corrupt) final WAL lines that were
+    /// discarded since this WAL handle was opened.
+    pub torn_tail_dropped: usize,
+    /// Records that could not be replayed (legacy records that no longer
+    /// parse or validate, poisoned vectors) and were copied to
+    /// `<wal>.quarantine` instead of being applied.
+    pub quarantined_records: usize,
+    /// Otherwise valid records skipped because they depend on a
+    /// quarantined claim (evidence, edges, vectors).
+    pub dependent_skipped: usize,
+}
+
+/// Environment variable that switches replay to strict mode.
+pub const WAL_REPLAY_STRICT_ENV: &str = "DASH_WAL_REPLAY_STRICT";
+
+/// How replay treats records that cannot be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReplayPolicy {
+    /// Legacy (pre-checksum) records that fail to parse or validate, and
+    /// poisoned vectors, are quarantined; replay continues.
+    #[default]
+    Lenient,
+    /// Any record that cannot be applied fails replay.
+    Strict,
+}
+
+impl ReplayPolicy {
+    /// Parses the value of [`WAL_REPLAY_STRICT_ENV`]: `1`, `true`, `yes`
+    /// or `on` (case-insensitive) select strict mode.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => Self::Strict,
+            _ => Self::Lenient,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var(WAL_REPLAY_STRICT_ENV).ok().as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -83,6 +217,19 @@ pub struct WalReplayBoundary {
     pub snapshot_record_count: usize,
     pub wal_delta_record_count: usize,
     pub total_replay_record_count: usize,
+    /// Persistent identifier of the current WAL file lineage. Changes
+    /// whenever the WAL is compacted or reset.
+    pub wal_generation: u64,
+}
+
+/// A point in the WAL: `records` lines of the WAL lineage `generation`
+/// (the snapshot, if any, is part of that lineage). A persisted vector index
+/// records the position it reflects so a restart can replay only the lines
+/// after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WalPosition {
+    pub generation: u64,
+    pub records: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,14 +241,345 @@ pub struct WalReplicationDelta {
     pub wal_lines: Vec<String>,
 }
 
+/// Generation-aware replication frame. `from_offset`/`next_offset` are
+/// positions inside the WAL lineage identified by `generation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalReplicationFrame {
+    pub generation: u64,
+    pub from_offset: usize,
+    pub next_offset: usize,
+    pub total_records: usize,
+    pub needs_resync: bool,
+    pub wal_lines: Vec<String>,
+    /// Set when the follower's position was the exact end of an earlier
+    /// generation that a checkpoint closed: the frame then starts at offset
+    /// 0 of the current generation, and the follower continues there without
+    /// a full resync (see [`GenerationTransition`]).
+    pub switched_from: Option<WalPosition>,
+}
+
+/// A checkpoint closed WAL generation `from_generation` after its
+/// replication view held `from_records` lines and opened `to_generation`
+/// with an empty WAL and a snapshot of exactly the state those lines (on top
+/// of the previous snapshot) produce. A follower whose cursor is
+/// `(from_generation, from_records)` therefore holds the new snapshot's
+/// state and may continue from `(to_generation, 0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationTransition {
+    pub from_generation: u64,
+    pub from_records: usize,
+    pub to_generation: u64,
+}
+
+/// Transitions kept in `<wal>.gen.transitions` (newest last).
+pub const GENERATION_TRANSITIONS_KEPT: usize = 16;
+
+/// The WAL file of the generation the latest checkpoint closed, kept as
+/// `<wal>.closed.<generation>` until the next checkpoint. A checkpoint runs
+/// right after the write that triggered it, under the same lock, so a
+/// follower is practically never at the exact end of the closed generation:
+/// serving it the rest of that generation from this file brings it to the
+/// end, where it switches to the new generation instead of resyncing.
+struct ClosedGeneration {
+    generation: u64,
+    /// Replication view length of the closed generation (its transition's
+    /// `from_records`).
+    records: usize,
+    path: PathBuf,
+    /// How the closed file's lines are stored.
+    codec: LineCodec,
+    /// Index of the closed file, built on first use after a restart.
+    index: ReplicationIndex,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalReplicationExport {
     pub snapshot_lines: Vec<String>,
     pub wal_lines: Vec<String>,
 }
 
+/// Prefix of the batch-commit record that opens a commit group. A group is
+/// `B2(~grp:<id>) <records...> B2(<id>)`; on replay a group whose closing
+/// `B2(<id>)` is missing was torn by a crash and is discarded as a whole,
+/// so a bundle is never partially applied (DATA-10).
+pub const GROUP_BEGIN_PREFIX: &str = "~grp:";
+
+/// Prefix of the commit id used by single `/v1/ingest` transactions. These
+/// markers only delimit the WAL group; they are never registered as batch
+/// commits in the store.
+pub const SINGLE_TX_PREFIX: &str = "~tx:";
+
+/// `true` for commit ids that only delimit WAL groups and carry no batch
+/// metadata of their own.
+/// Upper bound on how far a replication frame may be extended past
+/// `max_records` to end on a commit-group boundary. Followers accept frames
+/// of `max_records + REPLICATION_GROUP_EXTENSION_MAX` lines.
+pub const REPLICATION_GROUP_EXTENSION_MAX: usize = 1_000_000;
+
+enum GroupEvent {
+    Begin(String),
+    End(String),
+}
+
+fn group_event(line: &str) -> Option<GroupEvent> {
+    if !line.starts_with("B2	") {
+        return None;
+    }
+    let Ok(PersistedRecord::BatchCommit(commit)) = line_to_record(line) else {
+        return None;
+    };
+    if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+        return Some(GroupEvent::Begin(id.to_string()));
+    }
+    Some(GroupEvent::End(commit.commit_id))
+}
+
+fn closes_group(open_id: &str, end_id: &str) -> bool {
+    end_id == open_id || end_id.strip_prefix(SINGLE_TX_PREFIX) == Some(open_id)
+}
+
+/// Splits `lines` into the units a reader may observe: each commit group
+/// (begin marker to closing marker) is one span, every ungrouped record its
+/// own span, and an unterminated group runs to the end (or to the next
+/// begin marker). Spans are contiguous and cover all of `lines`.
+pub fn commit_group_spans(lines: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        match group_event(line) {
+            Some(GroupEvent::Begin(id)) => {
+                if let Some((start, _)) = open.take() {
+                    spans.push(start..idx);
+                }
+                open = Some((idx, id));
+            }
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
+                if let Some((start, _)) = open.take() {
+                    spans.push(start..idx + 1);
+                }
+            }
+            _ => {
+                if open.is_none() {
+                    spans.push(idx..idx + 1);
+                }
+            }
+        }
+    }
+    if let Some((start, _)) = open {
+        spans.push(start..lines.len());
+    }
+    spans
+}
+
+/// Number of leading `lines` that form complete commit groups (plus
+/// ungrouped legacy records). A trailing unterminated group is excluded, so
+/// a replication follower applies only whole groups and re-fetches from the
+/// group's first line.
+pub fn complete_group_prefix_len(lines: &[String]) -> usize {
+    let mut open: Option<(usize, String)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        match group_event(line) {
+            Some(GroupEvent::Begin(id)) => open = Some((idx, id)),
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    open.map_or(lines.len(), |(start, _)| start)
+}
+
+/// Why a frame cannot be extended to the end of its commit group.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupTooLarge {
+    start: usize,
+    cap: usize,
+}
+
+/// A replication frame cut from the view, or why it cannot be cut.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameCut {
+    Lines {
+        next_offset: usize,
+        lines: Vec<String>,
+    },
+    GroupTooLarge(GroupTooLarge),
+}
+
+/// Cuts the frame starting at view line `from` (`lines` yields the view from
+/// `from` on; the view holds `total` lines). The frame covers up to
+/// `max_records` lines and does not end inside a commit group: a group that
+/// closes within `cap` records of its first line is shipped whole. A larger
+/// group that starts after `from` is left for the next frame (the frame ends
+/// just before it); one that starts at `from` can never be shipped, which is
+/// an error rather than a frame the follower would hold back forever. A
+/// group still open at the end of the log is a write in progress and is left
+/// as is.
+///
+/// Lines are consumed lazily: past the frame only while a group is open, and
+/// only the frame's own lines are kept in memory.
+fn cut_frame(
+    mut lines: impl Iterator<Item = Result<String, StoreError>>,
+    from: usize,
+    max_records: usize,
+    total: usize,
+    cap: usize,
+) -> Result<FrameCut, StoreError> {
+    let next = from.saturating_add(max_records.max(1)).min(total);
+    let mut take = |idx: usize| -> Result<String, StoreError> {
+        lines.next().transpose()?.ok_or_else(|| {
+            StoreError::Io(format!(
+                "replication view ended at line {idx}, expected {total} lines"
+            ))
+        })
+    };
+    let mut frame = Vec::with_capacity(next.saturating_sub(from));
+    let mut open: Option<(usize, String)> = None;
+    for idx in from..next {
+        let line = take(idx)?;
+        match group_event(&line) {
+            Some(GroupEvent::Begin(id)) => open = Some((idx, id)),
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
+                open = None;
+            }
+            _ => {}
+        }
+        frame.push(line);
+    }
+    let Some((start, id)) = open else {
+        return Ok(FrameCut::Lines {
+            next_offset: next,
+            lines: frame,
+        });
+    };
+    let closes = |line: &str| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end));
+    let bound = total.min(start.saturating_add(cap));
+    let mut idx = next;
+    while idx < bound {
+        let line = take(idx)?;
+        idx += 1;
+        let done = closes(&line);
+        frame.push(line);
+        if done {
+            return Ok(FrameCut::Lines {
+                next_offset: idx,
+                lines: frame,
+            });
+        }
+    }
+    frame.truncate(next - from);
+    let mut closes_beyond_cap = false;
+    while idx < total {
+        let line = take(idx)?;
+        idx += 1;
+        if closes(&line) {
+            closes_beyond_cap = true;
+            break;
+        }
+    }
+    if !closes_beyond_cap {
+        return Ok(FrameCut::Lines {
+            next_offset: next,
+            lines: frame,
+        });
+    }
+    if start > from {
+        frame.truncate(start - from);
+        Ok(FrameCut::Lines {
+            next_offset: start,
+            lines: frame,
+        })
+    } else {
+        Ok(FrameCut::GroupTooLarge(GroupTooLarge { start, cap }))
+    }
+}
+
+/// The commit id carried by a batch-commit WAL line (legacy `B` or checksummed
+/// `B2`), or `None` for any other line, an unreadable line, or a commit-group
+/// begin/end marker (markers are framing, not client-visible batch commits).
+pub fn batch_commit_id_from_wal_line(line: &str) -> Option<String> {
+    if !(line.starts_with("B\t") || line.starts_with("B2\t")) {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::BatchCommit(commit) if !is_group_marker_commit_id(&commit.commit_id) => {
+            Some(commit.commit_id)
+        }
+        _ => None,
+    }
+}
+
+/// The tombstone carried by a WAL line, or `None` for any other (or an
+/// unreadable) line. Lets a replica see which tenants a replicated batch
+/// deleted from, e.g. to refresh derived per-tenant files.
+pub fn tombstone_from_wal_line(line: &str) -> Option<Tombstone> {
+    if !line.starts_with("T2\t") {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::Tombstone(record) => Some(record.tombstone),
+        _ => None,
+    }
+}
+
+pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
+    commit_id.starts_with(GROUP_BEGIN_PREFIX) || commit_id.starts_with(SINGLE_TX_PREFIX)
+}
+
+/// Drops records of commit groups that were never closed. Records outside
+/// any group (legacy appends) pass through untouched. Returns the kept
+/// records and the number of discarded records.
+pub(crate) fn resolve_commit_groups<T>(
+    records: Vec<T>,
+    record_of: impl Fn(&T) -> &PersistedRecord,
+) -> (Vec<T>, usize) {
+    let mut out = Vec::with_capacity(records.len());
+    let mut open: Option<(String, Vec<T>)> = None;
+    let mut discarded = 0usize;
+    for item in records {
+        if let PersistedRecord::BatchCommit(commit) = record_of(&item) {
+            if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+                if let Some((_, buffered)) = open.take() {
+                    discarded += buffered.len() + 1;
+                }
+                open = Some((id.to_string(), Vec::new()));
+                continue;
+            }
+            let closes = open.as_ref().is_some_and(|(id, _)| {
+                commit.commit_id == *id
+                    || commit.commit_id.strip_prefix(SINGLE_TX_PREFIX) == Some(id.as_str())
+            });
+            if closes {
+                if let Some((_, buffered)) = open.take() {
+                    out.extend(buffered);
+                }
+                out.push(item);
+                continue;
+            }
+        }
+        match open.as_mut() {
+            Some((_, buffered)) => buffered.push(item),
+            None => out.push(item),
+        }
+    }
+    if let Some((_, buffered)) = open {
+        discarded += buffered.len() + 1;
+    }
+    (out, discarded)
+}
+
 pub struct FileWal {
     path: PathBuf,
+    /// Keyring captured when the WAL was opened (`None`: encryption off).
+    keyring: KeyringRef,
+    /// How the lines of the current WAL file are stored.
+    codec: LineCodec,
     wal_records: usize,
     sync_every_records: usize,
     append_buffer_max_records: usize,
@@ -110,7 +588,51 @@ pub struct FileWal {
     append_buffer: Vec<String>,
     pub(crate) unsynced_records: usize,
     last_sync_at: Instant,
+    generation: u64,
+    torn_tail_dropped: usize,
+    /// Lines left out of the most recent replication view because lenient
+    /// replay would quarantine them.
+    replication_skipped: usize,
+    /// Largest commit group (in records) a replication frame may be
+    /// extended to cover.
+    replication_group_cap: usize,
+    replication_group_too_large_total: u64,
+    /// Incremental index of the replication view, so a replication frame
+    /// reads only the lines it ships instead of the whole file.
+    replication_index: ReplicationIndex,
+    /// Recent checkpoint transitions, oldest first (see
+    /// [`GenerationTransition`]).
+    transitions: Vec<GenerationTransition>,
+    /// The generation the latest checkpoint closed, if its file is kept.
+    closed: Option<ClosedGeneration>,
+    /// Set after an fsync failure. Once set, every write path fails closed:
+    /// after a failed fsync the kernel may already have dropped the dirty
+    /// pages, so retrying the fsync could report success for data that never
+    /// reached the disk (fsyncgate). Only a restart, which re-reads the log
+    /// from disk, clears it.
+    poisoned: Option<String>,
+    /// The lines read when the WAL was opened, with the file length then;
+    /// the first replay uses them instead of reading (and decrypting) the
+    /// file again, when the file has not changed since.
+    open_scan: std::sync::Mutex<Option<OpenScan>>,
+    /// A checkpoint whose snapshot is not published yet: `<wal>.snapshot`
+    /// is a pending marker and replay reads the base snapshot and closed
+    /// WAL files it lists (see `checkpoint`).
+    pending: Option<PendingCheckpoint>,
+    /// Generation started by the checkpoint whose snapshot is being written
+    /// (between `begin_checkpoint` and `finish_checkpoint`).
+    checkpoint_in_flight: Option<u64>,
+    /// Files the last rotation renamed out of the way, handed to the next
+    /// checkpoint ticket for deletion outside the lock.
+    retired_on_rotation: Vec<PathBuf>,
 }
+
+/// The WAL's `(physical line number, line)` pairs read at open, with the
+/// file length at that time.
+type OpenScan = (u64, Vec<(usize, String)>);
+
+/// Prefix of the error returned by every write to a poisoned WAL.
+pub const WAL_POISONED_PREFIX: &str = "wal_poisoned";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalWritePolicy {
@@ -159,16 +681,79 @@ impl FileWal {
         path: impl AsRef<Path>,
         policy: WalWritePolicy,
     ) -> Result<Self, StoreError> {
+        Self::open_with_keyring(path, policy, crypt::current_keyring())
+    }
+
+    /// [`FileWal::open_with_policy`] with an explicit keyring instead of the
+    /// one in effect (`encryption::current()`). With a keyring, new files
+    /// are encrypted and an existing plaintext WAL is rewritten encrypted
+    /// here; without one, an encrypted WAL fails to open (fail closed).
+    pub fn open_with_keyring(
+        path: impl AsRef<Path>,
+        policy: WalWritePolicy,
+        keyring: Option<std::sync::Arc<encryption::Keyring>>,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             create_dir_all(parent)?;
         }
+        let existed = path.exists();
         OpenOptions::new().create(true).append(true).open(&path)?;
-        let wal_records = count_non_empty_lines(&path)?;
+        if !existed {
+            sync_parent_dir(&path)?;
+        }
+        let mut torn_header = 0usize;
+        let mut codec = match crypt::detect_line_file(&path, keyring.as_ref())? {
+            Detected::Plain => LineCodec::Plain,
+            Detected::Encrypted(codec) => {
+                crypt::terminate_lone_header(&path)?;
+                codec
+            }
+            Detected::TornHeader => {
+                // A crash while the file was being created: nothing but a
+                // partial header was written.
+                let saved = save_truncated_tail(&path, 0, &LineCodec::Plain)?;
+                eprintln!(
+                    "warning: discarding the incomplete encryption header of write-ahead log {} (saved to {})",
+                    path.display(),
+                    saved.display()
+                );
+                let file = OpenOptions::new().write(true).open(&path)?;
+                file.set_len(0)?;
+                file.sync_all()?;
+                torn_header = 1;
+                LineCodec::Plain
+            }
+        };
+        // One read (and, for an encrypted file, one decryption) of the
+        // whole file serves the torn-tail repair, the commit-group check,
+        // the record count and the first replay.
+        let mut scan = scan_wal(&path, &codec)?;
+        let torn_tail_dropped = torn_header
+            + repair_torn_tail(&path, &codec, &mut scan)?
+            + truncate_unterminated_group(&path, &codec, &mut scan)?;
+        if !codec.is_encrypted()
+            && let Some(keyring) = keyring.as_ref()
+        {
+            codec = encrypt_plain_line_file(&path, keyring, &scan)?;
+        }
+        let wal_records = scan.lines.len();
+        let opened_len = std::fs::metadata(&path)?.len();
+        let generation = load_or_create_generation(&generation_path_for(&path))?;
+        let transitions = load_transitions(&transitions_path_for(&path));
+        let pending = recover_pending_checkpoint(&path, keyring.as_ref())?;
+        let closed = load_closed_generation(
+            &path,
+            transitions.last(),
+            pending.as_ref().map_or(&[][..], |p| p.replay.as_slice()),
+            keyring.as_ref(),
+        )?;
         Ok(Self {
             path,
+            keyring,
+            codec,
             wal_records,
             sync_every_records: policy.sync_every_records.max(1),
             append_buffer_max_records: policy.append_buffer_max_records.max(1),
@@ -177,7 +762,167 @@ impl FileWal {
             append_buffer: Vec::new(),
             unsynced_records: 0,
             last_sync_at: Instant::now(),
+            generation,
+            torn_tail_dropped,
+            replication_skipped: 0,
+            replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
+            replication_group_too_large_total: 0,
+            replication_index: ReplicationIndex::default(),
+            transitions,
+            closed,
+            poisoned: None,
+            open_scan: std::sync::Mutex::new(Some((opened_len, scan.lines))),
+            pending,
+            checkpoint_in_flight: None,
+            retired_on_rotation: Vec::new(),
         })
+    }
+
+    /// Why this WAL refuses writes, or `None` while it is healthy. Set by the
+    /// first failed fsync and never cleared by this handle.
+    pub fn poisoned_reason(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    /// Testing aid for crates that cannot reach the store's failpoints: puts
+    /// the WAL into the state a failed fsync leaves it in.
+    #[doc(hidden)]
+    pub fn poison_for_testing(&mut self, reason: &str) {
+        self.poisoned = Some(reason.to_string());
+    }
+
+    fn ensure_writable(&self) -> Result<(), StoreError> {
+        match &self.poisoned {
+            Some(reason) => Err(StoreError::Io(format!(
+                "{WAL_POISONED_PREFIX}: an earlier fsync failed ({reason}); the WAL refuses writes until the service restarts"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn poison(&mut self, err: &std::io::Error) -> StoreError {
+        let reason = format!("fsync of {} failed: {err}", self.path.display());
+        eprintln!("error: {reason}; the WAL is now poisoned and refuses writes");
+        self.poisoned = Some(reason.clone());
+        StoreError::Io(format!("{WAL_POISONED_PREFIX}: {reason}"))
+    }
+
+    /// Appends `lines` as one unit and applies the write policy once for the
+    /// whole unit (with the default policy: one write and one fsync). This is
+    /// the group-commit entry point: the lines of many requests share a single
+    /// fsync.
+    ///
+    /// On a write error the file is truncated back to where it was, so a
+    /// half-written unit never sits in front of later records, and the error
+    /// is returned. On an fsync error the WAL is poisoned (see
+    /// [`FileWal::poisoned_reason`]) and no rollback is attempted.
+    pub fn append_group_lines(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let rollback_point = self.begin_rollback_point()?;
+        self.append_buffer.extend(lines.iter().cloned());
+        self.wal_records += lines.len();
+        self.unsynced_records += lines.len();
+        let result = self.apply_write_policy();
+        if let Err(err) = result {
+            if self.poisoned.is_none() {
+                if let Err(rollback_err) = self.rollback_to(rollback_point) {
+                    eprintln!(
+                        "group commit rollback failed after WAL append error: {rollback_err:?}"
+                    );
+                }
+                // The unit is not in the log, whether or not the truncation
+                // above could run (it cannot when the file is unreachable).
+                self.append_buffer.clear();
+                self.wal_records = rollback_point.wal_records;
+                self.unsynced_records = 0;
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// `true` when the WAL (not the snapshot, which never holds one) contains
+    /// a tombstone record. Used by the redb cold-start path: a redb file
+    /// reflects a later state than the start of the log, and replaying writes
+    /// that a later tombstone undid over that state is only safe from an
+    /// empty store (a released vector dimension may have been re-established
+    /// with a different size).
+    pub fn contains_tombstones(&self) -> Result<bool, StoreError> {
+        let is_tombstone = |line: &str| line.starts_with("T2\t");
+        if self.append_buffer.iter().any(|line| is_tombstone(line)) {
+            return Ok(true);
+        }
+        // Everything replayed before the WAL counts too: the closed WAL files
+        // of a pending checkpoint, and a snapshot taken from an export built
+        // while one was pending (its snapshot section holds those files).
+        if self
+            .replay_prefix_lines_raw()?
+            .iter()
+            .any(|line| is_tombstone(line))
+        {
+            return Ok(true);
+        }
+        let scan = scan_wal(&self.path, &self.codec)?;
+        Ok(scan.lines.iter().any(|(_, line)| is_tombstone(line)))
+    }
+
+    /// Persistent identifier of the current WAL lineage. It changes every
+    /// time the WAL is compacted (checkpoint), replaced by a replication
+    /// export, or rolled back over already-flushed records.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Number of WAL/snapshot lines the most recent replication frame or
+    /// export left out because lenient replay quarantines them (unparseable
+    /// legacy lines and their dependents). They are never served to
+    /// followers; offsets index the served (filtered) view.
+    pub fn replication_skipped_lines(&self) -> usize {
+        self.replication_skipped
+    }
+
+    /// Overrides the largest commit group (in records) a replication frame
+    /// may be extended to cover (default [`REPLICATION_GROUP_EXTENSION_MAX`]).
+    /// Bytes read from the WAL file to serve replication frames since this
+    /// handle was opened. Serving a frame reads the lines appended since the
+    /// previous frame plus the frame itself (and fewer than
+    /// 64 lines before it), never the whole log.
+    pub fn replication_read_bytes_total(&self) -> u64 {
+        self.replication_index.read_bytes()
+    }
+
+    pub fn set_replication_group_cap(&mut self, cap: usize) {
+        self.replication_group_cap = cap.max(1);
+    }
+
+    /// Frame requests refused because a commit group exceeded the cap
+    /// (`replication_group_too_large`).
+    pub fn replication_group_too_large_total(&self) -> u64 {
+        self.replication_group_too_large_total
+    }
+
+    /// KEK id of the data key of the current WAL file (`None`: the file is
+    /// not encrypted).
+    pub fn encryption_key_id(&self) -> Option<&str> {
+        self.codec.key_id()
+    }
+
+    /// Torn tail lines discarded since this handle was opened.
+    pub fn torn_tail_dropped(&self) -> usize {
+        self.torn_tail_dropped
+    }
+
+    fn bump_generation(&mut self) -> Result<(), StoreError> {
+        let mut next = new_generation();
+        while next == self.generation {
+            next = new_generation();
+        }
+        write_generation(&generation_path_for(&self.path), next)?;
+        self.generation = next;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -208,10 +953,12 @@ impl FileWal {
         self.append_buffer.len()
     }
 
+    pub fn generation_path(&self) -> PathBuf {
+        generation_path_for(&self.path)
+    }
+
     pub fn snapshot_path(&self) -> PathBuf {
-        let mut path = self.path.clone().into_os_string();
-        path.push(".snapshot");
-        PathBuf::from(path)
+        checkpoint::snapshot_path_for(&self.path)
     }
 
     pub fn append_claim(&mut self, claim: &Claim) -> Result<(), StoreError> {
@@ -252,8 +999,31 @@ impl FileWal {
         }))
     }
 
+    /// Opens a commit group. Every record appended afterwards belongs to
+    /// the group until `append_batch_commit` is called with the same
+    /// `commit_id` (single ingests use `SINGLE_TX_PREFIX + claim_id` for
+    /// the closing record and pass the bare `claim_id`-based id here).
+    pub fn begin_group(&mut self, group_id: &str, ts_unix_ms: u64) -> Result<(), StoreError> {
+        self.append_record(&PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{GROUP_BEGIN_PREFIX}{group_id}"),
+            batch_size: 0,
+            ts_unix_ms,
+            claim_ids: Vec::new(),
+        }))
+    }
+
     pub fn wal_record_count(&self) -> Result<usize, StoreError> {
         Ok(self.wal_records)
+    }
+
+    /// Current position: this lineage and every record appended so far
+    /// (including records still in the append buffer; flush first when the
+    /// position must be durable).
+    pub fn position(&self) -> WalPosition {
+        WalPosition {
+            generation: self.generation,
+            records: self.wal_records,
+        }
     }
 
     pub fn wal_size_bytes(&self) -> Result<u64, StoreError> {
@@ -261,7 +1031,7 @@ impl FileWal {
     }
 
     pub fn replay_boundary(&self) -> Result<WalReplayBoundary, StoreError> {
-        let snapshot_record_count = self.replay_snapshot_lines_raw()?.len();
+        let snapshot_record_count = self.replay_prefix_lines_raw()?.len();
         let mut wal_delta_record_count = self.replay_wal_lines_raw()?.len();
         wal_delta_record_count = wal_delta_record_count.saturating_add(self.append_buffer.len());
         Ok(WalReplayBoundary {
@@ -269,6 +1039,7 @@ impl FileWal {
             snapshot_record_count,
             wal_delta_record_count,
             total_replay_record_count: snapshot_record_count.saturating_add(wal_delta_record_count),
+            wal_generation: self.generation,
         })
     }
 
@@ -281,6 +1052,9 @@ impl FileWal {
     }
 
     pub fn rollback_to(&mut self, point: WalRollbackPoint) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        self.forget_open_scan();
+        let discards_records = self.wal_records > point.wal_records;
         self.append_buffer.clear();
         let file = OpenOptions::new()
             .create(true)
@@ -288,10 +1062,21 @@ impl FileWal {
             .truncate(false)
             .open(&self.path)?;
         file.set_len(point.file_len_bytes)?;
-        file.sync_data()?;
+        self.replication_index.reset();
+        if let Err(err) = sync_wal_data(&file) {
+            return Err(self.poison(&err));
+        }
+        // The file is back at the rollback point: the counters must say so
+        // even if the generation bump below fails (a full disk can refuse
+        // the new generation file while the truncation succeeded).
         self.wal_records = point.wal_records;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
+        if discards_records {
+            failpoint!("wal.rollback_truncated");
+            // Rolled-back lines may already have been served to followers.
+            self.bump_generation()?;
+        }
         Ok(())
     }
 
@@ -302,59 +1087,448 @@ impl FileWal {
                 "raw WAL record line must not be empty".to_string(),
             ));
         }
-        let _ = line_to_record(line)?;
+        check_replicated_line(line)?;
         self.append_raw_record_line_unchecked(line.to_string())
     }
 
+    /// Legacy offset-only delta. Does not detect compaction; prefer
+    /// [`FileWal::replication_frame_from`].
     pub fn replication_delta_from(
         &mut self,
         from_offset: usize,
         max_records: usize,
     ) -> Result<WalReplicationDelta, StoreError> {
-        self.flush_pending_sync()?;
-        let wal_lines = self.replay_wal_lines_raw()?;
-        let total_records = wal_lines.len();
-        if from_offset > total_records {
-            return Ok(WalReplicationDelta {
-                from_offset,
-                next_offset: total_records,
-                total_records,
-                needs_resync: true,
-                wal_lines: Vec::new(),
-            });
-        }
-        let limit = max_records.max(1);
-        let next_offset = from_offset.saturating_add(limit).min(total_records);
+        let frame = self.replication_frame_inner(None, from_offset, max_records, false)?;
         Ok(WalReplicationDelta {
+            from_offset: frame.from_offset,
+            next_offset: frame.next_offset,
+            total_records: frame.total_records,
+            needs_resync: frame.needs_resync,
+            wal_lines: frame.wal_lines,
+        })
+    }
+
+    /// Generation-aware delta. `from_generation` is the generation the
+    /// follower last observed (`None` if it has never synced). The frame
+    /// has `needs_resync = true` when the generation differs (the WAL was
+    /// compacted or reset, so offsets are meaningless), when the follower
+    /// has no known generation but is not a fresh follower, or when
+    /// `from_offset` is beyond the end of the WAL. On resync,
+    /// `next_offset == total_records` and `wal_lines` is empty.
+    pub fn replication_frame_from(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        self.replication_frame_inner(from_generation, from_offset, max_records, true)
+    }
+
+    /// [`FileWal::replication_frame_from`] for a follower that can switch
+    /// generations: when `(from_generation, from_offset)` is the exact end
+    /// of a generation that checkpoints have since closed (following the
+    /// recorded transitions up to the current generation), the frame starts
+    /// at offset 0 of the current generation with `switched_from` set,
+    /// instead of asking for a resync.
+    pub fn replication_frame_with_switch(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        if let Some(generation) = from_generation
+            && generation != self.generation
+            && self.resolve_transition(generation, from_offset)
+        {
+            let current = self.generation;
+            let mut frame = self.replication_frame_inner(Some(current), 0, max_records, true)?;
+            if !frame.needs_resync {
+                frame.switched_from = Some(WalPosition {
+                    generation,
+                    records: from_offset,
+                });
+            }
+            return Ok(frame);
+        }
+        if let Some(generation) = from_generation
+            && let Some(frame) =
+                self.closed_generation_frame(generation, from_offset, max_records)?
+        {
+            return Ok(frame);
+        }
+        self.replication_frame_inner(from_generation, from_offset, max_records, true)
+    }
+
+    /// A frame of the retained closed generation for a follower still inside
+    /// it (`from_offset` before its end), or `None` when that generation is
+    /// not retained, does not lead to the current one, or cannot be read.
+    fn closed_generation_frame(
+        &mut self,
+        generation: u64,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<Option<WalReplicationFrame>, StoreError> {
+        let Some((closed_generation, closed_records)) =
+            self.closed.as_ref().map(|c| (c.generation, c.records))
+        else {
+            return Ok(None);
+        };
+        if closed_generation != generation
+            || from_offset >= closed_records
+            || !self.resolve_transition(closed_generation, closed_records)
+        {
+            return Ok(None);
+        }
+        // `total_records` of a closed-generation frame counts what is left in
+        // both generations, so the follower's lag and its "more available"
+        // decision cover the records waiting after the switch too.
+        self.flush_pending_sync()?;
+        let current_len = self.replication_view_len()?;
+        let cap = self.replication_group_cap;
+        let Some(closed) = self.closed.as_mut() else {
+            return Ok(None);
+        };
+        if !closed.path.exists()
+            || !closed.index.refresh(&closed.path, &closed.codec)?
+            || closed.index.total() != closed.records
+        {
+            return Ok(None);
+        }
+        let lines = closed
+            .index
+            .lines_from(&closed.path, &closed.codec, from_offset)?;
+        match cut_frame(lines, from_offset, max_records, closed_records, cap)? {
+            FrameCut::Lines { next_offset, lines } => Ok(Some(WalReplicationFrame {
+                generation,
+                from_offset,
+                next_offset,
+                total_records: closed_records + current_len,
+                needs_resync: false,
+                wal_lines: lines,
+                switched_from: None,
+            })),
+            FrameCut::GroupTooLarge(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )))
+            }
+        }
+    }
+
+    /// Deletes the retained closed generation (a follower that serves no
+    /// one of its own does not need it).
+    pub fn discard_closed_generation(&mut self) {
+        if let Some(closed) = self.closed.take()
+            && !self.is_pending_replay_generation(closed.generation)
+        {
+            let _ = std::fs::remove_file(&closed.path);
+        }
+    }
+
+    /// The retained closed generation and its view length, if any.
+    pub fn closed_generation(&self) -> Option<(u64, usize)> {
+        self.closed.as_ref().map(|c| (c.generation, c.records))
+    }
+
+    /// `true` when the recorded transitions lead from the end position
+    /// `(generation, records)` to the current generation.
+    fn resolve_transition(&self, generation: u64, records: usize) -> bool {
+        let (mut generation, mut records) = (generation, records);
+        // Each step moves to a newer generation; the bound only guards
+        // against a corrupt file with a cycle.
+        for _ in 0..=self.transitions.len() {
+            if generation == self.generation {
+                return records == 0;
+            }
+            let Some(step) = self
+                .transitions
+                .iter()
+                .rev()
+                .find(|t| t.from_generation == generation)
+            else {
+                return false;
+            };
+            if step.from_records != records {
+                return false;
+            }
+            generation = step.to_generation;
+            records = 0;
+        }
+        false
+    }
+
+    /// Recorded checkpoint transitions, oldest first.
+    pub fn generation_transitions(&self) -> &[GenerationTransition] {
+        &self.transitions
+    }
+
+    fn replication_frame_inner(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+        check_generation: bool,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        self.flush_pending_sync()?;
+        // Only the new tail of the file is read here; the view itself is
+        // read lazily below, from the frame's first line on.
+        if !self.replication_index.refresh(&self.path, &self.codec)? {
+            return self.replication_frame_full_scan(
+                from_generation,
+                from_offset,
+                max_records,
+                check_generation,
+            );
+        }
+        self.note_replication_skipped(self.replication_index.skipped());
+        let total_records = self.replication_index.total();
+        if let Some(resync) = self.resync_frame(
+            from_generation,
             from_offset,
-            next_offset,
             total_records,
-            needs_resync: false,
-            wal_lines: wal_lines[from_offset..next_offset].to_vec(),
+            check_generation,
+        ) {
+            return Ok(resync);
+        }
+        let lines = self
+            .replication_index
+            .lines_from(&self.path, &self.codec, from_offset)?;
+        let cut = cut_frame(
+            lines,
+            from_offset,
+            max_records,
+            total_records,
+            self.replication_group_cap,
+        )?;
+        self.finish_frame(from_offset, total_records, cut)
+    }
+
+    /// [`FileWal::replication_frame_inner`] built from a full scan of the
+    /// file. Used only when the incremental index cannot cover the file
+    /// (see [`ReplicationIndex::refresh`]).
+    fn replication_frame_full_scan(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+        check_generation: bool,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        let scanned_bytes = self.wal_size_bytes()?;
+        let (wal_lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.replication_index.note_read(scanned_bytes);
+        self.note_replication_skipped(skipped);
+        let total_records = wal_lines.len();
+        if let Some(resync) = self.resync_frame(
+            from_generation,
+            from_offset,
+            total_records,
+            check_generation,
+        ) {
+            return Ok(resync);
+        }
+        let lines = wal_lines.into_iter().skip(from_offset).map(Ok);
+        let cut = cut_frame(
+            lines,
+            from_offset,
+            max_records,
+            total_records,
+            self.replication_group_cap,
+        )?;
+        self.finish_frame(from_offset, total_records, cut)
+    }
+
+    /// The resync frame when the follower's position is not in this view:
+    /// another generation, no known generation on a non-fresh WAL, or an
+    /// offset past the end.
+    fn resync_frame(
+        &self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        total_records: usize,
+        check_generation: bool,
+    ) -> Option<WalReplicationFrame> {
+        let generation_ok = !check_generation
+            || match from_generation {
+                Some(g) => g == self.generation,
+                None => from_offset == 0 && !self.snapshot_path().exists(),
+            };
+        if generation_ok && from_offset <= total_records {
+            return None;
+        }
+        Some(WalReplicationFrame {
+            generation: self.generation,
+            from_offset,
+            next_offset: total_records,
+            total_records,
+            needs_resync: true,
+            wal_lines: Vec::new(),
+            switched_from: None,
+        })
+    }
+
+    fn finish_frame(
+        &mut self,
+        from_offset: usize,
+        total_records: usize,
+        cut: FrameCut,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        match cut {
+            FrameCut::Lines { next_offset, lines } => Ok(WalReplicationFrame {
+                generation: self.generation,
+                from_offset,
+                next_offset,
+                total_records,
+                needs_resync: false,
+                wal_lines: lines,
+                switched_from: None,
+            }),
+            FrameCut::GroupTooLarge(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )))
+            }
+        }
+    }
+
+    /// `(generation, replication view length)` after flushing.
+    pub fn replication_position(&mut self) -> Result<(u64, usize), StoreError> {
+        self.flush_pending_sync()?;
+        Ok((self.generation, self.replication_view_len()?))
+    }
+
+    /// Length of the replication view of the flushed WAL.
+    fn replication_view_len(&mut self) -> Result<usize, StoreError> {
+        if self.replication_index.refresh(&self.path, &self.codec)? {
+            self.note_replication_skipped(self.replication_index.skipped());
+            return Ok(self.replication_index.total());
+        }
+        let scanned_bytes = self.wal_size_bytes()?;
+        let (lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.replication_index.note_read(scanned_bytes);
+        self.note_replication_skipped(skipped);
+        Ok(lines.len())
+    }
+
+    /// Freezes the inputs of a chunked export: writes the WAL's replication
+    /// lines to `wal_out` and opens the snapshot, so the export file can be
+    /// built after the WAL lock is released (see `replication_export`).
+    pub(crate) fn freeze_for_export(
+        &mut self,
+        wal_out: &mut dyn Write,
+    ) -> Result<ExportFreeze, StoreError> {
+        self.flush_pending_sync()?;
+        // While a checkpoint is pending, the state before the WAL is the
+        // base snapshot plus the closed WAL files it lists; the open handles
+        // keep reading them even if the checkpoint publishes and deletes
+        // them meanwhile.
+        let snapshot = match self.replay_base_path() {
+            Some(path) => open_line_file_with_codec(&path, self.keyring.as_ref())?,
+            None => None,
+        };
+        let mut closed = Vec::new();
+        for path in self.pending_replay_paths() {
+            let opened = open_line_file_with_codec(&path, self.keyring.as_ref())?;
+            closed.push(
+                opened.ok_or_else(|| StoreError::Io(format!("{} is missing", path.display())))?,
+            );
+        }
+        let mut wal_records = 0usize;
+        if self.replication_index.refresh(&self.path, &self.codec)? {
+            self.note_replication_skipped(self.replication_index.skipped());
+            for line in self
+                .replication_index
+                .lines_from(&self.path, &self.codec, 0)?
+            {
+                let line = line?;
+                wal_out.write_all(line.as_bytes())?;
+                wal_out.write_all(b"\n")?;
+                wal_records += 1;
+            }
+            if wal_records != self.replication_index.total() {
+                return Err(StoreError::Io(format!(
+                    "replication view read {wal_records} lines, index holds {}",
+                    self.replication_index.total()
+                )));
+            }
+        } else {
+            let scanned_bytes = self.wal_size_bytes()?;
+            let (lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+            self.replication_index.note_read(scanned_bytes);
+            self.note_replication_skipped(skipped);
+            for line in &lines {
+                wal_out.write_all(line.as_bytes())?;
+                wal_out.write_all(b"\n")?;
+            }
+            wal_records = lines.len();
+        }
+        Ok(ExportFreeze {
+            generation: self.generation,
+            wal_records,
+            snapshot,
+            closed,
         })
     }
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
         self.flush_pending_sync()?;
+        let (snapshot_lines, skipped_snapshot) =
+            filter_replication_lines(self.replay_prefix_lines_raw()?);
+        let (wal_lines, skipped_wal) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.note_replication_skipped(skipped_snapshot + skipped_wal);
         Ok(WalReplicationExport {
-            snapshot_lines: self.replay_snapshot_lines_raw()?,
-            wal_lines: self.replay_wal_lines_raw()?,
+            snapshot_lines,
+            wal_lines,
         })
+    }
+
+    fn ensure_no_checkpoint_in_flight(&self) -> Result<(), StoreError> {
+        if self.checkpoint_in_flight.is_some() {
+            return Err(StoreError::Conflict(CHECKPOINT_IN_PROGRESS.to_string()));
+        }
+        Ok(())
+    }
+
+    /// A resync replaced `<wal>.snapshot` (and with it a pending marker): the
+    /// files of the pending checkpoint are no longer replayed.
+    fn retire_pending_after_snapshot_replaced(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let generation = self.generation;
+            self.retire_pending_files(&pending, generation).delete();
+        }
+    }
+
+    fn note_replication_skipped(&mut self, skipped: usize) {
+        if skipped != self.replication_skipped {
+            eprintln!(
+                "warning: replication view of {} leaves out {skipped} line(s) that lenient replay quarantines",
+                self.path.display()
+            );
+        }
+        self.replication_skipped = skipped;
     }
 
     pub fn replace_with_replication_export(
         &mut self,
         export: &WalReplicationExport,
     ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        self.ensure_no_checkpoint_in_flight()?;
         self.flush_pending_sync()?;
-        for line in &export.snapshot_lines {
-            let _ = line_to_record(line)?;
-        }
-        for line in &export.wal_lines {
-            let _ = line_to_record(line)?;
+        for line in export.snapshot_lines.iter().chain(&export.wal_lines) {
+            check_replicated_line(line)?;
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
+        self.retire_pending_after_snapshot_replaced();
+        self.bump_generation()?;
+        self.discard_closed_generation();
+        self.replication_index.reset();
         self.write_wal_lines_raw(&export.wal_lines)?;
         self.wal_records = export.wal_lines.len();
         self.unsynced_records = 0;
@@ -363,17 +1537,133 @@ impl FileWal {
         Ok(())
     }
 
+    /// [`FileWal::replace_with_replication_export`] from a verified export
+    /// file, streaming: the snapshot section becomes `<wal>.snapshot`
+    /// (temp file, fsync, rename) and the WAL section the WAL, under a new
+    /// generation. Every line is checked first, so a bad line leaves the
+    /// local files untouched.
+    pub fn replace_with_replication_export_file(
+        &mut self,
+        export: &ReplicationExportFile,
+    ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        self.ensure_no_checkpoint_in_flight()?;
+        self.flush_pending_sync()?;
+        export.for_each_line(|_, line| check_replicated_line(line))?;
+        self.forget_open_scan();
+
+        let snapshot_path = self.snapshot_path();
+        let mut tmp_path = snapshot_path.clone().into_os_string();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        {
+            let snapshot_codec = LineCodec::create(self.keyring.as_ref())?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut out = std::io::BufWriter::new(&mut file);
+            if let Some(header) = snapshot_codec.header_line() {
+                out.write_all(header.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+            out.write_all(snapshot_codec.encode(SNAPSHOT_HEADER).as_bytes())?;
+            out.write_all(b"\n")?;
+            export.for_each_line(|section, line| {
+                if section == ExportSection::Snapshot {
+                    out.write_all(snapshot_codec.encode(line).as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Ok(())
+            })?;
+            out.flush()?;
+            drop(out);
+            sync_file(&file)?;
+        }
+        rename_file(&tmp_path, &snapshot_path)?;
+        sync_parent_dir(&snapshot_path)?;
+        self.retire_pending_after_snapshot_replaced();
+        failpoint!("export_apply.snapshot_replaced");
+
+        self.bump_generation()?;
+        self.discard_closed_generation();
+        self.replication_index.reset();
+        {
+            let codec = LineCodec::create(self.keyring.as_ref())?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+            self.codec = codec.clone();
+            let mut out = std::io::BufWriter::new(&mut file);
+            if let Some(header) = codec.header_line() {
+                out.write_all(header.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+            export.for_each_line(|section, line| {
+                if section == ExportSection::Wal {
+                    out.write_all(codec.encode(line).as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Ok(())
+            })?;
+            out.flush()?;
+            drop(out);
+            file.sync_all()?;
+        }
+        sync_parent_dir(&self.path)?;
+        self.wal_records = export.wal_records;
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
+        self.append_buffer.clear();
+        Ok(())
+    }
+
+    /// Appends replicated lines as one unit: every line is checked first,
+    /// then all are written with one write and one fsync (whatever the
+    /// write policy), instead of one fsync per line.
+    pub fn append_replicated_lines(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        let mut checked = Vec::with_capacity(lines.len());
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                return Err(StoreError::Parse(
+                    "raw WAL record line must not be empty".to_string(),
+                ));
+            }
+            check_replicated_line(line)?;
+            checked.push(line.to_string());
+        }
+        self.append_group_lines(&checked)?;
+        self.flush_pending_sync()
+    }
+
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
         self.append_raw_record_line_unchecked(record_to_line(record))
     }
 
     fn append_raw_record_line_unchecked(&mut self, line: String) -> Result<(), StoreError> {
+        self.ensure_writable()?;
         self.append_buffer.push(line);
         self.wal_records += 1;
         self.unsynced_records += 1;
+        self.apply_write_policy()
+    }
+
+    /// Flushes and/or syncs the pending records as the write policy demands.
+    fn apply_write_policy(&mut self) -> Result<(), StoreError> {
         if self.background_flush_only {
             return Ok(());
         }
+        let started = Instant::now();
+        let result = self.apply_write_policy_inner();
+        crate::observe::observe_wal_append(started.elapsed());
+        result
+    }
+
+    fn apply_write_policy_inner(&mut self) -> Result<(), StoreError> {
         let interval_elapsed = self
             .sync_interval
             .is_some_and(|interval| self.last_sync_at.elapsed() >= interval);
@@ -410,13 +1700,35 @@ impl FileWal {
         if self.append_buffer.is_empty() {
             return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        for line in self.append_buffer.drain(..) {
-            writeln!(file, "{line}")?;
+        self.ensure_writable()?;
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
+        self.write_append_buffer(&mut file)
+    }
+
+    /// Writes the whole append buffer with a single `write_all` and empties
+    /// it (also on error, as before).
+    fn write_append_buffer(&mut self, file: &mut File) -> Result<(), StoreError> {
+        if self.append_buffer.is_empty() {
+            return Ok(());
         }
+        self.forget_open_scan();
+        let bytes: usize = self.append_buffer.iter().map(|line| line.len() + 1).sum();
+        let bytes = if self.codec.is_encrypted() {
+            bytes * 4 / 3 + self.append_buffer.len() * 64
+        } else {
+            bytes
+        };
+        let mut buf = String::with_capacity(bytes);
+        for line in self.append_buffer.drain(..) {
+            self.codec.push_line(&mut buf, &line);
+        }
+        let start = file.metadata()?.len();
+        file.write_all(buf.as_bytes())?;
+        crate::observe::observe_wal_bytes_written(buf.len());
+        // Keep the replication index current from memory (see
+        // `ReplicationIndex::observe_append`).
+        self.replication_index
+            .observe_append(start, buf.as_bytes(), &self.codec);
         Ok(())
     }
 
@@ -424,110 +1736,220 @@ impl FileWal {
         if self.unsynced_records == 0 && self.append_buffer.is_empty() {
             return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        for line in self.append_buffer.drain(..) {
-            writeln!(file, "{line}")?;
-        }
+        self.ensure_writable()?;
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
+        self.write_append_buffer(&mut file)?;
         if self.unsynced_records > 0 {
-            file.sync_data()?;
+            if let Err(err) = sync_wal_data(&file) {
+                return Err(self.poison(&err));
+            }
             self.unsynced_records = 0;
             self.last_sync_at = Instant::now();
         }
         Ok(())
     }
 
-    pub(crate) fn replay_records_with_stats(
+    /// Path of the quarantine file: `<wal>.quarantine`.
+    pub fn quarantine_path(&self) -> PathBuf {
+        quarantine_path_for(&self.path)
+    }
+
+    /// Parses the snapshot and WAL (plus the unflushed append buffer)
+    /// into replayable items, applying `policy` to lines that cannot be
+    /// parsed. See [`ReplayPolicy`] and `docs/operations/wal-recovery.md`.
+    ///
+    /// With `collect_vectors_from = Some(n)` the replay also reports the
+    /// claim ids of the vector records after the first `n` WAL lines (the
+    /// catch-up set of a persisted vector index saved at line `n`).
+    pub(crate) fn replay_with_policy(
         &self,
-    ) -> Result<(Vec<PersistedRecord>, WalReplayStats), StoreError> {
-        let snapshot_records = self.replay_snapshot_records()?;
-        let mut wal_records = self.replay_wal_records()?;
-        if !self.append_buffer.is_empty() {
-            for line in &self.append_buffer {
-                wal_records.push(line_to_record(line)?);
+        policy: ReplayPolicy,
+        collect_vectors_from: Option<usize>,
+    ) -> Result<WalReplay, StoreError> {
+        let mut sink = QuarantineSink::load(self.quarantine_path(), self.keyring.clone())?;
+        let mut parser = ReplayParser::new(policy);
+        let mut items = Vec::new();
+
+        let snapshot_lines = self.replay_snapshot_lines_raw()?;
+        let snapshot_count = {
+            let mut n = 0usize;
+            for (idx, line) in snapshot_lines.into_iter().enumerate() {
+                let origin = format!("snapshot record {}", idx + 1);
+                if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                    items.push(item);
+                    n += 1;
+                }
+            }
+            n
+        };
+        // A pending checkpoint's closed WAL files come between the base
+        // snapshot and the WAL; they are WAL records (commit groups,
+        // tombstones) and replay as such.
+        let mut wal_items = Vec::new();
+        for path in self.pending_replay_paths() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let codec = crypt::line_codec_for(&path, self.keyring.as_ref())?;
+            for (line_no, line) in scan_wal(&path, &codec)?.lines {
+                let origin = format!("{name} line {line_no}");
+                if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                    wal_items.push(item);
+                }
             }
         }
+        let scan = self.scan_for_replay()?;
+        // Vector-index changes after line `from` (see
+        // `WalReplay::vector_catch_up`); impossible when the WAL is shorter
+        // than `from`.
+        let mut catch_up = collect_vectors_from
+            .filter(|from| *from <= scan.lines.len())
+            .map(|_| VectorCatchUp::default());
+        let collect_from = collect_vectors_from.unwrap_or(usize::MAX);
+        for (index, (line_no, line)) in scan.lines.into_iter().enumerate() {
+            let origin = format!("wal line {line_no}");
+            if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                if index >= collect_from
+                    && let Some(catch_up) = catch_up.as_mut()
+                {
+                    catch_up.observe(&item.record);
+                }
+                wal_items.push(item);
+            }
+        }
+        for line in &self.append_buffer {
+            let record = line_to_record(line)?;
+            if let Some(catch_up) = catch_up.as_mut() {
+                catch_up.observe(&record);
+            }
+            wal_items.push(ReplayItem {
+                record,
+                legacy: false,
+                raw: None,
+                origin: "unflushed wal buffer".to_string(),
+            });
+        }
+        // Commit groups that were never closed are torn writes: drop them
+        // whole (quarantined lines were already removed, so a group with a
+        // quarantined member still closes normally).
+        let (wal_items, discarded) = resolve_commit_groups(wal_items, |item| &item.record);
+        if discarded > 0 {
+            eprintln!("warning: discarded {discarded} records of an unterminated WAL commit group");
+        }
+        let wal_count = wal_items.len();
+        items.extend(wal_items);
         let stats = WalReplayStats {
-            snapshot_records: snapshot_records.len(),
-            wal_records: wal_records.len(),
+            snapshot_records: snapshot_count,
+            wal_records: wal_count,
+            torn_tail_dropped: self.torn_tail_dropped,
+            quarantined_records: parser.quarantined,
+            dependent_skipped: 0,
         };
-
-        let mut out = snapshot_records;
-        out.extend(wal_records);
-        Ok((out, stats))
+        Ok(WalReplay {
+            items,
+            stats,
+            sink,
+            quarantined_claim_ids: parser.quarantined_claim_ids,
+            vector_catch_up: catch_up,
+        })
     }
 
-    fn replay_snapshot_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
-        self.replay_snapshot_lines_raw()?
-            .into_iter()
-            .map(|line| line_to_record(&line))
-            .collect()
+    /// Drops the lines cached at open (the file is about to change).
+    fn forget_open_scan(&mut self) {
+        *self.open_scan.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// The WAL's lines for a replay: the ones read at open while the file is
+    /// unchanged since (taken once), otherwise a fresh scan.
+    fn scan_for_replay(&self) -> Result<WalScan, StoreError> {
+        let cached = self
+            .open_scan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((len, lines)) = cached
+            && std::fs::metadata(&self.path)?.len() == len
+        {
+            return Ok(WalScan {
+                lines,
+                valid_len: len,
+                torn_tail: false,
+                missing_newline: false,
+            });
+        }
+        scan_wal(&self.path, &self.codec)
+    }
+
+    /// Lines of the snapshot replay starts from (the base snapshot while a
+    /// checkpoint is pending).
     fn replay_snapshot_lines_raw(&self) -> Result<Vec<String>, StoreError> {
-        let snapshot_path = self.snapshot_path();
+        let Some(snapshot_path) = self.replay_base_path() else {
+            return Ok(Vec::new());
+        };
         if !snapshot_path.exists() {
             return Ok(Vec::new());
         }
-        let file = OpenOptions::new().read(true).open(snapshot_path)?;
+        let codec = crypt::line_codec_for(&snapshot_path, self.keyring.as_ref())?;
+        let file = OpenOptions::new().read(true).open(&snapshot_path)?;
         let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let header = loop {
-            match lines.next() {
-                Some(line) => {
-                    let line = line?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    break line;
-                }
-                None => {
-                    return Err(StoreError::Parse("snapshot file is empty".to_string()));
-                }
-            }
-        };
-        if header != SNAPSHOT_HEADER {
-            return Err(StoreError::Parse(
-                "snapshot file has invalid header".to_string(),
-            ));
-        }
-
+        let mut header_seen = false;
         let mut out = Vec::new();
-        for line in lines {
-            let line = line?;
+        for (idx, raw) in reader.split(b'\n').enumerate() {
+            let raw = raw?;
+            let line = codec.decode(&raw).map_err(|reason| {
+                StoreError::Parse(format!("snapshot line {}: {reason}", idx + 1))
+            })?;
             if line.trim().is_empty() {
+                continue;
+            }
+            if !header_seen {
+                if line != SNAPSHOT_HEADER {
+                    return Err(StoreError::Parse(
+                        "snapshot file has invalid header".to_string(),
+                    ));
+                }
+                header_seen = true;
                 continue;
             }
             out.push(line);
         }
+        if !header_seen {
+            return Err(StoreError::Parse("snapshot file is empty".to_string()));
+        }
         Ok(out)
     }
 
-    fn replay_wal_records(&self) -> Result<Vec<PersistedRecord>, StoreError> {
-        self.replay_wal_lines_raw()?
-            .into_iter()
-            .map(|line| line_to_record(&line))
-            .collect()
+    /// Lines of the closed WAL files a pending checkpoint replays between
+    /// the base snapshot and the WAL (empty when none is pending).
+    fn replay_closed_lines_raw(&self) -> Result<Vec<String>, StoreError> {
+        let mut out = Vec::new();
+        for path in self.pending_replay_paths() {
+            let codec = crypt::line_codec_for(&path, self.keyring.as_ref())?;
+            out.extend(
+                scan_wal(&path, &codec)?
+                    .lines
+                    .into_iter()
+                    .map(|(_, line)| line),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Everything replay applies before the WAL: the snapshot lines, then
+    /// the lines of the closed WAL files of a pending checkpoint.
+    fn replay_prefix_lines_raw(&self) -> Result<Vec<String>, StoreError> {
+        let mut lines = self.replay_snapshot_lines_raw()?;
+        lines.extend(self.replay_closed_lines_raw()?);
+        Ok(lines)
     }
 
     fn replay_wal_lines_raw(&self) -> Result<Vec<String>, StoreError> {
-        let file = OpenOptions::new().read(true).open(&self.path)?;
-        let reader = BufReader::new(file);
-        let mut out = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            out.push(line);
-        }
-        Ok(out)
-    }
-
-    fn write_snapshot_records(&self, records: &[PersistedRecord]) -> Result<(), StoreError> {
-        self.write_snapshot_lines_raw(&records.iter().map(record_to_line).collect::<Vec<String>>())
+        Ok(scan_wal(&self.path, &self.codec)?
+            .lines
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect())
     }
 
     fn write_snapshot_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
@@ -542,59 +1964,291 @@ impl FileWal {
         tmp_path.push(".tmp");
         let tmp_path = PathBuf::from(tmp_path);
 
+        let codec = LineCodec::create(self.keyring.as_ref())?;
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        writeln!(file, "{SNAPSHOT_HEADER}")?;
-        for line in lines {
-            writeln!(file, "{line}")?;
-        }
-        file.sync_all()?;
-        rename(tmp_path, snapshot_path)?;
+        crypt::write_line_file(
+            &mut file,
+            &codec,
+            std::iter::once(SNAPSHOT_HEADER).chain(lines.iter().map(String::as_str)),
+        )?;
+        failpoint!("snapshot.tmp_written");
+        sync_file(&file)?;
+        failpoint!("snapshot.fsynced");
+        drop(file);
+        rename_file(&tmp_path, &snapshot_path)?;
+        failpoint!("snapshot.renamed");
+        sync_parent_dir(&snapshot_path)?;
+        failpoint!("snapshot.dir_synced");
         Ok(())
     }
 
-    fn write_wal_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
+    fn write_wal_lines_raw(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        self.forget_open_scan();
+        let codec = LineCodec::create(self.keyring.as_ref())?;
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        for line in lines {
-            writeln!(file, "{line}")?;
-        }
-        file.sync_data()?;
+        self.codec = codec.clone();
+        crypt::write_line_file(&mut file, &codec, lines.iter().map(String::as_str))?;
+        file.sync_all()?;
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
+    /// Starts a new, empty WAL under a new generation. The old file is
+    /// renamed to `<wal>.closed.<old generation>` (replacing the previously
+    /// closed one), so followers still inside that generation can be served
+    /// its remaining lines (see [`ClosedGeneration`]).
     fn truncate_wal(&mut self) -> Result<(), StoreError> {
         self.append_buffer.clear();
-        OpenOptions::new()
+        self.forget_open_scan();
+        let closed_generation = self.generation;
+        // New lineage first: a crash between the bump and the truncation
+        // only causes a spurious resync, never a silent skip.
+        self.bump_generation()?;
+        failpoint!("wal.generation_bumped");
+        let previous = self.closed.take();
+        let index = self.replication_index.take_for_renamed_file();
+        let closed_path = closed_path_for(&self.path, closed_generation);
+        let new_codec = LineCodec::create(self.keyring.as_ref())?;
+        rename_file(&self.path, &closed_path)?;
+        failpoint!("wal.closed_renamed");
+        let closed_codec = std::mem::replace(&mut self.codec, new_codec);
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
+        if let Some(header) = self.codec.header_line() {
+            write_line(&mut file, header)?;
+        }
+        sync_file(&file)?;
+        drop(file);
+        sync_parent_dir(&self.path)?;
+        failpoint!("wal.truncated");
+        if let Some(previous) = previous
+            && previous.path != closed_path
+            && !self.is_pending_replay_generation(previous.generation)
+        {
+            // Renamed now, deleted by the snapshot writer after the lock is
+            // released (see `CheckpointTicket::retired_on_rotation`).
+            let retired = checkpoint::retired_path_for(
+                &self.path,
+                &format!("closed-{:016x}", previous.generation),
+                self.generation,
+            );
+            match rename_file(&previous.path, &retired) {
+                Ok(()) => self.retired_on_rotation.push(retired),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&previous.path);
+                }
+            }
+        }
+        self.closed = Some(ClosedGeneration {
+            generation: closed_generation,
+            records: index.total(),
+            path: closed_path,
+            codec: closed_codec,
+            index,
+        });
         self.wal_records = 0;
         self.unsynced_records = 0;
         self.last_sync_at = Instant::now();
         Ok(())
     }
 
+    /// A whole checkpoint on the calling thread: rotation, snapshot of
+    /// `snapshot_records`, publication (see `checkpoint`).
+    #[cfg(test)]
     pub(crate) fn compact_with_snapshot(
         &mut self,
         snapshot_records: &[PersistedRecord],
     ) -> Result<WalCheckpointStats, StoreError> {
-        let truncated_wal_records = self.wal_records;
-        self.flush_pending_sync()?;
-        self.write_snapshot_records(snapshot_records)?;
-        self.truncate_wal()?;
+        let ticket = self.begin_checkpoint()?;
+        let written = ticket.write_snapshot(snapshot_records.iter().map(record_to_line));
+        let snapshot_records = match written {
+            Ok(count) => count,
+            Err(err) => {
+                self.abort_checkpoint(&ticket);
+                return Err(err);
+            }
+        };
+        if let Err(err) = ticket.publish() {
+            self.abort_checkpoint(&ticket);
+            return Err(err);
+        }
+        self.finish_checkpoint(&ticket)?.delete();
         Ok(WalCheckpointStats {
-            snapshot_records: snapshot_records.len(),
-            truncated_wal_records,
+            snapshot_records,
+            truncated_wal_records: ticket.truncated_wal_records,
         })
     }
+}
+
+impl FileWal {
+    /// Appends a transition to `<wal>.gen.transitions` (temp file, fsync,
+    /// rename). A failure is logged, not returned: without the record a
+    /// follower falls back to a full resync.
+    fn record_transition(&mut self, transition: GenerationTransition) {
+        let mut next = self.transitions.clone();
+        next.push(transition);
+        let excess = next.len().saturating_sub(GENERATION_TRANSITIONS_KEPT);
+        next.drain(..excess);
+        match write_transitions(&transitions_path_for(&self.path), &next) {
+            Ok(()) => self.transitions = next,
+            Err(err) => eprintln!(
+                "warning: could not record the WAL generation transition (followers will resync): {err:?}"
+            ),
+        }
+    }
+}
+
+/// Opens the line file `path` with the codec its first line declares
+/// (`None`: no such file). The handle is at offset 0.
+fn open_line_file_with_codec(
+    path: &Path,
+    keyring: Option<&std::sync::Arc<encryption::Keyring>>,
+) -> Result<Option<(File, LineCodec)>, StoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let what = path.display().to_string();
+    let codec = match crypt::detect_open_line_file(&mut file, keyring, &what)? {
+        Detected::Encrypted(codec) => codec,
+        Detected::Plain => LineCodec::Plain,
+        Detected::TornHeader => {
+            return Err(StoreError::Parse(format!(
+                "{what}: the encryption header is incomplete"
+            )));
+        }
+    };
+    Ok(Some((file, codec)))
+}
+
+fn closed_path_for(wal_path: &Path, generation: u64) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(format!(".closed.{generation:016x}"));
+    PathBuf::from(path)
+}
+
+/// The closed generation file that matches the newest transition. Closed
+/// files of other generations (left by a crash, or by a checkpoint whose
+/// transition could not be recorded) are deleted, except those a pending
+/// checkpoint still replays (`replay`).
+fn load_closed_generation(
+    wal_path: &Path,
+    newest: Option<&GenerationTransition>,
+    replay: &[u64],
+    keyring: Option<&std::sync::Arc<encryption::Keyring>>,
+) -> Result<Option<ClosedGeneration>, StoreError> {
+    let replay_names: Vec<String> = replay
+        .iter()
+        .filter_map(|g| {
+            closed_path_for(wal_path, *g)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .collect();
+    let keep = newest.map(|t| closed_path_for(wal_path, t.from_generation));
+    let keep_name = keep
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().to_string());
+    if let (Some(dir), Some(name)) = (wal_path.parent(), wal_path.file_name()) {
+        let prefix = format!("{}.closed.", name.to_string_lossy());
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with(&prefix)
+                    && Some(&file_name) != keep_name.as_ref()
+                    && !replay_names.contains(&file_name)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    let (Some(newest), Some(path)) = (newest, keep) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let codec = crypt::line_codec_for(&path, keyring)?;
+    Ok(Some(ClosedGeneration {
+        generation: newest.from_generation,
+        records: newest.from_records,
+        path,
+        codec,
+        index: ReplicationIndex::default(),
+    }))
+}
+
+fn transitions_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".gen.transitions");
+    PathBuf::from(path)
+}
+
+/// One `<from:016x> <records> <to:016x>` line per transition. Unreadable
+/// lines are ignored (a follower that needed one resyncs).
+fn load_transitions(path: &Path) -> Vec<GenerationTransition> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let from_generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let from_records = parts.next()?.parse::<usize>().ok()?;
+            let to_generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(GenerationTransition {
+                from_generation,
+                from_records,
+                to_generation,
+            })
+        })
+        .collect()
+}
+
+fn write_transitions(path: &Path, transitions: &[GenerationTransition]) -> Result<(), StoreError> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut body = String::new();
+    for t in transitions {
+        body.push_str(&format!(
+            "{:016x} {} {:016x}\n",
+            t.from_generation, t.from_records, t.to_generation
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(body.as_bytes())?;
+    sync_file(&file)?;
+    drop(file);
+    rename_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
 }
 
 impl Drop for FileWal {
@@ -603,106 +2257,1040 @@ impl Drop for FileWal {
     }
 }
 
-fn count_non_empty_lines(path: &Path) -> Result<usize, StoreError> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    let reader = BufReader::new(file);
-    let mut count = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            count += 1;
+fn with_context(err: StoreError, context: &str) -> StoreError {
+    match err {
+        StoreError::Parse(msg) => StoreError::Parse(format!("{context}: {msg}")),
+        other => other,
+    }
+}
+
+fn write_line(file: &mut File, line: &str) -> Result<(), StoreError> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    file.write_all(buf.as_bytes())?;
+    Ok(())
+}
+
+/// fsync the directory containing `path` so that creations, renames and
+/// truncations of directory entries are durable. No-op on platforms where
+/// directories cannot be opened for syncing.
+pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    trace_op!("fsync_dir");
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// `File::sync_data` for WAL appends, with a test-only failpoint (`wal.sync`)
+/// so tests can inject an fsync failure.
+fn sync_wal_data(file: &File) -> std::io::Result<()> {
+    let started = Instant::now();
+    let result = sync_wal_data_inner(file);
+    crate::observe::observe_wal_fsync(started.elapsed(), result.is_ok());
+    result
+}
+
+fn sync_wal_data_inner(file: &File) -> std::io::Result<()> {
+    failpoint!("wal.sync");
+    file.sync_data()
+}
+
+/// `File::sync_all` with a test-only trace of the operation order.
+pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
+    trace_op!("fsync_file");
+    file.sync_all()
+}
+
+/// `fs::rename` with a test-only trace of the operation order.
+pub(crate) fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    trace_op!("rename");
+    rename(from, to)
+}
+
+fn generation_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".gen");
+    PathBuf::from(path)
+}
+
+fn new_generation() -> u64 {
+    loop {
+        let value: u64 = rand::random();
+        if value != 0 {
+            return value;
         }
     }
-    Ok(count)
 }
+
+fn write_generation(path: &Path, generation: u64) -> Result<(), StoreError> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    write_line(&mut file, &format!("{generation:016x}"))?;
+    sync_file(&file)?;
+    drop(file);
+    rename_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn load_or_create_generation(path: &Path) -> Result<u64, StoreError> {
+    if let Ok(raw) = std::fs::read_to_string(path)
+        && let Ok(value) = u64::from_str_radix(raw.trim(), 16)
+        && value != 0
+    {
+        return Ok(value);
+    }
+    let generation = new_generation();
+    write_generation(path, generation)?;
+    Ok(generation)
+}
+
+struct WalScan {
+    /// `(1-based physical line number, line)` for every non-blank line that
+    /// is kept (a torn final line is excluded).
+    lines: Vec<(usize, String)>,
+    /// Byte length of the valid prefix of the file.
+    valid_len: u64,
+    /// Whether a torn tail was discarded.
+    torn_tail: bool,
+    /// Whether the valid prefix lacks a trailing newline.
+    missing_newline: bool,
+}
+
+/// Reads the WAL and separates the valid prefix from a torn tail. Only the
+/// final line is parsed here; interior lines are returned verbatim so
+/// that a corrupt interior line is reported (with its line number) by
+/// the caller rather than silently dropped.
+fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .read_to_end(&mut bytes)?;
+
+    let raw = physical_lines(&bytes);
+
+    // Decode text (decrypting an encrypted file); a line that does not
+    // decode is treated as an unparseable line.
+    let decoded = decode_lines(&bytes, &raw, codec);
+
+    // Index of the last non-blank physical line.
+    let last_content = decoded
+        .iter()
+        .rposition(|text| text.as_ref().map_or(true, |t| !t.trim().is_empty()));
+
+    let mut lines = Vec::new();
+    let mut valid_len = bytes.len() as u64;
+    let mut torn_tail = false;
+    let mut missing_newline = false;
+    for (idx, (&(s, _, terminated), text)) in raw.iter().zip(decoded).enumerate() {
+        let is_last = Some(idx) == last_content;
+        if is_last {
+            let ok = text.as_deref().is_ok_and(|t| is_valid_tail(t, terminated));
+            if !ok {
+                torn_tail = true;
+                valid_len = s as u64;
+                // Blank lines before the torn line stay in the prefix.
+                break;
+            }
+            if !terminated {
+                missing_newline = true;
+            }
+        }
+        match text {
+            Ok(t) if t.trim().is_empty() => {}
+            Ok(t) => lines.push((idx + 1, t)),
+            Err(reason) => {
+                return Err(StoreError::Parse(format!("wal line {}: {reason}", idx + 1)));
+            }
+        }
+    }
+    Ok(WalScan {
+        lines,
+        valid_len,
+        torn_tail,
+        missing_newline,
+    })
+}
+
+/// Decodes every physical line of `bytes`. Decryption of a large encrypted
+/// file runs on all cores (lines are independent), so a cold start does not
+/// pay the decryption serially.
+fn decode_lines(
+    bytes: &[u8],
+    raw: &[(usize, usize, bool)],
+    codec: &LineCodec,
+) -> Vec<Result<String, String>> {
+    const PARALLEL_MIN_LINES: usize = 4096;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if !codec.is_encrypted() || raw.len() < PARALLEL_MIN_LINES || workers < 2 {
+        return raw
+            .iter()
+            .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+            .collect();
+    }
+    let per = raw.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = raw
+            .chunks(per)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("line decoder thread panicked"))
+            .collect()
+    })
+}
+
+/// Splits `bytes` into physical lines: `(start, end, terminated)` with `end`
+/// exclusive of the newline.
+fn physical_lines(bytes: &[u8]) -> Vec<(usize, usize, bool)> {
+    let mut raw = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            raw.push((start, i, true));
+            start = i + 1;
+        }
+    }
+    if start < bytes.len() {
+        raw.push((start, bytes.len(), false));
+    }
+    raw
+}
+
+/// Whether a final line is a complete record. An unterminated line is only
+/// trusted when it carries a verified checksum.
+fn is_valid_tail(text: &str, terminated: bool) -> bool {
+    // A newline-terminated legacy line is a complete (if possibly unreadable)
+    // record, not a torn write: keep it so replay can quarantine it instead
+    // of silently truncating it away.
+    if terminated && is_legacy_kind(record_kind(text)) {
+        return true;
+    }
+    let checksummed = split_and_verify_crc(text).is_ok_and(|(_, c)| c);
+    // A terminated line with a verified checksum was written whole: if this
+    // reader cannot parse it (a record kind from a newer binary), replay must
+    // fail on it rather than truncate it away as a torn write.
+    if terminated && checksummed {
+        return true;
+    }
+    line_to_record(text).is_ok() && (terminated || checksummed)
+}
+
+fn quarantine_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".quarantine");
+    PathBuf::from(path)
+}
+
+fn record_kind(line: &str) -> &str {
+    line.split('\t').next().unwrap_or("")
+}
+
+/// Record kinds written before checksums and escape-safe encoding existed.
+fn is_legacy_kind(kind: &str) -> bool {
+    matches!(kind, "C" | "E" | "G" | "V" | "B")
+}
+
+/// Every checksummed record kind this reader understands. `T2` (tombstone)
+/// is the newest; a reader that predates it fails replay on the unknown kind
+/// (see `ReplayParser::parse`) rather than skipping a delete.
+fn is_versioned_kind(kind: &str) -> bool {
+    matches!(kind, "C2" | "E2" | "G2" | "V2" | "B2" | "T2")
+}
+
+fn is_known_kind(kind: &str) -> bool {
+    is_legacy_kind(kind) || is_versioned_kind(kind)
+}
+
+/// One parsed replay record plus the metadata the replay policy needs.
+pub(crate) struct ReplayItem {
+    pub(crate) record: PersistedRecord,
+    /// The record was written in a legacy (unchecksummed) format.
+    pub(crate) legacy: bool,
+    /// Raw line, kept only for legacy records (the quarantine copy).
+    pub(crate) raw: Option<String>,
+    /// Human-readable position, e.g. `wal line 12`.
+    pub(crate) origin: String,
+}
+
+impl ReplayItem {
+    /// Raw line for the quarantine file: the original text for legacy
+    /// records, the canonical encoding otherwise.
+    pub(crate) fn quarantine_line(&self) -> String {
+        match &self.raw {
+            Some(raw) => raw.clone(),
+            None => record_to_line(&self.record),
+        }
+    }
+
+    /// Whether this record references a claim id in `ids`.
+    pub(crate) fn depends_on(&self, ids: &HashSet<String>) -> bool {
+        match &self.record {
+            PersistedRecord::Evidence(e) => ids.contains(&e.claim_id),
+            PersistedRecord::Edge(e) => {
+                ids.contains(&e.from_claim_id) || ids.contains(&e.to_claim_id)
+            }
+            PersistedRecord::ClaimVector(v) => ids.contains(&v.claim_id),
+            PersistedRecord::Claim(_)
+            | PersistedRecord::BatchCommit(_)
+            | PersistedRecord::Tombstone(_) => false,
+        }
+    }
+}
+
+/// What changed in the vector indexes after the WAL position a persisted
+/// vector index was saved at, so a restore can bring the saved index up to
+/// date instead of rebuilding it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VectorCatchUp {
+    /// Claims with a vector record after the saved position.
+    pub(crate) claim_ids: HashSet<String>,
+    /// `(tenant, claim)` of every claim tombstone after the saved position.
+    pub(crate) deleted_claims: Vec<(String, String)>,
+    /// Tenants erased after the saved position.
+    pub(crate) erased_tenants: HashSet<String>,
+}
+
+impl VectorCatchUp {
+    fn observe(&mut self, record: &PersistedRecord) {
+        match record {
+            PersistedRecord::ClaimVector(v) => {
+                self.claim_ids.insert(v.claim_id.clone());
+            }
+            PersistedRecord::Tombstone(t) => match &t.tombstone {
+                Tombstone::Claim {
+                    tenant_id,
+                    claim_id,
+                } => {
+                    self.deleted_claims
+                        .push((tenant_id.clone(), claim_id.clone()));
+                }
+                Tombstone::Tenant { tenant_id } => {
+                    self.erased_tenants.insert(tenant_id.clone());
+                }
+                Tombstone::Evidence { .. } => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+pub(crate) struct WalReplay {
+    pub(crate) items: Vec<ReplayItem>,
+    pub(crate) stats: WalReplayStats,
+    pub(crate) sink: QuarantineSink,
+    /// Claim ids of legacy claim lines quarantined at parse time.
+    pub(crate) quarantined_claim_ids: HashSet<String>,
+    /// Vector-index changes after the requested WAL line; `None` when none
+    /// was requested or the WAL is shorter than that line.
+    pub(crate) vector_catch_up: Option<VectorCatchUp>,
+}
+
+/// Collects quarantined raw lines and appends them (fsynced) to
+/// `<wal>.quarantine`. Lines already present in the file are not appended
+/// again, so restarting never grows the file.
+pub(crate) struct QuarantineSink {
+    path: PathBuf,
+    codec: LineCodec,
+    seen: HashSet<String>,
+    pending: Vec<String>,
+}
+
+impl QuarantineSink {
+    /// Loads `<wal>.quarantine`. With a keyring, a plaintext quarantine file
+    /// is rewritten encrypted (it holds raw record lines).
+    fn load(path: PathBuf, keyring: KeyringRef) -> Result<Self, StoreError> {
+        let mut seen = HashSet::new();
+        let mut codec = LineCodec::create(keyring.as_ref())?;
+        if path.exists() {
+            let existing = crypt::line_codec_for(&path, keyring.as_ref())?;
+            let bytes = std::fs::read(&path)?;
+            for (idx, raw) in bytes.split(|b| *b == b'\n').enumerate() {
+                let line = match &existing {
+                    LineCodec::Plain => String::from_utf8_lossy(raw)
+                        .trim_end_matches('\r')
+                        .to_string(),
+                    encrypted => encrypted.decode(raw).map_err(|reason| {
+                        StoreError::Parse(format!("{} line {}: {reason}", path.display(), idx + 1))
+                    })?,
+                };
+                if !line.is_empty() {
+                    seen.insert(line);
+                }
+            }
+            if existing.is_encrypted() || keyring.is_none() {
+                codec = existing;
+            } else if !seen.is_empty() {
+                let mut tmp = path.clone().into_os_string();
+                tmp.push(".encrypt.tmp");
+                let tmp = PathBuf::from(tmp);
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                let mut lines: Vec<&str> = seen.iter().map(String::as_str).collect();
+                lines.sort_unstable();
+                crypt::write_line_file(&mut file, &codec, lines)?;
+                sync_file(&file)?;
+                drop(file);
+                rename_file(&tmp, &path)?;
+                sync_parent_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(Self {
+            path,
+            codec,
+            seen,
+            pending: Vec::new(),
+        })
+    }
+
+    /// A sink that is never flushed to disk.
+    fn detached() -> Self {
+        Self {
+            path: PathBuf::new(),
+            codec: LineCodec::Plain,
+            seen: HashSet::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, raw: &str) {
+        if self.seen.insert(raw.to_string()) {
+            self.pending.push(raw.to_string());
+        }
+    }
+
+    pub(crate) fn flush(&mut self) -> Result<(), StoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let existed = self.path.exists();
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
+        for line in &self.pending {
+            write_line(&mut file, &self.codec.encode(line))?;
+        }
+        file.sync_all()?;
+        drop(file);
+        if !existed {
+            sync_parent_dir(&self.path)?;
+        }
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+struct ReplayParser {
+    policy: ReplayPolicy,
+    quarantined: usize,
+    quarantined_claim_ids: HashSet<String>,
+    /// The previous line was quarantined as an unparseable legacy record, so
+    /// an unrecognisable line directly after it is the remainder of the same
+    /// record (a legacy field containing a raw newline).
+    prev_failed: bool,
+    /// Suppress the per-line warning (replication views re-run the parser on
+    /// every poll).
+    quiet: bool,
+}
+
+impl ReplayParser {
+    fn new(policy: ReplayPolicy) -> Self {
+        Self {
+            policy,
+            quarantined: 0,
+            quarantined_claim_ids: HashSet::new(),
+            prev_failed: false,
+            quiet: false,
+        }
+    }
+
+    fn parse(
+        &mut self,
+        line: String,
+        origin: String,
+        sink: &mut QuarantineSink,
+    ) -> Result<Option<ReplayItem>, StoreError> {
+        match line_to_record(&line) {
+            Ok(record) => {
+                self.prev_failed = false;
+                let legacy = is_legacy_kind(record_kind(&line));
+                Ok(Some(ReplayItem {
+                    record,
+                    legacy,
+                    raw: legacy.then_some(line),
+                    origin,
+                }))
+            }
+            Err(err) => {
+                let kind = record_kind(&line);
+                let legacy = is_legacy_kind(kind);
+                // A line carrying a verified checksum is a whole record of a
+                // kind this reader does not know (written by a newer binary,
+                // e.g. a tombstone), never a fragment of a broken legacy line:
+                // it must fail the replay rather than be quarantined.
+                let checksummed = matches!(split_and_verify_crc(&line), Ok((_, true)));
+                let continuation = self.prev_failed && !is_known_kind(kind) && !checksummed;
+                if self.policy == ReplayPolicy::Strict || !(legacy || continuation) {
+                    return Err(with_context(err, &origin));
+                }
+                if !self.quiet {
+                    eprintln!(
+                        "warning: quarantining unreadable legacy record at {origin}: {err:?}"
+                    );
+                }
+                if kind == "C"
+                    && let Some(id) = line.split('\t').nth(1).and_then(|f| unescape_field(f).ok())
+                {
+                    self.quarantined_claim_ids.insert(id);
+                }
+                sink.push(&line);
+                self.quarantined += 1;
+                self.prev_failed = true;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// A replicated line must parse, except legacy-format lines, which a
+/// follower mirrors verbatim (its own lenient replay quarantines them just
+/// like the leader's).
+pub fn check_replicated_line(line: &str) -> Result<(), StoreError> {
+    match line_to_record(line) {
+        Ok(_) => Ok(()),
+        Err(_) if is_legacy_kind(record_kind(line)) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Drops the lines lenient replay would quarantine (unparseable legacy
+/// lines, continuation fragments and records depending on a quarantined
+/// legacy claim) from a replication view, using the replay parser itself so
+/// the decision cannot drift. Lines that only fail validation against the
+/// store state (control characters in ids, poisoned vectors) are still
+/// served; followers skip those (see
+/// `InMemoryStore::apply_persisted_record_line_lenient`). Returns the kept
+/// lines and the number dropped.
+fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
+    let mut filter = ReplicationFilter::new();
+    let mut kept = Vec::with_capacity(lines.len());
+    let mut skipped = 0usize;
+    for line in lines {
+        if filter.keep(&line) {
+            kept.push(line);
+        } else {
+            skipped += 1;
+        }
+    }
+    (kept, skipped)
+}
+
+/// Rewrites the plaintext WAL at `path` encrypted under a fresh DEK
+/// (temporary file, fsync, rename, directory fsync) and returns its codec.
+/// The record lines are unchanged, so replication offsets keep their meaning.
+/// Called on open once the torn tail is repaired.
+fn encrypt_plain_line_file(
+    path: &Path,
+    keyring: &std::sync::Arc<encryption::Keyring>,
+    scan: &WalScan,
+) -> Result<LineCodec, StoreError> {
+    let codec = LineCodec::create(Some(keyring))?;
+    if !scan.lines.is_empty() {
+        eprintln!(
+            "info: encrypting the existing plaintext write-ahead log {} ({} lines) under key {}",
+            path.display(),
+            scan.lines.len(),
+            keyring.active_key_id()
+        );
+    }
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".encrypt.tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    crypt::write_line_file(
+        &mut file,
+        &codec,
+        scan.lines.iter().map(|(_, l)| l.as_str()),
+    )?;
+    sync_file(&file)?;
+    drop(file);
+    rename_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(codec)
+}
+
+/// Truncates a torn final WAL line (and terminates an otherwise valid
+/// unterminated one), using `scan` of the file, and updates `scan` to the
+/// repaired file. Returns the number of dropped lines (0 or 1).
+fn repair_torn_tail(
+    path: &Path,
+    codec: &LineCodec,
+    scan: &mut WalScan,
+) -> Result<usize, StoreError> {
+    if !scan.torn_tail && !scan.missing_newline {
+        return Ok(0);
+    }
+    let file = OpenOptions::new().write(true).open(path)?;
+    if scan.torn_tail {
+        let saved = save_truncated_tail(path, scan.valid_len, codec)?;
+        eprintln!(
+            "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes; removed bytes saved to {})",
+            path.display(),
+            scan.valid_len,
+            saved.display()
+        );
+        file.set_len(scan.valid_len)?;
+        file.sync_all()?;
+        scan.torn_tail = false;
+        return Ok(1);
+    }
+    drop(file);
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    scan.missing_newline = false;
+    scan.valid_len += 1;
+    Ok(0)
+}
+
+/// Copies the bytes of `path` from `from` to EOF into a fresh, fsynced
+/// `<path>.truncated-<unix-ms>` sidecar so a truncation never destroys data
+/// irrecoverably. Returns the sidecar path. For an encrypted file the
+/// sidecar starts with the file's encryption header line, so it can be
+/// decrypted on its own.
+fn save_truncated_tail(path: &Path, from: u64, codec: &LineCodec) -> Result<PathBuf, StoreError> {
+    use std::io::{Seek, SeekFrom};
+    let mut src = OpenOptions::new().read(true).open(path)?;
+    src.seek(SeekFrom::Start(from))?;
+    let mut tail = Vec::new();
+    src.read_to_end(&mut tail)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut attempt = 0u32;
+    loop {
+        let mut name = path.to_path_buf().into_os_string();
+        if attempt == 0 {
+            name.push(format!(".truncated-{ts}"));
+        } else {
+            name.push(format!(".truncated-{ts}-{attempt}"));
+        }
+        let sidecar = PathBuf::from(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sidecar)
+        {
+            Ok(mut out) => {
+                if let Some(header) = codec.header_line() {
+                    out.write_all(header.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                out.write_all(&tail)?;
+                out.sync_all()?;
+                sync_parent_dir(&sidecar)?;
+                return Ok(sidecar);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
+/// Physically truncates an unterminated commit group at the end of the log
+/// (see [`GROUP_BEGIN_PREFIX`]) so later appends cannot be mistaken for
+/// members of the torn group. Returns the number of dropped lines.
+///
+/// Interior corruption is never "repaired" by truncation: a `B2` line that
+/// fails to parse or verify, or any unreadable line inside the apparently
+/// open group, is a hard error naming the line (an unterminated group can
+/// only be a crash artifact, so every line in it must be intact). The
+/// removed bytes of a genuine torn group are first saved to a
+/// `<wal>.truncated-<ts>` sidecar.
+fn truncate_unterminated_group(
+    path: &Path,
+    codec: &LineCodec,
+    scan: &mut WalScan,
+) -> Result<usize, StoreError> {
+    let mut open: Option<(usize, String)> = None;
+    for (line_no, line) in &scan.lines {
+        if !line.starts_with("B2\t") {
+            continue;
+        }
+        let commit = match line_to_record(line) {
+            Ok(PersistedRecord::BatchCommit(commit)) => commit,
+            Ok(_) => continue,
+            Err(err) => return Err(with_context(err, &format!("wal line {line_no}"))),
+        };
+        if let Some(id) = commit.commit_id.strip_prefix(GROUP_BEGIN_PREFIX) {
+            open = Some((*line_no, id.to_string()));
+        } else if open.as_ref().is_some_and(|(_, id)| {
+            commit.commit_id == *id
+                || commit.commit_id.strip_prefix(SINGLE_TX_PREFIX) == Some(id.as_str())
+        }) {
+            open = None;
+        }
+    }
+    let Some((begin_line, _)) = open else {
+        return Ok(0);
+    };
+    for (line_no, line) in scan.lines.iter().filter(|(n, _)| *n > begin_line) {
+        if let Err(err) = line_to_record(line)
+            && !is_legacy_kind(record_kind(line))
+        {
+            return Err(with_context(
+                err,
+                &format!(
+                    "wal line {line_no} (inside the open commit group starting at line {begin_line})"
+                ),
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    OpenOptions::new()
+        .read(true)
+        .open(path)?
+        .read_to_end(&mut bytes)?;
+    let mut offset = 0usize;
+    for (idx, chunk) in bytes.split_inclusive(|b| *b == b'\n').enumerate() {
+        if idx + 1 == begin_line {
+            break;
+        }
+        offset += chunk.len();
+    }
+    let dropped = scan.lines.iter().filter(|(n, _)| *n >= begin_line).count();
+    let saved = save_truncated_tail(path, offset as u64, codec)?;
+    eprintln!(
+        "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records; removed bytes saved to {})",
+        path.display(),
+        saved.display()
+    );
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(offset as u64)?;
+    file.sync_all()?;
+    scan.lines.retain(|(n, _)| *n < begin_line);
+    scan.valid_len = offset as u64;
+    Ok(dropped)
+}
+
 pub(crate) fn record_to_line(record: &PersistedRecord) -> String {
-    match record {
+    let body = match record {
         PersistedRecord::Claim(c) => format!(
-            "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "C2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&c.claim_id),
             escape_field(&c.tenant_id),
             escape_field(&c.canonical_text),
             c.confidence,
-            c.event_time_unix
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            pack_string_list(&c.entities),
-            pack_string_list(&c.embedding_ids),
+            opt_num(c.event_time_unix),
+            escape_field(&pack_string_list(&c.entities)),
+            escape_field(&pack_string_list(&c.embedding_ids)),
             c.claim_type
                 .as_ref()
                 .map(claim_type_to_str)
                 .unwrap_or("null"),
-            c.valid_from
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.valid_to
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.created_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            c.updated_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string())
+            opt_num(c.valid_from),
+            opt_num(c.valid_to),
+            opt_num(c.created_at),
+            opt_num(c.updated_at),
         ),
         PersistedRecord::Evidence(e) => format!(
-            "E\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "E2\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&e.evidence_id),
             escape_field(&e.claim_id),
             escape_field(&e.source_id),
             stance_to_str(&e.stance),
             e.source_quality,
-            e.chunk_id
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.span_start
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            e.span_end
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            e.doc_id
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.extraction_model
-                .as_ref()
-                .map(|v| escape_field(v))
-                .unwrap_or_else(|| "null".to_string()),
-            e.ingested_at
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "null".to_string())
+            encode_opt_string(e.chunk_id.as_deref()),
+            opt_num(e.span_start),
+            opt_num(e.span_end),
+            encode_opt_string(e.doc_id.as_deref()),
+            encode_opt_string(e.extraction_model.as_deref()),
+            opt_num(e.ingested_at),
         ),
         PersistedRecord::Edge(edge) => format!(
-            "G\t{}\t{}\t{}\t{}\t{}",
+            "G2\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             escape_field(&edge.edge_id),
             escape_field(&edge.from_claim_id),
             escape_field(&edge.to_claim_id),
             relation_to_str(&edge.relation),
-            edge.strength
+            edge.strength,
+            escape_field(&pack_string_list(&edge.reason_codes)),
+            opt_num(edge.created_at),
         ),
         PersistedRecord::ClaimVector(record) => format!(
-            "V\t{}\t{}",
+            "V2\t{}\t{}",
             escape_field(&record.claim_id),
             pack_f32_list(&record.values)
         ),
         PersistedRecord::BatchCommit(record) => format!(
-            "B\t{}\t{}\t{}\t{}",
+            "B2\t{}\t{}\t{}\t{}",
             escape_field(&record.commit_id),
             record.batch_size,
             record.ts_unix_ms,
-            pack_string_list(&record.claim_ids)
+            escape_field(&pack_string_list(&record.claim_ids))
         ),
+        // `T2 <scope> <tenant> <target> <ts>`; the target of a tenant
+        // tombstone is empty (the tenant id is already the second field).
+        PersistedRecord::Tombstone(record) => {
+            let target = match &record.tombstone {
+                Tombstone::Tenant { .. } => "",
+                other => other.target_id(),
+            };
+            format!(
+                "T2\t{}\t{}\t{}\t{}",
+                record.tombstone.scope(),
+                escape_field(record.tombstone.tenant_id()),
+                escape_field(target),
+                record.ts_unix_ms
+            )
+        }
+    };
+    format!("{body}\t{CRC_PREFIX}{:08x}", crc32(body.as_bytes()))
+}
+
+fn opt_num<T: ToString>(value: Option<T>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+/// Optional strings are tagged so that the literal string "null" round-trips:
+/// `-` means absent, `+<escaped>` means present.
+fn encode_opt_string(value: Option<&str>) -> String {
+    match value {
+        None => "-".to_string(),
+        Some(v) => format!("+{}", escape_field(v)),
     }
 }
 
+fn decode_opt_string(raw: &str) -> Result<Option<String>, StoreError> {
+    if raw == "-" {
+        return Ok(None);
+    }
+    match raw.strip_prefix('+') {
+        Some(rest) => Ok(Some(unescape_field(rest)?)),
+        None => Err(StoreError::Parse(
+            "invalid optional string field in wal".to_string(),
+        )),
+    }
+}
+
+fn decode_list(raw: &str) -> Result<Vec<String>, StoreError> {
+    unpack_string_list(&unescape_field(raw)?)
+}
+
+const CRC_PREFIX: &str = "crc=";
+
+/// CRC-32 (IEEE 802.3, reflected) used as a per-record integrity suffix.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Splits a trailing `\tcrc=<8 hex>` suffix off `line`. Returns the body and
+/// whether a checksum was present (and verified).
+fn split_and_verify_crc(line: &str) -> Result<(&str, bool), StoreError> {
+    let Some(idx) = line.rfind('\t') else {
+        return Ok((line, false));
+    };
+    let Some(hex) = line[idx + 1..].strip_prefix(CRC_PREFIX) else {
+        return Ok((line, false));
+    };
+    let body = &line[..idx];
+    let expected = (hex.len() == 8)
+        .then(|| u32::from_str_radix(hex, 16).ok())
+        .flatten()
+        .ok_or_else(|| StoreError::Parse("wal record has malformed checksum".to_string()))?;
+    if crc32(body.as_bytes()) != expected {
+        return Err(StoreError::Parse(
+            "wal record checksum mismatch".to_string(),
+        ));
+    }
+    Ok((body, true))
+}
+
 pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> {
-    let parts: Vec<&str> = line.split('\t').collect();
+    let (body, has_crc) = split_and_verify_crc(line)?;
+    let parts: Vec<&str> = body.split('\t').collect();
     if parts.is_empty() {
         return Err(StoreError::Parse("empty wal record".to_string()));
     }
+    if is_versioned_kind(parts[0]) && !has_crc {
+        return Err(StoreError::Parse(
+            "wal record is missing its checksum".to_string(),
+        ));
+    }
     match parts[0] {
+        "C2" => {
+            if parts.len() != 13 {
+                return Err(StoreError::Parse(
+                    "claim record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Claim(Claim {
+                claim_id: unescape_field(parts[1])?,
+                tenant_id: unescape_field(parts[2])?,
+                canonical_text: unescape_field(parts[3])?,
+                confidence: parts[4].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("claim record has invalid confidence".to_string())
+                })?,
+                event_time_unix: parse_optional_i64_field(parts[5], "event_time")?,
+                entities: decode_list(parts[6])?,
+                embedding_ids: decode_list(parts[7])?,
+                claim_type: parse_optional_claim_type_field(parts[8])?,
+                valid_from: parse_optional_i64_field(parts[9], "valid_from")?,
+                valid_to: parse_optional_i64_field(parts[10], "valid_to")?,
+                created_at: parse_optional_i64_field(parts[11], "created_at")?,
+                updated_at: parse_optional_i64_field(parts[12], "updated_at")?,
+            }))
+        }
+        "E2" => {
+            if parts.len() != 12 {
+                return Err(StoreError::Parse(
+                    "evidence record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Evidence(Evidence {
+                evidence_id: unescape_field(parts[1])?,
+                claim_id: unescape_field(parts[2])?,
+                source_id: unescape_field(parts[3])?,
+                stance: str_to_stance(parts[4])?,
+                source_quality: parts[5].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("evidence record has invalid source_quality".to_string())
+                })?,
+                chunk_id: decode_opt_string(parts[6])?,
+                span_start: parse_optional_u32_field(parts[7], "span_start")?,
+                span_end: parse_optional_u32_field(parts[8], "span_end")?,
+                doc_id: decode_opt_string(parts[9])?,
+                extraction_model: decode_opt_string(parts[10])?,
+                ingested_at: parse_optional_i64_field(parts[11], "ingested_at")?,
+            }))
+        }
+        "G2" => {
+            if parts.len() != 8 {
+                return Err(StoreError::Parse(
+                    "edge record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::Edge(ClaimEdge {
+                edge_id: unescape_field(parts[1])?,
+                from_claim_id: unescape_field(parts[2])?,
+                to_claim_id: unescape_field(parts[3])?,
+                relation: str_to_relation(parts[4])?,
+                strength: parts[5].parse::<f32>().map_err(|_| {
+                    StoreError::Parse("edge record has invalid strength".to_string())
+                })?,
+                reason_codes: decode_list(parts[6])?,
+                created_at: parse_optional_i64_field(parts[7], "created_at")?,
+            }))
+        }
+        "B2" => {
+            if parts.len() != 5 {
+                return Err(StoreError::Parse(
+                    "batch commit record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::BatchCommit(BatchCommitRecord {
+                commit_id: unescape_field(parts[1])?,
+                batch_size: parts[2].parse::<usize>().map_err(|_| {
+                    StoreError::Parse("batch commit record has invalid batch_size".to_string())
+                })?,
+                ts_unix_ms: parts[3].parse::<u64>().map_err(|_| {
+                    StoreError::Parse("batch commit record has invalid ts_unix_ms".to_string())
+                })?,
+                claim_ids: decode_list(parts[4])?,
+            }))
+        }
+        "V2" => {
+            if parts.len() != 3 {
+                return Err(StoreError::Parse(
+                    "vector record has invalid field count".to_string(),
+                ));
+            }
+            Ok(PersistedRecord::ClaimVector(ClaimVectorRecord {
+                claim_id: unescape_field(parts[1])?,
+                values: unpack_f32_list(parts[2])?,
+            }))
+        }
+        "T2" => {
+            if parts.len() != 5 {
+                return Err(StoreError::Parse(
+                    "tombstone record has invalid field count".to_string(),
+                ));
+            }
+            let tenant_id = unescape_field(parts[2])?;
+            let target = unescape_field(parts[3])?;
+            let tombstone = match parts[1] {
+                "claim" => Tombstone::Claim {
+                    tenant_id,
+                    claim_id: target,
+                },
+                "evidence" => Tombstone::Evidence {
+                    tenant_id,
+                    evidence_id: target,
+                },
+                "tenant" if target.is_empty() => Tombstone::Tenant { tenant_id },
+                "tenant" => {
+                    return Err(StoreError::Parse(
+                        "tenant tombstone must not name a target".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(StoreError::Parse(
+                        "tombstone record has unknown scope".to_string(),
+                    ));
+                }
+            };
+            tombstone.validate()?;
+            let ts_unix_ms = parts[4].parse::<u64>().map_err(|_| {
+                StoreError::Parse("tombstone record has invalid ts_unix_ms".to_string())
+            })?;
+            Ok(PersistedRecord::Tombstone(TombstoneRecord {
+                tombstone,
+                ts_unix_ms,
+            }))
+        }
         "C" => {
             if !(parts.len() == 6 || parts.len() == 8 || parts.len() == 13) {
                 return Err(StoreError::Parse(
@@ -877,6 +3465,7 @@ fn escape_field(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn pack_string_list(values: &[String]) -> String {
@@ -909,15 +3498,16 @@ fn unpack_string_list(raw: &str) -> Result<Vec<String>, StoreError> {
             .parse::<usize>()
             .map_err(|_| StoreError::Parse("invalid packed list length in wal".to_string()))?;
         offset += 1;
-        if offset + len > bytes.len() {
-            return Err(StoreError::Parse(
-                "packed list length exceeds wal field size".to_string(),
-            ));
-        }
-        let value = std::str::from_utf8(&bytes[offset..offset + len])
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| {
+                StoreError::Parse("packed list length exceeds wal field size".to_string())
+            })?;
+        let value = std::str::from_utf8(&bytes[offset..end])
             .map_err(|_| StoreError::Parse("invalid UTF-8 in packed list field".to_string()))?;
         out.push(value.to_string());
-        offset += len;
+        offset = end;
     }
     Ok(out)
 }
@@ -984,7 +3574,7 @@ fn parse_optional_claim_type_field(raw: &str) -> Result<Option<ClaimType>, Store
     Ok(Some(str_to_claim_type(raw)?))
 }
 
-fn unescape_field(value: &str) -> Result<String, StoreError> {
+pub(crate) fn unescape_field(value: &str) -> Result<String, StoreError> {
     let mut output = String::with_capacity(value.len());
     let mut escaped = false;
     for ch in value.chars() {
@@ -993,6 +3583,7 @@ fn unescape_field(value: &str) -> Result<String, StoreError> {
                 '\\' => output.push('\\'),
                 't' => output.push('\t'),
                 'n' => output.push('\n'),
+                'r' => output.push('\r'),
                 other => {
                     return Err(StoreError::Parse(format!(
                         "invalid escape sequence: \\{other}"
@@ -1072,5 +3663,587 @@ fn str_to_relation(raw: &str) -> Result<Relation, StoreError> {
         "duplicates" => Ok(Relation::Duplicates),
         "depends_on" => Ok(Relation::DependsOn),
         _ => Err(StoreError::Parse("invalid relation in wal".to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Offline inspection and repair (used by the `wal-inspect` tool).
+// These functions never go through `FileWal::open`, so inspecting a file
+// does not modify it.
+// ---------------------------------------------------------------------
+
+/// A line that failed to parse or verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalInvalidLine {
+    /// 1-based physical line number.
+    pub line_no: usize,
+    pub error: String,
+    /// The error is a checksum failure (mismatch, malformed or missing).
+    pub checksum_failure: bool,
+    pub raw: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalInspection {
+    /// The file is a `<wal>.snapshot` (it starts with the snapshot header).
+    pub is_snapshot: bool,
+    /// Valid records by on-disk kind (`C`, `C2`, `V2`, ...).
+    pub kind_counts: BTreeMap<String, usize>,
+    pub valid_records: usize,
+    /// Valid records in a legacy (unchecksummed) format.
+    pub legacy_records: usize,
+    /// WAL lineage id from `<wal>.gen`, if present.
+    pub generation: Option<u64>,
+    /// 1-based line number of a torn final line, if any.
+    pub torn_tail_line: Option<usize>,
+    pub torn_tail_bytes: u64,
+    /// The final valid line lacks its newline terminator.
+    pub missing_final_newline: bool,
+    /// Invalid lines that are not the torn tail (in file order).
+    pub invalid_lines: Vec<WalInvalidLine>,
+    /// The file is the pending marker a checkpoint keeps at
+    /// `<wal>.snapshot` while its snapshot is written (see
+    /// `docs/operations/wal-durability.md`): no records, only what replay
+    /// reads instead.
+    pub pending_checkpoint: Option<PendingCheckpointInfo>,
+}
+
+/// Content of a pending checkpoint marker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingCheckpointInfo {
+    /// Replay starts from `<wal>.snapshot.base`.
+    pub base: bool,
+    /// Closed generations whose `<wal>.closed.<generation>` files replay
+    /// applies after the base, oldest first.
+    pub replay: Vec<u64>,
+}
+
+/// The marker's content when `bytes` (stored with `codec`) is a pending
+/// checkpoint marker.
+fn pending_marker(
+    bytes: &[u8],
+    codec: &LineCodec,
+) -> Option<Result<PendingCheckpointInfo, StoreError>> {
+    let mut text = String::new();
+    for raw in bytes.split(|b| *b == b'\n') {
+        text.push_str(&codec.decode(raw).ok()?);
+        text.push('\n');
+    }
+    let first = text.lines().find(|line| !line.trim().is_empty())?;
+    if first != checkpoint::PENDING_HEADER {
+        return None;
+    }
+    Some(
+        checkpoint::parse_pending_marker(&text)
+            .map(|(base, replay)| PendingCheckpointInfo { base, replay }),
+    )
+}
+
+impl WalInspection {
+    pub fn first_invalid(&self) -> Option<&WalInvalidLine> {
+        self.invalid_lines.first()
+    }
+
+    pub fn checksum_failures(&self) -> usize {
+        self.invalid_lines
+            .iter()
+            .filter(|l| l.checksum_failure)
+            .count()
+    }
+}
+
+struct ClassifiedLine {
+    line_no: usize,
+    start: usize,
+    end: usize,
+    terminated: bool,
+    /// `Ok(kind)` for a valid record.
+    verdict: Result<String, WalInvalidLine>,
+}
+
+struct Classified {
+    is_snapshot: bool,
+    header_end: usize,
+    lines: Vec<ClassifiedLine>,
+    /// Index into `lines` of a torn final line.
+    torn_tail: Option<usize>,
+}
+
+fn classify_file(bytes: &[u8], codec: &LineCodec) -> Classified {
+    let phys = physical_lines(bytes);
+    let decoded: Vec<Result<String, String>> = phys
+        .iter()
+        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+        .collect();
+    let decode = |idx: usize| -> Option<&str> { decoded[idx].as_deref().ok() };
+    let mut lines = Vec::new();
+    let mut is_snapshot = false;
+    let mut header_end = 0usize;
+    let mut header_seen = false;
+    for (idx, &(s, e, terminated)) in phys.iter().enumerate() {
+        let text = decode(idx);
+        if text.is_some_and(|t| t.trim().is_empty()) {
+            // The encryption header line belongs to the kept prefix.
+            if !header_seen && encryption::is_header_line(&bytes[s..e]) {
+                header_end = if terminated { e + 1 } else { e };
+            }
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            if text == Some(SNAPSHOT_HEADER) {
+                is_snapshot = true;
+                header_end = if terminated { e + 1 } else { e };
+                continue;
+            }
+        }
+        let verdict = match text {
+            None => Err(WalInvalidLine {
+                line_no: idx + 1,
+                error: decoded[idx].as_ref().err().cloned().unwrap_or_default(),
+                checksum_failure: false,
+                raw: bytes[s..e].to_vec(),
+            }),
+            Some(t) => match line_to_record(t) {
+                Ok(_) => Ok(record_kind(t).to_string()),
+                Err(err) => {
+                    let error = match err {
+                        StoreError::Parse(m) => m,
+                        other => format!("{other:?}"),
+                    };
+                    Err(WalInvalidLine {
+                        line_no: idx + 1,
+                        checksum_failure: error.contains("checksum"),
+                        error,
+                        // The decrypted text for an encrypted file.
+                        raw: if codec.is_encrypted() {
+                            t.as_bytes().to_vec()
+                        } else {
+                            bytes[s..e].to_vec()
+                        },
+                    })
+                }
+            },
+        };
+        lines.push(ClassifiedLine {
+            line_no: idx + 1,
+            start: s,
+            end: e,
+            terminated,
+            verdict,
+        });
+    }
+    // Only a WAL has a torn tail; a snapshot is replaced atomically.
+    let torn_tail = if is_snapshot {
+        None
+    } else {
+        lines.last().and_then(|last| {
+            let ok = decode(last.line_no - 1).is_some_and(|t| is_valid_tail(t, last.terminated));
+            (!ok).then_some(lines.len() - 1)
+        })
+    };
+    Classified {
+        is_snapshot,
+        header_end,
+        lines,
+        torn_tail,
+    }
+}
+
+/// The codec of a WAL or snapshot file from its bytes, using the keyring in
+/// effect (`encryption::current()`).
+fn codec_for_bytes(path: &Path, bytes: &[u8]) -> Result<LineCodec, StoreError> {
+    let first = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+    if !encryption::is_header_line(first) {
+        return Ok(LineCodec::Plain);
+    }
+    let keyring = crypt::current_keyring();
+    let text = std::str::from_utf8(first)
+        .map_err(|_| StoreError::Parse(format!("{}: invalid encryption header", path.display())))?;
+    let cipher = encryption::LineCipher::from_header_line(
+        keyring.as_deref(),
+        text,
+        &path.display().to_string(),
+    )
+    .map_err(crypt::enc_err)?;
+    Ok(LineCodec::Encrypted(std::sync::Arc::new(cipher)))
+}
+
+fn read_generation(path: &Path) -> Option<u64> {
+    let raw = std::fs::read_to_string(generation_path_for(path)).ok()?;
+    u64::from_str_radix(raw.trim(), 16).ok().filter(|v| *v != 0)
+}
+
+/// Inspects a WAL or snapshot file without modifying it.
+pub fn inspect_wal_file(path: impl AsRef<Path>) -> Result<WalInspection, StoreError> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let codec = codec_for_bytes(path, &bytes)?;
+    if let Some(marker) = pending_marker(&bytes, &codec) {
+        return Ok(match marker {
+            Ok(info) => WalInspection {
+                is_snapshot: true,
+                pending_checkpoint: Some(info),
+                ..WalInspection::default()
+            },
+            Err(err) => WalInspection {
+                is_snapshot: true,
+                invalid_lines: vec![WalInvalidLine {
+                    line_no: 1,
+                    error: format!("{err:?}"),
+                    checksum_failure: false,
+                    raw: bytes.iter().take(256).copied().collect(),
+                }],
+                ..WalInspection::default()
+            },
+        });
+    }
+    let classified = classify_file(&bytes, &codec);
+    let mut out = WalInspection {
+        is_snapshot: classified.is_snapshot,
+        generation: if classified.is_snapshot {
+            None
+        } else {
+            read_generation(path)
+        },
+        ..WalInspection::default()
+    };
+    for (idx, line) in classified.lines.into_iter().enumerate() {
+        if classified.torn_tail == Some(idx) {
+            out.torn_tail_line = Some(line.line_no);
+            out.torn_tail_bytes = bytes.len() as u64 - line.start as u64;
+            continue;
+        }
+        match line.verdict {
+            Ok(kind) => {
+                out.valid_records += 1;
+                if is_legacy_kind(&kind) {
+                    out.legacy_records += 1;
+                }
+                *out.kind_counts.entry(kind).or_default() += 1;
+                if !line.terminated {
+                    out.missing_final_newline = true;
+                }
+            }
+            Err(invalid) => out.invalid_lines.push(invalid),
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalRepairOptions {
+    /// Report what would change without touching any file.
+    pub dry_run: bool,
+    /// Move invalid non-tail lines into `<wal>.quarantine` and drop them
+    /// from the rewritten file. Without this they are left in place.
+    pub quarantine_invalid: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WalRepairReport {
+    pub dry_run: bool,
+    pub torn_tail_bytes: u64,
+    pub torn_tail_dropped: bool,
+    pub quarantined_lines: usize,
+    /// Invalid lines still present in the file after the repair.
+    pub invalid_remaining: usize,
+    pub records_kept: usize,
+    /// Whether the file was (or, for a dry run, would be) rewritten.
+    pub changed: bool,
+    pub backup_path: Option<PathBuf>,
+    pub quarantine_path: Option<PathBuf>,
+}
+
+/// Repairs a WAL (or snapshot) file in place: drops a torn tail and,
+/// optionally, quarantines invalid interior lines. Before any change a
+/// `<file>.bak` copy is taken (an existing `.bak` is never overwritten) and
+/// the new contents are written to a temporary file that is renamed over
+/// the original.
+pub fn repair_wal_file(
+    path: impl AsRef<Path>,
+    options: WalRepairOptions,
+) -> Result<WalRepairReport, StoreError> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let codec = codec_for_bytes(path, &bytes)?;
+    if pending_marker(&bytes, &codec).is_some() {
+        return Err(StoreError::Parse(format!(
+            "{} is a pending checkpoint marker, not a snapshot; it holds no records to repair (the service completes or rolls back the checkpoint at startup)",
+            path.display()
+        )));
+    }
+    let classified = classify_file(&bytes, &codec);
+    let mut report = WalRepairReport {
+        dry_run: options.dry_run,
+        ..WalRepairReport::default()
+    };
+    let mut out: Vec<u8> = bytes[..classified.header_end].to_vec();
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    let mut quarantined: Vec<Vec<u8>> = Vec::new();
+    let mut rewrite_needed = false;
+    for (idx, line) in classified.lines.iter().enumerate() {
+        if classified.torn_tail == Some(idx) {
+            report.torn_tail_dropped = true;
+            report.torn_tail_bytes = bytes.len() as u64 - line.start as u64;
+            rewrite_needed = true;
+            continue;
+        }
+        if !line.terminated {
+            rewrite_needed = true;
+        }
+        match &line.verdict {
+            Err(invalid) if options.quarantine_invalid => {
+                quarantined.push(invalid.raw.clone());
+                rewrite_needed = true;
+            }
+            Err(_) => {
+                report.invalid_remaining += 1;
+                out.extend_from_slice(&bytes[line.start..line.end]);
+                out.push(b'\n');
+            }
+            Ok(_) => {
+                report.records_kept += 1;
+                out.extend_from_slice(&bytes[line.start..line.end]);
+                out.push(b'\n');
+            }
+        }
+    }
+    report.quarantined_lines = quarantined.len();
+    report.changed = rewrite_needed && out != bytes;
+    if !report.changed {
+        return Ok(report);
+    }
+
+    let wal_path = if classified.is_snapshot {
+        path.to_str()
+            .and_then(|p| p.strip_suffix(".snapshot"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let mut backup = path.to_path_buf().into_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    report.backup_path = Some(backup.clone());
+    if !quarantined.is_empty() {
+        report.quarantine_path = Some(quarantine_path_for(&wal_path));
+    }
+    if options.dry_run {
+        return Ok(report);
+    }
+
+    if backup.exists() {
+        return Err(StoreError::Io(format!(
+            "refusing to overwrite existing backup {}; move it away first",
+            backup.display()
+        )));
+    }
+    std::fs::copy(path, &backup)?;
+    File::open(&backup)?.sync_all()?;
+    sync_parent_dir(&backup)?;
+
+    if let Some(qpath) = &report.quarantine_path {
+        // Same storage as replay's quarantine (encrypted with a keyring).
+        let mut sink = QuarantineSink::load(qpath.clone(), crypt::current_keyring())?;
+        for raw in &quarantined {
+            sink.pending.push(String::from_utf8_lossy(raw).into_owned());
+        }
+        sink.flush()?;
+    }
+
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".repair.tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(&out)?;
+    file.sync_all()?;
+    drop(file);
+    rename(&tmp, path)?;
+    sync_parent_dir(path)?;
+
+    // Removing interior records shifts replication offsets; start a new
+    // lineage so followers resync instead of silently skipping.
+    if !classified.is_snapshot && !quarantined.is_empty() {
+        write_generation(&generation_path_for(&wal_path), new_generation())?;
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    fn random_string(rng: &mut impl Rng) -> String {
+        const POOL: &[&str] = &[
+            "\t",
+            "\n",
+            "\r",
+            "\r\n",
+            "\\",
+            "\\t",
+            "\\n",
+            "null",
+            "-",
+            "+",
+            "crc=00000000",
+            "\t crc=",
+            "\0",
+            "\u{1f}",
+            "a",
+            "Z",
+            "0",
+            ":",
+            ",",
+            " ",
+            "\u{e9}",
+            "\u{65e5}\u{672c}",
+            "\u{1f600}",
+            "\u{2028}",
+        ];
+        let n = rng.gen_range(0..8);
+        (0..n)
+            .map(|_| POOL[rng.gen_range(0..POOL.len())])
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    fn random_opt(rng: &mut impl Rng) -> Option<String> {
+        rng.gen_bool(0.5).then(|| random_string(rng))
+    }
+
+    fn random_list(rng: &mut impl Rng) -> Vec<String> {
+        (0..rng.gen_range(0..4))
+            .map(|_| random_string(rng))
+            .collect()
+    }
+
+    fn roundtrip(record: &PersistedRecord) -> PersistedRecord {
+        let line = record_to_line(record);
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        line_to_record(&line).unwrap_or_else(|e| panic!("{line:?}: {e:?}"))
+    }
+
+    #[test]
+    fn random_strings_round_trip_through_every_record_kind() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..2000 {
+            let claim = Claim {
+                claim_id: random_string(&mut rng),
+                tenant_id: random_string(&mut rng),
+                canonical_text: random_string(&mut rng),
+                confidence: 0.25,
+                event_time_unix: rng.gen_bool(0.5).then(|| rng.gen_range(-5..5)),
+                entities: random_list(&mut rng),
+                embedding_ids: random_list(&mut rng),
+                claim_type: None,
+                valid_from: None,
+                valid_to: Some(9),
+                created_at: Some(1),
+                updated_at: None,
+            };
+            match roundtrip(&PersistedRecord::Claim(claim.clone())) {
+                PersistedRecord::Claim(back) => assert_eq!(back, claim),
+                other => panic!("{other:?}"),
+            }
+            let evidence = Evidence {
+                evidence_id: random_string(&mut rng),
+                claim_id: random_string(&mut rng),
+                source_id: random_string(&mut rng),
+                stance: Stance::Neutral,
+                source_quality: 0.5,
+                chunk_id: random_opt(&mut rng),
+                span_start: Some(1),
+                span_end: None,
+                doc_id: random_opt(&mut rng),
+                extraction_model: random_opt(&mut rng),
+                ingested_at: Some(7),
+            };
+            match roundtrip(&PersistedRecord::Evidence(evidence.clone())) {
+                PersistedRecord::Evidence(back) => assert_eq!(back, evidence),
+                other => panic!("{other:?}"),
+            }
+            let edge = ClaimEdge {
+                edge_id: random_string(&mut rng),
+                from_claim_id: random_string(&mut rng),
+                to_claim_id: random_string(&mut rng),
+                relation: Relation::Refines,
+                strength: 0.75,
+                reason_codes: random_list(&mut rng),
+                created_at: rng.gen_bool(0.5).then_some(1_700_000_000),
+            };
+            match roundtrip(&PersistedRecord::Edge(edge.clone())) {
+                PersistedRecord::Edge(back) => assert_eq!(back, edge),
+                other => panic!("{other:?}"),
+            }
+            let batch = BatchCommitRecord {
+                commit_id: random_string(&mut rng),
+                batch_size: 3,
+                ts_unix_ms: 99,
+                claim_ids: random_list(&mut rng),
+            };
+            match roundtrip(&PersistedRecord::BatchCommit(batch.clone())) {
+                PersistedRecord::BatchCommit(back) => {
+                    assert_eq!(back.commit_id, batch.commit_id);
+                    assert_eq!(back.claim_ids, batch.claim_ids);
+                }
+                other => panic!("{other:?}"),
+            }
+            let vector = ClaimVectorRecord {
+                claim_id: random_string(&mut rng),
+                values: vec![0.5, -1.25],
+            };
+            match roundtrip(&PersistedRecord::ClaimVector(vector.clone())) {
+                PersistedRecord::ClaimVector(back) => {
+                    assert_eq!(back.claim_id, vector.claim_id);
+                    assert_eq!(back.values, vector.values);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_records_without_checksum_still_parse() {
+        let legacy_edge = "G\te1\ta\tb\tsupports\t0.5";
+        match line_to_record(legacy_edge).unwrap() {
+            PersistedRecord::Edge(e) => {
+                assert!(e.reason_codes.is_empty());
+                assert_eq!(e.created_at, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(line_to_record("C\tc1\tt\ttext\t0.9\tnull\t\t").is_ok());
+        assert!(line_to_record("B\tcommit-1\t1\t1700000000000\t2:c1").is_ok());
+    }
+
+    #[test]
+    fn versioned_records_require_a_valid_checksum() {
+        let edge = ClaimEdge {
+            edge_id: "e".into(),
+            from_claim_id: "a".into(),
+            to_claim_id: "b".into(),
+            relation: Relation::Supports,
+            strength: 0.5,
+            reason_codes: vec!["r".into()],
+            created_at: Some(5),
+        };
+        let line = record_to_line(&PersistedRecord::Edge(edge));
+        assert!(line.starts_with("G2\t") && line.contains("\tcrc="));
+        let (body, _) = line.rsplit_once('\t').unwrap();
+        assert!(line_to_record(body).is_err(), "missing checksum must fail");
+        let mut bad = line.clone();
+        bad.truncate(bad.len() - 1);
+        assert!(line_to_record(&bad).is_err());
+        let corrupted = line.replacen("G2\te\t", "G2\tx\t", 1);
+        assert!(line_to_record(&corrupted).is_err());
     }
 }

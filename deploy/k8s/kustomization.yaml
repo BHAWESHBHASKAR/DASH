@@ -4,32 +4,44 @@
 # Apply with:
 #   kubectl apply -k deploy/k8s
 #
-# This sets a common owner label, pins every resource to the
-# dash-system namespace, and pulls the ordered list of files in the
-# sequence required by Kubernetes admission (Namespace first, then
-# ConfigMap/Secrets, then workloads, then network/ingress policies,
-# then autoscaling).
+# Create the Secrets first (see 11-secrets.yaml); the pods will not start
+# without them. This kustomization sets a common owner label, pins every
+# resource to the dash-system namespace, and lists the files in admission
+# order (Namespace, ConfigMap, workloads, ingress, network policies,
+# disruption budgets). There is intentionally no HorizontalPodAutoscaler:
+# scale retrieval manually with
+#   kubectl -n dash-system scale statefulset dash-retrieval --replicas=N
+# Ingestion and control-plane are single-writer and must stay at 1 replica.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: dash-system
 # `labels:` is the Kustomize 5+ replacement for the deprecated
-# `commonLabels:` key. `includeSelectors: true` propagates the
-# labels into matchLabels/selector fields automatically.
+# `commonLabels:` key. The owner labels go on every object's metadata
+# and on the pod templates, but NOT into selectors:
+# `includeSelectors: true` would also rewrite every `matchLabels` in the
+# NetworkPolicies, including the peers outside this kustomization. The
+# allow-dns egress peer then became
+#   {k8s-app: kube-dns, app.kubernetes.io/part-of: dash,
+#    app.kubernetes.io/managed-by: kustomize}
+# which no CoreDNS pod carries, so every DASH pod lost DNS under any CNI
+# that enforces NetworkPolicy (the ingress-nginx peer broke the same way).
+# The workload selectors already match on app.kubernetes.io/name and
+# app.kubernetes.io/component, which is all they need.
 labels:
-- includeSelectors: true
+- includeSelectors: false
+  includeTemplates: true
   pairs:
     app.kubernetes.io/part-of: dash
     app.kubernetes.io/managed-by: kustomize
 resources:
   - 00-namespace.yaml
   - 10-config.yaml
-  - 11-secrets.yaml
   - 20-retrieval.yaml
   - 30-ingestion.yaml
+  - 35-control-plane.yaml
   - 40-ingress.yaml
   - 50-networkpolicy.yaml
   - 60-pdb.yaml
-  - 70-hpa.yaml
 # Apply the namespace manifest first so subsequent resources can
 # reference it; this is implicit on `kustomize build` but explicit
 # here to make the intent visible in code review.

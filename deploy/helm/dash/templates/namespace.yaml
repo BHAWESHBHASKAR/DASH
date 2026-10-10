@@ -8,11 +8,11 @@ on real clusters, so this defaults to false. Toggle via
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ .Values.namespace.name | default "dash-system" }}
+  name: {{ include "dash.namespace" . }}
   labels:
     app.kubernetes.io/part-of: dash
     app.kubernetes.io/managed-by: {{ .Release.Service }}
-    name: {{ .Values.namespace.name | default "dash-system" }}
+    name: {{ include "dash.namespace" . }}
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/audit: restricted

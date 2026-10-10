@@ -8,23 +8,24 @@ hide:
 
 > **Evidence-first retrieval for citation-grade RAG.**
 
-DASH is a production-grade vector database that stores atomic **claims** with their supporting **evidence** and recorded **contradictions**. Every retrieval result ships with the citations that justify it — the source identifier, the stance (supports / contradicts / neutral), the source quality, and an optional character span — so a downstream model or a downstream auditor can answer the question *"why did the system say that?"*.
+DASH is a pre-1.0 evidence-first vector database (not yet production-ready; see the README Status section) that stores atomic **claims** with their supporting **evidence** and recorded **contradictions**. Every retrieval result ships with the citations that justify it — the source identifier, the stance (supports / contradicts / neutral), the source quality, and an optional character span — so a downstream model or a downstream auditor can answer the question *"why did the system say that?"*.
 
-- **OpenAI drop-in** — `POST /v1/embeddings` is wire-byte compatible with the OpenAI v1 API. Point any OpenAI client at DASH with one environment variable.
+- **OpenAI-compatible embeddings** — `POST /v1/embeddings` follows the OpenAI v1 request and response shape. Point an OpenAI client at DASH by setting its base URL and API key (a credential with the `retrieve` role is required).
 - **Semantic-first retrieval** — dense-similarity is the primary ranking signal; lexical/BM25 acts as a small tie-breaker. The result is a defensible ranking for retrieval-augmented generation.
-- **Durable on-disk storage** — `redb`-backed persistence for claims, evidence, edges, vectors, and the tenant→claim set. Hash-chained audit log. Crash-recovery semantics are explicit and tested.
+- **On-disk storage** — a write-ahead log with checkpoints, plus a `redb` mirror (on by default when a WAL path is set). Optional SHA-256 hash-chained audit log. Recovery is tested for the single-process case; known gaps are listed in the issue register.
 
 ## At a glance
 
-=== "Python"
+=== "Python (OpenAI client)"
 
     ```python
+    import os
     import openai
 
-    # Point any OpenAI client at DASH
+    # Point an OpenAI client at DASH's retrieval service
     client = openai.OpenAI(
         base_url="http://localhost:8080/v1",
-        api_key="not_needed",
+        api_key=os.environ["DASH_RETRIEVAL_API_KEY"],
     )
 
     resp = client.embeddings.create(
@@ -34,48 +35,29 @@ DASH is a production-grade vector database that stores atomic **claims** with th
     vec = resp.data[0].embedding
     ```
 
-=== "Go"
-
-    ```go
-    package main
-
-    import (
-        "context"
-        "fmt"
-        dash "github.com/BHAWESHBHASKAR/dash-go"
-    )
-
-    func main() {
-        client := dash.NewClient("http://localhost:8080")
-        emb, err := client.Embeddings.Create(context.Background(), &dash.EmbeddingRequest{
-            Model: "text-embedding-3-small",
-            Input: "Company X acquired Company Y",
-        })
-        if err != nil {
-            panic(err)
-        }
-        fmt.Println(emb.Data[0].Embedding[:5])
-    }
-    ```
-
-=== "curl"
+=== "curl (retrieve)"
 
     ```bash
-    curl -X POST http://localhost:8080/v1/embeddings \
+    curl -fsS -X POST http://localhost:8080/v1/retrieve \
       -H "Content-Type: application/json" \
+      -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
       -d '{
-        "input": "Company X acquired Company Y",
-        "model": "text-embedding-3-small"
+        "tenant_id": "t1",
+        "query": "Company X acquired Company Y",
+        "top_k": 5,
+        "stance_mode": "support_only"
       }'
     ```
+
+The [Quickstart](quickstart.md) shows how to start the stack and generate the keys. The first-party [SDKs](guides/sdks.md) are installed from a checkout; none is published to a package registry yet.
 
 ## What makes DASH different
 
 Naive RAG ranks documents by vector similarity and returns the top *k* chunks. That works for "summarize this article" but fails in three common enterprise cases:
 
-1. **Two sources say opposite things** — and the system has no way to demote the contradicted one. DASH treats a `Stance::Contradicts` evidence record as a hard demotion signal, and the retrieval API exposes `stance_mode: support_only` to filter contradicted claims out entirely.
+1. **Two sources say opposite things** — and the system has no way to demote the contradicted one. DASH counts `Stance::Contradicts` evidence (and contradicting edges) against a claim and lowers its score, and the retrieval API exposes `stance_mode: support_only` to drop claims with more contradictions than supports.
 2. **A fact has a temporal window** — and the version retrieved is stale. Every claim carries `event_time_unix`, `valid_from`, and `valid_to`; the retrieval API takes a `time_range` constraint.
-3. **An auditor asks "why did the model say that?"** — and the answer is "because a 768-dimensional number was close to a query." DASH returns `{ claim, score, supports, contradicts, citations[] }` — every citation carries its `source_id`, `stance`, `source_quality`, and optional `chunk_id` plus `span_start`/`span_end` for character-level traceability.
+3. **An auditor asks "why did the model say that?"** — and the answer is "because a high-dimensional vector was close to a query." DASH returns `{ claim_id, canonical_text, score, supports, contradicts, citations[] }` — every citation carries its `source_id`, `stance`, `source_quality`, and optional `chunk_id` plus `span_start`/`span_end` for character-level traceability.
 
 ## Next steps
 
@@ -93,7 +75,7 @@ Naive RAG ranks documents by vector similarity and returns the top *k* chunks. T
 
     ---
 
-    Why DASH exists, the two-service architecture, the data model, and the
+    Why DASH exists, the service architecture, the data model, and the
     durability story.
 
     [:octicons-arrow-right-24: Read the concepts](concepts/index.md)
@@ -103,7 +85,7 @@ Naive RAG ranks documents by vector similarity and returns the top *k* chunks. T
     ---
 
     The wire-level reference for `/v1/ingest`, `/v1/retrieve`,
-    `/v1/embeddings`, `/v1/health`, and `/metrics`.
+    `/v1/embeddings`, `/v1/health`, and `/metrics`, with auth requirements and status codes.
 
     [:octicons-arrow-right-24: API reference](reference/api.md)
 
@@ -111,8 +93,8 @@ Naive RAG ranks documents by vector similarity and returns the top *k* chunks. T
 
     ---
 
-    Open source under Apache 2.0. 379 Rust tests + 86 Go + 65 TypeScript
-    + 59 Python across the workspace.
+    Open source under Apache 2.0. 807 Rust tests plus SDK tests in six
+    languages (static counts in the README).
 
     [:octicons-arrow-right-24: BHAWESHBHASKAR/DASH](https://github.com/BHAWESHBHASKAR/DASH)
 

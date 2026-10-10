@@ -8,15 +8,13 @@ namespace Dash;
 // ---------------------------------------------------------------------------
 
 /// <summary>
-/// Response body for <c>GET /health</c>. <see cref="Status"/> is the
-/// only field the SDK inspects; everything else is forwarded
-/// verbatim so callers can read deployment-specific diagnostics.
+/// Response body for <c>GET /health</c>. The server currently returns
+/// <c>{"status":"ok"}</c>; every other field is optional.
 /// </summary>
 public sealed record HealthResponse
 {
-    /// <summary>One of <c>"ok"</c>, <c>"degraded"</c>, <c>"unhealthy"</c>.</summary>
     [JsonPropertyName("status")]
-    public required string Status { get; init; }
+    public string Status { get; init; } = string.Empty;
 
     [JsonPropertyName("version")]
     public string? Version { get; init; }

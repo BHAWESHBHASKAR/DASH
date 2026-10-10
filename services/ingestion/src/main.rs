@@ -3,7 +3,16 @@ use ingestion::{
     transport::IngestionRuntime, transport::serve_http_with_workers,
 };
 use schema::{Claim, Evidence, Stance};
-use store::{AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, WalWritePolicy};
+use std::sync::Arc;
+use std::time::Duration;
+
+use store::{
+    AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, VectorIndexPersistence,
+    VectorIndexRestore, WalWritePolicy,
+};
+
+/// Default `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS`.
+const DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS: u64 = 300_000;
 
 const SAFE_WAL_SYNC_EVERY_RECORDS_MAX: usize = 256;
 const SAFE_WAL_APPEND_BUFFER_RECORDS_MAX: usize = 256;
@@ -29,6 +38,8 @@ struct WalDurabilityConfig {
 
 fn main() {
     dash_common::init_logging();
+    dash_observe::process::mark_start();
+    dash_config::startup_check(dash_config::Service::Ingestion);
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass
     // `--cli` or `--no-serve` to run the one-shot path without
@@ -37,8 +48,10 @@ fn main() {
     // assumed the default was to serve, and the service would
     // silently exit after printing the startup banner.
     let serve_mode = !std::env::args().any(|arg| arg == "--cli" || arg == "--no-serve");
-    let bind_addr = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
+    let requested_bind = env_with_fallback("DASH_INGEST_BIND", "EME_INGEST_BIND")
         .unwrap_or_else(|| "127.0.0.1:8081".to_string());
+    // Dev mode only ever listens on loopback (see dash_common::resolve_bind_addr).
+    let bind_addr = dash_common::resolve_bind_addr(&requested_bind);
     let http_workers = parse_http_workers();
     let ann_tuning = parse_ann_tuning_config();
     let segment_dir = env_with_fallback("DASH_INGEST_SEGMENT_DIR", "EME_INGEST_SEGMENT_DIR");
@@ -87,15 +100,15 @@ fn main() {
         }
     };
 
-    if let Err(reason) = validate_startup_secrets() {
-        if dash_common::strict_secrets_enabled() {
-            tracing::error!("ingestion startup secret validation failed: {reason}");
-            std::process::exit(2);
-        } else {
-            tracing::error!(
-                "ingestion startup warning: {reason} (set DASH_STRICT_SECRETS=1 to fail)"
-            );
-        }
+    // Fail closed: refuse to start without usable authentication unless
+    // DASH_INSECURE_DEV_MODE=1 is set explicitly. The validated policy is
+    // built once here and shared by every request.
+    if serve_mode && let Err(reason) = ingestion::transport::initialize_auth_policy() {
+        tracing::error!("ingestion startup refused: {reason}");
+        std::process::exit(2);
+    }
+    if serve_mode {
+        ingestion::transport::warn_replication_transport(&bind_addr);
     }
 
     let input = IngestInput {
@@ -129,6 +142,37 @@ fn main() {
         }],
         edges: vec![],
     };
+
+    {
+        let wal_path = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH");
+        let disk_disabled = env_with_fallback(
+            "DASH_INGEST_PERSISTENCE_DISABLE",
+            "EME_INGEST_PERSISTENCE_DISABLE",
+        )
+        .as_deref()
+            == Some("1");
+        let redb = (!disk_disabled && wal_path.is_some()).then(|| {
+            std::path::PathBuf::from(
+                env_with_fallback(
+                    "DASH_INGEST_PERSISTENCE_PATH",
+                    "EME_INGEST_PERSISTENCE_PATH",
+                )
+                .unwrap_or_else(|| "./data/dash-ingestion.redb".to_string()),
+            )
+        });
+        init_encryption(
+            "ingestion",
+            store::EncryptionStatePaths {
+                vector_index: wal_path
+                    .as_deref()
+                    .and_then(parse_vector_index_persistence)
+                    .map(|p| p.path().to_path_buf()),
+                wal: wal_path.map(std::path::PathBuf::from),
+                redb,
+                segment_dirs: segment_dir.iter().map(std::path::PathBuf::from).collect(),
+            },
+        );
+    }
 
     if let Some(wal_path) = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH") {
         let wal_async_flush_interval_ms = resolve_wal_async_flush_interval_ms(
@@ -179,9 +223,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_stats_and_ann_tuning(
+        let vector_index_persistence = parse_vector_index_persistence(&wal_path);
+        let (mut store, load_stats) = match InMemoryStore::load_from_wal_with_vector_index(
             &wal,
             ann_tuning.clone(),
+            ReplayPolicy::from_env(),
+            vector_index_persistence.as_deref().map(|p| p.path()),
         ) {
             Ok(result) => result,
             Err(err) => {
@@ -189,6 +236,22 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        match (&vector_index_persistence, &load_stats.vector_index) {
+            (Some(persistence), restore) => {
+                persistence.note_restored(restore);
+                let message = format!(
+                    "ingestion vector index '{}': {}",
+                    persistence.path().display(),
+                    restore.describe()
+                );
+                if matches!(restore, VectorIndexRestore::Rebuilt { .. }) {
+                    tracing::warn!("{message}");
+                } else {
+                    tracing::info!("{message}");
+                }
+            }
+            (None, _) => tracing::info!("ingestion vector index persistence: off"),
+        }
         // Default-on disk persistence (redb PR 2). The
         // `DASH_INGEST_PERSISTENCE_PATH` env var overrides the path;
         // setting `DASH_INGEST_PERSISTENCE_DISABLE=1` reverts to the
@@ -207,42 +270,20 @@ fn main() {
         )
         .unwrap_or_else(|| "./data/dash-ingestion.redb".to_string());
         if !disk_disabled {
-            // `with_disk` always returns Ok(self) — on open failure
-            // the in-memory state is preserved and `disk_status` is
-            // set to `Unavailable`. We still inspect the result to
-            // log the reason. Wrap the move+rebind in a block so
-            // the borrow checker sees the reassignment.
-            store = match store.with_disk(&disk_path) {
-                Ok(updated) => {
-                    match updated.disk_status() {
-                        store::DiskStatus::Unavailable { reason } => {
-                            tracing::error!(
-                                "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
-                            );
-                        }
-                        _ => {
-                            tracing::info!("ingestion persistence: disk={disk_path}");
-                        }
-                    }
-                    updated
-                }
-                Err(err) => {
-                    // Unreachable: `with_disk` always returns Ok.
-                    // Kept for defensive completeness. Reconstruct
-                    // a disk-less store with Unavailable status so
-                    // the rest of the function has a usable store.
+            // `attach_disk` never fails: on open failure the in-memory
+            // state is preserved and `disk_status` is `Unavailable`, which
+            // is logged here.
+            store = store.attach_disk(&disk_path);
+            match store.disk_status() {
+                store::DiskStatus::Unavailable { reason } => {
                     tracing::error!(
-                        "ingestion redb open failed for '{disk_path}': {err}; falling back to in-memory mode"
+                        "ingestion redb open failed for '{disk_path}': {reason}; falling back to in-memory mode"
                     );
-                    // We can't reconstruct the original (it was
-                    // moved into with_disk). In practice this is
-                    // unreachable; the caller code below uses
-                    // `store` which is now in an unknown state.
-                    // To make the borrow checker happy, we panic
-                    // — this branch is unreachable in practice.
-                    unreachable!("with_disk always returns Ok");
                 }
-            };
+                _ => {
+                    tracing::info!("ingestion persistence: disk={disk_path}");
+                }
+            }
         }
         tracing::info!(
             "ingestion startup replay: claims_loaded={}, evidence_loaded={}, edges_loaded={}, vectors_loaded={}, snapshot_records={}, wal_delta_records={}",
@@ -253,6 +294,14 @@ fn main() {
             load_stats.replay.snapshot_records,
             load_stats.replay.wal_records
         );
+        if load_stats.replay.quarantined_records > 0 || load_stats.replay.dependent_skipped > 0 {
+            tracing::warn!(
+                "ingestion startup replay quarantined {} unreadable legacy record(s) and skipped {} dependent record(s); see '{}.quarantine' and docs/operations/wal-recovery.md",
+                load_stats.replay.quarantined_records,
+                load_stats.replay.dependent_skipped,
+                wal_path
+            );
+        }
         tracing::info!(
             "ingestion wal durability: sync_every_records={}, append_buffer_records={}, sync_interval_ms={}, async_flush_interval_ms={}, background_flush_only={}, unsafe_override={}",
             wal.sync_every_records(),
@@ -264,27 +313,38 @@ fn main() {
             wal.background_flush_only(),
             allow_unsafe_wal_durability
         );
-        let policy = CheckpointPolicy {
-            max_wal_records: parse_env_with_fallback::<usize>(
+        let policy = ingestion::transport::checkpoint_policy_from_values(
+            env_with_fallback(
                 "DASH_CHECKPOINT_MAX_WAL_RECORDS",
                 "EME_CHECKPOINT_MAX_WAL_RECORDS",
-            ),
-            max_wal_bytes: parse_env_with_fallback::<u64>(
+            )
+            .as_deref(),
+            env_with_fallback(
                 "DASH_CHECKPOINT_MAX_WAL_BYTES",
                 "EME_CHECKPOINT_MAX_WAL_BYTES",
-            ),
-        };
+            )
+            .as_deref(),
+        );
+        tracing::info!(
+            "ingestion checkpoint policy: max_wal_records={}, max_wal_bytes={}",
+            policy
+                .max_wal_records
+                .map_or_else(|| "off".to_string(), |n| n.to_string()),
+            policy
+                .max_wal_bytes
+                .map_or_else(|| "off".to_string(), |n| n.to_string())
+        );
 
         if serve_mode {
             tracing::info!("ingestion transport listening on http://{bind_addr}");
             tracing::info!("ingestion transport workers: {http_workers}");
             tracing::info!(
-                "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-                store.ann_tuning().max_neighbors_base,
-                store.ann_tuning().max_neighbors_upper,
-                store.ann_tuning().search_expansion_factor,
-                store.ann_tuning().search_expansion_min,
-                store.ann_tuning().search_expansion_max
+                "ingestion vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+                store.ann_tuning().connectivity,
+                store.ann_tuning().expansion_add,
+                store.ann_tuning().expansion_search,
+                store.ann_tuning().flat_threshold,
+                store.ann_tuning().rerank
             );
             tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
             tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
@@ -295,7 +355,14 @@ fn main() {
             if let Some(segment_dir) = segment_dir.as_deref() {
                 tracing::info!("ingestion segment publish dir: {segment_dir}");
             }
-            let runtime = IngestionRuntime::persistent(store, wal, policy);
+            let mut runtime = IngestionRuntime::persistent(store, wal, policy);
+            if let Some(persistence) = vector_index_persistence {
+                runtime = runtime.with_vector_index_persistence(persistence);
+            }
+            match runtime.group_commit_summary() {
+                Some(summary) => tracing::info!("ingestion wal group commit: enabled, {summary}"),
+                None => tracing::info!("ingestion wal group commit: disabled"),
+            }
             if let Some(reason) = runtime.placement_routing_error() {
                 tracing::error!("ingestion placement routing configuration error: {reason}");
                 std::process::exit(2);
@@ -336,12 +403,12 @@ fn main() {
             tracing::info!("ingestion transport listening on http://{bind_addr}");
             tracing::info!("ingestion transport workers: {http_workers}");
             tracing::info!(
-                "ingestion ann tuning: base_neighbors={}, upper_neighbors={}, search_factor={}, search_min={}, search_max={}",
-                store.ann_tuning().max_neighbors_base,
-                store.ann_tuning().max_neighbors_upper,
-                store.ann_tuning().search_expansion_factor,
-                store.ann_tuning().search_expansion_min,
-                store.ann_tuning().search_expansion_max
+                "ingestion vector index tuning: connectivity={}, expansion_add={}, expansion_search={}, flat_threshold={}, rerank={}",
+                store.ann_tuning().connectivity,
+                store.ann_tuning().expansion_add,
+                store.ann_tuning().expansion_search,
+                store.ann_tuning().flat_threshold,
+                store.ann_tuning().rerank
             );
             tracing::info!("ingestion health endpoint: http://{bind_addr}/health");
             tracing::info!("ingestion metrics endpoint: http://{bind_addr}/metrics");
@@ -382,45 +449,31 @@ fn main() {
     }
 }
 
+/// Installs the encryption keyring from `DASH_ENCRYPTION_KEY_FILE` (ADR
+/// 0005) and checks the data already on disk before anything is opened:
+/// encrypted files without a usable key stop the service (fail closed).
+fn init_encryption(service: &str, paths: store::EncryptionStatePaths) {
+    match store::init_encryption_from_env(&paths) {
+        Ok(Some(keyring)) => tracing::info!(
+            "{service} encryption at rest: on (provider {}, active key id {}, {} key id(s) configured)",
+            keyring.provider_name(),
+            keyring.active_key_id(),
+            keyring.key_ids().len()
+        ),
+        Ok(None) => tracing::info!(
+            "{service} encryption at rest: off (set DASH_ENCRYPTION_KEY_FILE to enable it)"
+        ),
+        Err(reason) => {
+            tracing::error!("{service} startup refused: encryption at rest: {reason}");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)
         .ok()
         .or_else(|| std::env::var(fallback).ok())
-}
-
-fn validate_startup_secrets() -> Result<(), String> {
-    let api_key = env_with_fallback("DASH_INGEST_API_KEY", "EME_INGEST_API_KEY");
-    let api_keys = env_with_fallback("DASH_INGEST_API_KEYS", "EME_INGEST_API_KEYS");
-    let jwt_secret = env_with_fallback(
-        "DASH_INGEST_JWT_HS256_SECRET",
-        "EME_INGEST_JWT_HS256_SECRET",
-    );
-    let jwt_secrets = env_with_fallback(
-        "DASH_INGEST_JWT_HS256_SECRETS",
-        "EME_INGEST_JWT_HS256_SECRETS",
-    );
-
-    if let Some(value) = api_key.as_deref() {
-        dash_common::validate_secret(value, "DASH_INGEST_API_KEY")?;
-    }
-    if let Some(value) = api_keys.as_deref() {
-        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_API_KEYS")?;
-    }
-    if let Some(value) = jwt_secret.as_deref() {
-        dash_common::validate_secret(value, "DASH_INGEST_JWT_HS256_SECRET")?;
-    }
-    if let Some(value) = jwt_secrets.as_deref() {
-        dash_common::validate_secret_csv(Some(value), "DASH_INGEST_JWT_HS256_SECRETS")?;
-    }
-
-    if dash_common::strict_secrets_enabled() && api_key.is_none() && api_keys.is_none() {
-        return Err(
-            "DASH_STRICT_SECRETS=1 requires at least one ingest API key (DASH_INGEST_API_KEY or DASH_INGEST_API_KEYS)"
-                .into(),
-        );
-    }
-
-    Ok(())
 }
 
 fn parse_env_with_fallback<T>(primary: &str, fallback: &str) -> Option<T>
@@ -573,47 +626,68 @@ fn validate_wal_durability_guardrails(config: &WalDurabilityConfig) -> Result<()
 fn parse_ann_tuning_config() -> AnnTuningConfig {
     let defaults = AnnTuningConfig::default();
     AnnTuningConfig {
-        max_neighbors_base: parse_env_first::<usize>(&[
+        connectivity: parse_env_first::<usize>(&[
             "DASH_INGEST_ANN_MAX_NEIGHBORS_BASE",
             "DASH_ANN_MAX_NEIGHBORS_BASE",
             "EME_INGEST_ANN_MAX_NEIGHBORS_BASE",
             "EME_ANN_MAX_NEIGHBORS_BASE",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_base),
-        max_neighbors_upper: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_MAX_NEIGHBORS_UPPER",
-            "DASH_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_INGEST_ANN_MAX_NEIGHBORS_UPPER",
-            "EME_ANN_MAX_NEIGHBORS_UPPER",
+        .unwrap_or(defaults.connectivity),
+        expansion_add: parse_env_first::<usize>(&[
+            "DASH_INGEST_ANN_EXPANSION_ADD",
+            "DASH_ANN_EXPANSION_ADD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.max_neighbors_upper),
-        search_expansion_factor: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_SEARCH_EXPANSION_FACTOR",
-            "DASH_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_INGEST_ANN_SEARCH_EXPANSION_FACTOR",
-            "EME_ANN_SEARCH_EXPANSION_FACTOR",
-        ])
-        .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_factor),
-        search_expansion_min: parse_env_first::<usize>(&[
+        .unwrap_or(defaults.expansion_add),
+        expansion_search: parse_env_first::<usize>(&[
             "DASH_INGEST_ANN_SEARCH_EXPANSION_MIN",
             "DASH_ANN_SEARCH_EXPANSION_MIN",
             "EME_INGEST_ANN_SEARCH_EXPANSION_MIN",
             "EME_ANN_SEARCH_EXPANSION_MIN",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_min),
-        search_expansion_max: parse_env_first::<usize>(&[
-            "DASH_INGEST_ANN_SEARCH_EXPANSION_MAX",
-            "DASH_ANN_SEARCH_EXPANSION_MAX",
-            "EME_INGEST_ANN_SEARCH_EXPANSION_MAX",
-            "EME_ANN_SEARCH_EXPANSION_MAX",
+        .unwrap_or(defaults.expansion_search),
+        flat_threshold: parse_env_first::<usize>(&[
+            "DASH_INGEST_VECTOR_FLAT_THRESHOLD",
+            "DASH_VECTOR_FLAT_THRESHOLD",
         ])
         .filter(|value| *value > 0)
-        .unwrap_or(defaults.search_expansion_max),
+        .unwrap_or(defaults.flat_threshold),
+        rerank: parse_env_first::<usize>(&["DASH_INGEST_VECTOR_RERANK", "DASH_VECTOR_RERANK"])
+            .unwrap_or(defaults.rerank),
     }
+}
+
+/// Vector index persistence settings (on by default, file next to the WAL).
+/// Values were validated by `dash_config::startup_check`.
+fn parse_vector_index_persistence(wal_path: &str) -> Option<Arc<VectorIndexPersistence>> {
+    let enabled = parse_env_first::<String>(&[
+        "DASH_INGEST_VECTOR_INDEX_PERSIST",
+        "DASH_VECTOR_INDEX_PERSIST",
+    ])
+    .is_none_or(|raw| {
+        !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    });
+    if !enabled {
+        return None;
+    }
+    let path = std::env::var("DASH_INGEST_VECTOR_INDEX_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| format!("{wal_path}.vindex"));
+    let interval_ms = parse_env_first::<u64>(&[
+        "DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS",
+        "DASH_VECTOR_INDEX_SAVE_INTERVAL_MS",
+    ])
+    .unwrap_or(DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS);
+    Some(Arc::new(VectorIndexPersistence::new(
+        path,
+        (interval_ms > 0).then(|| Duration::from_millis(interval_ms)),
+    )))
 }
 
 fn parse_env_first<T>(keys: &[&str]) -> Option<T>

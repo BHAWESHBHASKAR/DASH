@@ -86,28 +86,147 @@ app.kubernetes.io/component: control-plane
 {{- default (include "dash.componentName" (list . "control-plane")) .Values.serviceAccount.controlPlane.name -}}
 {{- end -}}
 
-{{/* Image reference for a component. */}}
-{{- define "dash.retrievalImage" -}}
-{{- $repo := .Values.image.retrieval.repository | default (printf "%s/%s" .Values.image.repository "retrieval") -}}
-{{- $tag := .Values.image.retrieval.tag | default .Values.image.tag -}}
-{{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
+{{/*
+Image reference for a component: <registry>/<repository>-<service>:<tag>
+Usage: include "dash.image" (list . "retrieval" "retrieval")
+  arg 1 = root context, arg 2 = service name used in the image name,
+  arg 3 = key under .Values.image holding per-service overrides.
+*/}}
+{{- define "dash.image" -}}
+{{- $top := index . 0 -}}
+{{- $svc := index . 1 -}}
+{{- $key := index . 2 -}}
+{{- $o := index $top.Values.image $key -}}
+{{- $repo := default (printf "%s-%s" $top.Values.image.repository $svc) $o.repository -}}
+{{- $tag := default $top.Values.image.tag $o.tag -}}
+{{- printf "%s/%s:%s" $top.Values.image.registry $repo $tag -}}
 {{- end -}}
 
-{{- define "dash.ingestionImage" -}}
-{{- $repo := .Values.image.ingestion.repository | default (printf "%s/%s" .Values.image.repository "ingestion") -}}
-{{- $tag := .Values.image.ingestion.tag | default .Values.image.tag -}}
-{{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
-{{- end -}}
+{{- define "dash.retrievalImage" -}}{{ include "dash.image" (list . "retrieval" "retrieval") }}{{- end -}}
+{{- define "dash.ingestionImage" -}}{{ include "dash.image" (list . "ingestion" "ingestion") }}{{- end -}}
+{{- define "dash.controlPlaneImage" -}}{{ include "dash.image" (list . "control-plane" "controlPlane") }}{{- end -}}
 
-{{- define "dash.controlPlaneImage" -}}
-{{- $repo := .Values.image.controlPlane.repository | default (printf "%s/%s" .Values.image.repository "control-plane") -}}
-{{- $tag := .Values.image.controlPlane.tag | default .Values.image.tag -}}
-{{- printf "%s/%s:%s" .Values.image.registry $repo $tag -}}
-{{- end -}}
-
-{{/* Image pull secrets list (deduplicated). */}}
+{{/* Image pull secrets list. */}}
 {{- define "dash.imagePullSecrets" -}}
 {{- range .Values.image.pullSecrets }}
 - name: {{ . }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Validate a secret value. Fails the render when the value is missing, shorter
+than 32 characters, or looks like a placeholder.
+Usage: include "dash.secretValue" (list .Values.secret.retrieval.apiKey "secret.retrieval.apiKey")
+*/}}
+{{- define "dash.secretValue" -}}
+{{- $name := index . 1 -}}
+{{- $v := required (printf "%s is required (set it, or reference an existing Secret via secret.existingSecret.*)" $name) (index . 0) | toString -}}
+{{- if lt (len $v) 32 -}}
+{{- fail (printf "%s must be at least 32 characters (generate one with: openssl rand -hex 32)" $name) -}}
+{{- end -}}
+{{- $lower := lower $v -}}
+{{- range (list "change-me" "changeme" "placeholder" "replace-me" "replace_me" "example" "sample") -}}
+{{- if contains . $lower -}}
+{{- fail (printf "%s looks like a placeholder value; supply a real random secret" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (hasPrefix "<" $v) (hasSuffix ">" $v) -}}
+{{- fail (printf "%s looks like a placeholder value; supply a real random secret" $name) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{/* Names of the per-component Secrets (existing or chart-managed). */}}
+{{- define "dash.retrievalSecretName" -}}
+{{- default (printf "%s-retrieval-secrets" (include "dash.fullname" .)) .Values.secret.existingSecret.retrieval -}}
+{{- end -}}
+{{- define "dash.ingestionSecretName" -}}
+{{- default (printf "%s-ingestion-secrets" (include "dash.fullname" .)) .Values.secret.existingSecret.ingestion -}}
+{{- end -}}
+{{- define "dash.controlPlaneSecretName" -}}
+{{- default (printf "%s-control-plane-secrets" (include "dash.fullname" .)) .Values.secret.existingSecret.controlPlane -}}
+{{- end -}}
+
+{{/*
+Namespace of every namespaced resource: namespace.name when set, otherwise
+the release namespace (`helm install --namespace`). Before, the default was a
+hard-coded "dash-system", so `helm install -n other` put the objects outside
+the release namespace (and failed when dash-system did not exist).
+*/}}
+{{- define "dash.namespace" -}}
+{{- default .Release.Namespace .Values.namespace.name -}}
+{{- end -}}
+
+{{/*
+Init container that creates the data directories on a fresh PVC.
+Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
+*/}}
+{{- define "dash.initDataDirs" -}}
+{{- $top := index . 0 -}}
+- name: init-data-dirs
+  image: {{ index . 1 | quote }}
+  imagePullPolicy: {{ $top.Values.image.pullPolicy }}
+  command: ["/bin/sh", "-c", {{ printf "mkdir -p %s" (index . 2) | quote }}]
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 32Mi
+  securityContext:
+    {{- toYaml $top.Values.containerSecurityContext | nindent 4 }}
+  volumeMounts:
+  - name: data
+    mountPath: {{ $top.Values.config.persistencePath }}
+{{- end -}}
+
+{{/* Merged resources for a component: base, then component overrides. */}}
+{{- define "dash.resources" -}}
+{{- $top := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $base := dict "requests" (deepCopy $top.Values.resources.requests) "limits" (deepCopy $top.Values.resources.limits) -}}
+{{- $over := default (dict) (index $top.Values.resources $key) -}}
+{{- toYaml (mergeOverwrite $base (deepCopy $over)) -}}
+{{- end -}}
+
+{{/* Probe scheme: HTTPS when the listeners serve TLS (kubelet does not verify the certificate). */}}
+{{- define "dash.probeScheme" -}}
+{{- ternary "HTTPS" "HTTP" .Values.tls.enabled -}}
+{{- end -}}
+
+{{/* Read-only mount of the TLS Secret (tls.crt, tls.key, ca.crt). */}}
+{{- define "dash.tlsVolumeMount" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  mountPath: {{ .Values.tls.mountPath }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "dash.tlsVolume" -}}
+{{- if .Values.tls.enabled }}
+- name: tls
+  secret:
+    secretName: {{ required "tls.secretName is required when tls.enabled=true (a Secret with tls.crt, tls.key and ca.crt)" .Values.tls.secretName }}
+    defaultMode: 0440
+{{- end }}
+{{- end -}}
+
+{{/* Read-only mount of the encryption key Secret (docs/operations/encryption.md). */}}
+{{- define "dash.encryptionVolumeMount" -}}
+{{- if .Values.encryption.enabled }}
+- name: encryption-key
+  mountPath: {{ .Values.encryption.mountPath }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "dash.encryptionVolume" -}}
+{{- if .Values.encryption.enabled }}
+- name: encryption-key
+  secret:
+    secretName: {{ required "encryption.secretName is required when encryption.enabled=true (a Secret holding the key under encryption.keyName)" .Values.encryption.secretName }}
+    defaultMode: 0400
 {{- end }}
 {{- end -}}

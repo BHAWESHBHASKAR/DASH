@@ -59,6 +59,9 @@ pub struct StoreLoadStats {
     pub evidence_loaded: usize,
     pub edges_loaded: usize,
     pub vectors_loaded: usize,
+    /// How the vector indexes were obtained: loaded from the persisted
+    /// index (plus WAL catch-up) or built from the replayed vectors.
+    pub vector_index: crate::VectorIndexRestore,
 }
 
 /// Snapshot of the in-memory index sizes, suitable for `/metrics`
@@ -71,5 +74,11 @@ pub struct StoreIndexStats {
     pub inverted_terms: usize,
     pub entity_terms: usize,
     pub temporal_buckets: usize,
+    /// Vectors held by the per-tenant vector indexes (flat or HNSW).
     pub ann_vector_buckets: usize,
+    /// Estimated heap held by the vector indexes themselves (quantised
+    /// HNSW graph and flat copies); the full-precision vectors in
+    /// `claim_vectors` are not included.
+    #[serde(default)]
+    pub vector_index_bytes: usize,
 }

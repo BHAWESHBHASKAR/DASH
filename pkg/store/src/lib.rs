@@ -1,40 +1,88 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
-use graph::summarize_edges;
-use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
+use cow_map::CowMap;
+use graph::summarize_incoming_edges;
+use ranking::{RankSignals, hybrid_relevance, lexical_relevance, prior_score, ranked_score};
 use schema::{
-    Citation, Claim, ClaimEdge, Evidence, RetrievalRequest, RetrievalResult, Stance, StanceMode,
-    ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
+    Citation, Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, RetrievalResult, Stance,
+    StanceMode, ValidationError, validate_claim, validate_edge, validate_evidence,
 };
 
+#[macro_use]
+mod failpoint;
+mod checkpoint;
+mod cow_map;
+mod crypt;
+mod delete;
 mod disk;
+mod value_codec;
+pub use checkpoint::{BackgroundWrite, CheckpointJob, FinishedCheckpoint, StoreSnapshot};
+pub use delete::{DeleteOutcome, DeleteStats, PreparedDelete};
 pub use disk::{DiskBackedStore, DiskStatus};
 
-mod ann;
 #[cfg(feature = "gpu-backend")]
 mod gpu;
+mod group_commit;
 mod metrics;
+pub mod observe;
+pub mod text_index;
+pub mod vector_index;
+mod vector_persist;
 mod wal;
-pub use ann::AnnTuningConfig;
-pub(crate) use ann::{ANN_GRAPH_LEVELS, ScoredNode, TenantAnnGraph};
+pub use crypt::{EncryptionStatePaths, check_encryption_state, init_encryption_from_env};
+/// The encryption crate, re-exported so services and tools use the same
+/// version as the store.
+pub use encryption;
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
+use text_index::{QueryTerms, TenantTextIndex, analyze_query};
+pub use vector_index::AnnTuningConfig;
+use vector_index::{TenantVectorIndex, exact_top_k};
+pub use vector_persist::{
+    VECTOR_INDEX_FORMAT_VERSION, VectorIndexPersistence, VectorIndexRestore, VectorIndexSaveStats,
+    VectorIndexSnapshot,
+};
 
-#[derive(Default)]
-pub(crate) struct Bm25Context {
-    doc_freq: HashMap<String, usize>,
-    total_docs: usize,
-    avg_doc_len: f32,
+/// The claims a retrieve scores and the BM25 of each one that shares a
+/// query term (see [`InMemoryStore::candidate_claim_ids`]).
+struct Candidates {
+    /// Sorted by claim id.
+    ids: Vec<String>,
+    query_terms: QueryTerms,
 }
 
-pub(crate) use wal::{BatchCommitRecord, ClaimVectorRecord, PersistedRecord, line_to_record};
-pub use wal::{
-    CheckpointPolicy, FileWal, WalCheckpointStats, WalEvent, WalReplayBoundary, WalReplayStats,
-    WalReplicationDelta, WalReplicationExport, WalRollbackPoint, WalWritePolicy,
+pub use group_commit::{
+    CommitTicket, GROUP_COMMIT_MAX_WAIT_LIMIT, GroupCommitConfig, GroupCommitError, GroupCommitLog,
+    GroupCommitStats, GroupCommitter,
 };
+pub(crate) use wal::{
+    BatchCommitRecord, ClaimVectorRecord, PersistedRecord, ReplayItem, line_to_record,
+    record_to_line,
+};
+pub use wal::{
+    CHECKPOINT_IN_PROGRESS, CheckpointPolicy, CheckpointTicket, FileWal, PendingCheckpointInfo,
+    ReplayPolicy, RetiredFiles, WAL_POISONED_PREFIX, WAL_REPLAY_STRICT_ENV, WalCheckpointStats,
+    WalEvent, WalInspection, WalInvalidLine, WalPosition, WalRepairOptions, WalRepairReport,
+    WalReplayBoundary, WalReplayStats, WalReplicationDelta, WalReplicationExport,
+    WalReplicationFrame, WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
+};
+pub use wal::{
+    ChunkFetch, ChunkRead, DownloadOutcome, DownloadPaths, DownloadedExport,
+    EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
+    EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, GENERATION_TRANSITIONS_KEPT,
+    GenerationTransition, HttpExportSource, LocalExportSource, ReplicationExportChunk,
+    ReplicationExportFile, ReplicationExportManifest, ReplicationExportStats,
+    ReplicationExportStore, download_export, hash_file, valid_export_id,
+};
+pub use wal::{
+    GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
+    batch_commit_id_from_wal_line, check_replicated_line, commit_group_spans,
+    complete_group_prefix_len, is_group_marker_commit_id,
+};
+pub use wal::{Tombstone, tombstone_from_wal_line};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
@@ -43,6 +91,74 @@ pub struct BatchCommitMetadata {
     pub ts_unix_ms: u64,
     pub claim_ids: Vec<String>,
     pub payload_fingerprint: String,
+}
+
+/// A validated single-bundle ingest whose WAL lines are encoded but not yet
+/// written. Produced by [`InMemoryStore::prepare_atomic_ingest`]; the caller
+/// makes [`PreparedIngest::wal_lines`] durable (directly or through a
+/// [`GroupCommitter`]) and only then calls
+/// [`InMemoryStore::apply_prepared_ingest`].
+#[derive(Debug, Clone)]
+pub struct PreparedIngest {
+    claim: Claim,
+    evidence: Vec<Evidence>,
+    edges: Vec<ClaimEdge>,
+    vector: Option<Vec<f32>>,
+    wal_lines: Vec<String>,
+}
+
+impl PreparedIngest {
+    /// The encoded commit group: begin marker, records, closing marker.
+    pub fn wal_lines(&self) -> &[String] {
+        &self.wal_lines
+    }
+
+    pub fn claim_id(&self) -> &str {
+        &self.claim.claim_id
+    }
+}
+
+/// Result of [`InMemoryStore::apply_replicated_lines`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicatedApply {
+    pub applied: usize,
+    /// Lines lenient replay would quarantine (see
+    /// [`InMemoryStore::apply_persisted_record_line_lenient`]).
+    pub skipped: usize,
+    /// The redb write of the frame failed: the handle was detached and the
+    /// disk marked unavailable (the WAL stays the source of truth).
+    pub disk_error: Option<String>,
+}
+
+/// Replicated lines applied in memory whose redb writes are still pending
+/// (see [`InMemoryStore::apply_replicated_group`]).
+#[derive(Debug, Default)]
+pub struct ReplicatedBatch {
+    ops: Vec<StagedDiskOp>,
+    applied: usize,
+    skipped: usize,
+}
+
+impl ReplicatedBatch {
+    /// Lines applied so far.
+    pub fn applied(&self) -> usize {
+        self.applied
+    }
+
+    /// Lines skipped so far (lenient replay would quarantine them).
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
+}
+
+/// Result of [`InMemoryStore::ingest_atomic_persistent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicIngestOutcome {
+    /// `false` when the bundle was already fully applied (idempotent retry).
+    pub applied: bool,
+    /// Set when redb rejected the mirrored write after the WAL commit. The
+    /// write itself is durable (WAL) and visible; redb was detached.
+    pub disk_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,35 +204,149 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
-#[derive(Default, Clone)]
-/// `Clone` preserves the disk handle via `Arc` (refcount bump, not a
-/// deep redb copy). This is the redb PR 2 fix: cloning a store no
-/// longer silently drops the disk handle. Before this change, a
-/// manual `Clone` impl was required because `redb::Database` is not
-/// `Clone`; the impl set `disk: None` and `disk_status: Unavailable`
-/// on the clone, which caused disk writes to be silently lost on any
-/// code path that cloned the store. With `Arc<DiskBackedStore>`,
-/// the cloned store shares the same redb handle and writes to either
-/// are visible to both.
+/// Upper bound on the in-memory WAL event ring (PERF-05). The ring is
+/// only an observability aid (`wal_len`); the durable log is the
+/// `FileWal`. Without a bound the leader grew by one entry per applied
+/// record, forever.
+pub const DEFAULT_WAL_EVENT_CAPACITY: usize = 8192;
+
+/// Bounded ring of recent [`WalEvent`]s plus a monotonic total.
+#[derive(Debug)]
+struct WalEventRing {
+    events: VecDeque<WalEvent>,
+    total: u64,
+    capacity: usize,
+}
+
+impl Default for WalEventRing {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            total: 0,
+            capacity: DEFAULT_WAL_EVENT_CAPACITY,
+        }
+    }
+}
+
+impl WalEventRing {
+    fn push(&mut self, event: WalEvent) {
+        self.total = self.total.saturating_add(1);
+        if self.capacity == 0 {
+            return;
+        }
+        while self.events.len() >= self.capacity {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    fn trim(&mut self) {
+        while self.events.len() > self.capacity {
+            self.events.pop_front();
+        }
+    }
+}
+
+impl Clone for WalEventRing {
+    /// A cloned ring starts empty (it keeps the capacity and the running
+    /// total) so cloning a store never copies thousands of events.
+    fn clone(&self) -> Self {
+        Self {
+            events: VecDeque::new(),
+            total: self.total,
+            capacity: self.capacity,
+        }
+    }
+}
+
+/// One disk mutation recorded by a detached (staged) store so that
+/// [`InMemoryStore::commit_staged`] can replay it onto the real redb
+/// handle after the WAL append succeeded (DATA-09).
+#[derive(Debug, Clone)]
+enum StagedDiskOp {
+    Claim(Claim),
+    Evidence(Evidence),
+    Edge(ClaimEdge),
+    Vector {
+        claim_id: String,
+        tenant_id: String,
+        vector: Vec<f32>,
+        new_dim: Option<usize>,
+    },
+    BatchCommit(BatchCommitMetadata),
+    /// Everything one tombstone removes, applied in one redb transaction.
+    Delete(delete::DiskDeletion),
+}
+
+/// Reverse edge index entry: `from` points at the indexed claim.
+#[derive(Debug, Clone)]
+struct IncomingEdge {
+    from_claim_id: String,
+    relation: Relation,
+    strength: f32,
+}
+
+/// In-memory claim store.
+///
+/// # Cloning and the disk handle (DATA-09)
+///
+/// `Clone` is **detached**: the clone never holds the redb handle. A
+/// clone is meant to be a *staged* copy: mutate it, append to the WAL,
+/// and only then call [`InMemoryStore::commit_staged`] on the live
+/// store, which replays the staged disk writes onto redb and swaps the
+/// in-memory state. If the batch is rolled back, the staged clone is
+/// simply dropped and redb was never touched. `clone_detached` is the
+/// explicit spelling of the same operation.
+///
+/// Do not assign a staged clone over the live store (`self.store =
+/// staged`) when a disk is attached: that would drop the handle. Use
+/// `commit_staged`.
+#[derive(Default)]
 pub struct InMemoryStore {
-    claims: HashMap<String, Claim>,
-    evidence_by_claim: HashMap<String, Vec<Evidence>>,
-    edges_by_claim: HashMap<String, Vec<ClaimEdge>>,
-    claim_vectors: HashMap<String, Vec<f32>>,
-    ann_vector_graphs: HashMap<String, TenantAnnGraph>,
+    claims: CowMap<Claim>,
+    evidence_by_claim: CowMap<Vec<Evidence>>,
+    edges_by_claim: CowMap<Vec<ClaimEdge>>,
+    /// Reverse index: target claim id -> edges pointing at it.
+    edges_in: HashMap<String, Vec<IncomingEdge>>,
+    claim_vectors: CowMap<Vec<f32>>,
+    /// Per-tenant vector index (flat below the threshold, HNSW above).
+    /// Holds no full-precision copy: rerank reads `claim_vectors`.
+    vector_indexes: HashMap<String, TenantVectorIndex>,
+    /// `true` while a bulk load is replaying vectors: they are collected in
+    /// `claim_vectors` only and the indexes are built once afterwards.
+    defer_vector_index: bool,
     tenant_vector_dims: HashMap<String, usize>,
     tenant_claim_ids: HashMap<String, HashSet<String>>,
-    inverted_index: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// Per-tenant full-text index (BM25 over analysed `canonical_text`).
+    text_indexes: HashMap<String, TenantTextIndex>,
     entity_index: HashMap<String, HashMap<String, HashSet<String>>>,
     embedding_index: HashMap<String, HashMap<String, HashSet<String>>>,
     temporal_index: HashMap<String, BTreeMap<i64, HashSet<String>>>,
-    batch_commits: HashMap<String, BatchCommitMetadata>,
-    claim_tokens: HashMap<String, Vec<String>>,
+    batch_commits: CowMap<BatchCommitMetadata>,
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
-    wal: Vec<WalEvent>,
+    wal: WalEventRing,
     disk: Option<Arc<disk::DiskBackedStore>>,
     disk_status: disk::DiskStatus,
+    /// `Some` only on detached clones: disk writes recorded for
+    /// `commit_staged`.
+    staged_disk_ops: Option<Vec<StagedDiskOp>>,
+    /// Claim ids of legacy claim records a replication follower skipped, so
+    /// records depending on them are skipped too.
+    replica_skipped_claims: HashSet<String>,
+    /// The WAL position this state reflects, when the owner of the WAL keeps
+    /// it here (set by the WAL loaders and the replication follower). A
+    /// persisted vector index records it. Kept by `commit_staged` and
+    /// `replace_state_from`: only the WAL owner moves it.
+    wal_position: Option<WalPosition>,
+}
+
+impl Clone for InMemoryStore {
+    /// Detached clone; see the type-level docs. Equivalent to
+    /// [`InMemoryStore::clone_detached`].
+    fn clone(&self) -> Self {
+        self.clone_detached()
+    }
 }
 
 impl InMemoryStore {
@@ -138,8 +368,15 @@ impl InMemoryStore {
         &self.ann_tuning
     }
 
+    /// Change the vector index tuning. Existing indexes are rebuilt from the
+    /// stored vectors so the new connectivity, beam widths, flat threshold
+    /// and rerank width apply to them too (a cold-start-sized cost).
     pub fn set_ann_tuning(&mut self, ann_tuning: AnnTuningConfig) {
+        if self.ann_tuning == ann_tuning {
+            return;
+        }
         self.ann_tuning = ann_tuning;
+        self.rebuild_vector_indexes();
     }
 
     pub fn vector_backend_runtime(&self) -> VectorBackendRuntime {
@@ -163,19 +400,25 @@ impl InMemoryStore {
     /// store is always returned (the caller's in-memory state is
     /// preserved).
     pub fn with_disk(self, path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        Ok(self.attach_disk(path))
+    }
+
+    /// Infallible form of [`InMemoryStore::with_disk`]: on open failure the
+    /// in-memory state is kept and [`InMemoryStore::disk_status`] reports
+    /// `Unavailable { reason }`, so callers inspect the status instead of a
+    /// `Result` that can never be `Err`.
+    pub fn attach_disk(self, path: impl AsRef<std::path::Path>) -> Self {
         match disk::DiskBackedStore::new(path) {
-            Ok(disk) => Ok(Self {
+            Ok(disk) => Self {
                 disk: Some(Arc::new(disk)),
                 disk_status: disk::DiskStatus::Available,
                 ..self
-            }),
-            Err(reason) => Ok(Self {
+            },
+            Err(reason) => Self {
                 disk: None,
-                disk_status: disk::DiskStatus::Unavailable {
-                    reason: reason.clone(),
-                },
+                disk_status: disk::DiskStatus::Unavailable { reason },
                 ..self
-            }),
+            },
         }
     }
 
@@ -183,6 +426,154 @@ impl InMemoryStore {
     /// no disk was attached (the default in-memory mode).
     pub fn disk_status(&self) -> &disk::DiskStatus {
         &self.disk_status
+    }
+
+    /// Clone the in-memory state WITHOUT the redb handle (DATA-09).
+    ///
+    /// The returned store records the disk writes it would have made
+    /// instead of performing them. Use it as the staging area for an
+    /// atomic batch: mutate the clone, append to the WAL, and only after
+    /// the WAL append succeeded call [`InMemoryStore::commit_staged`] on
+    /// the live store. Dropping the clone (rollback) leaves redb
+    /// untouched. `Clone::clone` is the same operation.
+    pub fn clone_detached(&self) -> Self {
+        Self {
+            claims: self.claims.clone(),
+            evidence_by_claim: self.evidence_by_claim.clone(),
+            edges_by_claim: self.edges_by_claim.clone(),
+            edges_in: self.edges_in.clone(),
+            claim_vectors: self.claim_vectors.clone(),
+            vector_indexes: self.vector_indexes.clone(),
+            defer_vector_index: false,
+            tenant_vector_dims: self.tenant_vector_dims.clone(),
+            tenant_claim_ids: self.tenant_claim_ids.clone(),
+            text_indexes: self.text_indexes.clone(),
+            entity_index: self.entity_index.clone(),
+            embedding_index: self.embedding_index.clone(),
+            temporal_index: self.temporal_index.clone(),
+            batch_commits: self.batch_commits.clone(),
+            ann_tuning: self.ann_tuning.clone(),
+            vector_backend_runtime: self.vector_backend_runtime,
+            wal: self.wal.clone(),
+            disk: None,
+            disk_status: self.disk_status.clone(),
+            staged_disk_ops: Some(Vec::new()),
+            replica_skipped_claims: self.replica_skipped_claims.clone(),
+            wal_position: self.wal_position,
+        }
+    }
+
+    /// The WAL position this state reflects, if the WAL owner recorded one.
+    pub fn wal_position(&self) -> Option<WalPosition> {
+        self.wal_position
+    }
+
+    /// Record the WAL position this state reflects. Call it while holding
+    /// whatever serialises WAL appends with store mutations, right after the
+    /// mutation that the last appended record describes.
+    pub fn set_wal_position(&mut self, position: Option<WalPosition>) {
+        self.wal_position = position;
+    }
+
+    /// A point-in-time copy of every tenant's vector index for saving with
+    /// [`VectorIndexSnapshot::save`]. Cheap: an HNSW index is shared
+    /// copy-on-write (the next write to the live index copies it once while
+    /// the snapshot is alive); a flat index (at most the flat threshold of
+    /// vectors) is copied. `position` must be the WAL position this state
+    /// reflects.
+    pub fn vector_index_snapshot(&self, position: WalPosition) -> VectorIndexSnapshot {
+        let mut tenants: Vec<(String, TenantVectorIndex)> = self
+            .vector_indexes
+            .iter()
+            .map(|(tenant, index)| (tenant.clone(), index.clone()))
+            .collect();
+        tenants.sort_by(|a, b| a.0.cmp(&b.0));
+        VectorIndexSnapshot::new(position, self.ann_tuning.clone(), tenants)
+    }
+
+    /// Adopt a staged clone produced by [`InMemoryStore::clone_detached`]
+    /// (or `clone()`), after the caller has durably appended the same
+    /// mutations to the WAL.
+    ///
+    /// In-memory state is swapped in first (the WAL is the source of
+    /// truth and is already committed), then the staged disk writes are
+    /// replayed onto this store's redb handle. If a disk write fails the
+    /// disk handle is dropped and `disk_status` becomes `Unavailable` so
+    /// redb is never left silently diverging, and the error is returned;
+    /// the in-memory commit still stands. A no-disk store simply swaps.
+    pub fn commit_staged(&mut self, staged: InMemoryStore) -> Result<(), StoreError> {
+        let mut staged = staged;
+        let ops = staged.staged_disk_ops.take().unwrap_or_default();
+
+        let disk = self.disk.take();
+        let disk_status = self.disk_status.clone();
+        let mut own_staging = self.staged_disk_ops.take();
+        let wal_position = self.wal_position;
+        let mut ring = std::mem::take(&mut self.wal);
+        ring.total = ring.total.max(staged.wal.total);
+        ring.events.append(&mut staged.wal.events);
+        ring.trim();
+
+        *self = staged;
+        self.wal = ring;
+        self.disk = disk;
+        self.disk_status = disk_status;
+        self.wal_position = wal_position;
+
+        match self.disk.clone() {
+            Some(disk) => {
+                if let Err(reason) = disk.write_ops(&ops) {
+                    self.disk = None;
+                    self.disk_status = disk::DiskStatus::Unavailable {
+                        reason: reason.clone(),
+                    };
+                    return Err(StoreError::Io(reason));
+                }
+            }
+            None => {
+                if let Some(buffer) = own_staging.as_mut() {
+                    buffer.extend(ops);
+                }
+            }
+        }
+        self.staged_disk_ops = own_staging;
+        Ok(())
+    }
+
+    /// Replace ALL in-memory state with `fresh` (built from a replication
+    /// export) instead of merging onto it, keeping this store's redb handle.
+    /// The redb file is cleared and rewritten from the new state so it never
+    /// retains rows the leader no longer has. If the redb rewrite fails the
+    /// handle is dropped, `disk_status` becomes `Unavailable`, and the error
+    /// is returned; the in-memory replacement still stands.
+    pub fn replace_state_from(&mut self, fresh: InMemoryStore) -> Result<(), StoreError> {
+        let mut fresh = fresh;
+        let disk = self.disk.take();
+        let disk_status = self.disk_status.clone();
+        let own_staging = self.staged_disk_ops.take();
+        let wal_position = self.wal_position;
+        let mut ring = std::mem::take(&mut self.wal);
+        ring.total = ring.total.max(fresh.wal.total);
+        ring.events.append(&mut fresh.wal.events);
+        ring.trim();
+
+        *self = fresh;
+        self.wal = ring;
+        self.disk = disk;
+        self.disk_status = disk_status;
+        self.staged_disk_ops = own_staging;
+        self.wal_position = wal_position;
+
+        if let Some(disk) = self.disk.clone()
+            && let Err(reason) = disk.clear_all().and_then(|()| disk.checkpoint_from(self))
+        {
+            self.disk = None;
+            self.disk_status = disk::DiskStatus::Unavailable {
+                reason: reason.clone(),
+            };
+            return Err(StoreError::Io(reason));
+        }
+        Ok(())
     }
 
     /// Construct an `InMemoryStore` by bulk-loading from a disk
@@ -202,32 +593,9 @@ impl InMemoryStore {
             store: &mut InMemoryStore,
             wal: &mut FileWal,
         ) -> Result<StoreLoadStats, String> {
-            let (records, replay_stats) = wal
-                .replay_records_with_stats()
-                .map_err(|e| format!("wal replay: {e:?}"))?;
-            let mut claims_loaded = 0usize;
-            let mut evidence_loaded = 0usize;
-            let mut edges_loaded = 0usize;
-            let mut vectors_loaded = 0usize;
-            for record in records {
-                match &record {
-                    PersistedRecord::Claim(_) => claims_loaded += 1,
-                    PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                    PersistedRecord::Edge(_) => edges_loaded += 1,
-                    PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
-                    PersistedRecord::BatchCommit(_) => {}
-                }
-                store
-                    .apply_persisted_record(record)
-                    .map_err(|e| format!("apply_persisted_record: {e:?}"))?;
-            }
-            Ok(StoreLoadStats {
-                replay: replay_stats,
-                claims_loaded,
-                evidence_loaded,
-                edges_loaded,
-                vectors_loaded,
-            })
+            store
+                .replay_wal(wal, ReplayPolicy::from_env())
+                .map_err(|e| format!("wal replay: {e:?}"))
         }
 
         // 1. Open the disk. If the open fails, fall back to the
@@ -247,6 +615,9 @@ impl InMemoryStore {
         let mut store = Self {
             disk,
             disk_status: disk::DiskStatus::Recovering,
+            // The bulk load only fills `claim_vectors`; the WAL replay that
+            // follows builds the vector indexes once at its end.
+            defer_vector_index: true,
             ..Self::new_with_ann_tuning(ann_tuning)
         };
         // Arc::clone the disk handle so we can hold a borrow on the
@@ -258,6 +629,16 @@ impl InMemoryStore {
         // the disk was an owned `DiskBackedStore` (not Clone-able
         // because it wraps a `redb::Database`).
         let disk = Arc::clone(store.disk.as_ref().expect("disk was just attached"));
+        // With a tombstone in the WAL the redb state cannot serve as the
+        // base of the replay (see `FileWal::contains_tombstones`): rebuild
+        // redb from the WAL instead, which is the source of truth anyway.
+        let reset = wal
+            .contains_tombstones()
+            .map_err(|e| format!("wal scan: {e:?}"))?;
+        if reset {
+            disk.clear_all()
+                .map_err(|e| format!("disk reset before tombstone replay: {e}"))?;
+        }
         let claims_loaded = disk
             .bulk_load_claims_into(&mut store)
             .map_err(|e| format!("disk bulk load: {e}"))?;
@@ -267,7 +648,9 @@ impl InMemoryStore {
         // with the WAL tail counts (claims loaded by the bulk
         // path will be overwritten in `claims_loaded` by the WAL
         // tail counter, so we explicitly prefer the bulk count).
-        stats.claims_loaded = claims_loaded;
+        if !reset {
+            stats.claims_loaded = claims_loaded;
+        }
         store.disk_status = disk::DiskStatus::Available;
         Ok((store, stats))
     }
@@ -293,32 +676,203 @@ impl InMemoryStore {
         wal: &FileWal,
         ann_tuning: AnnTuningConfig,
     ) -> Result<(Self, StoreLoadStats), StoreError> {
+        Self::load_from_wal_with_policy(wal, ann_tuning, ReplayPolicy::from_env())
+    }
+
+    /// Like [`Self::load_from_wal_with_stats_and_ann_tuning`] with an explicit
+    /// [`ReplayPolicy`] instead of the `DASH_WAL_REPLAY_STRICT` environment
+    /// variable.
+    pub fn load_from_wal_with_policy(
+        wal: &FileWal,
+        ann_tuning: AnnTuningConfig,
+        policy: ReplayPolicy,
+    ) -> Result<(Self, StoreLoadStats), StoreError> {
+        Self::load_from_wal_with_vector_index(wal, ann_tuning, policy, None)
+    }
+
+    /// Like [`Self::load_from_wal_with_policy`], restoring the vector indexes
+    /// from the persisted index at `vector_index_path` instead of building
+    /// them, when that file is intact and matches: same format version and
+    /// tuning, saved for the current WAL generation. Only the vector records
+    /// after the saved WAL position are then applied (catch-up), and the
+    /// result is verified against every replayed vector before it is used.
+    /// Any mismatch or corruption logs a warning and falls back to building
+    /// the indexes from the replayed vectors, so a stale or corrupt index is
+    /// never served. `stats.vector_index` reports which path was taken.
+    pub fn load_from_wal_with_vector_index(
+        wal: &FileWal,
+        ann_tuning: AnnTuningConfig,
+        policy: ReplayPolicy,
+        vector_index_path: Option<&std::path::Path>,
+    ) -> Result<(Self, StoreLoadStats), StoreError> {
         let mut store = Self::new_with_ann_tuning(ann_tuning);
-        let (records, replay_stats) = wal.replay_records_with_stats()?;
+        let stats = store.replay_wal_with_vector_index(wal, policy, vector_index_path)?;
+        Ok((store, stats))
+    }
+
+    /// Replays the snapshot and WAL into `self`.
+    ///
+    /// Lenient policy: a legacy (pre-checksum) record that cannot be parsed
+    /// or fails validation, and a vector that fails validation, is copied to
+    /// `<wal>.quarantine`, counted in `quarantined_records` and skipped;
+    /// records that depend on a quarantined claim are skipped and counted in
+    /// `dependent_skipped`. Any other record that cannot be applied, and every
+    /// such record under the strict policy, fails the load.
+    fn replay_wal(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+    ) -> Result<StoreLoadStats, StoreError> {
+        self.replay_wal_with_vector_index(wal, policy, None)
+    }
+
+    fn replay_wal_with_vector_index(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+        vector_index_path: Option<&std::path::Path>,
+    ) -> Result<StoreLoadStats, StoreError> {
+        // Vectors are collected first and indexed once at the end: restored
+        // from the persisted index, or built per tenant in bulk
+        // (multi-threaded) instead of one insert per record.
+        self.defer_vector_index = true;
+        // The saved position decides which vector records replay reports as
+        // the catch-up set; the file itself is fully verified afterwards.
+        let collect_from = vector_index_path
+            .and_then(vector_persist::peek_saved_position)
+            .filter(|saved| saved.generation == wal.generation())
+            .map(|saved| saved.records);
+        let (mut stats, caught_up) = match self.replay_wal_records(wal, policy, collect_from) {
+            Ok(result) => result,
+            Err(err) => {
+                self.rebuild_vector_indexes();
+                return Err(err);
+            }
+        };
+        stats.vector_index = match vector_index_path {
+            Some(path) => self.restore_vector_indexes(path, wal, caught_up),
+            None => {
+                self.rebuild_vector_indexes();
+                VectorIndexRestore::NotConfigured
+            }
+        };
+        self.wal_position = Some(wal.position());
+        Ok(stats)
+    }
+
+    fn replay_wal_records(
+        &mut self,
+        wal: &FileWal,
+        policy: ReplayPolicy,
+        collect_vectors_from: Option<usize>,
+    ) -> Result<(StoreLoadStats, Option<wal::VectorCatchUp>), StoreError> {
+        fn hard(err: StoreError, origin: &str) -> StoreError {
+            match err {
+                StoreError::Validation(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::InvalidVector(_) => StoreError::Parse(format!("{origin}: {err:?}")),
+                other => other,
+            }
+        }
+        let lenient = policy == ReplayPolicy::Lenient;
+        let replay = wal.replay_with_policy(policy, collect_vectors_from)?;
+        let caught_up = replay.vector_catch_up;
+        let mut stats = replay.stats;
+        let mut sink = replay.sink;
+        let mut bad_claims = replay.quarantined_claim_ids;
         let mut claims_loaded = 0usize;
         let mut evidence_loaded = 0usize;
         let mut edges_loaded = 0usize;
         let mut vectors_loaded = 0usize;
 
-        for record in records {
-            match &record {
-                PersistedRecord::Claim(_) => claims_loaded += 1,
-                PersistedRecord::Evidence(_) => evidence_loaded += 1,
-                PersistedRecord::Edge(_) => edges_loaded += 1,
-                PersistedRecord::ClaimVector(_) => vectors_loaded += 1,
-                PersistedRecord::BatchCommit(_) => {}
+        for item in replay.items {
+            if lenient && !bad_claims.is_empty() && item.depends_on(&bad_claims) {
+                eprintln!(
+                    "warning: skipping {} (depends on a quarantined claim)",
+                    item.origin
+                );
+                sink.push(&item.quarantine_line());
+                stats.dependent_skipped += 1;
+                continue;
             }
-            store.apply_persisted_record(record)?;
+            let ReplayItem {
+                record,
+                legacy,
+                raw,
+                origin,
+            } = item;
+            if lenient
+                && let PersistedRecord::ClaimVector(v) = &record
+                && let Err(
+                    e @ (StoreError::InvalidVector(_)
+                    | StoreError::MissingClaim(_)
+                    | StoreError::Validation(_)),
+                ) = self.validate_claim_vector(&v.claim_id, &v.values)
+            {
+                eprintln!("warning: quarantining poisoned vector at {origin}: {e:?}");
+                sink.push(&raw.unwrap_or_else(|| record_to_line(&record)));
+                stats.quarantined_records += 1;
+                continue;
+            }
+            let claim_id = match &record {
+                PersistedRecord::Claim(c) if legacy || !bad_claims.is_empty() => {
+                    Some(c.claim_id.clone())
+                }
+                _ => None,
+            };
+            let counter = match &record {
+                PersistedRecord::Claim(_) => Some(0),
+                PersistedRecord::Evidence(_) => Some(1),
+                PersistedRecord::Edge(_) => Some(2),
+                PersistedRecord::ClaimVector(_) => Some(3),
+                PersistedRecord::BatchCommit(_) | PersistedRecord::Tombstone(_) => None,
+            };
+            let known_claim = claim_id
+                .as_ref()
+                .is_some_and(|id| self.claims.contains_key(id));
+            match self.apply_persisted_record(record) {
+                Ok(()) => {
+                    match counter {
+                        Some(0) => claims_loaded += 1,
+                        Some(1) => evidence_loaded += 1,
+                        Some(2) => edges_loaded += 1,
+                        Some(3) => vectors_loaded += 1,
+                        _ => {}
+                    }
+                    if let Some(id) = &claim_id {
+                        bad_claims.remove(id);
+                    }
+                }
+                Err(
+                    e @ (StoreError::Validation(_)
+                    | StoreError::MissingClaim(_)
+                    | StoreError::InvalidVector(_)),
+                ) if lenient && legacy => {
+                    eprintln!("warning: quarantining legacy record at {origin}: {e:?}");
+                    if let Some(line) = &raw {
+                        sink.push(line);
+                    }
+                    stats.quarantined_records += 1;
+                    if let Some(id) = claim_id
+                        && !known_claim
+                    {
+                        bad_claims.insert(id);
+                    }
+                }
+                Err(e) => return Err(hard(e, &origin)),
+            }
         }
+        sink.flush()?;
         Ok((
-            store,
             StoreLoadStats {
-                replay: replay_stats,
+                replay: stats,
                 claims_loaded,
                 evidence_loaded,
                 edges_loaded,
                 vectors_loaded,
+                vector_index: VectorIndexRestore::NotConfigured,
             },
+            caught_up,
         ))
     }
 
@@ -352,6 +906,214 @@ impl InMemoryStore {
         self.apply_bundle(claim, evidence, edges)
     }
 
+    /// `true` when applying this exact bundle (and vector) would not change
+    /// the store: the claim, every evidence row, every edge and the vector
+    /// are already present and identical. Used to make retries of an
+    /// ambiguous request a no-op (DATA-10, DATA-12).
+    pub fn bundle_already_applied(
+        &self,
+        claim: &Claim,
+        evidence: &[Evidence],
+        edges: &[ClaimEdge],
+        vector: Option<&[f32]>,
+    ) -> bool {
+        if self.claims.get(&claim.claim_id) != Some(claim) {
+            return false;
+        }
+        let stored_evidence = self.evidence_by_claim.get(&claim.claim_id);
+        for evd in evidence {
+            let found = stored_evidence.is_some_and(|list| {
+                list.iter()
+                    .any(|e| e.evidence_id == evd.evidence_id && e == evd)
+            });
+            if !found {
+                return false;
+            }
+        }
+        let stored_edges = self.edges_by_claim.get(&claim.claim_id);
+        for edge in edges {
+            let found = stored_edges.is_some_and(|list| {
+                list.iter().any(|e| {
+                    e.to_claim_id == edge.to_claim_id && e.relation == edge.relation && e == edge
+                })
+            });
+            if !found {
+                return false;
+            }
+        }
+        match vector {
+            Some(values) => self
+                .claim_vectors
+                .get(&claim.claim_id)
+                .is_some_and(|stored| stored.as_slice() == values),
+            None => true,
+        }
+    }
+
+    /// Validate a vector for a claim that may not exist yet: non-empty,
+    /// finite and matching the tenant's established dimension.
+    fn validate_vector_for_tenant(
+        &self,
+        tenant_id: &str,
+        vector: &[f32],
+    ) -> Result<(), StoreError> {
+        validate_vector(vector)?;
+        if let Some(existing_dim) = self.tenant_vector_dims.get(tenant_id)
+            && *existing_dim != vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "vector dimension mismatch for tenant '{tenant_id}': expected {existing_dim}, got {}",
+                vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Run `apply` against the in-memory state with disk writes deferred,
+    /// then replay them onto redb. A disk failure drops the handle and
+    /// marks the disk `Unavailable` (the WAL is the source of truth) and is
+    /// reported as `Ok(Some(reason))`.
+    fn apply_with_deferred_disk<F>(&mut self, apply: F) -> Result<Option<String>, StoreError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), StoreError>,
+    {
+        let disk = self.disk.take();
+        let previous_staging = self.staged_disk_ops.replace(Vec::new());
+        let result = apply(self);
+        let ops = self.staged_disk_ops.take().unwrap_or_default();
+        self.staged_disk_ops = previous_staging;
+        self.disk = disk;
+        let mut disk_failure = None;
+        if let Some(disk) = self.disk.clone()
+            && let Err(reason) = disk.write_ops(&ops)
+        {
+            self.disk = None;
+            self.disk_status = disk::DiskStatus::Unavailable {
+                reason: reason.clone(),
+            };
+            disk_failure = Some(reason);
+        }
+        result.map(|()| disk_failure)
+    }
+
+    /// Atomically ingest one bundle (claim, evidence, edges and optional
+    /// vector) as a single WAL commit group (DATA-10).
+    ///
+    /// Everything is validated first; the WAL group (`begin` marker, the
+    /// records, closing commit marker) is appended next and rolled back on
+    /// failure; only then is the in-memory state (and redb) updated. A
+    /// crash inside the group leaves a torn group that replay discards, so
+    /// a partial bundle can never be observed. Nothing is written when the
+    /// bundle is already fully applied (an idempotent retry).
+    pub fn ingest_atomic_persistent(
+        &mut self,
+        wal: &mut FileWal,
+        claim: Claim,
+        evidence: Vec<Evidence>,
+        edges: Vec<ClaimEdge>,
+        vector: Option<Vec<f32>>,
+        ts_unix_ms: u64,
+    ) -> Result<AtomicIngestOutcome, StoreError> {
+        let Some(prepared) =
+            self.prepare_atomic_ingest(claim, evidence, edges, vector, ts_unix_ms)?
+        else {
+            return Ok(AtomicIngestOutcome {
+                applied: false,
+                disk_error: None,
+            });
+        };
+        wal.append_group_lines(prepared.wal_lines())?;
+        self.apply_prepared_ingest(prepared)
+    }
+
+    /// First half of [`InMemoryStore::ingest_atomic_persistent`]: validates
+    /// the bundle against the current state and encodes its WAL commit group
+    /// without writing anything. Returns `None` when the bundle is already
+    /// fully applied (an idempotent retry needs no WAL write).
+    pub fn prepare_atomic_ingest(
+        &self,
+        claim: Claim,
+        evidence: Vec<Evidence>,
+        edges: Vec<ClaimEdge>,
+        vector: Option<Vec<f32>>,
+        ts_unix_ms: u64,
+    ) -> Result<Option<PreparedIngest>, StoreError> {
+        self.validate_bundle(&claim, &evidence, &edges)?;
+        if let Some(values) = vector.as_deref() {
+            self.validate_vector_for_tenant(&claim.tenant_id, values)?;
+        }
+        if self.bundle_already_applied(&claim, &evidence, &edges, vector.as_deref()) {
+            return Ok(None);
+        }
+
+        let claim_id = claim.claim_id.clone();
+        let mut records = Vec::with_capacity(evidence.len() + edges.len() + 4);
+        records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{GROUP_BEGIN_PREFIX}{claim_id}"),
+            batch_size: 0,
+            ts_unix_ms,
+            claim_ids: Vec::new(),
+        }));
+        records.push(PersistedRecord::Claim(claim.clone()));
+        records.extend(evidence.iter().cloned().map(PersistedRecord::Evidence));
+        records.extend(edges.iter().cloned().map(PersistedRecord::Edge));
+        if let Some(values) = vector.as_ref() {
+            records.push(PersistedRecord::ClaimVector(ClaimVectorRecord {
+                claim_id: claim_id.clone(),
+                values: values.clone(),
+            }));
+        }
+        records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
+            commit_id: format!("{SINGLE_TX_PREFIX}{claim_id}"),
+            batch_size: 1,
+            ts_unix_ms,
+            claim_ids: vec![claim_id],
+        }));
+        let wal_lines = records.iter().map(record_to_line).collect();
+        Ok(Some(PreparedIngest {
+            claim,
+            evidence,
+            edges,
+            vector,
+            wal_lines,
+        }))
+    }
+
+    /// Second half of [`InMemoryStore::ingest_atomic_persistent`]: applies a
+    /// prepared bundle to memory (and redb) after its WAL lines are durable.
+    /// Callers must apply prepared ingests in WAL order and must not let a
+    /// conflicting write (same claim, edge target or a first vector for the
+    /// tenant) reach the store between prepare and apply.
+    pub fn apply_prepared_ingest(
+        &mut self,
+        prepared: PreparedIngest,
+    ) -> Result<AtomicIngestOutcome, StoreError> {
+        let PreparedIngest {
+            claim,
+            evidence,
+            edges,
+            vector,
+            ..
+        } = prepared;
+        let claim_id = claim.claim_id.clone();
+        let disk_error = self.apply_with_deferred_disk(|store| {
+            store.apply_bundle(claim, evidence, edges)?;
+            if let Some(values) = vector {
+                store.apply_claim_vector(&claim_id, values)?;
+            }
+            Ok(())
+        })?;
+        Ok(AtomicIngestOutcome {
+            applied: true,
+            disk_error,
+        })
+    }
+
+    /// The vector dimension established for `tenant_id`, if any.
+    pub fn tenant_vector_dim(&self, tenant_id: &str) -> Option<usize> {
+        self.tenant_vector_dims.get(tenant_id).copied()
+    }
+
     pub fn ingest_bundle_persistent_with_policy(
         &mut self,
         wal: &mut FileWal,
@@ -383,17 +1145,11 @@ impl InMemoryStore {
         claim_id: &str,
         vector: Vec<f32>,
     ) -> Result<(), StoreError> {
-        validate_vector(&vector)?;
+        // Validate (claim exists, finite, dimension) BEFORE the WAL append
+        // so a rejected request can never poison replay (DATA-03).
+        self.validate_claim_vector(claim_id, &vector)?;
         wal.append_claim_vector(claim_id, &vector)?;
         self.apply_claim_vector(claim_id, vector)
-    }
-
-    pub fn checkpoint_and_compact(
-        &self,
-        wal: &mut FileWal,
-    ) -> Result<WalCheckpointStats, StoreError> {
-        let records = self.snapshot_records();
-        wal.compact_with_snapshot(&records)
     }
 
     pub fn observe_batch_commit(
@@ -417,6 +1173,176 @@ impl InMemoryStore {
 
     pub fn apply_persisted_record_line(&mut self, line: &str) -> Result<(), StoreError> {
         self.apply_persisted_record(line_to_record(line)?)
+    }
+
+    /// Applies one replicated line the way lenient WAL replay would: a legacy
+    /// record that cannot be parsed or validated, a poisoned vector, and a
+    /// record depending on a skipped legacy claim are skipped (`Ok(false)`)
+    /// instead of failing, so a follower converges to the leader's lenient
+    /// replay state rather than wedging. Everything else behaves like
+    /// [`InMemoryStore::apply_persisted_record_line`]; `Ok(true)` means the
+    /// line was applied.
+    pub fn apply_persisted_record_line_lenient(&mut self, line: &str) -> Result<bool, StoreError> {
+        let kind = line.split('\t').next().unwrap_or_default();
+        let legacy = matches!(kind, "C" | "E" | "G" | "V" | "B");
+        let record = match line_to_record(line) {
+            Ok(record) => record,
+            Err(err) => {
+                if !legacy {
+                    return Err(err);
+                }
+                eprintln!("warning: replication skipping unreadable legacy record: {err:?}");
+                if kind == "C"
+                    && let Some(id) = line.split('\t').nth(1)
+                    && let Ok(id) = wal::unescape_field(id)
+                {
+                    self.replica_skipped_claims.insert(id);
+                }
+                return Ok(false);
+            }
+        };
+        let depends = match &record {
+            PersistedRecord::Evidence(e) => self.replica_skipped_claims.contains(&e.claim_id),
+            PersistedRecord::Edge(e) => {
+                self.replica_skipped_claims.contains(&e.from_claim_id)
+                    || self.replica_skipped_claims.contains(&e.to_claim_id)
+            }
+            PersistedRecord::ClaimVector(v) => self.replica_skipped_claims.contains(&v.claim_id),
+            PersistedRecord::Claim(_)
+            | PersistedRecord::BatchCommit(_)
+            | PersistedRecord::Tombstone(_) => false,
+        };
+        if depends {
+            return Ok(false);
+        }
+        if let PersistedRecord::ClaimVector(v) = &record
+            && let Err(
+                StoreError::InvalidVector(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::Validation(_),
+            ) = self.validate_claim_vector(&v.claim_id, &v.values)
+        {
+            eprintln!(
+                "warning: replication skipping poisoned vector for '{}'",
+                v.claim_id
+            );
+            return Ok(false);
+        }
+        let claim_id = match &record {
+            PersistedRecord::Claim(c) => Some(c.claim_id.clone()),
+            _ => None,
+        };
+        let known_claim = claim_id
+            .as_ref()
+            .is_some_and(|id| self.claims.contains_key(id));
+        match self.apply_persisted_record(record) {
+            Ok(()) => {
+                if let Some(id) = claim_id {
+                    self.replica_skipped_claims.remove(&id);
+                }
+                Ok(true)
+            }
+            Err(
+                err @ (StoreError::Validation(_)
+                | StoreError::MissingClaim(_)
+                | StoreError::InvalidVector(_)),
+            ) if legacy => {
+                eprintln!(
+                    "warning: replication skipping legacy record that fails validation: {err:?}"
+                );
+                if let Some(id) = claim_id
+                    && !known_claim
+                {
+                    self.replica_skipped_claims.insert(id);
+                }
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Applies a run of replicated lines (one delta frame) to this store in
+    /// place: [`Self::apply_replicated_group`] for the whole run, then
+    /// [`Self::finish_replicated_batch`]. See those for the failure
+    /// contract.
+    pub fn apply_replicated_lines(
+        &mut self,
+        lines: &[String],
+        keep_wal_events: bool,
+    ) -> Result<ReplicatedApply, StoreError> {
+        let mut batch = ReplicatedBatch::default();
+        self.apply_replicated_group(lines, keep_wal_events, &mut batch)?;
+        Ok(self.finish_replicated_batch(batch))
+    }
+
+    /// Applies replicated lines in place, each the way
+    /// [`Self::apply_persisted_record_line_lenient`] does, and collects
+    /// their redb writes in `batch` instead of writing them.
+    ///
+    /// Unlike staging on [`Self::clone_detached`] this costs time and memory
+    /// proportional to the lines, not to the store. Every line is parsed
+    /// before anything is applied, so a run with an unreadable record is
+    /// rejected untouched. A record that parses but cannot be applied (the
+    /// follower diverged from the leader) fails the call after a prefix of
+    /// the run was applied in memory; the caller must then drop `batch` and
+    /// rebuild its state (a follower resyncs).
+    ///
+    /// With `keep_wal_events == false` the in-memory event ring is left as
+    /// it was (the retrieval follower does not serve the event stream).
+    pub fn apply_replicated_group(
+        &mut self,
+        lines: &[String],
+        keep_wal_events: bool,
+        batch: &mut ReplicatedBatch,
+    ) -> Result<(), StoreError> {
+        for line in lines {
+            wal::check_replicated_line(line)?;
+        }
+        let saved_ring = (!keep_wal_events).then(|| std::mem::take(&mut self.wal));
+        let disk = self.disk.take();
+        let previous_staging = self.staged_disk_ops.replace(std::mem::take(&mut batch.ops));
+        let result = (|| {
+            for line in lines {
+                if self.apply_persisted_record_line_lenient(line)? {
+                    batch.applied += 1;
+                } else {
+                    batch.skipped += 1;
+                }
+            }
+            Ok::<(), StoreError>(())
+        })();
+        batch.ops = self.staged_disk_ops.take().unwrap_or_default();
+        self.staged_disk_ops = previous_staging;
+        self.disk = disk;
+        if let Some(mut ring) = saved_ring {
+            ring.total = ring.total.max(self.wal.total);
+            self.wal = ring;
+        }
+        result
+    }
+
+    /// Writes the redb mutations collected in `batch` in one transaction (a
+    /// store without a disk keeps them for its own staging, if any). A
+    /// failed write detaches the disk and marks it unavailable; the WAL
+    /// stays the source of truth.
+    pub fn finish_replicated_batch(&mut self, batch: ReplicatedBatch) -> ReplicatedApply {
+        let mut outcome = ReplicatedApply {
+            applied: batch.applied,
+            skipped: batch.skipped,
+            disk_error: None,
+        };
+        if let Some(disk) = self.disk.clone() {
+            if let Err(reason) = disk.write_ops(&batch.ops) {
+                self.disk = None;
+                self.disk_status = disk::DiskStatus::Unavailable {
+                    reason: reason.clone(),
+                };
+                outcome.disk_error = Some(reason);
+            }
+        } else if let Some(buffer) = self.staged_disk_ops.as_mut() {
+            buffer.extend(batch.ops);
+        }
+        outcome
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {
@@ -482,6 +1408,32 @@ impl InMemoryStore {
         self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
     }
 
+    /// Like [`Self::retrieve_with_time_range_query_vector_and_allowed_claim_ids`]
+    /// but also returns the number of candidates scanned, so callers do not
+    /// need a second candidate pass just to report the count.
+    pub fn retrieve_with_candidate_count_query_vector_and_allowed_claim_ids(
+        &self,
+        req: &RetrievalRequest,
+        from_unix: Option<i64>,
+        to_unix: Option<i64>,
+        query_vector: Option<&[f32]>,
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> (Vec<RetrievalResult>, usize) {
+        let candidates = self.candidate_claim_ids(
+            &req.tenant_id,
+            &req.query,
+            (from_unix, to_unix),
+            query_vector,
+            req.top_k,
+            allowed_claim_ids,
+        );
+        let candidate_count = candidates.ids.len();
+        (
+            self.score_and_rank_candidate_claim_ids(req, query_vector, candidates),
+            candidate_count,
+        )
+    }
+
     pub fn retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
         &self,
         req: &RetrievalRequest,
@@ -491,25 +1443,23 @@ impl InMemoryStore {
         candidate_claim_ids: &HashSet<String>,
         allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Vec<RetrievalResult> {
-        let mut candidates: Vec<String> = candidate_claim_ids
-            .iter()
-            .filter_map(|claim_id| {
-                let claim = self.claims.get(claim_id)?;
-                if claim.tenant_id != req.tenant_id {
-                    return None;
-                }
-                if !claim_matches_time_range(claim, from_unix, to_unix) {
-                    return None;
-                }
-                if let Some(allowed_ids) = allowed_claim_ids
-                    && !allowed_ids.contains(claim_id.as_str())
-                {
-                    return None;
-                }
-                Some(claim_id.clone())
-            })
-            .collect();
-        candidates.sort_unstable();
+        // The explicit set (the segment base plus the WAL delta) only
+        // narrows the pool; which claims of the pool are candidates follows
+        // the same relevance rule as every other retrieve path (see
+        // `candidate_claim_ids`), so an answer never depends on whether a
+        // segment directory is configured.
+        let pool: HashSet<String> = match allowed_claim_ids {
+            Some(allowed) => candidate_claim_ids.intersection(allowed).cloned().collect(),
+            None => candidate_claim_ids.clone(),
+        };
+        let candidates = self.candidate_claim_ids(
+            &req.tenant_id,
+            &req.query,
+            (from_unix, to_unix),
+            query_vector,
+            req.top_k,
+            Some(&pool),
+        );
         self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
     }
 
@@ -517,10 +1467,33 @@ impl InMemoryStore {
         &self,
         req: &RetrievalRequest,
         query_vector: Option<&[f32]>,
-        candidates: Vec<String>,
+        candidates: Candidates,
     ) -> Vec<RetrievalResult> {
+        // DATA-05: a malformed query vector (non-finite, zero norm, wrong
+        // dimension) must not silently degrade into NaN scores or a
+        // cross-dimension scan. Callers wanting a precise error use
+        // `validate_query_vector`.
+        if let Some(vector) = query_vector
+            && self.validate_query_vector(&req.tenant_id, vector).is_err()
+        {
+            return Vec::new();
+        }
+        let Candidates {
+            ids: candidates,
+            query_terms,
+        } = candidates;
         let mut ranked: Vec<RetrievalResult> = Vec::new();
-        let bm25_context = self.bm25_context_for_tenant(&req.tenant_id, &req.query);
+
+        // BM25 of every candidate (zero when it shares no query term), and
+        // the query's BM25 upper bound that maps it into [0, 1).
+        let text_index = self.text_indexes.get(&req.tenant_id);
+        let bm25_max = text_index
+            .map(|index| index.max_score(&query_terms))
+            .unwrap_or(0.0);
+        let bm25: Vec<f64> = match text_index {
+            Some(index) => index.score_many(&query_terms, &candidates),
+            None => vec![0.0; candidates.len()],
+        };
         let dense_similarities = query_vector.map(|vector| {
             let candidate_vectors: Vec<(String, &[f32])> = candidates
                 .iter()
@@ -537,34 +1510,61 @@ impl InMemoryStore {
                 .into_iter()
                 .collect::<HashMap<String, f32>>()
         });
-
-        for claim_id in candidates {
-            let Some(claim) = self.claims.get(&claim_id) else {
+        for (position, claim_id) in candidates.iter().enumerate() {
+            let Some(claim) = self.claims.get(claim_id) else {
                 continue;
             };
 
-            let evidence = self
+            // Borrow, never clone, on the scoring path (PERF-02).
+            let evidence: &[Evidence] = self
                 .evidence_by_claim
                 .get(&claim.claim_id)
-                .cloned()
-                .unwrap_or_default();
-            let edges = self
-                .edges_by_claim
-                .get(&claim.claim_id)
-                .cloned()
-                .unwrap_or_default();
-            let edge_summary = summarize_edges(&edges);
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
 
-            let supports = evidence
-                .iter()
-                .filter(|e| matches!(e.stance, Stance::Supports))
-                .count()
-                + edge_summary.supports;
-            let contradicts = evidence
-                .iter()
-                .filter(|e| matches!(e.stance, Stance::Contradicts))
-                .count()
-                + edge_summary.contradicts;
+            // IDX-05: an edge `from --supports--> to` supports the TARGET
+            // claim. Only edges pointing at this claim count, both
+            // endpoints must exist in this claim's tenant, and
+            // self-edges are ignored.
+            let edge_summary = summarize_incoming_edges(
+                self.edges_in
+                    .get(&claim.claim_id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|edge| {
+                        edge.from_claim_id != claim.claim_id
+                            && self
+                                .claims
+                                .get(&edge.from_claim_id)
+                                .is_some_and(|source| source.tenant_id == claim.tenant_id)
+                    })
+                    .map(|edge| (edge.from_claim_id.as_str(), &edge.relation, edge.strength)),
+            );
+
+            let mut evidence_supports = 0usize;
+            let mut evidence_contradicts = 0usize;
+            let mut support_sources: HashSet<&str> = HashSet::new();
+            let mut contradiction_sources: HashSet<&str> = HashSet::new();
+            for evd in evidence {
+                match evd.stance {
+                    Stance::Supports => {
+                        evidence_supports += 1;
+                        support_sources.insert(evd.source_id.as_str());
+                    }
+                    Stance::Contradicts => {
+                        evidence_contradicts += 1;
+                        contradiction_sources.insert(evd.source_id.as_str());
+                    }
+                    Stance::Neutral => {}
+                }
+            }
+            // Reported counts are raw (evidence rows + distinct edge
+            // sources); the ranking signal counts each distinct
+            // source_id once and is saturated inside `ranking`.
+            let supports = evidence_supports + edge_summary.supports;
+            let contradicts = evidence_contradicts + edge_summary.contradicts;
+            let signal_supports = support_sources.len() + edge_summary.supports;
+            let signal_contradicts = contradiction_sources.len() + edge_summary.contradicts;
 
             if matches!(req.stance_mode, StanceMode::SupportOnly) && contradicts > supports {
                 continue;
@@ -576,53 +1576,26 @@ impl InMemoryStore {
                 evidence.iter().map(|e| e.source_quality).sum::<f32>() / evidence.len() as f32
             };
 
-            let bm25 = self
-                .claim_tokens
-                .get(&claim.claim_id)
-                .map(|tokens| {
-                    bm25_score(
-                        &req.query,
-                        tokens,
-                        &bm25_context.doc_freq,
-                        bm25_context.total_docs,
-                        bm25_context.avg_doc_len,
-                    )
-                })
-                .unwrap_or(0.0);
-
-            let dense_similarity = dense_similarities
-                .as_ref()
-                .and_then(|scores| scores.get(&claim.claim_id))
-                .copied()
-                .unwrap_or(0.0);
-
-            let lexical_score = score_claim_with_bm25(
-                &req.query,
+            let priors = prior_score(
                 claim,
                 avg_quality,
                 RankSignals {
-                    supports,
-                    contradicts,
+                    supports: signal_supports,
+                    contradicts: signal_contradicts,
                 },
-                bm25,
             );
-
-            let score = if query_vector.is_some() {
-                // Semantic-first retrieval: dense similarity is the
-                // PRIMARY signal (cosine in [-1, 1] -> mapped to
-                // [0, 1] via the embedding backend). The lexical/BM25
-                // score is a small tie-breaker when dense similarities
-                // are tied. This replaces the historical 0.35 additive
-                // weight with semantic-primary scoring, which is the
-                // right default when the caller explicitly provides
-                // a query vector.
-                let dense_primary = (dense_similarity + 1.0) * 0.5;
-                dense_primary + (lexical_score * 0.1)
+            let text_relevance = if bm25_max > 0.0 {
+                (bm25[position] / bm25_max) as f32
             } else {
-                // Lexical-only retrieval: historical behavior
-                // (dense_similarity is 0.0 when no query_vector).
-                lexical_score + (dense_similarity * 0.35)
+                0.0
             };
+            let relevance = if let Some(scores) = dense_similarities.as_ref() {
+                // Hybrid: calibrated blend, vector similarity first.
+                hybrid_relevance(scores.get(claim_id).copied(), text_relevance)
+            } else {
+                lexical_relevance(text_relevance)
+            };
+            let score = ranked_score(relevance, priors);
 
             let citations = evidence
                 .iter()
@@ -653,12 +1626,30 @@ impl InMemoryStore {
         ranked.into_iter().take(req.top_k).collect()
     }
 
+    /// All claims of a tenant, sorted by `claim_id`. Uses the per-tenant
+    /// claim-id index, so the cost is O(tenant), not O(all claims)
+    /// (PERF-02).
     pub fn claims_for_tenant(&self, tenant_id: &str) -> Vec<Claim> {
-        self.claims
-            .values()
-            .filter(|claim| claim.tenant_id == tenant_id)
-            .cloned()
-            .collect()
+        let mut out: Vec<Claim> = self.tenant_claims(tenant_id).cloned().collect();
+        out.sort_unstable_by(|a, b| a.claim_id.cmp(&b.claim_id));
+        out
+    }
+
+    /// Number of claims owned by `tenant_id` (O(1)).
+    pub fn claim_count_for_tenant(&self, tenant_id: &str) -> usize {
+        self.tenant_claim_ids
+            .get(tenant_id)
+            .map(HashSet::len)
+            .unwrap_or(0)
+    }
+
+    /// Borrowing iterator over a tenant's claims, in unspecified order.
+    fn tenant_claims<'a>(&'a self, tenant_id: &str) -> impl Iterator<Item = &'a Claim> + 'a {
+        self.tenant_claim_ids
+            .get(tenant_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|claim_id| self.claims.get(claim_id))
     }
 
     pub fn tenant_ids(&self) -> Vec<String> {
@@ -713,6 +1704,14 @@ impl InMemoryStore {
             .unwrap_or_default()
     }
 
+    /// Evidence rows attached to `claim_id`, in stored order.
+    pub fn evidence_for_claim(&self, claim_id: &str) -> Vec<Evidence> {
+        self.evidence_by_claim
+            .get(claim_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn claims_for_entity(&self, tenant_id: &str, entity: &str) -> Vec<Claim> {
         let mut out: Vec<Claim> = self
             .claim_ids_for_entity(tenant_id, entity)
@@ -725,9 +1724,9 @@ impl InMemoryStore {
 
     pub fn index_stats(&self) -> StoreIndexStats {
         let inverted_terms = self
-            .inverted_index
+            .text_indexes
             .values()
-            .map(|tenant_index| tenant_index.len())
+            .map(TenantTextIndex::term_count)
             .sum();
         let entity_terms = self
             .entity_index
@@ -739,10 +1738,11 @@ impl InMemoryStore {
             .values()
             .map(|timeline| timeline.len())
             .sum();
-        let ann_vector_buckets = self
-            .ann_vector_graphs
+        let ann_vector_buckets = self.vector_indexes.values().map(|index| index.len()).sum();
+        let vector_index_bytes = self
+            .vector_indexes
             .values()
-            .map(|graph| graph.levels.first().map(|level| level.len()).unwrap_or(0))
+            .map(|index| index.heap_bytes())
             .sum();
         StoreIndexStats {
             tenant_count: self.tenant_claim_ids.len(),
@@ -752,6 +1752,7 @@ impl InMemoryStore {
             entity_terms,
             temporal_buckets,
             ann_vector_buckets,
+            vector_index_bytes,
         }
     }
 
@@ -763,6 +1764,7 @@ impl InMemoryStore {
         to_unix: Option<i64>,
     ) -> usize {
         self.candidate_claim_ids(tenant_id, query, (from_unix, to_unix), None, 5, None)
+            .ids
             .len()
     }
 
@@ -801,6 +1803,7 @@ impl InMemoryStore {
             req.top_k,
             allowed_claim_ids,
         )
+        .ids
         .len()
     }
 
@@ -813,9 +1816,14 @@ impl InMemoryStore {
         if query_vector.is_empty() {
             return 0;
         }
-        let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-        self.vector_candidates(tenant_id, query_vector, vector_top_n)
-            .len()
+        self.vector_candidates(
+            tenant_id,
+            query_vector,
+            candidate_depth(top_k),
+            (None, None),
+            None,
+        )
+        .len()
     }
 
     pub fn ann_vector_top_candidates(
@@ -827,7 +1835,32 @@ impl InMemoryStore {
         if query_vector.is_empty() || top_n == 0 {
             return Vec::new();
         }
-        self.vector_candidates(tenant_id, query_vector, top_n)
+        self.vector_candidates(tenant_id, query_vector, top_n, (None, None), None)
+    }
+
+    /// Like [`Self::ann_vector_top_candidates`] but only claims matching
+    /// `time_range` and (when given) `allowed_claim_ids` are candidates, so
+    /// the result is the `top_n` best of the ALLOWED set rather than the
+    /// allowed part of the global top `top_n`. Small allowed sets are scanned
+    /// exactly (see the strategy note on `vector_candidates`).
+    pub fn ann_vector_top_candidates_filtered(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+        top_n: usize,
+        time_range: (Option<i64>, Option<i64>),
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> Vec<String> {
+        if query_vector.is_empty() || top_n == 0 {
+            return Vec::new();
+        }
+        self.vector_candidates(
+            tenant_id,
+            query_vector,
+            top_n,
+            time_range,
+            allowed_claim_ids,
+        )
     }
 
     pub fn exact_vector_top_candidates(
@@ -836,18 +1869,19 @@ impl InMemoryStore {
         query_vector: &[f32],
         top_n: usize,
     ) -> Vec<String> {
-        if query_vector.is_empty() || top_n == 0 {
+        if top_n == 0 || self.validate_query_vector(tenant_id, query_vector).is_err() {
             return Vec::new();
         }
 
+        // Scan only this tenant's claims (IDX-03), never the global
+        // vector map.
         let candidate_vectors: Vec<(String, &[f32])> = self
-            .claim_vectors
-            .iter()
-            .filter_map(|(claim_id, vector)| {
-                let claim = self.claims.get(claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
-                }
+            .tenant_claim_ids
+            .get(tenant_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|claim_id| {
+                let vector = self.claim_vectors.get(claim_id)?;
                 Some((claim_id.clone(), vector.as_slice()))
             })
             .collect();
@@ -860,8 +1894,29 @@ impl InMemoryStore {
             .collect()
     }
 
+    /// Number of events currently buffered in the in-memory event ring.
+    /// The ring is bounded (see [`DEFAULT_WAL_EVENT_CAPACITY`]), so this
+    /// never exceeds the configured capacity; use
+    /// [`InMemoryStore::wal_events_total`] for the monotonic count.
     pub fn wal_len(&self) -> usize {
-        self.wal.len()
+        self.wal.events.len()
+    }
+
+    /// Monotonic number of events ever applied to this store instance.
+    pub fn wal_events_total(&self) -> u64 {
+        self.wal.total
+    }
+
+    /// Maximum number of events retained in the in-memory ring.
+    pub fn wal_event_capacity(&self) -> usize {
+        self.wal.capacity
+    }
+
+    /// Change the in-memory event ring capacity (0 keeps nothing).
+    /// Shrinking drops the oldest buffered events immediately.
+    pub fn set_wal_event_capacity(&mut self, capacity: usize) {
+        self.wal.capacity = capacity;
+        self.wal.trim();
     }
 
     /// Clear the in-memory WAL event buffer without affecting the
@@ -869,7 +1924,7 @@ impl InMemoryStore {
     /// that apply replicated records to an in-memory store but never
     /// truncate their own WAL file.
     pub fn clear_wal_events(&mut self) {
-        self.wal.clear();
+        self.wal.events.clear();
     }
 
     pub fn claims_len(&self) -> usize {
@@ -930,6 +1985,26 @@ impl InMemoryStore {
         Ok(record_threshold_met || byte_threshold_met)
     }
 
+    /// The claims of `tenant_id` a retrieve scores, sorted by claim id. This
+    /// is the single relevance rule of every retrieve path:
+    ///
+    /// - the `top_k * 20` (clamped to 100..=5000) claims with the highest
+    ///   BM25 for `query` in the tenant's full-text index (see
+    ///   [`text_index`]) are lexical candidates; only claims sharing at least
+    ///   one analysed query term have a BM25 above zero, and the time range
+    ///   and `allowed_claim_ids` are applied before the top is taken;
+    /// - with a valid `query_vector`, the same number of nearest claims are
+    ///   vector candidates;
+    /// - nothing else is: a claim with no query term and no vector
+    ///   similarity is never returned, even when fewer than `top_k` claims
+    ///   match. Recency, confidence, source quality and graph signals only
+    ///   rank candidates, they never make a claim one.
+    ///
+    /// A query without any word (empty or punctuation only) puts no lexical
+    /// constraint on the pool: every claim passing the filters is a
+    /// candidate (the HTTP API rejects an empty query).
+    ///
+    /// Time range and `allowed_claim_ids` then restrict the candidates.
     fn candidate_claim_ids(
         &self,
         tenant_id: &str,
@@ -938,100 +2013,158 @@ impl InMemoryStore {
         query_vector: Option<&[f32]>,
         top_k: usize,
         allowed_claim_ids: Option<&HashSet<String>>,
-    ) -> Vec<String> {
+    ) -> Candidates {
         let (from_unix, to_unix) = time_range;
+        let has_time = from_unix.is_some() || to_unix.is_some();
+        let passes = |claim_id: &str| {
+            allowed_claim_ids.is_none_or(|allowed| allowed.contains(claim_id))
+                && (!has_time
+                    || self
+                        .claims
+                        .get(claim_id)
+                        .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix)))
+        };
         let mut candidates: HashSet<String> = HashSet::new();
-        let query_tokens = tokenize(query);
+        let query_terms = analyze_query(query);
+        let top_n = candidate_depth(top_k);
 
-        if query_tokens.is_empty() {
+        if query_terms.is_empty() {
             if let Some(ids) = self.tenant_claim_ids.get(tenant_id) {
-                candidates.extend(ids.iter().cloned());
+                candidates.extend(ids.iter().filter(|id| passes(id)).cloned());
             }
-        } else if let Some(tenant_index) = self.inverted_index.get(tenant_id) {
-            for token in query_tokens {
-                if let Some(ids) = tenant_index.get(&token) {
-                    candidates.extend(ids.iter().cloned());
-                }
-            }
-            if candidates.is_empty()
-                && let Some(ids) = self.tenant_claim_ids.get(tenant_id)
-            {
-                candidates.extend(ids.iter().cloned());
-            }
+        } else if let Some(index) = self.text_indexes.get(tenant_id) {
+            let filter: Option<&dyn Fn(&str) -> bool> = if has_time || allowed_claim_ids.is_some() {
+                Some(&passes)
+            } else {
+                None
+            };
+            candidates.extend(
+                index
+                    .search(&query_terms, top_n, filter)
+                    .into_iter()
+                    .map(|(claim_id, _)| claim_id),
+            );
         }
 
         if let Some(vector) = query_vector {
-            let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-            for claim_id in self.vector_candidates(tenant_id, vector, vector_top_n) {
+            for claim_id in
+                self.vector_candidates(tenant_id, vector, top_n, time_range, allowed_claim_ids)
+            {
                 candidates.insert(claim_id);
             }
         }
 
-        if from_unix.is_some() || to_unix.is_some() {
-            candidates.retain(|claim_id| {
-                self.claims
-                    .get(claim_id)
-                    .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix))
-            });
-        }
-        if let Some(allowed_ids) = allowed_claim_ids {
-            candidates = candidates.intersection(allowed_ids).cloned().collect();
-        }
-
-        let mut out: Vec<String> = candidates
+        let mut ids: Vec<String> = candidates
             .into_iter()
             .filter(|claim_id| {
-                self.claims
-                    .get(claim_id)
-                    .is_some_and(|claim| claim.tenant_id == tenant_id)
+                passes(claim_id)
+                    && self
+                        .claims
+                        .get(claim_id)
+                        .is_some_and(|claim| claim.tenant_id == tenant_id)
             })
             .collect();
-        out.sort_unstable();
-        out
+        ids.sort_unstable();
+        Candidates { ids, query_terms }
     }
 
+    /// Vector candidates for `tenant_id`: the `top_n` claim ids most similar
+    /// to `query_vector`, best first, restricted to claims that match
+    /// `time_range` and (when given) `allowed_claim_ids`.
+    ///
+    /// Invalid (empty, non-finite, zero-norm, wrong-dimension) query vectors
+    /// yield no candidates: never a fallback scan (IDX-03). The search only
+    /// ever touches the tenant's own index.
+    ///
+    /// Strategy (ADR 0003): a tenant at or below the flat threshold is
+    /// scanned exactly. Above it, a filter whose allowed set is no larger
+    /// than the threshold is also scanned exactly (filtered HNSW is slower
+    /// and less exact on small allowed sets); otherwise the HNSW runs with
+    /// the filter as a predicate.
     fn vector_candidates(
         &self,
         tenant_id: &str,
         query_vector: &[f32],
         top_n: usize,
+        time_range: (Option<i64>, Option<i64>),
+        allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Vec<String> {
-        if query_vector.is_empty() {
+        if top_n == 0 || self.validate_query_vector(tenant_id, query_vector).is_err() {
             return Vec::new();
         }
+        let Some(index) = self.vector_indexes.get(tenant_id) else {
+            return Vec::new();
+        };
+        let (from_unix, to_unix) = time_range;
+        let has_time = from_unix.is_some() || to_unix.is_some();
+        let in_range = |claim_id: &str| {
+            !has_time
+                || self
+                    .claims
+                    .get(claim_id)
+                    .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix))
+        };
+        let passes = |claim_id: &str| {
+            allowed_claim_ids.is_none_or(|allowed| allowed.contains(claim_id)) && in_range(claim_id)
+        };
 
-        let mut scoped_ids = self.approximate_vector_candidate_ids(tenant_id, query_vector, top_n);
-        if scoped_ids.is_empty() {
-            scoped_ids = self
-                .claim_vectors
-                .keys()
-                .filter(|claim_id| {
-                    self.claims
-                        .get(*claim_id)
-                        .is_some_and(|claim| claim.tenant_id == tenant_id)
-                })
-                .cloned()
+        if (!has_time && allowed_claim_ids.is_none()) || !index.is_hnsw() {
+            let filter: Option<&dyn Fn(&str) -> bool> = if has_time || allowed_claim_ids.is_some() {
+                Some(&passes)
+            } else {
+                None
+            };
+            return index
+                .search(query_vector, top_n, filter, &self.claim_vectors)
+                .into_iter()
+                .map(|(claim_id, _)| claim_id)
                 .collect();
         }
 
-        let candidate_vectors: Vec<(String, &[f32])> = scoped_ids
-            .into_iter()
-            .filter_map(|claim_id| {
-                let vector = self.claim_vectors.get(&claim_id)?;
-                let claim = self.claims.get(&claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
+        // Large tenant with a filter: size the allowed set first.
+        let limit = self.ann_tuning.flat_threshold;
+        let exact_ids: Option<Vec<&str>> = match allowed_claim_ids {
+            Some(allowed) if allowed.len() <= limit => Some(
+                allowed
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| index.contains(id) && in_range(id))
+                    .collect(),
+            ),
+            Some(_) => None,
+            None => {
+                // Time filter only: count matches, stopping once the set is
+                // too large to scan.
+                let mut matching: Vec<&str> = Vec::new();
+                let mut small = true;
+                for id in self.tenant_claim_ids.get(tenant_id).into_iter().flatten() {
+                    if index.contains(id) && in_range(id) {
+                        if matching.len() == limit {
+                            small = false;
+                            break;
+                        }
+                        matching.push(id.as_str());
+                    }
                 }
-                Some((claim_id, vector.as_slice()))
-            })
-            .collect();
-        let mut scored = self.score_query_candidate_vectors(query_vector, candidate_vectors);
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
+                small.then_some(matching)
+            }
+        };
+        match exact_ids {
+            Some(ids) => exact_top_k(
+                query_vector,
+                ids.into_iter()
+                    .filter_map(|id| self.claim_vectors.get(id).map(|v| (id, v.as_slice()))),
+                top_n,
+            )
             .into_iter()
-            .take(top_n)
-            .map(|(claim_id, _)| claim_id)
-            .collect()
+            .map(|(claim_id, _)| claim_id.to_string())
+            .collect(),
+            None => index
+                .search(query_vector, top_n, Some(&passes), &self.claim_vectors)
+                .into_iter()
+                .map(|(claim_id, _)| claim_id)
+                .collect(),
+        }
     }
 
     fn score_query_candidate_vectors(
@@ -1055,210 +2188,9 @@ impl InMemoryStore {
         score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
     }
 
-    fn approximate_vector_candidate_ids(
-        &self,
-        tenant_id: &str,
-        query_vector: &[f32],
-        top_n: usize,
-    ) -> HashSet<String> {
-        let mut out = HashSet::new();
-        let Some(graph) = self.ann_vector_graphs.get(tenant_id) else {
-            return out;
-        };
-        let Some(entry_point) = graph.entry_point.as_ref() else {
-            return out;
-        };
-        let Some(mut current_score) = self
-            .claim_vectors
-            .get(entry_point)
-            .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
-        else {
-            return out;
-        };
-        let mut current = entry_point.clone();
-
-        let max_level = graph.entry_level.min(ANN_GRAPH_LEVELS.saturating_sub(1));
-        for level in (1..=max_level).rev() {
-            loop {
-                let mut improved = false;
-                let Some(neighbors) = graph.levels[level].get(&current) else {
-                    break;
-                };
-                for neighbor_id in neighbors {
-                    let Some(score) =
-                        self.claim_vectors
-                            .get(neighbor_id)
-                            .and_then(|neighbor_vector| {
-                                cosine_similarity(query_vector, neighbor_vector)
-                            })
-                    else {
-                        continue;
-                    };
-                    if score > current_score {
-                        current = neighbor_id.clone();
-                        current_score = score;
-                        improved = true;
-                    }
-                }
-                if !improved {
-                    break;
-                }
-            }
-        }
-
-        let mut frontier = std::collections::BinaryHeap::new();
-        let mut visited = HashSet::new();
-        if visited.insert(current.clone()) {
-            frontier.push(ScoredNode {
-                claim_id: current,
-                score: current_score,
-            });
-        }
-        if visited.insert(entry_point.clone())
-            && let Some(score) = self
-                .claim_vectors
-                .get(entry_point)
-                .and_then(|entry_vector| cosine_similarity(query_vector, entry_vector))
-        {
-            frontier.push(ScoredNode {
-                claim_id: entry_point.clone(),
-                score,
-            });
-        }
-
-        let expansion_budget = top_n
-            .saturating_mul(self.ann_tuning.search_expansion_factor.max(1))
-            .clamp(
-                self.ann_tuning.search_expansion_min.max(1),
-                self.ann_tuning
-                    .search_expansion_max
-                    .max(self.ann_tuning.search_expansion_min.max(1)),
-            );
-        let mut expanded = 0usize;
-
-        while let Some(node) = frontier.pop() {
-            out.insert(node.claim_id.clone());
-            expanded += 1;
-            if expanded >= expansion_budget {
-                break;
-            }
-
-            let Some(neighbors) = graph.levels[0].get(&node.claim_id) else {
-                continue;
-            };
-            for neighbor_id in neighbors {
-                if !visited.insert(neighbor_id.clone()) {
-                    continue;
-                }
-                let Some(neighbor_vector) = self.claim_vectors.get(neighbor_id) else {
-                    continue;
-                };
-                let Some(score) = cosine_similarity(query_vector, neighbor_vector) else {
-                    continue;
-                };
-                frontier.push(ScoredNode {
-                    claim_id: neighbor_id.clone(),
-                    score,
-                });
-            }
-        }
-
-        out
-    }
-
-    fn bm25_context_for_tenant(&self, tenant_id: &str, query: &str) -> Bm25Context {
-        let total_docs = self
-            .tenant_claim_ids
-            .get(tenant_id)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-        if total_docs == 0 {
-            return Bm25Context::default();
-        }
-
-        let mut total_len = 0usize;
-        for claim_id in self.tenant_claim_ids.get(tenant_id).into_iter().flatten() {
-            total_len += self
-                .claim_tokens
-                .get(claim_id)
-                .map(|tokens| tokens.len())
-                .unwrap_or(0);
-        }
-        let avg_doc_len = (total_len as f32 / total_docs as f32).max(1.0);
-
-        let mut doc_freq = HashMap::new();
-        if let Some(index) = self.inverted_index.get(tenant_id) {
-            for token in tokenize(query) {
-                doc_freq.insert(
-                    token.clone(),
-                    index.get(&token).map(|ids| ids.len()).unwrap_or(0),
-                );
-            }
-        }
-
-        Bm25Context {
-            doc_freq,
-            total_docs,
-            avg_doc_len,
-        }
-    }
-
+    #[cfg(test)]
     fn snapshot_records(&self) -> Vec<PersistedRecord> {
-        let mut claim_ids: Vec<String> = self.claims.keys().cloned().collect();
-        claim_ids.sort_unstable();
-
-        let mut records = Vec::new();
-        for claim_id in &claim_ids {
-            if let Some(claim) = self.claims.get(claim_id) {
-                records.push(PersistedRecord::Claim(claim.clone()));
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(values) = self.claim_vectors.get(claim_id) {
-                records.push(PersistedRecord::ClaimVector(ClaimVectorRecord {
-                    claim_id: claim_id.clone(),
-                    values: values.clone(),
-                }));
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(evidence) = self.evidence_by_claim.get(claim_id) {
-                let mut evidence = evidence.clone();
-                evidence.sort_by(|a, b| a.evidence_id.cmp(&b.evidence_id));
-                for evd in evidence {
-                    records.push(PersistedRecord::Evidence(evd));
-                }
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(edges) = self.edges_by_claim.get(claim_id) {
-                let mut edges = edges.clone();
-                edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
-                for edge in edges {
-                    records.push(PersistedRecord::Edge(edge));
-                }
-            }
-        }
-
-        let mut commit_ids: Vec<&String> = self.batch_commits.keys().collect();
-        commit_ids.sort_unstable();
-        for commit_id in commit_ids {
-            let metadata = self
-                .batch_commits
-                .get(commit_id)
-                .expect("batch commit should exist");
-            records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
-                commit_id: metadata.commit_id.clone(),
-                batch_size: metadata.batch_size,
-                ts_unix_ms: metadata.ts_unix_ms,
-                claim_ids: metadata.claim_ids.clone(),
-            }));
-        }
-
-        records
+        self.snapshot_state().records().collect()
     }
 
     fn validate_bundle(
@@ -1267,15 +2199,7 @@ impl InMemoryStore {
         evidence: &[Evidence],
         edges: &[ClaimEdge],
     ) -> Result<(), StoreError> {
-        validate_claim(claim)?;
-        if let Some(existing) = self.claims.get(&claim.claim_id)
-            && existing.tenant_id != claim.tenant_id
-        {
-            return Err(StoreError::Conflict(format!(
-                "claim_id '{}' already exists for tenant '{}'",
-                claim.claim_id, existing.tenant_id
-            )));
-        }
+        self.check_claim_applicable(claim)?;
         for evd in evidence {
             validate_evidence(evd)?;
             if evd.claim_id != claim.claim_id {
@@ -1287,6 +2211,78 @@ impl InMemoryStore {
             if edge.from_claim_id != claim.claim_id {
                 return Err(StoreError::MissingClaim(edge.from_claim_id.clone()));
             }
+        }
+        Ok(())
+    }
+
+    /// Validate a claim-vector upsert against the current state without
+    /// mutating anything. Callers that append to a WAL MUST call this
+    /// (or go through `upsert_claim_vector_persistent`) BEFORE the
+    /// append so a rejected request never reaches the log (DATA-03).
+    ///
+    /// Rejects: empty or non-finite vectors, an unknown claim, and a
+    /// dimension that differs from the tenant's established dimension.
+    pub fn validate_claim_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), StoreError> {
+        validate_vector(vector)?;
+        let claim = self
+            .claims
+            .get(claim_id)
+            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
+        if let Some(existing_dim) = self.tenant_vector_dims.get(&claim.tenant_id)
+            && *existing_dim != vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "vector dimension mismatch for tenant '{}': expected {}, got {}",
+                claim.tenant_id,
+                existing_dim,
+                vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a query vector for `tenant_id` (DATA-05, IDX-03): it must
+    /// be non-empty, finite, have a non-zero norm, and match the tenant's
+    /// vector dimension when the tenant has vectors. Retrieval entry
+    /// points return an empty result for an invalid query vector; call
+    /// this first to surface a precise error to the client.
+    pub fn validate_query_vector(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+    ) -> Result<(), StoreError> {
+        validate_vector(query_vector)?;
+        let norm_sq: f64 = query_vector
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum();
+        if norm_sq <= 0.0 {
+            return Err(StoreError::InvalidVector(
+                "query vector must have a non-zero norm".to_string(),
+            ));
+        }
+        if let Some(dim) = self.tenant_vector_dims.get(tenant_id)
+            && *dim != query_vector.len()
+        {
+            return Err(StoreError::InvalidVector(format!(
+                "query vector dimension mismatch: expected {}, got {}",
+                dim,
+                query_vector.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Claim-level checks shared by the pre-WAL validation and the apply
+    /// path: field validation plus the cross-tenant `claim_id` conflict.
+    /// The conflict error is deliberately generic (SEC-18): it must not
+    /// reveal which other tenant owns the id.
+    fn check_claim_applicable(&self, claim: &Claim) -> Result<(), StoreError> {
+        validate_claim(claim)?;
+        if let Some(existing) = self.claims.get(&claim.claim_id)
+            && existing.tenant_id != claim.tenant_id
+        {
+            return Err(StoreError::Conflict("claim_id already exists".to_string()));
         }
         Ok(())
     }
@@ -1316,17 +2312,33 @@ impl InMemoryStore {
                 self.apply_claim_vector(&record.claim_id, record.values)
             }
             PersistedRecord::BatchCommit(record) => self.apply_batch_commit_record(record),
+            PersistedRecord::Tombstone(record) => {
+                self.apply_tombstone(&record.tombstone).map(|_| ())
+            }
+        }
+    }
+
+    /// Mirror one mutation to the disk store. With a disk attached the
+    /// write happens immediately (disk BEFORE memory, as before). On a
+    /// detached staged clone the op is only recorded; `commit_staged`
+    /// replays it after the caller's WAL append (DATA-09). With neither,
+    /// this is a no-op.
+    fn mirror_op(&mut self, op: StagedDiskOp) -> Result<(), StoreError> {
+        if let Some(disk) = self.disk.as_ref() {
+            disk.write_ops(std::slice::from_ref(&op))
+                .map_err(StoreError::Io)
+        } else {
+            if let Some(buffer) = self.staged_disk_ops.as_mut() {
+                buffer.push(op);
+            }
+            Ok(())
         }
     }
 
     fn apply_claim(&mut self, claim: Claim) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state. If the disk
-        // write fails, the in-memory state is unchanged.
-        if let Some(disk) = self.disk.as_ref() {
-            disk.put_claim(&claim).map_err(StoreError::Io)?;
-            disk.add_claim_to_tenant(&claim.tenant_id, &claim.claim_id)
-                .map_err(StoreError::Io)?;
-        }
+        // Validate first so a rejected claim never touches disk.
+        self.check_claim_applicable(&claim)?;
+        self.mirror_op(StagedDiskOp::Claim(claim.clone()))?;
         self.apply_claim_inner(claim)
     }
 
@@ -1338,15 +2350,12 @@ impl InMemoryStore {
     }
 
     fn apply_claim_inner(&mut self, claim: Claim) -> Result<(), StoreError> {
-        validate_claim(&claim)?;
+        self.check_claim_applicable(&claim)?;
         let claim_id = claim.claim_id.clone();
         if let Some(previous) = self.claims.get(&claim_id).cloned() {
-            if previous.tenant_id != claim.tenant_id {
-                return Err(StoreError::Conflict(format!(
-                    "claim_id '{}' already exists for tenant '{}'",
-                    claim_id, previous.tenant_id
-                )));
-            }
+            // Re-upsert: refresh the text-derived indexes only. The
+            // claim's vector and ANN entry are kept (DATA-04); a new
+            // vector replaces them only via an explicit vector upsert.
             self.remove_claim_indexes(&previous);
         }
         self.add_claim_indexes(&claim);
@@ -1355,26 +2364,24 @@ impl InMemoryStore {
         Ok(())
     }
 
-    fn apply_evidence(&mut self, evidence: Evidence) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            // Read the current evidence blob (if any), append the
-            // new evidence, write it back. The on-disk blob is
-            // always a full Vec<Evidence> for the claim, so a single
-            // append + replace keeps the on-disk state consistent.
-            let mut current: Vec<Evidence> = disk
-                .get_evidence_blob(&evidence.claim_id)
-                .map_err(StoreError::Io)?
-                .unwrap_or_default();
-            current.push(evidence.clone());
-            disk.put_evidence_blob(&evidence.claim_id, &current)
-                .map_err(StoreError::Io)?;
+    fn check_evidence_applicable(&self, evidence: &Evidence) -> Result<(), StoreError> {
+        validate_evidence(evidence)?;
+        if !self.claims.contains_key(&evidence.claim_id) {
+            return Err(StoreError::MissingClaim(evidence.claim_id.clone()));
         }
+        Ok(())
+    }
+
+    fn apply_evidence(&mut self, evidence: Evidence) -> Result<(), StoreError> {
+        self.check_evidence_applicable(&evidence)?;
+        self.mirror_op(StagedDiskOp::Evidence(evidence.clone()))?;
         self.apply_evidence_inner(evidence)
     }
 
     /// Apply a pre-built evidence blob to the in-memory state.
-    /// No disk mirror. Used by the bulk-load path.
+    /// No disk mirror. Used by the bulk-load path. Upserts by
+    /// `evidence_id`, so a blob that already contains duplicates (from
+    /// before DATA-01) is collapsed on load.
     pub(crate) fn apply_evidence_blob_for_load(
         &mut self,
         claim_id: &str,
@@ -1385,44 +2392,42 @@ impl InMemoryStore {
         }
         let entry = self
             .evidence_by_claim
-            .entry(claim_id.to_string())
-            .or_default();
+            .get_or_default_mut(claim_id.to_string());
         for evd in evidence {
-            entry.push(evd.clone());
+            upsert_evidence(entry, evd.clone());
         }
         Ok(())
     }
 
     fn apply_evidence_inner(&mut self, evidence: Evidence) -> Result<(), StoreError> {
-        validate_evidence(&evidence)?;
-        if !self.claims.contains_key(&evidence.claim_id) {
-            return Err(StoreError::MissingClaim(evidence.claim_id));
+        self.check_evidence_applicable(&evidence)?;
+        let evidence_id = evidence.evidence_id.clone();
+        upsert_evidence(
+            self.evidence_by_claim
+                .get_or_default_mut(evidence.claim_id.clone()),
+            evidence,
+        );
+        self.wal.push(WalEvent::EvidenceUpsert(evidence_id));
+        Ok(())
+    }
+
+    fn check_edge_applicable(&self, edge: &ClaimEdge) -> Result<(), StoreError> {
+        validate_edge(edge)?;
+        if !self.claims.contains_key(&edge.from_claim_id) {
+            return Err(StoreError::MissingClaim(edge.from_claim_id.clone()));
         }
-        self.evidence_by_claim
-            .entry(evidence.claim_id.clone())
-            .or_default()
-            .push(evidence.clone());
-        self.wal
-            .push(WalEvent::EvidenceUpsert(evidence.evidence_id));
         Ok(())
     }
 
     fn apply_edge(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            let mut current: Vec<ClaimEdge> = disk
-                .get_edge_blob(&edge.from_claim_id)
-                .map_err(StoreError::Io)?
-                .unwrap_or_default();
-            current.push(edge.clone());
-            disk.put_edge_blob(&edge.from_claim_id, &current)
-                .map_err(StoreError::Io)?;
-        }
+        self.check_edge_applicable(&edge)?;
+        self.mirror_op(StagedDiskOp::Edge(edge.clone()))?;
         self.apply_edge_inner(edge)
     }
 
     /// Apply a pre-built edge blob to the in-memory state. No disk
-    /// mirror. Used by the bulk-load path.
+    /// mirror. Used by the bulk-load path. Upserts by
+    /// `(from, to, relation)`.
     pub(crate) fn apply_edge_blob_for_load(
         &mut self,
         from: &str,
@@ -1431,55 +2436,74 @@ impl InMemoryStore {
         if !self.claims.contains_key(from) {
             return Err(StoreError::MissingClaim(from.to_string()));
         }
-        let entry = self.edges_by_claim.entry(from.to_string()).or_default();
         for edge in edges {
-            entry.push(edge.clone());
+            self.upsert_edge_in_memory(edge.clone());
         }
         Ok(())
     }
 
     fn apply_edge_inner(&mut self, edge: ClaimEdge) -> Result<(), StoreError> {
-        validate_edge(&edge)?;
-        if !self.claims.contains_key(&edge.from_claim_id) {
-            return Err(StoreError::MissingClaim(edge.from_claim_id));
-        }
-        self.edges_by_claim
-            .entry(edge.from_claim_id.clone())
-            .or_default()
-            .push(edge.clone());
-        self.wal.push(WalEvent::EdgeUpsert(edge.edge_id));
+        self.check_edge_applicable(&edge)?;
+        let edge_id = edge.edge_id.clone();
+        self.upsert_edge_in_memory(edge);
+        self.wal.push(WalEvent::EdgeUpsert(edge_id));
         Ok(())
     }
 
-    fn apply_claim_vector(&mut self, claim_id: &str, vector: Vec<f32>) -> Result<(), StoreError> {
-        // Resolve the tenant and check the dimension match BEFORE
-        // doing any disk I/O, so we don't write a half-bad state.
-        let claim = self
-            .claims
-            .get(claim_id)
-            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
-        let tenant_id = claim.tenant_id.clone();
-        let new_dim_needed = match self.tenant_vector_dims.get(&tenant_id) {
-            Some(existing_dim) if *existing_dim != vector.len() => {
-                return Err(StoreError::InvalidVector(format!(
-                    "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id,
-                    existing_dim,
-                    vector.len()
-                )));
+    /// Upsert by `(from, to, relation)` and keep the reverse index in
+    /// sync. Re-applying the same edge never adds a second copy.
+    fn upsert_edge_in_memory(&mut self, edge: ClaimEdge) {
+        let list = self
+            .edges_by_claim
+            .get_or_default_mut(edge.from_claim_id.clone());
+        let existing = list
+            .iter()
+            .position(|e| e.to_claim_id == edge.to_claim_id && e.relation == edge.relation);
+        match existing {
+            Some(pos) => {
+                if let Some(incoming) = self.edges_in.get_mut(&edge.to_claim_id)
+                    && let Some(entry) = incoming.iter_mut().find(|i| {
+                        i.from_claim_id == edge.from_claim_id && i.relation == edge.relation
+                    })
+                {
+                    entry.strength = edge.strength;
+                }
+                list[pos] = edge;
             }
-            None => Some(vector.len()),
-            _ => None,
-        };
-
-        // Write to disk BEFORE mutating in-memory state.
-        if let Some(disk) = self.disk.as_ref() {
-            disk.put_vector(claim_id, &vector).map_err(StoreError::Io)?;
-            if let Some(dim) = new_dim_needed {
-                disk.put_tenant_dim(&tenant_id, dim)
-                    .map_err(StoreError::Io)?;
+            None => {
+                self.edges_in
+                    .entry(edge.to_claim_id.clone())
+                    .or_default()
+                    .push(IncomingEdge {
+                        from_claim_id: edge.from_claim_id.clone(),
+                        relation: edge.relation.clone(),
+                        strength: edge.strength,
+                    });
+                list.push(edge);
             }
         }
+    }
+
+    fn apply_claim_vector(&mut self, claim_id: &str, vector: Vec<f32>) -> Result<(), StoreError> {
+        // Validate (claim exists, finite, dimension) BEFORE any disk I/O
+        // so we never write a half-bad state.
+        self.validate_claim_vector(claim_id, &vector)?;
+        let tenant_id = self
+            .claims
+            .get(claim_id)
+            .map(|claim| claim.tenant_id.clone())
+            .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
+        let new_dim = if self.tenant_vector_dims.contains_key(&tenant_id) {
+            None
+        } else {
+            Some(vector.len())
+        };
+        self.mirror_op(StagedDiskOp::Vector {
+            claim_id: claim_id.to_string(),
+            tenant_id,
+            vector: vector.clone(),
+            new_dim,
+        })?;
         self.apply_claim_vector_inner(claim_id, vector)
     }
 
@@ -1498,37 +2522,22 @@ impl InMemoryStore {
         claim_id: &str,
         vector: Vec<f32>,
     ) -> Result<(), StoreError> {
-        validate_vector(&vector)?;
-        let claim = self
+        self.validate_claim_vector(claim_id, &vector)?;
+        let tenant_id = self
             .claims
             .get(claim_id)
+            .map(|claim| claim.tenant_id.clone())
             .ok_or_else(|| StoreError::MissingClaim(claim_id.to_string()))?;
-        let tenant_id = claim.tenant_id.clone();
-        match self.tenant_vector_dims.get(&tenant_id) {
-            Some(existing_dim) if *existing_dim != vector.len() => {
-                return Err(StoreError::InvalidVector(format!(
-                    "vector dimension mismatch for tenant '{}': expected {}, got {}",
-                    tenant_id,
-                    existing_dim,
-                    vector.len()
-                )));
-            }
-            None => {
-                self.tenant_vector_dims
-                    .insert(tenant_id.clone(), vector.len());
-            }
-            _ => {}
-        }
+        self.tenant_vector_dims
+            .entry(tenant_id.clone())
+            .or_insert(vector.len());
 
         if self.claim_vectors.contains_key(claim_id) {
             self.remove_vector_index_entry(&tenant_id, claim_id);
         }
 
+        let stored_vector = vector.clone();
         self.claim_vectors.insert(claim_id.to_string(), vector);
-        let stored_vector =
-            self.claim_vectors.get(claim_id).cloned().ok_or_else(|| {
-                StoreError::InvalidVector("failed to store claim vector".to_string())
-            })?;
         self.add_vector_index_entry(&tenant_id, claim_id, &stored_vector);
         self.wal
             .push(WalEvent::ClaimVectorUpsert(claim_id.to_string()));
@@ -1536,6 +2545,10 @@ impl InMemoryStore {
     }
 
     fn apply_batch_commit_record(&mut self, record: BatchCommitRecord) -> Result<(), StoreError> {
+        // Group delimiters carry no batch metadata of their own.
+        if is_group_marker_commit_id(&record.commit_id) {
+            return Ok(());
+        }
         // Compute the metadata the same way the inner function will,
         // so we can mirror to disk before mutating in-memory state.
         let payload_fingerprint =
@@ -1558,9 +2571,7 @@ impl InMemoryStore {
             claim_ids: record.claim_ids.clone(),
             payload_fingerprint: payload_fingerprint.clone(),
         };
-        if let Some(disk) = self.disk.as_ref() {
-            disk.put_batch_commit(&metadata).map_err(StoreError::Io)?;
-        }
+        self.mirror_op(StagedDiskOp::BatchCommit(metadata.clone()))?;
         self.batch_commits
             .insert(record.commit_id.clone(), metadata);
         self.wal.push(WalEvent::BatchCommit(record.commit_id));
@@ -1603,217 +2614,62 @@ impl InMemoryStore {
     }
 
     fn add_vector_index_entry(&mut self, tenant_id: &str, claim_id: &str, vector: &[f32]) {
-        let node_level = self.assign_ann_level(claim_id);
-        {
-            let graph = self
-                .ann_vector_graphs
-                .entry(tenant_id.to_string())
-                .or_default();
-            graph.node_levels.insert(claim_id.to_string(), node_level);
-            for level in 0..=node_level {
-                graph.levels[level].entry(claim_id.to_string()).or_default();
-            }
-            if graph.entry_point.is_none() {
-                graph.entry_point = Some(claim_id.to_string());
-                graph.entry_level = node_level;
-            }
+        if self.defer_vector_index {
+            return;
         }
-
-        for level in (0..=node_level).rev() {
-            let max_neighbors = self.ann_level_max_neighbors(level);
-            let neighbor_ids =
-                self.select_ann_neighbors(tenant_id, claim_id, vector, level, max_neighbors);
-            for neighbor_id in neighbor_ids {
-                self.connect_ann_nodes(tenant_id, level, claim_id, &neighbor_id, max_neighbors);
-            }
-        }
-
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id)
-            && node_level > graph.entry_level
-        {
-            graph.entry_point = Some(claim_id.to_string());
-            graph.entry_level = node_level;
-        }
+        let tuning = &self.ann_tuning;
+        let index = self
+            .vector_indexes
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| TenantVectorIndex::new(vector.len(), tuning.clone()));
+        // A vector that cannot be indexed (zero norm) stays stored but is
+        // unreachable by similarity search, as it never had a cosine score.
+        let _ = index.upsert(claim_id, vector);
     }
 
     fn remove_vector_index_entry(&mut self, tenant_id: &str, claim_id: &str) {
-        let mut remove_graph = false;
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id) {
-            graph.node_levels.remove(claim_id);
-            for level in &mut graph.levels {
-                level.remove(claim_id);
-                for neighbor_ids in level.values_mut() {
-                    neighbor_ids.retain(|id| id != claim_id);
-                }
-            }
-            if graph.entry_point.as_deref() == Some(claim_id) {
-                if let Some((next_id, next_level)) = graph
-                    .node_levels
-                    .iter()
-                    .max_by_key(|(_, level)| **level)
-                    .map(|(id, level)| (id.clone(), *level))
-                {
-                    graph.entry_point = Some(next_id);
-                    graph.entry_level = next_level;
-                } else {
-                    graph.entry_point = None;
-                    graph.entry_level = 0;
-                }
-            }
-            remove_graph = graph.node_levels.is_empty();
+        if self.defer_vector_index {
+            return;
         }
-        if remove_graph {
-            self.ann_vector_graphs.remove(tenant_id);
+        if let Some(index) = self.vector_indexes.get_mut(tenant_id) {
+            index.remove(claim_id);
+            if index.is_empty() {
+                self.vector_indexes.remove(tenant_id);
+            }
         }
     }
 
-    fn select_ann_neighbors(
-        &self,
-        tenant_id: &str,
-        claim_id: &str,
-        vector: &[f32],
-        level: usize,
-        max_neighbors: usize,
-    ) -> Vec<String> {
-        let mut scored: Vec<(String, f32)> = self
-            .claim_vectors
-            .iter()
-            .filter_map(|(other_claim_id, other_vector)| {
-                if other_claim_id == claim_id {
-                    return None;
-                }
-                let claim = self.claims.get(other_claim_id)?;
-                if claim.tenant_id != tenant_id {
-                    return None;
-                }
-                if !self.ann_node_is_visible_at_level(tenant_id, other_claim_id, level) {
-                    return None;
-                }
-                let sim = cosine_similarity(vector, other_vector)?;
-                Some((other_claim_id.clone(), sim))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        scored
-            .into_iter()
-            .take(max_neighbors)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
-    fn connect_ann_nodes(
-        &mut self,
-        tenant_id: &str,
-        level: usize,
-        claim_id: &str,
-        neighbor_id: &str,
-        max_neighbors: usize,
-    ) {
-        if claim_id == neighbor_id {
-            return;
+    /// Rebuild every tenant's vector index from `claim_vectors`, building
+    /// large tenants multi-threaded. Used when the tuning changes and at the
+    /// end of a bulk load; replaces the incremental per-vector inserts.
+    pub(crate) fn rebuild_vector_indexes(&mut self) {
+        self.defer_vector_index = false;
+        let mut by_tenant: HashMap<&str, Vec<(&str, &[f32])>> = HashMap::new();
+        for (claim_id, vector) in self.claim_vectors.iter() {
+            if let Some(claim) = self.claims.get(claim_id) {
+                by_tenant
+                    .entry(claim.tenant_id.as_str())
+                    .or_default()
+                    .push((claim_id.as_str(), vector.as_slice()));
+            }
         }
-        if level >= ANN_GRAPH_LEVELS {
-            return;
-        }
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id) {
-            if graph
-                .node_levels
-                .get(claim_id)
-                .is_none_or(|node_level| *node_level < level)
-                || graph
-                    .node_levels
-                    .get(neighbor_id)
-                    .is_none_or(|node_level| *node_level < level)
+        let mut indexes = HashMap::with_capacity(by_tenant.len());
+        for (tenant_id, mut items) in by_tenant {
+            // Deterministic insertion order regardless of hash iteration.
+            items.sort_unstable_by_key(|(claim_id, _)| *claim_id);
+            let dim = self
+                .tenant_vector_dims
+                .get(tenant_id)
+                .copied()
+                .unwrap_or_else(|| items[0].1.len());
+            let built = TenantVectorIndex::build(dim, self.ann_tuning.clone(), items.into_iter());
+            if let Ok(index) = built
+                && !index.is_empty()
             {
-                return;
-            }
-            let claim_neighbors = graph.levels[level].entry(claim_id.to_string()).or_default();
-            if !claim_neighbors.iter().any(|id| id == neighbor_id) {
-                claim_neighbors.push(neighbor_id.to_string());
-            }
-
-            let neighbor_neighbors = graph.levels[level]
-                .entry(neighbor_id.to_string())
-                .or_default();
-            if !neighbor_neighbors.iter().any(|id| id == claim_id) {
-                neighbor_neighbors.push(claim_id.to_string());
+                indexes.insert(tenant_id.to_string(), index);
             }
         }
-        self.prune_ann_neighbors(tenant_id, level, claim_id, max_neighbors);
-        self.prune_ann_neighbors(tenant_id, level, neighbor_id, max_neighbors);
-    }
-
-    fn prune_ann_neighbors(
-        &mut self,
-        tenant_id: &str,
-        level: usize,
-        claim_id: &str,
-        max_neighbors: usize,
-    ) {
-        if level >= ANN_GRAPH_LEVELS {
-            return;
-        }
-        let Some(node_vector) = self.claim_vectors.get(claim_id).cloned() else {
-            return;
-        };
-        let Some(candidate_neighbors) = self
-            .ann_vector_graphs
-            .get(tenant_id)
-            .and_then(|graph| graph.levels[level].get(claim_id))
-            .cloned()
-        else {
-            return;
-        };
-        if candidate_neighbors.len() <= max_neighbors {
-            return;
-        }
-
-        let mut scored: Vec<(String, f32)> = candidate_neighbors
-            .into_iter()
-            .filter_map(|neighbor_id| {
-                let neighbor_vector = self.claim_vectors.get(&neighbor_id)?;
-                let similarity = cosine_similarity(&node_vector, neighbor_vector)?;
-                Some((neighbor_id, similarity))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let keep: Vec<String> = scored
-            .into_iter()
-            .take(max_neighbors)
-            .map(|(neighbor_id, _)| neighbor_id)
-            .collect();
-
-        if let Some(graph) = self.ann_vector_graphs.get_mut(tenant_id)
-            && let Some(neighbors) = graph.levels[level].get_mut(claim_id)
-        {
-            neighbors.clear();
-            neighbors.extend(keep);
-        }
-    }
-
-    fn ann_node_is_visible_at_level(&self, tenant_id: &str, claim_id: &str, level: usize) -> bool {
-        self.ann_vector_graphs
-            .get(tenant_id)
-            .and_then(|graph| graph.node_levels.get(claim_id))
-            .is_some_and(|node_level| *node_level >= level)
-    }
-
-    fn ann_level_max_neighbors(&self, level: usize) -> usize {
-        if level == 0 {
-            self.ann_tuning.max_neighbors_base.max(1)
-        } else {
-            self.ann_tuning.max_neighbors_upper.max(1)
-        }
-    }
-
-    fn assign_ann_level(&self, claim_id: &str) -> usize {
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        claim_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        let level = (hash.trailing_zeros() as usize) / 4;
-        level.min(ANN_GRAPH_LEVELS.saturating_sub(1))
+        self.vector_indexes = indexes;
     }
 
     fn add_claim_indexes(&mut self, claim: &Claim) {
@@ -1822,22 +2678,10 @@ impl InMemoryStore {
             .or_default()
             .insert(claim.claim_id.clone());
 
-        let tokens = tokenize(&claim.canonical_text);
-        self.claim_tokens
-            .insert(claim.claim_id.clone(), tokens.clone());
-        let token_index = self
-            .inverted_index
+        self.text_indexes
             .entry(claim.tenant_id.clone())
-            .or_default();
-        let mut seen = HashSet::new();
-        for token in tokens {
-            if seen.insert(token.clone()) {
-                token_index
-                    .entry(token)
-                    .or_default()
-                    .insert(claim.claim_id.clone());
-            }
-        }
+            .or_default()
+            .insert(&claim.claim_id, &claim.canonical_text);
 
         let entity_index = self
             .entity_index
@@ -1881,11 +2725,8 @@ impl InMemoryStore {
     }
 
     fn remove_claim_indexes(&mut self, claim: &Claim) {
-        if let Some(previous) = self.claim_vectors.remove(&claim.claim_id) {
-            let _ = previous;
-            self.remove_vector_index_entry(&claim.tenant_id, &claim.claim_id);
-        }
-
+        // Vectors and ANN entries are intentionally NOT touched here
+        // (DATA-04): re-upserting a claim keeps its vector.
         let mut drop_tenant_claim_ids = false;
         if let Some(ids) = self.tenant_claim_ids.get_mut(&claim.tenant_id) {
             ids.remove(&claim.claim_id);
@@ -1895,32 +2736,13 @@ impl InMemoryStore {
             self.tenant_claim_ids.remove(&claim.tenant_id);
         }
 
-        if let Some(tokens) = self.claim_tokens.remove(&claim.claim_id)
-            && let Some(token_index) = self.inverted_index.get_mut(&claim.tenant_id)
-        {
-            let mut seen = HashSet::new();
-            let mut remove_tokens = Vec::new();
-            for token in tokens {
-                if !seen.insert(token.clone()) {
-                    continue;
-                }
-                if let Some(ids) = token_index.get_mut(&token) {
-                    ids.remove(&claim.claim_id);
-                    if ids.is_empty() {
-                        remove_tokens.push(token);
-                    }
-                }
-            }
-            for token in remove_tokens {
-                token_index.remove(&token);
-            }
+        let mut drop_text_index = false;
+        if let Some(index) = self.text_indexes.get_mut(&claim.tenant_id) {
+            index.remove(&claim.claim_id, &claim.canonical_text);
+            drop_text_index = index.is_empty();
         }
-        if self
-            .inverted_index
-            .get(&claim.tenant_id)
-            .is_some_and(|index| index.is_empty())
-        {
-            self.inverted_index.remove(&claim.tenant_id);
+        if drop_text_index {
+            self.text_indexes.remove(&claim.tenant_id);
         }
 
         let mut remove_entity_index = false;
@@ -1986,15 +2808,6 @@ impl InMemoryStore {
         if remove_temporal_index {
             self.temporal_index.remove(&claim.tenant_id);
         }
-
-        let has_remaining_vectors_for_tenant = self.claim_vectors.keys().any(|claim_id| {
-            self.claims
-                .get(claim_id)
-                .is_some_and(|stored_claim| stored_claim.tenant_id == claim.tenant_id)
-        });
-        if !has_remaining_vectors_for_tenant {
-            self.tenant_vector_dims.remove(&claim.tenant_id);
-        }
     }
 }
 
@@ -2049,6 +2862,12 @@ fn score_query_candidate_vectors_cpu(
             Some((claim_id.clone(), score))
         })
         .collect()
+}
+
+/// How many lexical and how many vector candidates a retrieve of `top_k`
+/// considers: `top_k * 20`, clamped to 100..=5000.
+pub fn candidate_depth(top_k: usize) -> usize {
+    top_k.saturating_mul(20).clamp(100, 5000)
 }
 
 fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {
@@ -2116,24 +2935,68 @@ fn validate_vector(vector: &[f32]) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Replace the evidence with the same `evidence_id`, or append it
+/// (DATA-01). Returns `true` when a new entry was appended.
+fn upsert_evidence(list: &mut Vec<Evidence>, evidence: Evidence) -> bool {
+    match list
+        .iter_mut()
+        .find(|existing| existing.evidence_id == evidence.evidence_id)
+    {
+        Some(slot) => {
+            *slot = evidence;
+            false
+        }
+        None => {
+            list.push(evidence);
+            true
+        }
+    }
+}
+
+/// Replace the edge with the same `(from, to, relation)`, or append it
+/// (DATA-01). Returns `true` when a new entry was appended.
+fn upsert_edge(list: &mut Vec<ClaimEdge>, edge: ClaimEdge) -> bool {
+    match list.iter_mut().find(|existing| {
+        existing.from_claim_id == edge.from_claim_id
+            && existing.to_claim_id == edge.to_claim_id
+            && existing.relation == edge.relation
+    }) {
+        Some(slot) => {
+            *slot = edge;
+            false
+        }
+        None => {
+            list.push(edge);
+            true
+        }
+    }
+}
+
+/// Cosine similarity accumulated in `f64` and clamped to `[-1, 1]`
+/// (DATA-05). Returns `None` for mismatched/empty inputs, zero norms, or
+/// any non-finite intermediate, so callers can never see a NaN score.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
         return None;
     }
-    let mut dot = 0.0f32;
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom <= f32::EPSILON {
-        None
-    } else {
-        Some(dot / denom)
+    if !denom.is_finite() || denom <= f64::MIN_POSITIVE {
+        return None;
     }
+    let cosine = dot / denom;
+    if !cosine.is_finite() {
+        return None;
+    }
+    Some(cosine.clamp(-1.0, 1.0) as f32)
 }
 
 #[cfg(test)]
@@ -3796,57 +4659,66 @@ mod tests {
     }
 
     #[test]
-    fn ann_graph_populates_multiple_levels_for_tenant() {
-        let mut store = InMemoryStore::new();
-        let mut high_level_claim_id = None;
+    fn tenant_vector_index_tracks_every_vector_and_converts_to_hnsw() {
+        let tuning = AnnTuningConfig {
+            flat_threshold: 64,
+            ..AnnTuningConfig::default()
+        };
+        let mut store = InMemoryStore::new_with_ann_tuning(tuning);
 
         for i in 0..256 {
             let claim_id = format!("c-level-{i}");
-            let level = store.assign_ann_level(&claim_id);
-            if level > 0 {
-                high_level_claim_id = Some(claim_id.clone());
-            }
-
             store
-                .ingest_bundle(
-                    claim(&claim_id, "ANN graph level population"),
-                    vec![],
-                    vec![],
-                )
+                .ingest_bundle(claim(&claim_id, "vector index population"), vec![], vec![])
                 .unwrap();
-            let vector = vec![
-                0.1 + (i as f32 * 0.001),
-                0.2,
-                0.3,
-                if level > 0 { 0.99 } else { 0.4 },
-            ];
+            let vector = vec![0.1 + (i as f32 * 0.001), 0.2, 0.3, 0.4 + (i % 7) as f32];
             store.upsert_claim_vector(&claim_id, vector).unwrap();
+            let index = store
+                .vector_indexes
+                .get("tenant-a")
+                .expect("tenant vector index should exist");
+            assert_eq!(index.len(), i + 1);
+            assert_eq!(index.is_hnsw(), i + 1 > 64, "after {} vectors", i + 1);
         }
-
-        let high_level_claim_id =
-            high_level_claim_id.expect("expected at least one claim to land in an upper ANN level");
-        let graph = store
-            .ann_vector_graphs
-            .get("tenant-a")
-            .expect("tenant ANN graph should exist");
-
-        assert_eq!(graph.levels[0].len(), 256);
-        assert!(!graph.levels[1].is_empty());
-        assert!(graph.entry_level >= 1);
-        assert!(graph.levels[graph.entry_level].contains_key(&high_level_claim_id));
+        let stats = store.index_stats();
+        assert_eq!(stats.ann_vector_buckets, 256);
+        assert!(stats.vector_index_bytes > 0);
     }
 
     #[test]
     fn store_ann_tuning_can_be_overridden() {
         let tuning = AnnTuningConfig {
-            max_neighbors_base: 8,
-            max_neighbors_upper: 4,
-            search_expansion_factor: 9,
-            search_expansion_min: 32,
-            search_expansion_max: 2048,
+            connectivity: 8,
+            expansion_add: 64,
+            expansion_search: 32,
+            flat_threshold: 1000,
+            rerank: 20,
         };
         let store = InMemoryStore::new_with_ann_tuning(tuning.clone());
         assert_eq!(store.ann_tuning(), &tuning);
+    }
+
+    #[test]
+    fn set_ann_tuning_rebuilds_existing_indexes() {
+        let mut store = InMemoryStore::new();
+        for i in 0..100 {
+            let claim_id = format!("c-{i}");
+            store
+                .ingest_bundle(claim(&claim_id, "rebuild me"), vec![], vec![])
+                .unwrap();
+            store
+                .upsert_claim_vector(&claim_id, vec![1.0, i as f32 * 0.01, 0.5, 0.25])
+                .unwrap();
+        }
+        assert!(!store.vector_indexes["tenant-a"].is_hnsw());
+        store.set_ann_tuning(AnnTuningConfig {
+            flat_threshold: 10,
+            ..AnnTuningConfig::default()
+        });
+        assert!(store.vector_indexes["tenant-a"].is_hnsw());
+        assert_eq!(store.vector_indexes["tenant-a"].len(), 100);
+        let top = store.ann_vector_top_candidates("tenant-a", &[1.0, 0.0, 0.5, 0.25], 1);
+        assert_eq!(top, vec!["c-0".to_string()]);
     }
 
     #[test]
@@ -3903,6 +4775,20 @@ mod tests {
     }
 
     #[test]
+    fn cosine_similarity_is_clamped_finite_and_rejects_degenerate_input() {
+        // f32 accumulation would overflow to inf/NaN here.
+        let huge = [3.0e38f32, 3.0e38, 3.0e38];
+        let one = cosine_similarity(&huge, &huge).expect("finite result");
+        assert!((-1.0..=1.0).contains(&one));
+        assert!((one - 1.0).abs() < 1e-6);
+        let opposite = [-3.0e38f32, -3.0e38, -3.0e38];
+        assert!((cosine_similarity(&huge, &opposite).unwrap() + 1.0).abs() < 1e-6);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 0.0]), None);
+        assert_eq!(cosine_similarity(&[f32::NAN, 1.0], &[1.0, 1.0]), None);
+    }
+
+    #[test]
     fn claim_id_reuse_across_tenants_is_rejected() {
         let mut store = InMemoryStore::new();
         store
@@ -3922,8 +4808,9 @@ mod tests {
             .expect_err("cross-tenant claim_id reuse should be rejected");
         match err {
             StoreError::Conflict(message) => {
-                assert!(message.contains("c-tenant-collision"));
-                assert!(message.contains("tenant-a"));
+                // SEC-18: the error must not reveal the owning tenant.
+                assert_eq!(message, "claim_id already exists");
+                assert!(!message.contains("tenant-a"));
             }
             other => panic!("expected Conflict, got {other:?}"),
         }

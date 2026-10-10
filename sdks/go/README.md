@@ -1,13 +1,13 @@
 # dash-go
 
-An idiomatic Go client for the [DASH](https://github.com/dash-retrieval/dash)
+An idiomatic Go client for the [DASH](https://github.com/BHAWESHBHASKAR/DASH)
 retrieval engine. DASH serves an OpenAI-compatible `/v1/embeddings`
 endpoint and a native `/v1/retrieve` endpoint that returns structured
 **Claim + Evidence + Contradiction** results — the differentiator that
 makes it a real retrieval engine, not a vector store.
 
 ```bash
-go get github.com/anomalyco/dash-go
+go get github.com/BHAWESHBHASKAR/DASH/sdks/go
 ```
 
 ## 5-minute quickstart
@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/anomalyco/dash-go"
+	"github.com/BHAWESHBHASKAR/DASH/sdks/go"
 )
 
 func main() {
@@ -54,7 +54,7 @@ it at DASH with `dash.NewOpenAICompatibleConfig`:
 ```go
 import (
 	openai "github.com/openai/openai-go"
-	"github.com/anomalyco/dash-go"
+	"github.com/BHAWESHBHASKAR/DASH/sdks/go"
 )
 
 cfg := dash.NewOpenAICompatibleConfig("http://localhost:8080", "not-required-for-local")
@@ -140,7 +140,7 @@ override.
 ```go
 import (
 	"errors"
-	"github.com/anomalyco/dash-go"
+	"github.com/BHAWESHBHASKAR/DASH/sdks/go"
 )
 
 client := dash.New("https://dash.example.com",
@@ -185,6 +185,18 @@ type DashError interface {
 also check the underlying network error (for example to test
 `net.Error.Timeout()`).
 
+## Deletes (0.3.0)
+
+```go
+c := dash.New("http://localhost:8080", dash.WithIngestionBaseURL("http://localhost:8081"))
+_, err := c.DeleteClaim(ctx, "tenant-a", "claim-1")   // claim, vector, evidence, edges
+_, err = c.DeleteEvidence(ctx, "tenant-a", "ev-1")    // every evidence row with this id
+res, err := c.DeleteTenant(ctx, "tenant-a")           // erase the tenant (admin role)
+fmt.Println(res.Deleted, res.ClaimsDeleted)
+```
+
+Without an ingestion URL the delete methods return `dash.ErrNoIngestionURL`. Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ## Why a Go SDK for DASH?
 
 DASH already speaks the OpenAI wire format, so most users can use
@@ -199,6 +211,21 @@ need a typed, first-class client:
   `DashAPIError`) instead of inspecting `*http.Response` by hand.
 - `context.Context` on every call for cancellation and timeouts.
 
+## Retrieve options (0.2.0)
+
+`retrieve` now sends and decodes the full server contract
+(`services/retrieval/src/transport/payload.rs`): `QueryEmbedding`, `EntityFilters`, `EmbeddingIDFilters`, `TimeRange` (`FromUnix` / `ToUnix`), `ReadConsistency`, `ReturnGraph` and `StanceMode`.
+Responses expose the optional `claim_confidence`, `contradiction_risk`,
+`graph`, `read_policy`, `read_quorum_met` and `serving_replica` fields
+(absent or `null` values decode as `nil`). The default `top_k` is now
+5 (the server default) instead of 10.
+
 ## License
 
 Apache-2.0.
+
+## Module path and version
+
+The module path is `github.com/BHAWESHBHASKAR/DASH/sdks/go` (the package
+name remains `dash`). Because the module lives in a subdirectory, release
+tags use the form `sdks/go/v0.2.0`. Current version: 0.2.0.

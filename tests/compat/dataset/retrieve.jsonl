@@ -1,0 +1,11 @@
+{"body": {"query": "Company X acquired Company Y", "query_embedding": [0.9917, 0.6155, -0.1508, -0.6516, -0.4323, 0.4169, 1.329, 1.6894], "tenant_id": "tenant-a", "top_k": 5}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "revenue", "query_embedding": [-0.2555, -0.8162, -0.6835, 0.1178, 1.057, 1.4989, 1.1849, 0.4282], "stance_mode": "support_only", "tenant_id": "tenant-a", "top_k": 3}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "merger regulators", "query_embedding": [-0.9258, -0.1794, 0.7784, 1.2985, 1.063, 0.3257, -0.2797, -0.2193], "return_graph": true, "tenant_id": "tenant-a", "top_k": 10}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"entity_filters": ["Company Y"], "query": "Company Y", "query_embedding": [-0.149, 0.782, 1.1968, 0.8573, 0.096, -0.4352, -0.2587, 0.5676], "tenant_id": "tenant-a", "top_k": 5}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "events in 2025", "query_embedding": [0.7985, 0.1248, -0.5677, -0.6792, -0.0496, 0.9202, 1.572, 1.4883], "tenant_id": "tenant-a", "time_range": {"from_unix": 1735689600, "to_unix": 1767225600}, "top_k": 5}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "Batch claim logistics", "query_embedding": [-0.9097, -0.7908, 0.0022, 0.9449, 1.3995, 1.0978, 0.3436, -0.2165], "tenant_id": "tenant-a", "top_k": 4}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "Widget Co fact", "query_embedding": [0.5522, 1.0963, 0.8865, 0.1571, -0.4641, -0.4314, 0.3062, 1.2661], "tenant_id": "tenant_b", "top_k": 4}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "Company X acquired Company Y in 2025", "tenant_id": "tenant-a", "top_k": 5}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "café 東京 unicode", "tenant_id": "tenant-a", "top_k": 3}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "Analysts expect shares", "stance_mode": "support_only", "tenant_id": "tenant-a", "top_k": 3}, "method": "POST", "path": "/v1/retrieve"}
+{"body": {"query": "office in Berlin", "tenant_id": "tenant-hash", "top_k": 2}, "method": "POST", "path": "/v1/retrieve"}

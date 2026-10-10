@@ -1,6 +1,6 @@
 # Benchmarks
 
-DASH ships a `perf_bench` micro-benchmark binary at `tests/benchmarks/src/perf_bench.rs`. The full source-of-truth document is in the source tree at `docs/benchmarks/performance.md`; this page summarizes the methodology and the latest published numbers so the public docs site is self-contained.
+DASH ships a `perf_bench` micro-benchmark binary at `tests/benchmarks/src/perf_bench.rs`. The full source-of-truth document is in the source tree at `docs/benchmarks/performance.md`; this page summarizes the methodology. It does not carry result numbers (see below).
 
 ## Methodology
 
@@ -12,7 +12,7 @@ The benchmark suite measures the six hot paths in the DASH retrieval pipeline:
 | `ingest_throughput_sequential.persistent_wal` | `ingest_bundle_persistent` + `FileWal::append_*` + `sync_data` | empty → 110    |        100 |
 | `retrieve_throughput_lexical`        | `InMemoryStore::retrieve` (no query vector)                            | 10 000 claims  |      1 000 |
 | `retrieve_throughput_semantic`        | `InMemoryStore::retrieve_semantic` (with 768-dim query vector)         | 10 000 + vec   |      1 000 |
-| `ann_search_throughput_at_scale`      | `InMemoryStore::ann_vector_top_candidates` (top-10)                    | 10 000 × 384-d |        500 |
+| `ann_search_throughput_at_scale`      | `InMemoryStore::ann_vector_top_candidates` (top-10; flat/`usearch` HNSW index, reports `build_ms`) | 10 000 × 384-d |        500 |
 | `wal_replay_throughput`               | `FileWal::open` + `load_from_wal_with_stats_and_ann_tuning`            | 1 000 claims   |        100 |
 
 All scenarios are timed with `std::time::Instant` per iteration. The distribution is summarized as p50 / p95 / p99 / min / max / mean microseconds, plus an aggregate throughput in operations per second.
@@ -64,33 +64,28 @@ The output is two-part:
 1. A human-readable per-scenario block on stdout.
 2. A single `BENCH_JSON:` line at the end of the run, with a stable JSON schema (one object per scenario).
 
-## Latest published numbers
+## Published numbers
 
-The latest baseline run was on commit `b3a4f1e` (the v0.1.0 release) on a `c6i.4xlarge` (16 vCPU, 32 GiB RAM, NVMe), single-tenant, single-process. The numbers are **DASH against itself** — there is no Pinecone / Weaviate / Milvus comparison in the current release. The competitor-comparison work is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Acompetitor-bench).
+**There are no verified published numbers.** An earlier version of this page showed a table attributed to commit `b3a4f1e` (a commit that does not exist in this repository) and a `c6i.4xlarge` instance, with latencies that contradict the in-tree document. That table could not be reproduced or traced to a run, and it was removed on 2026-10-09 (register item DOC-05).
 
-| Scenario                                  |     p50 |     p95 |     p99 |    mean | Throughput (ops/sec) |
-| ----------------------------------------- | ------: | ------: | ------: | ------: | -------------------: |
-| `ingest_throughput_sequential.in_memory`  |    1 µs |    8 µs |   14 µs |  1.99 µs |            502 512 |
-| `ingest_throughput_sequential.persistent_wal` |  18 µs |   42 µs |   78 µs |  22.3 µs |             44 843 |
-| `retrieve_throughput_lexical`             |  120 µs |  340 µs |  510 µs |  140 µs |              7 142 |
-| `retrieve_throughput_semantic`            |  210 µs |  580 µs |  890 µs |  240 µs |              4 166 |
-| `ann_search_throughput_at_scale`          |   85 µs |  220 µs |  340 µs |   98 µs |             10 204 |
-| `wal_replay_throughput`                   | 1.2 ms | 1.9 ms | 2.4 ms | 1.3 ms |                769 |
+What exists:
 
-!!! note "Reproducing these numbers"
-    The numbers above are the canonical reference for the v0.1.0 release. Reproducing them requires a `c6i.4xlarge` (or equivalent) and `--release`. The `BENCH_JSON:` line in the run output is the machine-readable form; the table above is the human-readable summary.
+- [`docs/benchmarks/performance.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/benchmarks/performance.md) records one first-run baseline dated 2026-06-15 on an unspecified "Apple M-series" machine. It is a single local run, not repeated, not produced by CI, and not tied to a commit. Use it only to see the shape of the results, not as a performance claim.
+- [`docs/benchmarks/history/`](https://github.com/BHAWESHBHASKAR/DASH/tree/main/docs/benchmarks/history) holds drill and smoke outputs; see the README there.
+
+No comparison against Pinecone, Weaviate, Milvus, Qdrant or Chroma exists. Reproducible benchmark numbers (command, commit, machine description, CI artifact) are planned work (P5/P7 in the master plan); until then do not quote a DASH latency or throughput figure.
 
 ## Where the suite does **not** cover
 
 The current release does **not** benchmark:
 
-- Cross-tenant isolation. The integration tests in `tests/store/` cover the isolation guarantees; the perf suite runs single-tenant.
-- Multi-replica retrieval. The `redb` PR 3 replication path is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Aredb-pr3).
-- ANN sharding. The sharding path is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Ashard-reshard).
+- Cross-tenant isolation. The perf suite runs single-tenant (isolation is covered by unit and integration tests in `pkg/store` and the services, not by this suite).
+- Multi-replica retrieval and replication lag under load.
+- ANN sharding (not implemented).
 - Embedding-provider latency. The `hash` provider is in-process; the `ollama`/`openai` paths add network latency that the suite does not measure.
 - Competitor comparison. Internal baselines only.
 
-These are tracked in the [issue tracker](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Abenchmark).
+ANN recall at scale is not measured by a reproducible job either (register IDX-01).
 
 ## For the source-of-truth doc
 

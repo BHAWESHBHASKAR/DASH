@@ -15,8 +15,21 @@
  *     console.log(response.data[0].embedding.slice(0, 3));
  */
 
+import {
+  MISSING_INGESTION_URL,
+  claimDeletePath,
+  deriveIngestionUrl,
+  evidenceDeletePath,
+  parseDeleteResponse,
+  tenantDeletePath,
+  type DeleteOptions,
+  type DeleteResponse,
+} from './deletes.js';
 import { EmbeddingsService } from './embeddings.js';
+import { DashError } from './errors.js';
 import { RetrieveService } from './retrieve.js';
+import { request as sendRequest, type RequestOptions } from './transport.js';
+import { trimTrailingSlashes } from './url.js';
 
 /** Default per-request timeout, in milliseconds. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -28,6 +41,12 @@ export interface ClientOptions {
    * The trailing slash is optional; the client normalises it.
    */
   baseUrl: string;
+  /**
+   * Root URL of the ingestion service, used by the delete methods. When
+   * omitted it is derived only for the conventional local layout
+   * (`baseUrl` on port 8080 maps to the same host on port 8081).
+   */
+  ingestionBaseUrl?: string;
   /**
    * Optional bearer token. When set, sent as
    * `Authorization: Bearer <api_key>`. When omitted, no auth
@@ -61,6 +80,8 @@ export interface ClientOptions {
 export class DashClient {
   /** Root URL of the DASH service, with any trailing `/` stripped. */
   readonly baseUrl: string;
+  /** Root URL of the ingestion service (deletes), if known. */
+  readonly ingestionBaseUrl?: string;
   /** Bearer token, if configured. */
   readonly apiKey?: string;
   /** Default per-request timeout, in milliseconds. */
@@ -83,7 +104,10 @@ export class DashClient {
       throw new Error('timeoutMs must be positive');
     }
 
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
+    this.baseUrl = trimTrailingSlashes(options.baseUrl);
+    this.ingestionBaseUrl = options.ingestionBaseUrl
+      ? trimTrailingSlashes(options.ingestionBaseUrl)
+      : deriveIngestionUrl(this.baseUrl);
     this.apiKey = options.apiKey;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this._fetchImpl = options.fetch;
@@ -92,6 +116,54 @@ export class DashClient {
       : undefined;
     this.embeddings = new EmbeddingsService(this);
     this.retrieve = new RetrieveService(this);
+  }
+
+  /**
+   * Call `DELETE /v1/claims/{claimId}?tenant_id=...`: remove the claim
+   * with its vector, evidence and every edge from or to it. Needs the
+   * `ingest` role. Idempotent (`deleted: false` when absent).
+   */
+  async deleteClaim(
+    tenantId: string,
+    claimId: string,
+    options: DeleteOptions = {},
+  ): Promise<DeleteResponse> {
+    return this._delete(claimDeletePath(tenantId, claimId), options);
+  }
+
+  /**
+   * Call `DELETE /v1/evidence/{evidenceId}?tenant_id=...`: remove every
+   * evidence row with this id on the tenant's claims. Needs `ingest`.
+   */
+  async deleteEvidence(
+    tenantId: string,
+    evidenceId: string,
+    options: DeleteOptions = {},
+  ): Promise<DeleteResponse> {
+    return this._delete(evidenceDeletePath(tenantId, evidenceId), options);
+  }
+
+  /**
+   * Call `DELETE /v1/tenants/{tenantId}`: erase all of the tenant's
+   * data. Needs the `admin` role for that tenant.
+   */
+  async deleteTenant(tenantId: string, options: DeleteOptions = {}): Promise<DeleteResponse> {
+    return this._delete(tenantDeletePath(tenantId), options);
+  }
+
+  private async _delete(path: string, options: DeleteOptions): Promise<DeleteResponse> {
+    if (!this.ingestionBaseUrl) {
+      throw new DashError(MISSING_INGESTION_URL, 0, 'configuration_error', '');
+    }
+    const opts: RequestOptions = {
+      method: 'DELETE',
+      url: `${this.ingestionBaseUrl}${path}`,
+      headers: this._authHeaders(),
+      fetchImpl: this._fetchImpl,
+      timeoutMs: options.timeoutMs ?? this.timeoutMs,
+    };
+    if (options.signal !== undefined) opts.signal = options.signal;
+    return parseDeleteResponse(await sendRequest<unknown>(opts));
   }
 
   /**
@@ -121,7 +193,7 @@ export class DashClient {
    * request URL.
    */
   _resolvePath(path: string): string {
-    const trimmedBase = this.baseUrl.replace(/\/+$/, '');
+    const trimmedBase = trimTrailingSlashes(this.baseUrl);
     const normalizedPath = path.startsWith('/') ? path : `/${path}`;
     if (trimmedBase.endsWith('/v1') && normalizedPath.startsWith('/v1/')) {
       return `${trimmedBase}${normalizedPath.slice(3)}`;

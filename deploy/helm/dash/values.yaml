@@ -1,34 +1,35 @@
 # Default values for the DASH Helm chart.
-# This is a YAML-formatted file. Override individual values with
-# `helm install ... --set key=value` or via a custom values.yaml:
+# Override individual values with `--set key=value` or a custom values file:
 #   helm install dash ./deploy/helm/dash -f my-values.yaml
 #
-# Full reference is generated from this file by `helm-docs` if
-# available, and is mirrored in README.md.
+# Secrets have NO defaults. `helm template` / `helm install` fail until each
+# one is supplied (--set secret.*) or an existing Secret is referenced
+# (secret.existingSecret.*). See README.md.
 
 # -----------------------------------------------------------------------------
 # Image / registry
 # -----------------------------------------------------------------------------
+# One image per service, named <registry>/<repository>-<service>:<tag>, e.g.
+# ghcr.io/bhaweshbhaskar/dash-retrieval:0.2.0. This matches what release.yml
+# publishes and what the raw manifests in deploy/k8s use.
 image:
-  # Registry shared by both services. Override per service if you
-  # need to mirror to a private registry.
   registry: ghcr.io
   repository: bhaweshbhaskar/dash
-  # Tag is intentionally pinned to chart appVersion; bump together.
+  # Tag is pinned to the chart appVersion; bump together.
   tag: "0.2.0"
   pullPolicy: IfNotPresent
   pullSecrets: []
-  # Per-service image overrides (rarely needed; default derives from
-  # image.registry / image.repository).
+  # Per-service overrides (rarely needed). `repository` here replaces the
+  # whole path after the registry, e.g. "mirror/dash-retrieval".
   retrieval:
-    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/retrieval"
-    tag: ""         # empty -> image.tag
+    repository: ""
+    tag: ""
   ingestion:
-    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/ingestion"
-    tag: ""         # empty -> image.tag
+    repository: ""
+    tag: ""
   controlPlane:
-    repository: ""  # empty -> "ghcr.io/bhaweshbhaskar/dash/control-plane"
-    tag: ""         # empty -> image.tag
+    repository: ""
+    tag: ""
 
 # -----------------------------------------------------------------------------
 # Names
@@ -37,28 +38,84 @@ nameOverride: ""
 fullnameOverride: ""
 
 # -----------------------------------------------------------------------------
-# Namespace handling. The chart does NOT create the namespace by
-# default - `helm install --create-namespace` is the recommended
-# path on production clusters (it preserves any pre-existing RBAC,
-# NetworkPolicies, or labels in the namespace). Set
-# `namespace.create: true` to let the chart render the Namespace
-# resource.
+# Namespace handling. Resources go to the release namespace
+# (`helm install --namespace dash-system`) unless `name` overrides it. The
+# chart does NOT create the namespace by default; `helm install
+# --create-namespace` is the recommended path.
 # -----------------------------------------------------------------------------
 namespace:
-  name: dash-system
+  name: ""
   create: false
 
 # -----------------------------------------------------------------------------
-# Replica counts (also drive the HPA lower bound)
+# Replica counts.
+#
+# Ingestion is the single writer and the control plane uses a file-backed
+# lease, so both are fixed at ONE replica (ingestion runs failover.replicas
+# pods when failover.enabled, of which one writes). Each retrieval
+# replica has its own PVC and follows the single ingestion pod via WAL
+# replication. Scale retrieval manually:
+#   kubectl -n <ns> scale statefulset dash-retrieval --replicas=N
+# (release "dash"; the prefix is <release>-dash when the release name does
+# not contain "dash"). Prefer `--set replicas.retrieval=N` with helm upgrade
+# so the next upgrade does not scale it back.
+# There is no HorizontalPodAutoscaler until the clustering phase.
 # -----------------------------------------------------------------------------
 replicas:
   retrieval: 2
-  ingestion: 2
-  controlPlane: 1  # leader election is file-backed; scale >1 requires a shared ReadWriteMany volume
+
+controlPlane:
+  # The control plane is optional. When enabled it needs secret.controlPlane.token.
+  enabled: true
 
 # -----------------------------------------------------------------------------
-# Common image-pull / runtime labels
+# Automatic failover of the ingestion leader (ADR 0006, docs/operations/
+# failover.md). Off by default: one ingestion pod, as before.
+#
+# When enabled (requires controlPlane.enabled):
+# * the ingestion StatefulSet runs `replicas` pods; the control plane names
+#   the leader (term + lease) and the others follow it over WAL replication;
+# * every ingestion pod's readiness probe is GET /v1/ready/leader, so the
+#   ingestion Service (and the ingress /v1/ingest* routes, and the retrieval
+#   followers' replication source) always point at the current leader only;
+#   followers show as not ready, which is expected;
+# * a headless Service <fullname>-ingestion-peers (publishNotReadyAddresses)
+#   gives every pod a stable DNS name for replication between ingestion pods;
+# * updateStrategy is OnDelete: a rolling update would wait forever for the
+#   followers to become ready. Roll by deleting follower pods one at a time
+#   (wait for each to report replication caught up in /v1/ready), then step
+#   the leader down (POST /v1/control-plane/ingest/step-down) and delete it;
+# * a PodDisruptionBudget lets followers be evicted and blocks evicting the
+#   leader: step it down before draining its node.
+#
+# Turning failover on for an existing release changes the StatefulSet's
+# serviceName, which Kubernetes does not allow in place: delete the
+# StatefulSet with `kubectl delete statefulset <name> --cascade=orphan`
+# first (pods and PVCs stay), then `helm upgrade`.
+#
+# With TLS, the certificate must also name the peer DNS names
+# (*.<fullname>-ingestion-peers.<ns>.svc.cluster.local).
 # -----------------------------------------------------------------------------
+failover:
+  enabled: false
+  replicas: 3
+  # Leader lease and promotion grace (control plane). Writes pause for about
+  # leaseMs + promotionGraceMs + heartbeatIntervalMs when the leader is lost.
+  leaseMs: 5000
+  promotionGraceMs: 1000
+  heartbeatIntervalMs: 1000
+  # Synchronous replication: answer a write only after this many followers
+  # durably applied it. 1 survives the loss of any single node; 0 is
+  # asynchronous (acknowledged writes not yet replicated are lost when the
+  # leader's node is lost).
+  minSyncReplicas: 1
+  syncTimeoutMs: 5000
+  # fail (503, retry) or degrade (200 with commit_status=sync_degraded).
+  syncOnTimeout: fail
+  # Readiness period of the ingestion pods (failure threshold 1): how fast
+  # the ingestion Service follows a leader change.
+  readinessPeriodSeconds: 2
+
 podLabels: {}
 podAnnotations: {}
 
@@ -66,13 +123,8 @@ podAnnotations: {}
 # ServiceAccounts
 # -----------------------------------------------------------------------------
 serviceAccount:
-  # When true, a ServiceAccount is created for each component with
-  # automountServiceAccountToken=false (PSP / PSS-friendly).
   create: true
-  # Annotations applied to each created ServiceAccount (e.g. for
-  # IRSA on EKS, Workload Identity on GKE).
   annotations: {}
-  # Name overrides; empty -> "<fullname>-<component>".
   retrieval:
     name: ""
   ingestion:
@@ -81,13 +133,18 @@ serviceAccount:
     name: ""
 
 # -----------------------------------------------------------------------------
-# Runtime configuration (DASH_*_PERSISTENCE_PATH, embedding provider, etc.)
-# Inlined as a ConfigMap and consumed via envFrom. All keys are
-# optional; remove a key to fall back to the binary's built-in default.
+# Runtime configuration. Rendered into a ConfigMap and consumed via envFrom.
 # -----------------------------------------------------------------------------
 config:
-  logLevel: info
+  logLevel: info            # RUST_LOG filter (add dash_access=debug for one line per request)
+  logFormat: json           # DASH_LOG_FORMAT: json (JSON lines) or text
+  strictSecrets: true       # DASH_STRICT_SECRETS
   embeddingProvider: hash   # one of: hash | openai | ollama
+  # Only used when embeddingProvider is ollama. Enable networkPolicy.ollama
+  # if the server runs inside the cluster.
+  ollamaEndpoint: "http://ollama.ollama.svc.cluster.local:11434"
+  # Mount path of the per-pod PVC. All WAL / redb / segment / audit /
+  # replication-offset paths are derived from it.
   persistencePath: /var/lib/dash
   wal:
     ingestSyncEveryRecords: 1
@@ -96,19 +153,21 @@ config:
     ingestBackgroundFlushOnly: false
     ingestSyncIntervalMs: 1000
   segment:
-    ingestMaintenanceIntervalMs: 0   # 0 = disabled; standalone daemon
+    ingestMaintenanceIntervalMs: 0   # 0 = disabled
   http:
     ingestWorkers: 8
     ingestQueueCapacity: 512
-    ingestTransportRuntime: std
     retrievalWorkers: 8
-    retrievalTransportRuntime: std
+    retrievalQueueCapacity: 512
   bind:
     ingestion: "0.0.0.0:8081"
     retrieval: "0.0.0.0:8080"
     controlPlane: "0.0.0.0:8090"
-
-  # Control-plane leader-election tunables.
+  # Audit logs are written to the persistent volume.
+  audit:
+    enabled: true
+  replication:
+    pollIntervalMs: 250
   controlPlane:
     leaseDurationMs: 30000
     leaseRenewalMs: 10000
@@ -117,30 +176,85 @@ config:
     maxWalBytes: 52428800
 
 # -----------------------------------------------------------------------------
-# Secrets. Values marked `null` MUST be supplied at install time via
-# `--set secret.openaiApiKey=...` (or a sealed/external secret).
+# Secrets. There are NO defaults: every value must be supplied, or the
+# component's Secret must be referenced with secret.existingSecret.<name>.
+# Values must be at least 32 characters and must not be placeholders
+# (change-me, replace-me, example, ...). Generate with `openssl rand -hex 32`.
+#
+# When secret.existingSecret.<component> is set, the chart renders no Secret
+# for that component and the named Secret must contain these keys:
+#   retrieval:    DASH_RETRIEVAL_API_KEY, DASH_RETRIEVAL_JWT_HS256_SECRET,
+#                 DASH_RETRIEVAL_REPLICATION_TOKEN
+#                 (+ DASH_OPENAI_API_KEY when embeddingProvider=openai)
+#   ingestion:    DASH_INGEST_API_KEY, DASH_INGEST_JWT_HS256_SECRET,
+#                 DASH_INGEST_REPLICATION_TOKEN
+#                 (+ DASH_OPENAI_API_KEY when embeddingProvider=openai)
+#   controlPlane: DASH_CONTROL_PLANE_TOKEN
+# The replication token must be identical in the retrieval and ingestion Secrets.
 # -----------------------------------------------------------------------------
 secret:
-  # JWT public key (PEM). Used to verify RS256/ES256 tokens. Leave
-  # null if you only use HS256 with the hs256Secret fields below.
-  jwtPublicKey: null
+  existingSecret:
+    retrieval: ""
+    ingestion: ""
+    controlPlane: ""
+  # Shared by ingestion (serves WAL) and retrieval (follows it).
+  replicationToken: null
+  # Required only when config.embeddingProvider=openai.
   openaiApiKey: null
-  ollamaBaseUrl: "http://ollama.ollama.svc.cluster.local:11434"
   retrieval:
     apiKey: null
     hs256Secret: null
   ingestion:
     apiKey: null
     hs256Secret: null
-  # If true, render an *empty* Secret scaffold (key names only). The
-  # operator is then expected to populate it out-of-band. Useful when
-  # integrating with External Secrets / Vault Agent sidecars.
-  create: true
+  controlPlane:
+    token: null
 
 # -----------------------------------------------------------------------------
-# Persistent storage (redb). Per-pod PVCs are created via
-# StatefulSet volumeClaimTemplates, so each replica gets its own
-# RWO volume.
+# Native TLS on every DASH listener (ingestion, retrieval, control plane) and
+# on replication. Off by default. See docs/operations/tls.md.
+#
+# secretName names a Secret with tls.crt, tls.key and ca.crt (the shape a
+# cert-manager Certificate produces). The certificate must name the in-cluster
+# service DNS names (<release>-dash-ingestion.<ns>.svc.cluster.local, the
+# retrieval and control-plane services) and carry both the "server auth" and
+# "client auth" usages: retrieval also presents it as its replication client
+# certificate. Files are re-read when they change, so cert-manager renewals
+# need no restart. When enabled, probes use HTTPS and the ingress talks HTTPS
+# to the backends.
+# -----------------------------------------------------------------------------
+tls:
+  enabled: false
+  secretName: ""
+  mountPath: /etc/dash/tls
+  # Ingestion verifies client certificates against ca.crt and requires a
+  # verified one (plus the token) on /internal/replication/*. Public routes
+  # still accept clients without a certificate.
+  mutual: true
+
+# -----------------------------------------------------------------------------
+# Encryption at rest (ADR 0005, docs/operations/encryption.md). Off by default.
+#
+# secretName names an existing Secret that holds the 32-byte key-encryption
+# key as 64 hex characters under `keyName`, for example:
+#   openssl rand -hex 32 > dash.key
+#   kubectl -n dash-system create secret generic dash-encryption-key \
+#     --from-file=active.key=dash.key
+# The Secret is mounted read-only (mode 0400) into ingestion and retrieval and
+# DASH_ENCRYPTION_KEY_FILE points at it. For a rotation add the new key to the
+# Secret, make it `keyName` and list the old one in `previousKeyNames`.
+# Keep a copy of every key outside the cluster: backups of the volumes hold
+# ciphertext only and are useless without the key.
+# -----------------------------------------------------------------------------
+encryption:
+  enabled: false
+  secretName: ""
+  keyName: active.key
+  previousKeyNames: []
+  mountPath: /etc/dash/encryption
+
+# -----------------------------------------------------------------------------
+# Persistent storage. Per-pod PVCs via StatefulSet volumeClaimTemplates.
 # -----------------------------------------------------------------------------
 persistence:
   enabled: true
@@ -150,24 +264,30 @@ persistence:
     - ReadWriteOnce
 
 # -----------------------------------------------------------------------------
-# Workload resources. CPU/Memory are applied to BOTH services unless
-# overridden under `.resources.retrieval` / `.resources.ingestion`.
+# Workload resources. Base values apply to every component unless overridden
+# under resources.retrieval / .ingestion / .controlPlane.
 # -----------------------------------------------------------------------------
 resources:
   requests:
     cpu: 250m
     memory: 256Mi
-    ephemeralStorage: 128Mi
+    ephemeral-storage: 128Mi
   limits:
     cpu: 1000m
     memory: 512Mi
-    ephemeralStorage: 512Mi
+    ephemeral-storage: 512Mi
   retrieval: {}
   ingestion: {}
-  controlPlane: {}
+  controlPlane:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
 
 # -----------------------------------------------------------------------------
-# Workload identity / scheduling
+# Scheduling
 # -----------------------------------------------------------------------------
 affinity:
   podAntiAffinity:
@@ -182,27 +302,31 @@ nodeSelector: {}
 tolerations: []
 
 # -----------------------------------------------------------------------------
-# Probes. Defaults match the raw manifests. The probe URL is /v1/health
-# by convention; override only if you've added a route prefix.
+# Probes (HTTP). Liveness and startup use /v1/live (process only); readiness
+# uses /v1/ready (also checks disk persistence and, on retrieval, that the
+# replication leader is reachable and the follower caught up). Startup must
+# not use /v1/ready: a follower started while ingestion is down would be
+# restarted in a loop instead of waiting. The control plane uses
+# /v1/control-plane/health and /v1/control-plane/ready.
 # -----------------------------------------------------------------------------
 probes:
   liveness:
-    path: /v1/health
+    path: /v1/live
     initialDelaySeconds: 0
     periodSeconds: 30
     timeoutSeconds: 5
     failureThreshold: 3
   readiness:
-    path: /v1/health
+    path: /v1/ready
     periodSeconds: 10
     timeoutSeconds: 3
     failureThreshold: 3
   startup:
-    path: /v1/health
+    path: /v1/live
     initialDelaySeconds: 5
     periodSeconds: 5
     timeoutSeconds: 3
-    failureThreshold: 30
+    failureThreshold: 60
 
 # -----------------------------------------------------------------------------
 # Service
@@ -212,11 +336,12 @@ service:
   ports:
     http: 80
     controlPlane: 8090
-  # If you change `service.ports.http`, you must also update
-  # ingress.rules[].http.paths[].backend.service.port.number.
 
 # -----------------------------------------------------------------------------
-# Ingress (retrieval only)
+# Ingress. /v1/ingest* (ingest, ingest/raw, ingest/document, ingest/batch) is
+# routed to ingestion; the remaining /v1 paths and /health go to retrieval.
+# The longest matching prefix wins in nginx. Replication (/internal/*) and
+# /metrics are never routed.
 # -----------------------------------------------------------------------------
 ingress:
   enabled: true
@@ -228,42 +353,52 @@ ingress:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
     cert-manager.io/cluster-issuer: letsencrypt-prod
+  # Set false to keep the write API cluster-internal.
+  exposeIngestion: true
+  ingestionPaths:
+    - path: /v1/ingest
+      pathType: Prefix
+  retrievalPaths:
+    - path: /v1
+      pathType: Prefix
+    - path: /health
+      pathType: Exact
   hosts:
     - host: dash.example.com
-      paths:
-        - path: /v1
-          pathType: Prefix
-        - path: /health
-          pathType: Exact
   tls:
     - hosts:
         - dash.example.com
-      secretName: dash-retrieval-tls
+      secretName: dash-tls
 
 # -----------------------------------------------------------------------------
 # NetworkPolicy
 # -----------------------------------------------------------------------------
 networkPolicy:
   enabled: true
-  # CIDRs that are considered "in-cluster" and excluded from the
-  # external egress rule. Override for clusters with non-RFC1918
-  # pod/service CIDRs.
+  # Private ranges excluded from the external-egress rule.
   internalCIDRs:
     - 10.0.0.0/8
     - 172.16.0.0/12
     - 192.168.0.0/16
+  # Ports allowed to public addresses (embedding providers over HTTPS).
   externalEgressPorts:
     - port: 443
       protocol: TCP
-    - port: 11434
-      protocol: TCP
+  # Allow retrieval and ingestion to reach an in-cluster Ollama server on
+  # private CIDRs. Enable when config.embeddingProvider=ollama.
+  ollama:
+    enabled: false
+    port: 11434
+    # Empty -> networkPolicy.internalCIDRs.
+    cidrs: []
   ingressNamespace: ingress-nginx
   ingressPodSelector:
     matchLabels:
       app.kubernetes.io/name: ingress-nginx
 
 # -----------------------------------------------------------------------------
-# PodDisruptionBudget
+# PodDisruptionBudget (retrieval only; ingestion and control plane are
+# single-replica and a budget would block node drains).
 # -----------------------------------------------------------------------------
 pdb:
   enabled: true
@@ -272,36 +407,7 @@ pdb:
   maxUnavailable: null
 
 # -----------------------------------------------------------------------------
-# HorizontalPodAutoscaler
-# -----------------------------------------------------------------------------
-hpa:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-  behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 30
-      policies:
-        - type: Percent
-          value: 100
-          periodSeconds: 30
-    scaleDown:
-      stabilizationWindowSeconds: 300
-      policies:
-        - type: Percent
-          value: 25
-          periodSeconds: 60
-
-# -----------------------------------------------------------------------------
-# Security context. Charts shipped as-is satisfy the Kubernetes
-# "restricted" pod security standard.
+# Security context. Satisfies the Kubernetes "restricted" pod security standard.
 # -----------------------------------------------------------------------------
 podSecurityContext:
   runAsNonRoot: true
@@ -325,3 +431,60 @@ containerSecurityContext:
 # Termination
 # -----------------------------------------------------------------------------
 terminationGracePeriodSeconds: 30
+
+# -----------------------------------------------------------------------------
+# Monitoring (Prometheus Operator and Grafana). All off by default; the
+# ServiceMonitor and PrometheusRule kinds need the Prometheus Operator CRDs.
+# Rules, dashboards, SLOs and runbooks: deploy/observability/,
+# docs/operations/slos.md and docs/operations/runbooks/.
+# -----------------------------------------------------------------------------
+metrics:
+  # DASH_METRICS_PUBLIC=1: serve /metrics without credentials. The ingress
+  # never routes /metrics; with networkPolicy.enabled only the peers in
+  # metrics.networkPolicy.from (and DASH pods) can reach the pods.
+  public: false
+  serviceMonitor:
+    enabled: false
+    # Namespace of the ServiceMonitor objects (empty -> release namespace).
+    namespace: ""
+    # Extra labels, e.g. `release: kube-prometheus-stack`, so the
+    # Prometheus instance selects the ServiceMonitors.
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    # Bearer credential Prometheus presents when metrics.public is false:
+    # a Secret name and key per component. Retrieval and ingestion need a
+    # credential holding the read_only (or admin) role that is unscoped or
+    # admin (see docs/operations/auth.md). The control plane defaults to its
+    # own token (DASH_CONTROL_PLANE_TOKEN in the control-plane Secret).
+    authorization:
+      retrieval:
+        secretName: ""
+        key: ""
+      ingestion:
+        secretName: ""
+        key: ""
+      controlPlane:
+        secretName: ""
+        key: DASH_CONTROL_PLANE_TOKEN
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
+    # Prefix for the relative runbook paths in annotations.runbook_url, e.g.
+    # https://github.com/<org>/<repo>/blob/<ref>/ (empty keeps them relative).
+    runbookBaseUrl: ""
+  grafanaDashboards:
+    # ConfigMap with the dashboards, labelled for the Grafana sidecar.
+    enabled: false
+    namespace: ""
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}
+  networkPolicy:
+    # Peers allowed to scrape the HTTP port when networkPolicy.enabled and
+    # metrics.serviceMonitor.enabled.
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring

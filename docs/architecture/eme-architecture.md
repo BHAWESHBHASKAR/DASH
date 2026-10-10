@@ -4,6 +4,16 @@ Version: v0.1 draft
 Date: 2026-02-17  
 Status: Architecture proposal
 
+> **Status note (2026-10-09, register item DOC-04).** This is the single canonical copy of the architecture
+> document. The root-level `EME_ARCHITECTURE.md` was a diverging duplicate (it lacked the "Current implementation
+> notes" and sections 21-22 added here) and is now a one-line pointer to this file. This document is a design
+> proposal plus dated implementation notes; it is **not** a description of the shipped API. Where it disagrees
+> with the code, the code wins: see the README Status section, `docs-site/docs/reference/api.md` and
+> `docs-site/docs/reference/planned-api.md`. In particular, the sections marked "NOT IMPLEMENTED" below describe
+> APIs that do not exist, and the "Current implementation notes" and "Implementation Reality Check" sections are
+> dated 2026-02-18 snapshots (they mention an optional `axum` transport that has since been removed, and call
+> the workspace tests green without a linked CI result).
+
 ## 1. Executive Summary
 
 DASH is a retrieval system designed for RAG where the primary data primitive is an **atomic claim with provenance**, not a standalone embedding vector.  
@@ -277,23 +287,28 @@ Alternative modes:
 
 ## 11. APIs (v1)
 
+> **Implementation status (2026-10-09):** the routes below are the original *proposal*. Only the routes marked
+> *implemented* exist. Everything else is **NOT IMPLEMENTED** (see `docs-site/docs/reference/planned-api.md`).
+> The implemented ingestion routes are `POST /v1/ingest`, `/v1/ingest/batch`, `/v1/ingest/raw` and
+> `/v1/ingest/document`; see `docs-site/docs/reference/api.md`.
+
 ### 11.1 Ingestion APIs
 
-- `POST /v1/sources`
-- `POST /v1/claims:upsert`
-- `POST /v1/evidence:upsert`
+- `POST /v1/sources` (NOT IMPLEMENTED)
+- `POST /v1/claims:upsert` (NOT IMPLEMENTED; claims are written with `POST /v1/ingest`)
+- `POST /v1/evidence:upsert` (NOT IMPLEMENTED; evidence is written inside `POST /v1/ingest`)
 
 ### 11.2 Retrieval APIs
 
-- `POST /v1/retrieve` (ranked evidence claims for RAG)
-- `POST /v1/retrieve:graph` (returns compact evidence subgraph)
-- `GET /v1/claims/{id}`
+- `POST /v1/retrieve` (ranked evidence claims for RAG) (implemented; `GET /v1/retrieve` also exists)
+- `POST /v1/retrieve:graph` (returns compact evidence subgraph) (NOT IMPLEMENTED; use `return_graph: true` on `/v1/retrieve`)
+- `GET /v1/claims/{id}` (NOT IMPLEMENTED)
 
 ### 11.3 Ops APIs
 
-- `GET /v1/health`
-- `GET /v1/indexes/status`
-- `POST /v1/admin/reindex`
+- `GET /v1/health` (implemented, with `/health`, `/live`, `/ready`, `/metrics`)
+- `GET /v1/indexes/status` (NOT IMPLEMENTED)
+- `POST /v1/admin/reindex` (NOT IMPLEMENTED)
 
 ### 11.4 Example retrieve request
 

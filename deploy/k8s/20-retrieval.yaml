@@ -1,9 +1,12 @@
 ---
-# Retrieval service: serves the OpenAI-compatible /v1/embeddings API
-# and forwards/coordinates reads. A StatefulSet is used (despite the
-# workload being called "deployment" in the design notes) because the
-# per-pod redb store requires a per-pod RWO PVC, and a Deployment with
-# two replicas sharing a RWO volume cannot be scheduled.
+# Retrieval service: serves /v1/retrieve and /v1/embeddings. Each replica
+# keeps its own redb store and WAL-derived state on its own RWO PVC and
+# follows the single ingestion pod through the replication endpoint
+# (DASH_RETRIEVAL_REPLICATION_SOURCE_URL in dash-config). Scale it by hand
+# (`kubectl -n dash-system scale statefulset dash-retrieval --replicas=N`);
+# a new replica starts empty and catches up from the ingestion export.
+# There is no HorizontalPodAutoscaler: a StatefulSet replica is not
+# interchangeable until the clustering phase lands.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -80,17 +83,42 @@ spec:
                   app.kubernetes.io/name: dash
                   app.kubernetes.io/component: retrieval
       terminationGracePeriodSeconds: 30
+      initContainers:
+      # A fresh PVC is empty; create the directories the service writes to.
+      - name: init-data-dirs
+        image: ghcr.io/bhaweshbhaskar/dash-retrieval:0.2.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c", "mkdir -p /var/lib/dash/state /var/lib/dash/segments /var/lib/dash/audit"]
+        resources:
+          requests:
+            cpu: 10m
+            memory: 16Mi
+          limits:
+            cpu: 100m
+            memory: 32Mi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          privileged: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/dash
       containers:
       - name: retrieval
-        image: ghcr.io/bhaweshbhaskar/dash/retrieval:0.2.0
+        image: ghcr.io/bhaweshbhaskar/dash-retrieval:0.2.0
         imagePullPolicy: IfNotPresent
+        # Matches the image ENTRYPOINT (/opt/dash/bin/dash-entrypoint), which
+        # selects the binary from DASH_BIN.
         command: ["/opt/dash/bin/dash-entrypoint"]
         args: ["--serve"]
         env:
         - name: DASH_BIN
           value: "retrieval"
-        - name: DASH_HEALTHCHECK_URL
-          value: "http://127.0.0.1:8080/v1/health"
         envFrom:
         - configMapRef:
             name: dash-config
@@ -109,23 +137,29 @@ spec:
             cpu: 1000m
             memory: 512Mi
             ephemeral-storage: 512Mi
+        # Startup gates only "the process is up" (/v1/live). /v1/ready also
+        # requires a reachable, caught-up replication leader on retrieval, so
+        # using it here restarted followers in a loop while ingestion was down.
         startupProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          httpGet:
+            path: /v1/live
+            port: http
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3
-          failureThreshold: 30
+          failureThreshold: 60
         livenessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          httpGet:
+            path: /v1/live
+            port: http
           periodSeconds: 30
           timeoutSeconds: 5
           successThreshold: 1
           failureThreshold: 3
         readinessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080/v1/health"]
+          httpGet:
+            path: /v1/ready
+            port: http
           periodSeconds: 10
           timeoutSeconds: 3
           successThreshold: 1
@@ -142,19 +176,15 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /var/lib/dash
+        # Writable scratch space. /opt/dash is NOT mounted over: it holds
+        # the image's binaries and entrypoint.
         - name: tmp
           mountPath: /tmp
-        - name: home
-          mountPath: /opt/dash
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
-      - name: home
-        emptyDir:
-          medium: Memory
-          sizeLimit: 32Mi
   volumeClaimTemplates:
   - metadata:
       name: data

@@ -22,13 +22,17 @@ from .client import Client, EmbeddingsNamespace
 from .errors import DashAPIError, DashConnectionError, DashError
 from .types import (
     Citation,
+    DeleteResponse,
     EmbeddingData,
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
+    GraphEdge,
+    RetrieveGraph,
     RetrieveRequest,
     RetrieveResponse,
     RetrieveResult,
+    TimeRange,
 )
 
 __all__ = [
@@ -45,11 +49,15 @@ __all__ = [
     "DashError",
     # Types
     "Citation",
+    "DeleteResponse",
     "EmbeddingData",
     "EmbeddingRequest",
     "EmbeddingResponse",
     "EmbeddingUsage",
+    "GraphEdge",
+    "RetrieveGraph",
     "RetrieveRequest",
     "RetrieveResponse",
     "RetrieveResult",
+    "TimeRange",
 ]

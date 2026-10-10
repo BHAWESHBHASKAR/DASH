@@ -6,6 +6,1193 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (automatic failover of the ingestion leader, P3 step 1, ADR 0006)
+
+- **Leader failover, off by default.** With `DASH_CONTROL_PLANE_INGEST_FAILOVER=1`
+  on the control plane and `DASH_INGEST_FAILOVER_CONTROL_PLANE_URL`,
+  `DASH_NODE_ID` and `DASH_INGEST_FAILOVER_ADVERTISE_URL` on every ingestion
+  node, the control plane names the ingestion leader and its term (a fencing
+  token persisted before use), the leader writes only while its lease is valid
+  (`DASH_CONTROL_PLANE_INGEST_LEASE_MS`, measured on its monotonic clock from
+  before the heartbeat), and when the lease lapses the most up-to-date synced
+  follower of the current term and WAL lineage is promoted after
+  `DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS` and a fresh report from every
+  live member. Placements led by the old node move to the new one (epoch + 1).
+  New endpoints: `POST /v1/control-plane/ingest/heartbeat`,
+  `GET /v1/control-plane/ingest`, `POST /v1/control-plane/ingest/step-down`
+  (planned handover), `GET /v1/ready/leader` on ingestion. See
+  `docs/operations/failover.md`.
+- **Fencing.** A promoted follower names its WAL after the old leader's
+  generation and checkpoints, so other followers continue without a resync or,
+  if they hold records the new leader never received, resync. Followers send
+  their term with every poll and refuse frames from an older term; a leader
+  that sees a newer term stops writing. Writes are checked against the lease
+  at the HTTP entry and again under the runtime lock before the WAL append. A
+  deposed leader copies its WAL to `<wal>.deposed-t<term>-<unix ms>` and
+  resyncs.
+- **Non-leader answers** to writes are `503` with `Retry-After: 1`,
+  `X-Dash-Leader: false`, `X-Dash-Leader-Node`, `X-Dash-Leader-Url` and
+  `X-Dash-Term` (backwards compatible: clients already retry 503).
+- **Synchronous replication** (`DASH_INGEST_MIN_SYNC_REPLICAS`, default 0):
+  a write is answered once N ingestion followers durably applied it, so with
+  N = 1 an acknowledged write survives the loss of any single node.
+  `DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS` and
+  `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT` (`fail`: 503
+  `sync_replication_timeout`; `degrade`: 200 with
+  `commit_status: sync_degraded`). Followers long-poll a caught-up leader
+  (`wait_ms`), and followers' WAL polls and commit acks get a reserved worker
+  lane so they never queue behind waiting writes.
+- **Metrics and alerts:** `dash_control_plane_ingest_*`,
+  `dash_ingest_failover_*`, `dash_ingest_sync_replication_*`; alerts
+  `DashIngestNoLeader`, `DashIngestFailoverBlocked`,
+  `DashIngestFailoverHappened`, `DashIngestSyncReplicationTimeouts` with
+  runbooks (25 alerts in total).
+- **Helm:** `failover.enabled` runs `failover.replicas` ingestion pods with
+  leader-only readiness (`/v1/ready/leader`, so the ingestion Service and the
+  retrieval followers follow the leader), a headless peers Service, an
+  ingestion PodDisruptionBudget, peer NetworkPolicy and
+  `updateStrategy: OnDelete`.
+- **Tests:** deterministic control-plane tests with an explicit clock,
+  ingestion tests of the write gate, demotion, fencing checkpoint, term checks
+  and synchronous writes, the e2e scenario `s14_leader_failover` (SIGKILL of
+  the leader under synchronous load; SIGSTOP and resume of the leader) and
+  `crash-test --failover` (120 randomized leader kills with checkpoints in
+  release builds: 0 of 4417 acknowledged requests lost, failover p50 about
+  2.65 s with a 2 s lease and 0.5 s grace).
+
+### Fixed
+
+- The replication client's per-read timeout had no effect: the HTTP client
+  applies the overall request deadline (60 s) instead when both are set. A
+  zero deadline now leaves only the per-read timeout, which failover
+  followers use for WAL polls and acks so a dead or paused leader is given up
+  on within seconds.
+- New connections waited up to 50 ms (25 ms on average) to be accepted while
+  a server was idle: the accept loop slept 50 ms between attempts. It now
+  sleeps 5 ms and classifies a new connection right after accepting it. This
+  shortens every request on a fresh connection (clients without keep-alive,
+  replication polls) and the synchronous-replication round trip.
+- A follower promoted while its background checkpoint was still writing the
+  snapshot (after crossing a leader checkpoint) refused the promotion: the
+  fencing checkpoint failed because only one checkpoint runs at a time.
+  Promotion and demotion now wait for that checkpoint first.
+- `crash-test` verified the files of the restarted service while a
+  background checkpoint could retire them; a file that disappears during its
+  check is now skipped instead of reported as damaged.
+- The e2e crash scenario listed the retrieval follower with one query, which
+  returns at most 5000 claims; it now lists it bucket by bucket.
+
+### Changed (background checkpoints)
+
+- **A checkpoint no longer blocks writes while it writes the snapshot.**
+  Under the ingestion lock it now only rotates the WAL (the current snapshot
+  is kept as a hard link `<wal>.snapshot.base`, a small pending marker
+  replaces `<wal>.snapshot`, the WAL becomes `<wal>.closed.<generation>`, a
+  new WAL starts) and copies the store state copy-on-write; a background
+  thread writes the snapshot and publishes it with one rename; under the WAL
+  lock it only ends the pending state, and the files it no longer needs are
+  deleted after the lock is released. Writes continue in the new WAL meanwhile. With a 1.1 GiB snapshot
+  (200,000 claims with 384-dimensional vectors, release build, 4 vCPU) the
+  longest ingest during a 150 s run with checkpoints went from 27.0 s to
+  0.57 s, the time writes are blocked per checkpoint from 23 to 27 s to
+  6.6 to 8.0 ms, and throughput from 174 to 272 ingests/s
+  (`docs/operations/replication-limits.md`, "Checkpoint cost").
+  The store keeps the maps a snapshot is written from (claims, evidence,
+  edges, vectors, batch metadata) in 4096 copy-on-write shards, so the copy
+  costs microseconds and a write during the snapshot copies one shard.
+- **Crash consistency.** While the marker is in place, replay reads the base
+  snapshot, the closed WAL files the marker lists and the WAL; after the
+  rename, the new snapshot and the WAL. A crash at any step recovers every
+  acknowledged write exactly once (failpoint tests for every step in
+  `pkg/store/src/failpoint.rs`). A failed snapshot write leaves the marker and
+  is retried with the same frozen state (no new rotation, so a failing
+  disk still makes WAL writes fail as before); a service that starts on a
+  marker starts a checkpoint right away. `docs/operations/wal-durability.md`
+  ("Checkpoints") has the full argument.
+- **Replication.** The generation transition is recorded at the rotation, so
+  followers switch to the new generation while the snapshot is still being
+  written (they never depend on it); a chunked export frozen during the
+  write carries the base snapshot plus the closed WAL as its snapshot
+  section. Follower generation switches use the same three steps (the
+  retrieval follower publishes its local snapshot on a later poll). The
+  replication index is now fed by every WAL append, so a checkpoint never
+  reads the WAL under the lock to measure the closed generation.
+- **On-disk format.** The published snapshot is unchanged. The pending
+  marker (`SNAP_PENDING\t1`) is new: a build from before this change refuses
+  to start on it instead of starting without its records; stop the service
+  cleanly before a rollback (see `docs/operations/upgrades.md`).
+  `wal-inspect` describes the marker and refuses to repair it; backup
+  bundles carry the base snapshot and closed WAL files of a pending
+  checkpoint (`data/wal/pending/`) and restore puts them back.
+- **Metrics.** `dash_wal_checkpoint_pause_seconds` (time a checkpoint holds
+  the WAL lock) and `dash_wal_checkpoint_in_progress`;
+  `dash_wal_checkpoint_duration_seconds` now runs from the rotation to the
+  published snapshot. The ingestion log reports each checkpoint's pause and
+  snapshot write time.
+- **`crash-test`** now requires every evidence row exactly once across the
+  snapshot and WAL sections (a record in both was tolerated before) and
+  verifies the base snapshot and closed WAL files with `wal-inspect`.
+### Added (encryption at rest, SEC-16, ADR 0005)
+
+- **Encryption at rest, off by default.** Setting `DASH_ENCRYPTION_KEY_FILE`
+  (a 32-byte key as 64 hex characters, mode `0600`/`0400`) encrypts the WAL,
+  snapshot, closed generations, quarantine and truncation sidecars,
+  replication exports and the follower's download part file, the persisted
+  vector index, segment files and manifests, and every redb value, with
+  AES-256-GCM under per-file data keys wrapped by the key (envelope
+  encryption). Nonces never repeat under a key. Line files keep one encrypted
+  line per record, so a torn final record is still truncated and a damaged
+  interior record is still a hard error naming the line. See
+  `docs/operations/encryption.md` and `docs/adr/0005-encryption-at-rest.md`.
+- **Fail closed:** a service that finds encrypted files without a key, or
+  under a key id it does not have, exits with status 2 before opening any
+  file and names the file and the key id.
+- **Migration:** plaintext data from earlier releases is read with a key
+  configured; the live WAL is rewritten encrypted on open, the snapshot,
+  vector index, segments and redb values on their next rewrite.
+- **Key rotation:** `DASH_ENCRYPTION_PREVIOUS_KEY_FILES` keeps retired keys
+  for decryption; new files use the active key, the redb data key is
+  rewrapped on open, and `wal-inspect rewrap <dir>` moves remaining file
+  headers to the active key without re-encrypting data. `wal-inspect keys
+  <dir>` lists the key id of every file.
+- **Deployment:** Helm values `encryption.enabled`, `encryption.secretName`,
+  `encryption.keyName`, `encryption.previousKeyNames`; Compose overlay
+  `deploy/container/docker-compose.encryption.yml`; systemd `LoadCredential=`
+  examples. `crash-test --encryption` and loadgen `--server-env` exercise it.
+- **Tests:** round trips and tampering for every file type, torn tails at every
+  byte offset, wrong and missing keys, rotation, migration of the 0.2 and 0.3
+  compat fixtures, encrypted replication (export, chunked resync, closed
+  generations), and a plaintext canary that drives the real services and scans
+  every file under the state directories.
+
+### Changed (encryption at rest)
+
+- `pkg/encryption` was rewritten: the unused `EncryptionProvider` /
+  `EnvProvider` API and the `DASH_ENCRYPTION_PROVIDER` /
+  `DASH_ENCRYPTION_MASTER_KEY` settings (never read by any service) are
+  removed. Keys come from files, not environment variables.
+- Opening a WAL reads (and, when encrypted, decrypts) the file once and the
+  first replay reuses those lines; cold start of a plaintext WAL got faster
+  too. Measured cost of encryption: about 6% lower ingest throughput and about
+  20% longer cold start (`docs/operations/encryption.md`).
+- Audit logs, identifiers used as redb keys and segment directory names, and
+  replication on the wire stay plaintext (use TLS for the wire). There is no
+  per-tenant key and no crypto-shredding; no cloud KMS provider ships (the
+  `KekProvider` interface is documented).
+### Changed (full-text relevance: BM25 index; ADR 0003 section 12)
+
+- **Lexical retrieval uses a per-tenant BM25 full-text index**
+  (`pkg/store/src/text_index.rs`) instead of the shared-word rule. Text is
+  split with the Unicode word rules (UAX #29) and lowercased; ASCII words
+  are stemmed (English Snowball); stop words are dropped from queries unless
+  nothing else remains. Lexical candidates are the `top_k * 20` claims
+  (clamped to 100..5000) with the highest BM25, chosen after the time range
+  and allowed-claim filters, instead of every claim sharing a token; vector
+  candidates are unchanged. The segment and in-memory paths still apply the
+  same rule, so answers do not depend on the segment directory.
+- **Behaviour changes a client can see.** Accented and non-Latin words are
+  now searchable (the old tokenizer kept ASCII letters and digits only, so
+  `café` became `caf` and `東京` was dropped); punctuation splits words
+  (`X-Y` matches `x` and `y`, `Company-Y` no longer becomes `companyy`);
+  inflected forms match (`acquire` finds `acquired`); a query that only
+  shares a stop word with a claim no longer matches it. Scores changed:
+  lexical relevance is BM25 divided by the query's BM25 upper bound, hybrid
+  relevance is `2/3 * (cosine + 1) / 2 + 1/3 * normalised BM25`, and the
+  prior signals (confidence, source quality, saturated support and
+  contradiction) are added at half weight. The response shape is unchanged.
+  The API reference documents the rule (`POST /v1/retrieve`, "Which claims
+  are returned" and "Terms and ranking").
+- **Quality gate.** A labelled relevance set (448 claims, 72 queries with
+  graded judgements, generated deterministically in
+  `pkg/store/tests/relevance/`) reports nDCG@10 / recall@10 for the old
+  rule (0.769 / 0.660), BM25 alone (0.874 / 0.838), hash-embedding vectors
+  alone (0.311 / 0.222), the store's lexical retrieve (0.863 / 0.826) and
+  hybrid retrieve (0.795 / 0.682, old hybrid 0.766 / 0.642);
+  `pkg/store/tests/relevance_eval.rs` fails below recorded floors.
+- **Cost** (release, 100,000 claims of 30 to 60 words, 4 vCPUs,
+  `tests/benchmarks/src/bin/fulltext_bench.rs`): text-only retrieve p50
+  0.27 to 1.7 ms (the previous rule: 2 ms to 0.8 s on the same queries);
+  index build 12.6 us per claim (1.26 s per 100k, added to the WAL replay);
+  index heap 549 B per claim; delete 220 us per claim. Details in
+  `docs/benchmarks/performance.md` ("Full-text index").
+- The index is rebuilt by the WAL replay at startup and kept in step by
+  ingest, re-upsert, claim and tenant tombstones, replication apply and
+  resync; it is not persisted. New dependencies: `unicode-segmentation`
+  (MIT or Apache-2.0) and `rust-stemmers` (MIT or BSD-3-Clause); `cargo
+  deny` passes. No new configuration.
+- Compat: `tests/compat/expected/*.json` list the requests whose order
+  changed with BM25 and why; a new `scores_changed` field states that scores
+  of the 0.3.0-dev fixture changed by design while claim order, stance
+  counts and citations are still compared.
+
+### Added (observability: metrics, request ids, alerts, runbooks, SLOs)
+
+- **`dash-observe` crate** (`pkg/observe`): lock-free Prometheus histograms,
+  an exposition writer, a strict exposition validator used by the tests,
+  process metrics and request instrumentation for the shared HTTP server.
+- **Shared metrics on every service**, including the control plane, which
+  now serves `GET /metrics` (control-plane token, or `DASH_METRICS_PUBLIC=1`):
+  `dash_http_server_requests_total{component,route,method,code}`, the
+  `dash_http_server_request_duration_seconds` histogram,
+  `dash_http_server_requests_in_flight`, `process_*` (resident memory, file
+  descriptors, CPU, threads, start time), `dash_process_uptime_seconds` and
+  `dash_build_info{component,version,git_sha}` (`DASH_GIT_SHA` at build time;
+  the release workflow passes the commit). Route labels come from a fixed
+  table per service; ids in delete paths never become labels.
+- **Storage, replication and embedding metrics**: WAL append and fsync
+  latency histograms, fsync failures, bytes appended, WAL size, group-commit
+  batch size histogram, checkpoint duration histogram, outcome counters and
+  last-success time, vector index save/load duration; embedding provider call
+  latency, calls, texts, errors by kind and circuit-breaker state;
+  `dash_retrieval_replication_lag_seconds` (time since the follower was last
+  caught up) next to the lag in records. Control-plane leadership, lease and
+  placement gauges.
+- **`X-Request-Id` on every request**: a valid client id (1 to 128 letters,
+  digits or `-_.:/+=@`) is kept, otherwise a 128-bit id is generated; it is
+  returned in the response header, added as `request_id` to JSON error
+  bodies (also for requests rejected while being read), stored in audit
+  records and carried by an `http_request` tracing span around every handler.
+  One `dash_access` log event per request (`debug`, `warn` for 5xx).
+- **Alerts, runbooks, SLOs and dashboards** in `deploy/observability/`: 21
+  alerts (target down, error rate, p99 latency, multi-window error-budget
+  burn, WAL poisoned or failing, disk unavailable or nearly full, slow
+  fsync, checkpoint failures, storage divergence, follower lag, follower not
+  ready, resync storm, visibility lag, control plane without a leader, audit
+  write failures and dropped denial records, embedding breaker open, load
+  shedding, file descriptors), each linked to a runbook in
+  `docs/operations/runbooks/`; SLO recording rules and
+  `docs/operations/slos.md`; three Grafana dashboards. `promtool test rules`
+  unit tests cover every alert.
+- **CI**: a new `observability` job runs `scripts/check_observability.sh`
+  (pinned, checksum-verified promtool; rule checks and tests; runbook,
+  metric-name and dashboard-query checks; Helm chart copies; the rendered
+  PrometheusRule). The deploy job lints and renders the chart with the
+  monitoring options.
+- **Helm**: `metrics.serviceMonitor`, `metrics.prometheusRule`,
+  `metrics.grafanaDashboards` (all off by default), `metrics.public`
+  (`DASH_METRICS_PUBLIC`), a scrape NetworkPolicy, and `config.logFormat`.
+
+### Changed (observability)
+
+- The Helm chart sets `DASH_LOG_FORMAT=json` by default (`config.logFormat`;
+  set `text` for the previous format).
+- The control plane initializes `tracing`, so `RUST_LOG` and
+  `DASH_LOG_FORMAT` apply to it too.
+- `deploy/container/monitoring/prometheus-alert-rules.yml` is replaced by
+  `deploy/observability/prometheus/`; `DashRetrieveServerErrorRate` is
+  superseded by `DashHighErrorRate` and `DashReadyProbeFailing` (which needed
+  a blackbox exporter) by `DashTargetDown` and the specific readiness alerts.
+
+### Added (P7 Kubernetes end-to-end test on kind)
+
+- **`scripts/kind_e2e.sh`** installs the Helm chart on a kind cluster (node
+  image pinned by digest; kind, helm and kubectl downloaded at pinned
+  versions and verified against their sha256 files), with the image built
+  from `deploy/container/Dockerfile`, secrets from `generate-secrets.sh`, Pod
+  Security "restricted" and NetworkPolicy enforced. It checks authenticated
+  ingest, retrieval from every retrieval replica, a delete, ingestion and
+  retrieval pod kills (and a follower whose PVC is deleted), backup and
+  restore, `helm upgrade` with changed values and from the chart of an older
+  commit, the raw manifests (`kubectl apply -k deploy/k8s`), and the TLS
+  variant with a self-signed CA. Diagnostics (pod logs, `kubectl describe`,
+  events, node logs) are written on failure. CI: `.github/workflows/kind-e2e.yml`
+  on pull requests touching the deployment or the services, and nightly.
+- **`scripts/k8s_backup_restore.sh`**: cold backup and restore of a release's
+  ingestion PVC through a helper pod, in the `backup_state_bundle.sh` format
+  (WAL, snapshot, segments, checksums) plus the audit log. A restore removes
+  the derived files so every retrieval follower resyncs to the restored
+  state.
+- **Operator guide `docs/operations/kubernetes.md`**: install, verify,
+  upgrade, backup and restore, failure behavior, scaling notes and current
+  limits (one ingestion pod without failover, manual retrieval scaling).
+
+### Fixed (Helm chart and manifests, found by the kind test)
+
+- **A default Helm install never became ready.** Helm renders YAML numbers
+  as float64, so `config.checkpoint.maxWalBytes` (52428800) reached the
+  ConfigMap as `DASH_CHECKPOINT_MAX_WAL_BYTES="5.24288e+07"` and ingestion
+  refused to start (`must be an integer`). Integer settings are now rendered
+  through `int64`; CI rejects numbers in exponent form.
+- **Retrieval pods were restarted in a loop while ingestion was down.** The
+  startup probe used `/v1/ready`, which on retrieval also requires a
+  reachable, caught-up replication leader. Startup now checks `/v1/live`
+  (chart and `deploy/k8s`); readiness still uses `/v1/ready`.
+- **`helm upgrade` did not apply configuration or secret changes.** Pods read
+  them through `envFrom` at start and nothing in the pod templates changed,
+  so they kept running with the old values. The pod templates now carry
+  `checksum/config` and `checksum/secrets`, so such an upgrade rolls the
+  StatefulSets.
+- **The chart ignored the release namespace.** `namespace.name` defaulted to
+  `dash-system`, so `helm install -n other` created every object in
+  `dash-system`. It now defaults to empty and the release namespace is used;
+  set it to override. Installs that pass `-n dash-system` (the documented
+  command) render unchanged. Upgrade note: a release installed into another
+  namespace that relied on the old default must set
+  `namespace.name=dash-system` on upgrade.
+- **The raw manifests cut every pod off from DNS.** `deploy/k8s` added its
+  owner labels with `includeSelectors: true`, which also wrote
+  `app.kubernetes.io/part-of: dash` and `app.kubernetes.io/managed-by:
+  kustomize` into the NetworkPolicy peer selectors. The `allow-dns` peer then
+  matched no CoreDNS pod, so under any CNI that enforces NetworkPolicy the
+  retrieval followers could not resolve the ingestion service and never
+  became ready (the ingress-nginx peer was broken the same way). The labels
+  now go on metadata and pod templates only; CI fails if a rendered
+  NetworkPolicy differs from `deploy/k8s/50-networkpolicy.yaml`. Upgrade
+  note: the StatefulSet selectors lose those two labels and selectors are
+  immutable, so a cluster that applied the old manifests must run
+  `kubectl -n dash-system delete statefulset dash-ingestion dash-retrieval
+  dash-control-plane --cascade=orphan` before `kubectl apply -k deploy/k8s`
+  (pods and PVCs are kept and adopted).
+
+### Changed (replication across checkpoints, follower throughput)
+
+- **Followers cross leader checkpoints without a full resync.** A checkpoint
+  now records a transition (closed generation, its replication view length,
+  new generation) in `<wal>.gen.transitions` and keeps the closed
+  generation's WAL as `<wal>.closed.<generation>` until the next checkpoint.
+  A follower still inside the closed generation is served the rest of it
+  from that file; at its end the leader moves the follower to offset 0 of
+  the new generation (`switch_from=` in the frame, only for followers that
+  send `gen_switch=1`) and the follower compacts its own WAL the same way.
+  Followers that missed a whole generation, are ahead of its end, or follow
+  a rolled-back or reset lineage resync as before. `/ready` and the metrics
+  count `generation_switches_total`. Safety argument and tests:
+  `docs/operations/replication-limits.md`.
+- **Full resyncs are chunked.** `GET /internal/replication/export/begin`
+  freezes the leader's state (snapshot handle plus a copy of the WAL's
+  replication lines, under the WAL lock only) into
+  `<wal>.exports/<id>.export` and answers a manifest with its SHA-256;
+  `/internal/replication/export/chunk` serves whole lines of it, at most 32
+  MiB per request, straight from the file. Followers download into
+  `<wal>.resync.part`, resume an interrupted download with the same export
+  id, verify the checksum, remove their cursor, replace snapshot and WAL from
+  the file (streaming) and write the cursor again, so a crash in between
+  ends in a resync that reuses the download. A data set larger than the
+  64 MiB response limit can now be replicated; previously a follower could
+  never bootstrap from it. New settings
+  `DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES` and
+  `DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES` (default 4 MiB). The
+  single-response `/internal/replication/export` is still served, and
+  followers fall back to it when a leader has no chunked export.
+- **Follower apply keeps up with the leader.** A frame is mirrored to the
+  follower WAL with one write and one fsync (it was one fsync per record),
+  applied to the live store in place, whole commit groups per write-lock
+  hold (it was staged on a full copy of the store per frame), and its redb
+  writes go into one transaction (it was one durable transaction per write).
+  In an update-heavy soak the retrieval follower's lag went from up to
+  178,032 WAL records (71 s to catch up after the load stopped) to at most
+  1,008 (0.15 s); numbers in `docs/operations/testing-durability.md`. A
+  record that parses but cannot be applied now sends the follower into a
+  full resync instead of retrying the frame forever.
+- **Leader writes batch their redb mirror writes.** An atomic bundle and a
+  batch write their redb mutations in one transaction (a delete already
+  did), and a claim row and its tenant membership share one; with
+  the follower changes, leader ingest throughput in the same soak went from
+  647.6/s to 1,293.8/s.
+- **Automatic checkpoints are on by default.** The ingestion service
+  checkpoints once its WAL reaches 256 MiB unless
+  `DASH_CHECKPOINT_MAX_WAL_BYTES` says otherwise; `0` turns the size
+  threshold off (`DASH_CHECKPOINT_MAX_WAL_RECORDS` also accepts `0`).
+  Justification in `docs/operations/replication-limits.md`; upgrade note in
+  `docs/operations/upgrades.md`.
+- **`loadgen` reports follower lag.** Every interval and at the end of the
+  run it samples the retrieval follower's lag in WAL records against the
+  leader's live position, and it measures how long the follower takes to
+  catch up after the load stops (`--catch-up-timeout-secs`).
+
+### Added (P7 upgrade and rollback compatibility)
+
+- **Upgrade compatibility tests** (`tests/compat`, crate `dash-compat`, part
+  of `cargo test --workspace`). Fixtures captured from the 0.2 release
+  (`main` at `ae86667`) and from this 0.3.0 tree hold the state each wrote
+  for a fixed dataset (WAL, snapshot, redb mirror, persisted vector index,
+  segment directories, audit logs, lease and placement files), the answers it
+  gave and the replication frames it served. The current code must replay
+  them strictly, hold exactly the data that was written, serve the recorded
+  retrieve answers before and after a checkpoint (by-design ranking changes
+  are listed with their reason in `tests/compat/expected/`), migrate redb
+  rows and the snapshot forward, continue the audit chain, take over the
+  lease with a higher fencing token, follow recorded 0.3 frames, serve
+  followers from an upgraded leader whose WAL still holds 0.2 records, and
+  accept 0.2 clients' ingest requests with compatible responses. Downgrade
+  rules are checked against oracles of the 0.2 readers.
+- **`scripts/compat/generate_fixtures.sh`**: captures a fixture from any git
+  ref (temporary worktree, its own target directory, both deleted
+  afterwards); part of the release checklist. How fixtures are made:
+  `tests/compat/README.md`.
+- **Operator guide `docs/operations/upgrades.md`**: supported paths, order of
+  operations (single node, leader and followers, control plane), what to
+  back up, rollback procedures, and the format version table (which release
+  writes what, which can read it).
+
+### Fixed (found by the compat tests)
+
+- **Followers followed 0.2 leaders unsafely.** Ingestion and retrieval
+  followers accepted WAL frames without a generation. A 0.2 leader serves a
+  fresh follower only its WAL tail (never the snapshot) and cannot signal a
+  compaction reliably, so a follower could silently miss checkpointed data
+  or skip records. Such frames are now refused: nothing is applied and
+  `/ready` reports `replication_leader_too_old` until the leader is
+  upgraded.
+- **Text-only retrieve answered 400 on tenants with client-supplied
+  vectors.** When the embedding provider's dimension differed from the
+  tenant's (vectors sent by clients), a retrieve without `query_embedding`
+  failed with `query_embedding: query vector dimension mismatch`, although
+  the client sent no vector; 0.2 answered it. The generated vector is now
+  dropped and the query answered from the lexical signals. An explicit
+  `query_embedding` of the wrong dimension is still a 400.
+- **Text-only retrieve returned claims that do not match the query when a
+  segment directory was configured.** The segment candidate path scored
+  every claim of the segment base and WAL delta and filled `top_k` with
+  claims that share no term with the query, ranked only by confidence,
+  source quality and graph signals; without a segment directory the same
+  query returned only the lexical matches. Both paths now apply one rule: a
+  claim is a candidate when it shares a term with the query or is a vector
+  candidate of the query vector; other signals only rank candidates.
+  Answers no longer depend on whether a segment directory is configured.
+  The index path's fallback to every claim of the tenant when no query term
+  matched anything is gone too: such a query now returns no results. The
+  rule is documented in the API reference (`POST /v1/retrieve`).
+- **Upgrade notes corrected.** "Mixed-version replication is not tested"
+  and "0.2.x is not expected to read 0.3.0 records (not tested)" are now
+  tested facts (refused both ways; rollback only by restoring the backup),
+  and 0.2 segment directories are not renamed (they carry no tenant
+  marker): the tenant is republished into its new directory.
+
+
+### Added (P2 crash-consistency, fault-injection and load harness)
+
+- **`tools/crash-test`**: randomized `kill -9` harness for the ingestion
+  service. Concurrent writers (single bundles with edges, atomic batches),
+  SIGKILL at a seeded random moment, `wal-inspect verify` before and after
+  recovery, restart-to-ready time, and an oracle of acknowledged writes (all
+  present with every evidence item and edge, nothing never sent, no evidence
+  written twice within the snapshot or within the WAL, unacknowledged
+  requests all-or-nothing). Seed printed, state directory kept on failure,
+  JSON summary. Runs with WAL group commit on (the default) and reads the
+  group-commit counters from `/metrics` before every kill, so the summary
+  shows that acknowledged writes shared fsyncs. 25 cycles run on every PR
+  (job `crash-test`), 1000 nightly.
+- **Disk-full scenarios** (`tests/e2e/tests/s10_disk_full.rs`): the real
+  ingestion binary under `RLIMIT_FSIZE` (writes fail with `EFBIG`) with the WAL
+  alone, during checkpoints and with the redb mirror. The e2e harness gained
+  `SpawnOpts::file_size_limit`, `Proc::rss_kib` and readiness helpers, and now
+  also builds `wal-inspect`.
+- **`tools/loadgen`**: closed-loop ingest/retrieve load generator (concurrency,
+  duration, mix, vector dimension, batch size, bounded id space) against
+  spawned servers or a running deployment; throughput and p50/p95/p99/max
+  latency as text and JSON; soak mode with interval stats, server RSS sampling
+  and growth/error gates.
+- **Nightly workflow** `.github/workflows/durability-nightly.yml`: 1000-cycle
+  crash run, a checkpoint-pressure run, a harness self-check (it must detect
+  lost writes when WAL durability is disabled), the disk-full scenarios, the
+  e2e crash scenario with 500 cycles, a 30-minute soak and a load report,
+  uploaded as artifacts. How to run and what is guaranteed:
+  `docs/operations/testing-durability.md`.
+
+### Fixed (found by the harness)
+
+- **Ingestion memory grew with the WAL when checkpoints were off.** Every
+  replication poll read the whole WAL file into memory to cut one frame out of
+  it, so the leader's RSS and per-poll latency grew with the log (a 3-minute
+  update-only soak on 2,000 claims went from 102 MiB to 851 MiB). The WAL now
+  indexes each line once as it is appended (one byte offset per 64 lines) and
+  a frame reads only the lines it ships; frames are identical to the old ones.
+  The same soak now stays at 32 to 38 MiB and ingests about twice as fast.
+  `FileWal::replication_read_bytes_total` reports the bytes read for frames.
+- **redb updated to 2.6.4**, which fixes unbounded page-cache growth when the
+  same keys are rewritten (measured on the store write path: live heap 5.1 to
+  8.9 MiB over 145,000 updates of 500 claims with 2.6.3, flat with 2.6.4).
+
+- **`/ready` ignored failed WAL writes.** With the redb mirror disabled or
+  still healthy, an ingestion node whose WAL volume was full answered every
+  write with 500 but kept reporting ready, so the load balancer kept sending
+  it writes. It now answers 503 `wal_write_failed` after a write could not be
+  persisted, until a 1 MiB probe file next to the WAL can be written and synced
+  (or a write succeeds). This covers failed appends (the group-commit path
+  included); a failed fsync still poisons the WAL and reports `wal_poisoned`
+  until a restart. New metrics `dash_ingest_wal_write_failure_total`,
+  `dash_ingest_wal_write_recovered_total`, `dash_ingest_wal_write_failing`.
+- **WAL rollback could leave the record count ahead of the file.** When the
+  truncation succeeded but writing the new generation file failed (possible on
+  a full disk), `FileWal::rollback_to` returned before resetting its counters,
+  so replication offsets and checkpoint decisions drifted from the file. The
+  counters are now reset right after the truncation.
+
+### Security
+
+- **The metadata router no longer sends its control-plane token in clear
+  text to a remote host.** Its control-plane client speaks plain HTTP, so a
+  bearer token is now refused unless the control plane is on loopback or
+  `DASH_ROUTER_ALLOW_INSECURE_HTTP=1` is set. The control plane's
+  leader-acquired log line now says "epoch" for the lease epoch counter.
+- **Static-analysis findings addressed.** Credential validation errors no
+  longer carry anything derived from the value (the "too short" message drops
+  the length); credential helpers are named for what they check
+  (`validate_credential*`); auth tests no longer print validated claims; the
+  segment change-detection seed is named `config_key` (it is not a
+  cryptographic salt); the audit fingerprint documents that it is a keyed MAC
+  over high-entropy credentials, not password storage; the TypeScript SDK
+  trims trailing slashes with a linear scan instead of a backtracking regex.
+  CodeQL now skips test-only trees and spikes (`.github/codeql/codeql-config.yml`).
+
+### Security (supply chain; register SEC-20, SEC-21)
+
+- **`bincode` removed (RUSTSEC-2025-0141, unmaintained).** The redb snapshot
+  values are now written by an in-tree codec (`pkg/store/src/value_codec.rs`)
+  that produces the same fixed-width little-endian layout `bincode` 1.x used,
+  prefixed with an 8-byte version header (`DASHv2\0\xff`). Values without the
+  header are read as legacy `bincode` values, so snapshots written by earlier
+  releases load unchanged, and rows are rewritten in the new format as they
+  are updated. Bytes captured from `bincode` 1.3.3 before its removal
+  (`pkg/store/tests/fixtures/legacy-bincode-v1.hex`) back the tests. Legacy
+  `StoreIndexStats` written before `vector_index_bytes` existed now load
+  with that field at 0 instead of failing. *Downgrade:* a release that still
+  uses `bincode` cannot read rows that carry the header; delete the redb file
+  and it is rebuilt from the WAL.
+- **`chacha20` 0.10.1 (yanked) updated to 0.10.2.** `cargo audit` now
+  reports no warnings.
+- **`cargo deny`** (`deny.toml`, new `cargo-deny` job in `security.yml`):
+  vulnerable, unsound, unmaintained and yanked crates fail; licenses must be
+  on a permissive allow-list; crates may come only from crates.io; wildcard
+  requirements are denied; duplicate versions are warnings. Workspace crates
+  now declare `license = "Apache-2.0"` (the `LICENSE` file) and
+  `publish = false`.
+- **Every GitHub Action is pinned to a full commit SHA** with the release tag
+  in a trailing comment, resolved with `git ls-remote`. `trivy-action` moves
+  from `@master` to v0.36.0. `cargo install` in CI uses `--locked` and an
+  exact version. Dependabot also covers the Java, Kotlin and C# SDKs.
+- **Container base images pinned by digest**: `rust:1.99-bookworm`,
+  `debian:bookworm-slim` and the `docker/dockerfile:1.7` frontend.
+- **Release supply chain** (`release.yml`): CycloneDX SBOM per binary and
+  target, SPDX SBOM per image attached as a cosign attestation, keyless
+  cosign signatures (Sigstore bundle per file, signature on each image
+  digest), `SHA256SUMS`, and GitHub build-provenance attestations for files
+  and images. `id-token: write` is limited to the two signing jobs.
+  Verification steps: `docs/operations/supply-chain.md`. Not yet exercised:
+  no tag has been pushed since.
+
+### Added (deletes and tenant erasure; register DATA-14)
+
+- **`DELETE /v1/claims/{claim_id}?tenant_id=...`** removes a claim with its
+  vector, its evidence and every edge from or to it; **`DELETE
+  /v1/evidence/{evidence_id}?tenant_id=...`** removes evidence rows by id;
+  **`DELETE /v1/tenants/{tenant_id}`** erases all of a tenant's data. Claim
+  and evidence deletes need the `ingest` role, tenant erasure `admin` for that
+  tenant. Every delete is idempotent (200 with `deleted: true|false`; a claim
+  of another tenant is reported as not found), audit-logged
+  (`delete_claim`, `delete_evidence`, `delete_tenant`) and gated by the audit
+  fail-closed check. New counters: `dash_ingest_delete_total{scope}`,
+  `dash_ingest_delete_noop_total`, `dash_ingest_delete_removed_total{kind}`.
+- **WAL tombstones.** A delete is one checksummed `T2` record framed as a
+  commit group, appended before memory, redb, the vector index and the
+  tenant's segments change; deletes drain the group-commit pipeline first.
+  Replay, replication followers (retrieval and ingestion) and resync apply
+  the same record; a persisted vector index saved before a delete is
+  corrected by the WAL catch-up; a checkpoint drops the deleted rows and the
+  tombstone. Deleting a tenant's last vector releases its vector dimension.
+  See `docs/operations/data-deletion.md` (backups taken before a delete still
+  hold the data).
+- **Readers fail closed on unknown record kinds.** A whole, checksummed WAL
+  record of a kind the reader does not know now fails replay under both
+  policies instead of being quarantined as a fragment after a broken legacy
+  line, or truncated as a torn write when it is the last line. *Downgrade:*
+  run a checkpoint before starting an older binary on a WAL that holds
+  tombstones.
+- **SDKs:** delete methods in the Python (sync and async), TypeScript, Go,
+  Java, Kotlin and C# (sync and async) clients, with a configurable
+  ingestion base URL (derived from a retrieval URL on port 8080).
+  `scripts/check_sdk_surface.sh` now guards the removed generic `/v1/delete`
+  API and checks every endpoint named in SDK sources against the API
+  reference.
+- ADR 0004 records why per-tenant write partitioning of the ingestion lock is
+  deferred.
+
+### Added (vector index persistence; P2 engine step 2)
+
+- **Restarts no longer rebuild the vector index.** Each service with a WAL
+  path saves its per-tenant vector indexes (flat rows or the `usearch` HNSW in
+  its native format, plus the claim-id key table) to `<WAL path>.vindex`
+  (`DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PATH`), and at startup loads that file
+  and applies only the vector records written to the WAL after it was saved.
+  Measured in release mode on 4 vCPUs (`tests/benchmarks/src/bin/cold_start.rs`):
+  50k x 384-d vectors start in 3.7 to 3.9 s instead of 8.0 to 12.0 s, 100k in
+  8.8 s instead of 23 to 27.5 s; what remains is the WAL replay itself (4.0 s
+  and 9.0 s without any HNSW work). Re-applying vectors written after the
+  last save costs about 0.7 ms each.
+- **Never a stale or corrupt index.** The file carries a manifest (format
+  version, ANN tuning, the WAL generation and record count it reflects, vector
+  counts, per-tenant SHA-256) and a header checksum. It is used only when every
+  checksum verifies, the format version and tuning match the configuration and
+  the WAL generation is the current one; after the catch-up every indexed
+  vector must match the fingerprint of the vector replayed from the WAL. Any
+  mismatch logs a warning and the indexes are rebuilt from the WAL as before.
+- **Saving never blocks requests for long.** A save takes a copy-on-write
+  snapshot of the indexes under the store lock and writes the file without it,
+  atomically (temporary file, fsync, rename, directory fsync). Saves run every
+  `DASH_*_VECTOR_INDEX_SAVE_INTERVAL_MS` (default 300000; `0` turns periodic
+  saves off) when the WAL moved, after every ingestion checkpoint and at a
+  clean shutdown. The first write to an HNSW index after a snapshot copies it
+  once (the existing copy-on-write path).
+- New settings `DASH_{INGEST,RETRIEVAL}_VECTOR_INDEX_PERSIST` (default on;
+  shared `DASH_VECTOR_INDEX_PERSIST`), `..._VECTOR_INDEX_PATH` and
+  `..._VECTOR_INDEX_SAVE_INTERVAL_MS` (shared
+  `DASH_VECTOR_INDEX_SAVE_INTERVAL_MS`). New store API:
+  `InMemoryStore::load_from_wal_with_vector_index`, `vector_index_snapshot`,
+  `wal_position`/`set_wal_position`, `VectorIndexSnapshot::save`,
+  `VectorIndexPersistence`, `FileWal::position`; `StoreLoadStats` gains
+  `vector_index` (how the indexes were obtained).
+- Benchmark `tests/benchmarks/src/bin/cold_start.rs` measures cold start with
+  and without the saved index. ADR 0003 section 11 and
+  `docs/operations/wal-recovery.md` describe the format, the load rules and
+  operations (the file is derived data: safe to delete while stopped, not
+  needed in backups).
+
+### Changed (WAL group commit)
+
+- **Concurrent single ingests share fsyncs.** `POST /v1/ingest` now goes
+  through a group committer (`pkg/store/src/group_commit.rs`): a request is
+  validated and encoded under the runtime lock, queued, and the lock is
+  released while one committer thread appends everything queued and syncs it
+  with a single `fdatasync`. Each request is still answered only after its
+  batch is durable, and records become visible in memory and redb in WAL
+  order. Requests that touch the same claim, an edge target or a tenant's
+  first vector dimension are serialized, so the result always equals a serial
+  replay of the WAL. Batch, raw and document ingests and replication apply
+  drain the pipeline first and are otherwise unchanged. Checkpoints only run
+  when no write is between commit and apply. On by default; settings
+  `DASH_INGEST_WAL_GROUP_COMMIT`, `DASH_INGEST_WAL_GROUP_COMMIT_MAX_WAIT_US`
+  (default 0), `..._MAX_BATCH_BYTES` (1 MiB) and `..._QUEUE_CAPACITY` (1024).
+  A full queue answers `503 wal_group_commit_queue_full` with `Retry-After: 1`.
+- **One fsync per single ingest.** Even with group commit off, a single
+  ingest's commit group is written with one `write` and one `fdatasync`
+  (before: one fsync per record, about five per ingest).
+- **A failed fsync poisons the WAL (fail closed).** After an `fdatasync`
+  error the WAL is never synced again by this process: the failing batch is
+  rejected without touching memory or redb, every later write answers
+  `503 wal_poisoned`, `/ready` reports `not_ready` with reason
+  `wal_poisoned`, and `dash_ingest_wal_poisoned` is 1 until a restart re-reads
+  the log. A write error that is not an fsync error truncates the partial
+  batch and leaves the WAL usable.
+- New metrics `dash_ingest_wal_group_commit_*` and `dash_ingest_wal_poisoned`.
+- Measured on a shared 4 vCPU VM (WAL only, 32 clients): 106 requests/s before,
+  968 with the single-fsync commit group, 2063 with group commit (6.5 requests
+  per fsync). With the default redb mirror the per-write redb transactions
+  now dominate (32 clients: 287 before, 575 off, 624 on in one round; 110,
+  217 and 393 in a second, busier round). Method, full table
+  and caveats: [`docs/operations/wal-durability.md`](docs/operations/wal-durability.md);
+  reproduce with `scripts/benchmark_ingest_group_commit.sh`.
+
+### Added (native TLS and mutual TLS; register SEC-08)
+
+- **Every listener can serve HTTPS itself.** The shared server (`pkg/http`)
+  terminates TLS with rustls (ring provider, TLS 1.2 and 1.3 safe defaults,
+  ALPN `http/1.1`) from a PEM certificate chain and key:
+  `DASH_INGEST_TLS_CERT_FILE` / `_KEY_FILE`, `DASH_RETRIEVAL_TLS_*`,
+  `DASH_CONTROL_PLANE_TLS_*`. TLS is off by default; a half-set or unusable
+  configuration stops the service at startup (exit 2).
+- **Client certificates.** `DASH_<SVC>_TLS_CLIENT_CA_FILE` verifies client
+  certificates (a presented certificate must chain to the CA);
+  `DASH_<SVC>_TLS_REQUIRE_CLIENT_CERT` makes one mandatory. The SHA-256
+  fingerprint of a verified certificate reaches handlers (`Request::tls`).
+- **Replication over mutual TLS.** Followers present
+  `DASH_REPLICATION_CLIENT_CERT_FILE` / `_KEY_FILE` to an `https://` source and
+  always verify the leader (web roots plus `DASH_REPLICATION_CA_FILE`; no way
+  to disable verification). Ingestion can require a verified client
+  certificate on `/internal/replication/*` only
+  (`DASH_INGEST_REPLICATION_REQUIRE_CLIENT_CERT`) and pin followers by
+  fingerprint (`DASH_INGEST_REPLICATION_ALLOWED_CLIENT_CERTS`), on top of the
+  token. The leader's plaintext-exposure warning no longer fires when its
+  listener serves TLS.
+- **Placement client over HTTPS.** `DASH_ROUTER_CONTROL_PLANE_URL` accepts
+  `https://` with `DASH_ROUTER_CONTROL_PLANE_CA_FILE` and an optional client
+  certificate (`DASH_ROUTER_CONTROL_PLANE_CLIENT_CERT_FILE` / `_KEY_FILE`); the
+  router's refusal to send its token over plain `http://` to a remote host
+  does not apply to `https://`.
+- **Handshakes cannot tie up workers.** The accept thread drives handshakes
+  non-blocking, bounded by `DASH_HTTP_FIRST_BYTE_TIMEOUT_MS`, the per-IP cap
+  and the pending bound; the health lane still classifies on the decrypted
+  request line. A plaintext request to a TLS port gets a plaintext 400.
+- **Certificate rotation without restart.** Certificate, key and client CA
+  files are re-read when their content changes (checked at most once per
+  second); a broken new file keeps the previous certificate.
+- **Deployment.** Helm `tls.enabled` / `tls.secretName` / `tls.mutual`, the
+  `deploy/k8s-tls` kustomize overlay (with an example cert-manager
+  `Certificate`), `deploy/container/docker-compose.tls.yml` with
+  `scripts/generate-dev-tls.sh` for development certificates, a TLS-aware
+  container healthcheck, and commented TLS blocks in the systemd env examples.
+  CI renders and validates the TLS variants.
+- **Docs.** New `docs/operations/tls.md`; `docs/operations/replication-security.md`,
+  the threat model, the SOC 2 readiness map and the security pages updated.
+- **Tests.** `pkg/http/tests/tls.rs` (handshake, TLS 1.2-only client, mTLS
+  accept and reject, plaintext refusal, stalled handshakes never reach a
+  worker, per-IP cap before the handshake, rotation, one-shot server),
+  replication-client and placement-client mTLS tests, and the end-to-end
+  scenario `tests/e2e/tests/s10_tls_replication.rs` (real binaries, retrieval
+  following ingestion over mutual TLS). Test PKI is generated per run by the
+  new `tests/tls-fixtures` crate.
+
+### Changed (vector search; P2 engine step 1, register IDX-01, IDX-02)
+
+- **Semantic retrieval now finds the true nearest neighbours.** The in-repo
+  HNSW-style graph (`pkg/store/src/ann.rs` and the graph code in `lib.rs`) is
+  removed. Its build was O(N^2) (20k vectors took 321 s in the ADR 0003 spike)
+  and on clustered data its recall@10 was about 0.15 beyond 5k vectors,
+  because the greedy search never left the entry cluster. Vector search is now
+  a per-tenant `TenantVectorIndex` (`pkg/store/src/vector_index.rs`): an exact
+  flat scan up to `DASH_*_VECTOR_FLAT_THRESHOLD` vectors (default 8192), then
+  a `usearch` HNSW (cosine, `i8` scalar quantisation, connectivity 16,
+  `ef_construction` 128, `ef_search` 256) whose best 50 candidates
+  (`DASH_*_VECTOR_RERANK`) are re-scored with exact `f32` cosine against the
+  stored vectors. The index holds about a third of the memory of an `f32` HNSW.
+  Recall@10 against brute force on seeded clustered data (`pkg/store/tests/vector_recall.rs`):
+  1.000 at 2k and 5k vectors, 0.998 at 20k (the removed graph: 0.48 at 2k, 0.34
+  at 5k on the same data). Measured build, query and startup numbers are in
+  `docs/benchmarks/performance.md`.
+- **Filters are applied inside the vector search.** Time-range, entity and
+  claim-id filters used to be applied after taking the global top-N, so a
+  selective filter could leave nothing. They are now predicates of the search
+  (new `InMemoryStore::ann_vector_top_candidates_filtered`), and an allowed set
+  no larger than the flat threshold is scanned exactly (ADR 0003 selection
+  rule). The old "empty ANN result, scan every vector" fallback is gone; an
+  invalid or wrong-dimension query vector still returns nothing and never
+  touches another tenant.
+- **Startup builds the vector index once.** WAL replay and the redb bulk load
+  collect vectors first and build each tenant's index at the end (multi-threaded
+  for large tenants). At this step the index was not persisted, so cold start
+  grew with the vector count (about 24 s for 100,000 x 384-d vectors on 4
+  vCPUs); see "vector index persistence" above. `set_ann_tuning` rebuilds
+  existing indexes.
+- **Tuning settings changed.** Removed (they described the old graph; if still
+  set they are ignored): `DASH_{INGEST,RETRIEVAL}_ANN_MAX_NEIGHBORS_UPPER`,
+  `..._ANN_SEARCH_EXPANSION_FACTOR`, `..._ANN_SEARCH_EXPANSION_MAX`, their shared
+  `DASH_ANN_*` spellings and the `DASH_BENCH_ANN_*` equivalents; the benchmark
+  flags `--ann-max-neighbors-upper`, `--ann-search-expansion-factor` and
+  `--ann-search-expansion-max` are gone too. `..._ANN_MAX_NEIGHBORS_BASE` now sets
+  the HNSW connectivity (default 16, was 12) and `..._ANN_SEARCH_EXPANSION_MIN`
+  the `ef_search` floor (default 256, was 64). New: `..._ANN_EXPANSION_ADD`
+  (128), `..._VECTOR_FLAT_THRESHOLD` (8192) and `..._VECTOR_RERANK` (50), plus
+  `DASH_BENCH_*` twins.
+- **API.** `store::AnnTuningConfig` now has the fields `connectivity`,
+  `expansion_add`, `expansion_search`, `flat_threshold` and `rerank`;
+  `StoreIndexStats` gains `vector_index_bytes` (`ann_vector_buckets` counts
+  indexed vectors); new public module `store::vector_index` (`VectorIndex`,
+  `FlatIndex`, `HnswIndex`, `TenantVectorIndex`).
+- `store` now uses `usearch` (it was declared but unused), which needs a C++
+  toolchain at build time. The GPU backend remains a placeholder.
+
+### Changed (internal)
+
+- Retrieval, ingestion and the control plane now share one HTTP/1.1 server and
+  request parser, the new `pkg/http` crate (`dash-http`), instead of three
+  hand-written copies (MNT-01). Routing, status codes, error messages, env var
+  names and metric names are unchanged. A handler panic is now answered with
+  500 instead of taking down a worker. The control plane gains the strict
+  parser (HTTP version check, 501 for `Transfer-Encoding`, bounded header
+  count, accept-error backoff) and escapes all JSON control characters. The
+  shared crate has socket-level and seeded property tests and a
+  `fuzz_http_request` fuzz target.
+
+The 0.3.0 release has not been tagged yet; its content is below.
+
+### Added (P1 typed configuration)
+
+- **Typed settings registry** (`pkg/config`, crate `dash-config`): one table
+  lists every environment setting the code reads (name, scope, value type,
+  default, description, deprecated aliases). The configuration reference page is
+  now generated from it (`cargo run -p dash-config -- docs`); `scripts/check_config_docs.sh`
+  wraps `dash-config docs --check`. The test
+  `registry_covers_every_env_var_read_by_code` fails when the code reads a
+  variable the registry lacks, or the registry lists one no code reads.
+- **Startup validation.** `ingestion`, `retrieval` and `control-plane` validate
+  their environment at startup: a malformed value of a typed setting (non-number,
+  out of range, unknown enum word, unparsable boolean, blank where blank is
+  meaningless) prints every error and exits with code 2. Unknown `DASH_*` /
+  `EME_*` variables and deprecated spellings (`EME_*`, `DASH_OLLAMA_BASE_URL`,
+  `DASH_*_JWT_ROLE_CLAIM`) are logged as warnings, with a did-you-mean
+  suggestion. `DASH_CONFIG_VALIDATION=warn` downgrades errors to warnings.
+  The validator accepts every value the existing readers accept; where readers
+  differ it accepts the union.
+- **Configuration file.** `DASH_CONFIG_FILE=/path/dash.toml` (tables
+  `[ingestion]`, `[retrieval]`, `[control_plane]`, `[common]`, lowercase keys
+  named after the variable suffix) fills settings that are not set in the
+  environment; the environment wins. Unknown keys are startup errors with a
+  suggestion; a file holding secret-typed keys must have mode 0600 or 0640.
+  See [Configuration file](docs-site/docs/operations/configuration-file.md).
+- **`dash-config` command line tool:** `validate`, `print` (effective value and
+  source, secrets redacted), `docs [--check]`, `list`.
+
+### Changed
+
+- `scripts/check_deploy_env.sh` no longer counts the names listed in
+  `pkg/config` as "read by the code".
+- The `DASH_STRICT_SECRETS` description now states that the control plane
+  applies it to its bearer token (it already did).
+
+## 0.3.0 (unreleased) - P0 production-readiness hardening
+
+All code listed here is merged in this tree; nothing is tagged or published.
+Defect IDs refer to
+[`docs/plans/2026-10-09-issue-register.md`](docs/plans/2026-10-09-issue-register.md);
+what each area covers, with test evidence and what is still open, is in
+[`docs/plans/2026-10-09-p0-status.md`](docs/plans/2026-10-09-p0-status.md).
+The authoritative scope and exit criteria are in
+[`docs/plans/2026-10-09-production-readiness-master-plan.md`](docs/plans/2026-10-09-production-readiness-master-plan.md).
+Items marked **Breaking** need action when upgrading from 0.2.x; the
+steps are in [Upgrading to 0.3.0](#upgrading-to-030).
+
+### Upgrading to 0.3.0
+
+Do these in order. Environment variable meanings are in
+[`docs-site/docs/reference/configuration.md`](docs-site/docs/reference/configuration.md).
+
+1. **Back up and verify the WAL before upgrading.** Stop writes, then run
+   `scripts/backup_state_bundle.sh` (it bundles the WAL, segments and
+   placement file). Build the new tool with
+   `cargo build --release -p wal-inspect` and run
+   `target/release/wal-inspect verify <wal>` on the ingestion WAL, the
+   retrieval WAL (if `DASH_RETRIEVAL_WAL_PATH` is set) and each
+   `<wal>.snapshot`. Exit status 0 means no problem, 1 means an interior
+   line is damaged (fix it first with the procedure in
+   [`docs/operations/wal-recovery.md`](docs/operations/wal-recovery.md)),
+   2 means a usage or I/O error. A torn final line is not a failure; the
+   service truncates it on start. `wal-inspect inspect <wal>` also shows
+   how many records are legacy. Legacy records stay readable; ones that can
+   no longer be parsed or validated are moved to `<wal>.quarantine` at
+   startup instead of blocking it (set `DASH_WAL_REPLAY_STRICT=1` in
+   staging to see them as errors). WAL records written by 0.3.0 use new
+   record kinds (`C2`, `E2`, `G2`, `V2`, `B2`) that 0.2.x cannot read, so
+   the only rollback is restoring this backup ([`docs/operations/upgrades.md`](docs/operations/upgrades.md)).
+2. **Generate secrets.** For Docker Compose run `scripts/generate-secrets.sh`
+   (it writes `deploy/container/.env` with mode 0600: the API keys, JWT
+   secrets, the replication token on both sides and the control-plane
+   token). Elsewhere create each value yourself, for example
+   `openssl rand -hex 32`. Strict validation is on by default: API keys,
+   scoped keys and replication tokens need at least 16 characters, HS256
+   JWT secrets at least 32, and placeholders such as `change-me`,
+   `example` or `<...>` are rejected. Replace any shorter or placeholder
+   secret you used before.
+3. **Set the variables the services now require.** Ingestion needs a
+   credential (`DASH_INGEST_API_KEY`, `DASH_INGEST_API_KEY_SCOPES` or
+   `DASH_INGEST_JWT_HS256_SECRET`, or OIDC) and
+   `DASH_INGEST_REPLICATION_TOKEN` if retrieval or another node follows it.
+   Retrieval needs a credential and, when it follows ingestion,
+   `DASH_RETRIEVAL_REPLICATION_TOKEN` equal to ingestion's
+   `DASH_INGEST_REPLICATION_TOKEN`. The control plane needs
+   `DASH_CONTROL_PLANE_TOKEN`; ingestion and retrieval present it to the
+   control plane through `DASH_ROUTER_CONTROL_PLANE_TOKEN` (or the same
+   `DASH_CONTROL_PLANE_TOKEN`). A service with no credentials exits with
+   code 2; for a local, throwaway setup only, `DASH_INSECURE_DEV_MODE=1`
+   allows it (and forces a loopback bind). Kubernetes and Helm manifests
+   used the wrong names `DASH_INGESTION_API_KEY` and
+   `DASH_INGESTION_JWT_HS256_SECRET`; the code reads `DASH_INGEST_*`. Use
+   `DASH_OLLAMA_ENDPOINT` (not `DASH_OLLAMA_BASE_URL`, which is only a
+   deprecated alias).
+4. **Check roles.** A JWT without a roles claim (`dash_roles` by default)
+   is now authenticated but gets 403 on every role-checked route: add the
+   claim, or set `DASH_INGEST_JWT_DEFAULT_ROLES` /
+   `DASH_RETRIEVAL_JWT_DEFAULT_ROLES`. Unscoped API keys
+   (`DASH_*_API_KEY`, `DASH_*_API_KEYS`) used to bypass role checks; they
+   now get `DASH_*_API_KEY_DEFAULT_ROLES`, which defaults to `ingest` on
+   ingestion and `retrieve` on retrieval. A key that must also read
+   `/metrics` or `/debug/*` needs `read_only` (or `admin`), for example
+   `DASH_RETRIEVAL_API_KEY_DEFAULT_ROLES=retrieve,read_only`. Tokens whose
+   lifetime exceeds 24 hours, tokens without `exp`, and wildcard (`*`)
+   tenants are now rejected unless you set
+   `DASH_*_JWT_MAX_LIFETIME_SECS` or `DASH_*_JWT_ALLOW_WILDCARD_TENANT=1`.
+   OIDC now requires `DASH_*_JWT_ISSUER`, `DASH_*_JWT_AUDIENCE` and an
+   `https://` JWKS URL.
+5. **Update clients and monitoring.** `/metrics`, `/debug/*` and
+   `/v1/embeddings` now require credentials (`read_only` for the first
+   two, `retrieve` for embeddings): give Prometheus an `x-api-key` or bearer
+   header, or set `DASH_METRICS_PUBLIC=1` to exempt `/metrics` only. Health
+   probes (`/health`, `/live`, `/ready`) stay open. Rate limits are now
+   enforced per tenant (defaults 100 rps / burst 200 on ingestion, 500 rps /
+   burst 1000 on retrieval; HTTP 429 with `Retry-After`): raise
+   `DASH_*_RATE_LIMIT_PER_TENANT_RPS` for bulk loaders or set it to `0` to
+   disable. `/v1/retrieve` rejects `top_k` above 1000
+   (`DASH_RETRIEVAL_MAX_TOP_K`). Token-id array inputs on `/v1/embeddings`
+   are rejected unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`.
+6. **Upgrade the replication leader first, then its followers.**
+   Replication frames now carry the WAL generation. Replication between
+   0.2.x and 0.3.0 is refused in both directions (tested): a 0.3.0 follower
+   rejects a 0.2.x leader's frames and reports `replication_leader_too_old`
+   in `/ready`, and a 0.2.x follower cannot parse 0.3.0 frames; neither
+   applies anything. An upgraded follower without a 0.3.0 cursor does a full
+   resync from the leader's export on its first poll; a retrieval follower
+   without a retrieval WAL always starts with a full resync. Stop all
+   control-plane replicas before upgrading them: 0.2.x cannot read the
+   0.3.0 lease file.
+7. **Tenant segment directories are rebuilt where their name changes.**
+   Tenant directories now have collision-free names (`tenant_b` becomes
+   `tenant_5fb`) and a `segments.tenant` marker. 0.2.x wrote no marker, so
+   a 0.2.x directory whose name changes is ambiguous: it is left untouched
+   (with a warning) and the tenant's segments are written to the new
+   directory on its next write; until then retrieval scans that tenant
+   without the segment prefilter. Nothing to do; delete the old directories
+   once every tenant has been republished.
+8. **Update SDK code.** Remove calls to `delete` in the Java, Kotlin and C#
+   SDKs (the server never had that route). Go users change the import path
+   to `github.com/BHAWESHBHASKAR/DASH/sdks/go`. SDK versions are 0.2.0.
+9. **After the upgrade.** Check `/ready` on both services, look for
+   `<wal>.quarantine` files and a startup warning about quarantined
+   records, re-run `wal-inspect verify`, and, if the audit log is enabled,
+   run `target/release/audit-verify --path <log>` (build it with
+   `cargo build --release -p audit-verify`). New audit records use the v2
+   encoding and continue the existing chain.
+
+### Security
+- **Breaking: deny by default.** Services refuse to start (exit 2) with no
+  credentials configured unless `DASH_INSECURE_DEV_MODE=1`; dev mode binds
+  loopback only unless `DASH_INSECURE_DEV_MODE_ALLOW_NON_LOOPBACK=1`
+  (SEC-01). A JWT-only configuration no longer falls through to an open
+  API-key branch (SEC-02).
+- **Breaking: strict secret validation on by default** (placeholders
+  rejected, at least 16 characters for keys and tokens, 32 for JWT secrets);
+  it can only be disabled with `DASH_STRICT_SECRETS=0` together with dev
+  mode (SEC-04, SEC-05). Errors never echo the secret.
+- **Breaking: roles.** `admin` implies every role and `read_only` implies
+  `retrieve`; a JWT without a roles claim gets no roles unless
+  `DASH_*_JWT_DEFAULT_ROLES` is set; legacy unscoped API keys get
+  `DASH_*_API_KEY_DEFAULT_ROLES` (primary role of the service by default)
+  instead of all roles (SEC-11).
+- **Breaking:** `/v1/embeddings`, `/debug/*` and `/metrics` require
+  authentication; `/metrics` can be exempted with `DASH_METRICS_PUBLIC=1`.
+  Authentication and authorization run before any embedding provider call
+  (SEC-09, SEC-10).
+- **Breaking:** replication endpoints require `DASH_INGEST_REPLICATION_TOKEN`
+  (constant-time comparison; 403 without it) and an ingestion follower will
+  not start without it (SEC-08).
+- **Breaking:** the control plane requires `DASH_CONTROL_PLANE_TOKEN`
+  (bearer, constant-time comparison) on every route except health and ready,
+  and refuses to start without it outside dev mode (SEC-07). Leases are
+  durable and fenced, the leader renews in the background, and promotion is
+  refused unless the replica reported zero replication lag (or `force=1`)
+  (CP-01, CP-02). The placement client in ingestion and retrieval presents
+  the token, has bounded timeouts, and no longer falls back to a stale
+  placement file unless `DASH_ROUTER_ALLOW_STALE_PLACEMENT=1`; ingestion
+  refuses writes when placement reloads have failed for longer than
+  `DASH_INGEST_PLACEMENT_STALE_GRACE_MS` (REP-08).
+- Per-tenant token-bucket rate limiting is enforced for API keys, JWTs and
+  OIDC, state is kept across requests, and the response is HTTP 429 with
+  `Retry-After` (SEC-06).
+- JWT and OIDC hardening: `exp` always required, maximum lifetime
+  (`DASH_*_JWT_MAX_LIFETIME_SECS`, default 86400), leeway capped at 60 s,
+  `jti` denylist, wildcard tenants opt-in, empty HS256 keys rejected;
+  OIDC requires `iss` and `aud`, an `https` JWKS URL, an asymmetric-algorithm
+  allow-list and a `kid`; the JWKS cache has single-flight fetches,
+  stale-while-revalidate (24 h), negative caching, a forced-refresh limit,
+  3 s / 256 KiB / no-redirect fetch bounds, and garbage tokens never trigger
+  a fetch (SEC-12, SEC-13, SEC-14).
+- Authentication settings reload on SIGHUP (optionally from
+  `DASH_CONFIG_RELOAD_FILE`); the key and `jti` revocation files reload when
+  their mtime or size changes, checked at most once per second (SEC-15 in
+  part; keys are still held in plaintext).
+- The OpenAI embedding provider uses HTTPS (rustls); the provider clients
+  are bounded (response cap, no redirects, total deadline, jittered
+  retries), the circuit breaker admits a single half-open probe, and sending
+  a key over plaintext HTTP to a non-loopback host is refused unless
+  `DASH_EMBEDDING_ALLOW_INSECURE_HTTP=1` (SEC-23, EMB-01, EMB-03, EMB-05).
+- Cross-tenant claim-id conflict errors no longer name the other tenant
+  (SEC-18, in part); tenant directories are collision-free (SEC-19);
+  identifier fields reject control characters.
+- Audit chain: one canonical v2 encoding shared by both services, file
+  locking, `fdatasync`, torn-tail truncation, explicit `chain_restart`
+  records instead of silent restarts, actor fingerprints, an optional
+  fail-closed gate (`DASH_*_AUDIT_FAIL_CLOSED`), and the shared verifier
+  `tools/audit-verify` (SEC-17). The chain is still **unkeyed** (no HMAC).
+
+### Reliability
+- Network embedding providers are wrapped in a circuit breaker (transport
+  errors, timeouts and 5xx only) and a concurrency cap; outages answer 503
+  with `Retry-After` in both services.
+- Health probes use reserved workers; idle connections are closed after a
+  first-byte timeout, the request deadline starts at accept, and
+  `DASH_HTTP_MAX_CONNS_PER_IP` caps connections per client.
+- Stricter request parsing: invalid percent-encoding, malformed HTTP
+  versions, header folding, `Expect` and (retrieval) duplicate JSON keys
+  are rejected.
+- Non-finite provider output is rejected; ingest rejects cross-tenant edge
+  targets and all-zero claim embeddings.
+- Python, TypeScript and Go SDKs decode `encoding_format="base64"`
+  embeddings and expose `dimensions`.
+
+### Data integrity and recovery
+- Evidence is upserted by `evidence_id` and edges by
+  `(from, to, relation)` in memory, in redb, on bulk load and on replication
+  re-apply, so retries, restarts and replays no longer duplicate citations
+  (DATA-01).
+- **WAL v2 records** (`C2`, `E2`, `G2`, `V2`, `B2`): every field escaped and
+  each record ends with a CRC-32 suffix (`crc=<8 hex>`). Legacy records are
+  still read. Tabs and newlines in claim text no longer poison replay
+  (DATA-02, DATA-07).
+- Edge `reason_codes` and `created_at` are persisted in `G2` records and
+  survive restarts; checkpoints and WAL repairs fsync the containing
+  directory after renames (DATA-06, DATA-08).
+- **Torn-tail recovery:** a partial or checksum-failing last line is
+  truncated at open instead of failing startup (DATA-07). A damaged interior
+  record is a hard error naming the line.
+- **WAL generation** (`<wal>.gen`) changes on checkpoint; replication frames
+  and exports carry it, and followers persist `(generation, offset)`
+  together and resync when it changes (REP-01, REP-02, REP-05).
+- **Atomic single ingest:** one bundle is one WAL commit group; a crash
+  inside a group replays as nothing and a torn group is discarded (DATA-10).
+  Batches are staged on a detached copy of the store and committed as a unit
+  (DATA-09).
+- **Quarantine of unreadable legacy records:** replay moves legacy records
+  that cannot be parsed or validated (and the records that depend on them)
+  into `<wal>.quarantine` instead of failing startup; `DASH_WAL_REPLAY_STRICT=1`
+  restores fail-fast.
+- Vector writes are validated before the WAL append; re-upserting a claim
+  keeps its vector and ANN entry; query vectors are validated and invalid
+  ones never produce NaN scores (DATA-03, DATA-04, DATA-05).
+- Replication protocol: bounded responses, atomic frame application, backoff,
+  generation-aware offsets, replace-on-resync keeping the redb handle, and
+  readiness (`/ready`, metrics) that reports lag, staleness and initial-sync
+  state. Frames never end inside a commit group (REP-03, REP-04, REP-06).
+- redb: single-transaction claim writes; the in-memory event buffer is a
+  bounded ring (PERF-05).
+- Batch idempotency is content aware: replaying a `commit_id` with the same
+  content is a no-op, reusing it with different content is applied as an
+  update (`updated: true`). Document-derived ids are collision-free and
+  evidence spans refer to offsets in the original text (DATA-12, DATA-13).
+
+### Behavior changes
+- **Breaking: edge direction.** An edge `from supports to` supports the
+  **target** claim (previously the author); contradicts edges penalize the
+  target. Dangling, cross-tenant and self edges are ignored and each distinct
+  source counts once. `supports` counts in results can differ from 0.2.x
+  (IDX-05).
+- **Ranking saturation.** The support bonus is `tanh`-saturated and capped
+  at 0.4 (historical slope of 0.08 per source for small counts), the
+  contradiction penalty is capped at 0.5; evidence from one `source_id`
+  counts once toward the ranking signal (the reported `supports` and
+  `contradicts` counts stay raw).
+- `/v1/embeddings`: errors use OpenAI's `{"error":{...}}` shape; provider
+  failures are 503 `embedding_unavailable` or 502 `embedding_provider_error`
+  (they were 400); token-id array inputs are rejected with 400
+  `unsupported_input_type` unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`;
+  `usage.prompt_tokens` is an estimate (`ceil(chars / 4)`); `dimensions`
+  must match the provider; at most 2048 inputs and
+  `DASH_EMBEDDING_MAX_TOTAL_CHARS` characters (EMB-06).
+- **HTTP status codes and bounds:** 413 for bodies over 16 MiB, 431 for
+  oversized or too many headers, 408 for a request that exceeds
+  `DASH_HTTP_REQUEST_TIMEOUT_MS`, 501 for `Transfer-Encoding`, 429 with
+  `Retry-After`, 502/503 for embedding provider failures, 503 when the
+  audit fail-closed gate or stale placement refuses a write. JSON is parsed
+  with a depth limit (a deeply nested body used to abort retrieval) and
+  UTF-8 decodes identically over GET and POST (ROB-01 to ROB-04).
+- **Retrieve bounds:** `top_k` at most 1000 (`DASH_RETRIEVAL_MAX_TOP_K`),
+  `query` at most 8 KiB, at most 256 filter values, query vectors of at most
+  8192 values; an invalid `query_embedding` is a 400.
+- The retrieve path resolves the segment prefilter before taking the store
+  read lock, makes one candidate scan per request, and scopes every vector
+  fallback to the requesting tenant (IDX-03, PERF-02, PERF-04).
+- Accept-loop errors no longer end the server, ingestion escapes control
+  characters in JSON output and percent-decodes query values (ROB-06,
+  ROB-09, ROB-10).
+- Retrieval fails to start (exit 1) on an invalid placement configuration;
+  ingestion exits 2.
+- `/metrics` gains per-route latency histograms, auth and rate-limit
+  counters, replication follower gauges and audit counters.
+- `DASH_OLLAMA_ENDPOINT` is the Ollama variable (`DASH_OLLAMA_BASE_URL`
+  remains as a deprecated alias); Ollama defaults to `/api/embed`
+  (EMB-02).
+
+### Operations and deployment
+- New tools: `tools/wal-inspect` (`inspect`, `verify`, `repair`;
+  [`docs/operations/wal-recovery.md`](docs/operations/wal-recovery.md)) and
+  `tools/audit-verify` (wrapped by `scripts/verify_audit_chain.sh`;
+  [`docs/operations/audit-chain.md`](docs/operations/audit-chain.md)).
+- New operations guide for authentication, roles, OIDC and reload:
+  [`docs/operations/auth.md`](docs/operations/auth.md).
+- Docker Compose: required generated secrets (`${VAR:?}`), published ports
+  on `127.0.0.1` (`DASH_PUBLISH_ADDR` to change), read-only root filesystem,
+  all capabilities dropped, replication wiring, audit logs, an optional
+  `control-plane` profile; images take a per-service `SERVICE` build arg and
+  a readiness healthcheck (DEP-08, DEP-10, SEC-20, SEC-24).
+- Kubernetes manifests: secrets are no longer committed (you create them),
+  replication is wired, ingest paths are routed, a control plane is added,
+  HorizontalPodAutoscalers are removed. Helm: secrets have no defaults and
+  are required, env names fixed, image naming matches the release workflow,
+  HPA removed. systemd: separate state directories per service,
+  sandboxing, a control-plane unit, generated environment secrets
+  (DEP-01 to DEP-06, DEP-09, SEC-03, SEC-04).
+- CI: deploy artifacts are validated, images are built on pull requests,
+  a control-plane release image is published, the Trivy action is pinned,
+  and Java, Kotlin and C# SDK jobs were added. There is no separate
+  end-to-end suite; end-to-end coverage lives in the Rust integration tests
+  (`services/retrieval/tests/end_to_end.rs`,
+  `services/retrieval/tests/replication_e2e.rs`,
+  `services/ingestion/tests/replication_follower.rs`).
+- `scripts/check_config_docs.sh` fails when an environment variable read by
+  the code is not documented in the configuration reference.
+
+### SDKs
+- Java, Kotlin and C# SDKs fixed and unified at version 0.2.0: response
+  bodies are read once, models follow the server contract, ingest targets the
+  ingestion service (separate base URL), retries are limited to idempotent
+  requests or requests with an `Idempotency-Key` and honor `Retry-After`
+  (SDK-01 to SDK-06).
+- **Breaking:** `delete()` removed from the Java, Kotlin and C# SDKs (there
+  is no `/v1/delete`).
+- Python, TypeScript and Go send and decode the full retrieve contract
+  (`query_embedding`, `entity_filters`, `embedding_id_filters`,
+  `time_range`, `read_consistency`, `return_graph`, graph and confidence
+  fields); the default `top_k` is 5 like the server; versions are 0.2.0.
+- **Breaking:** the Go module path is now
+  `github.com/BHAWESHBHASKAR/DASH/sdks/go` (was `github.com/anomalyco/dash-go`).
+
+### Documentation
+- README, configuration reference (regenerated from the code),
+  HTTP API reference, deploy guide, threat model, SOC 2 readiness mapping
+  and the operations guides were rewritten to describe only what the code
+  does (DOC-01 to DOC-07). Every README capability claim is tracked in
+  `docs/claims-ledger.md` and checked by `scripts/check_claims_ledger.sh`.
+
+### Not in 0.3.0
+HMAC-keyed audit chain, encryption at rest (the `pkg/encryption` library is
+not wired into storage), mTLS, an external penetration test, consensus
+replication and automatic failover, delete and tenant-management APIs, a real
+GPU backend, signed release images.
+
+## M11 - Enterprise identity, RBAC, encryption library, SOC 2 package (in tree, untagged; 2026-08-10)
+
+Delivered in commits `c55e8cb` (M11a/M11b) and `e38cd0b` (M11c/M11d). What
+exists and what does not:
+
+### Added
+- **OIDC/JWKS token validation** (`pkg/auth/src/oidc.rs`): JWKS fetch with
+  a refresh interval, issuer/audience/expiry checks, tenant claim
+  extraction. Enabled per service with `DASH_*_JWT_PROVIDER=oidc`. Unit
+  tests use a symmetric (`oct`/HS256) JWK; there is no end-to-end test
+  against an identity provider and no RSA/EC key test. *Correction
+  (0.3.0):* the OIDC path now has RS256 tests against generated keys and
+  an in-process stub IdP, plus the JWKS hardening listed above; there is
+  still no test against a real identity provider.
+- **Role-based access control**: roles `admin`, `ingest`, `retrieve`,
+  `read_only` parsed from JWT claims and scoped API keys
+  (`key:tenants:roles`) and checked per route in ingestion and retrieval.
+  Known gaps at the time: roles had no hierarchy, a JWT without a roles
+  claim got all roles, unscoped keys skipped role checks (SEC-11), and the
+  planned control-plane `admin` enforcement was not implemented (SEC-07).
+  *Correction (0.3.0):* the role hierarchy, role-less JWT handling,
+  default roles for unscoped keys and control-plane token authentication
+  are implemented; see 0.3.0 above.
+- **`pkg/encryption`**: an AES-256-GCM `EncryptionProvider` trait with an
+  environment master-key provider. This is a library only: no storage
+  code calls it, so no data is encrypted at rest by DASH (SEC-16).
+- **SOC 2 readiness package**: `docs/compliance/soc2-readiness.md`,
+  policy templates, and `scripts/soc2_evidence_collector.sh`. These
+  describe a target state; see the "Current status" column added in the
+  2026-10-09 documentation correction.
+
+## 0.2.x line - 2026-06-13 modernization (in tree, untagged)
+
+Everything below this heading was previously listed under `[Unreleased]`.
+Corrections made on 2026-10-09 are marked *Correction*.
+
+
 ### Added
 - **OpenAI-compatible `/v1/embeddings` endpoint** on the retrieval
   service. Any OpenAI client (langchain, llama-index, semantic-kernel,
@@ -40,7 +1227,7 @@ to [Semantic Versioning](https://semver.org/).
   in `[-1, 1]`, mapped to `[0, 1]`); the lexical/BM25 score becomes a
   small tie-breaker. 3 new integration tests cover the semantic-first
   guarantee.
-- **redb persistence (PR 1, additive, default off)** — `DiskBackedStore`
+- **redb persistence (PR 1, additive)** (*Correction:* PR 1 shipped default-off, but commit `6a242d8` (PR 2) made persistence default-on when a WAL path is set; disable with `DASH_*_PERSISTENCE_DISABLE=1`. The text below describes PR 1.) — `DiskBackedStore`
   struct in `pkg/store/src/disk.rs` provides on-disk durability for
   claims, evidence, edges, vectors, and the tenant→claim set. Enabled
   via `DASH_INGEST_PERSISTENCE_PATH` / `DASH_RETRIEVAL_PERSISTENCE_PATH`
@@ -77,10 +1264,13 @@ to [Semantic Versioning](https://semver.org/).
   `jsonwebtoken`, `serde_json`, `base64`, `sha2`, and `hex`. Public
   API preserved. 16 tests pass (was 7 in the hand-rolled impl —
   added 9 new edge-case tests including a FIPS SHA-256 known vector).
-- **Hand-rolled HNSW in pkg/store** — replaced the 4-level O(N²)-per-insert
-  HNSW scaffolding with the `usearch` crate. Per-tenant ANN graphs
-  are still isolated and dimension-pinned; the new index is
-  substantially faster on the benchmark suite.
+- **Hand-rolled HNSW in pkg/store** — *Correction (2026-10-09):* this
+  entry originally claimed the in-repo HNSW scaffolding was replaced by
+  the `usearch` crate and was "substantially faster". That did not
+  happen. `usearch` is declared in `Cargo.toml` but no source file uses
+  it; the ANN index is the in-repo HNSW-style graph in
+  `pkg/store/src/ann.rs` (register IDX-01). No benchmark in the
+  repository supports a speedup claim.
 - **Schema types** in `pkg/schema` — added `Serialize`/`Deserialize`
   derives to all public domain types with `#[serde(default)]` on
   optional fields.
@@ -101,6 +1291,12 @@ to [Semantic Versioning](https://semver.org/).
   `ingest_bundle`; fixed by merging into a single evidence vec).
 
 ### Test counts
+*Correction (2026-10-09):* the counts below are the figures recorded on
+2026-06-13 and were not re-verified. On 2026-10-09 the repository
+contains 420 Rust `#[test]`/`#[tokio::test]` declarations (static
+count). SDK test declarations: Python 64, Go 89, TypeScript 69, Java 21,
+Kotlin 12, C# 41. Pass/fail status is the CI result, not these numbers.
+
 - **Rust unit + integration tests:** 379 passing (was 333 at the start
   of this modernization campaign; +46 new tests across schema,
   auth, store (unit), store (integration_retrieval), retrieval,
@@ -111,13 +1307,9 @@ to [Semantic Versioning](https://semver.org/).
 - **Total across all stacks:** **589 tests passing.**
 
 ### Known limitations
-- The `InMemoryStore::Clone` derive was replaced with a manual impl
-  that drops the disk handle on clone. This is a known limitation of
-  the redb PR 1 design; the next PR will switch to `Arc<DiskBackedStore>`
-  to share the handle cheaply. Cloned stores used for batched ingest
-  staging will lose their disk attachment — this affects
-  `IngestionRuntime::ingest_batch` which does `self.store.clone()`
-  internally.
+- *Superseded:* the `InMemoryStore::Clone` limitation (disk handle dropped
+  on clone) was addressed by redb PR 2 (`Arc<DiskBackedStore>`, commit
+  `6a242d8`).
 - The `embeddings_for_claim` returns the full evidence vec; for tenants
   with thousands of evidence per claim, this is unbounded. A future
   PR will add pagination.
@@ -129,6 +1321,9 @@ to [Semantic Versioning](https://semver.org/).
 ## Earlier releases
 
 ### Pre-modernization
+(Note: the architecture document referred to here is
+`docs/architecture/eme-architecture.md`; the root `EME_ARCHITECTURE.md`
+is now a pointer to it.)
 The original EME/DASH architecture is documented in
 `docs/architecture/eme-architecture.md` (the "Evidence Memory Engine"
 phase 0 design). The 11-phase production rollout plan lives in

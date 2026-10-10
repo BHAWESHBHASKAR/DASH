@@ -1,0 +1,22 @@
+[package]
+name = "dash-config"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+description = "Typed registry of every DASH environment setting, with validation, a TOML file overlay and generated reference docs."
+
+[lib]
+name = "dash_config"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dash-config"
+path = "src/main.rs"
+
+[dependencies]
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

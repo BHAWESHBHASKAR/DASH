@@ -263,7 +263,7 @@ async def test_async_retrieve_default_stance_mode(
         await client.close()
     body = spy.call_args.kwargs["json"]
     assert body["stance_mode"] == "balanced"
-    assert body["top_k"] == 10
+    assert body["top_k"] == 5
     assert isinstance(response, RetrieveResponse)
     assert len(response.results) == 1
 
@@ -322,3 +322,32 @@ async def test_concurrent_embedding_requests_all_succeed(
         await client.close()
     assert len(results) == 5
     assert all(isinstance(r, EmbeddingResponse) for r in results)
+
+
+async def test_async_retrieve_sends_optional_server_fields(
+    base_url: str,
+    mocker: pytest.MockFixture,
+    sample_retrieve_response: Dict[str, Any],
+) -> None:
+    spy = _patch_async_request(mocker, MockResponse(200, sample_retrieve_response))
+    client = AsyncClient(base_url=base_url)
+    try:
+        await client.retrieve(
+            "tenant-a",
+            "q",
+            query_embedding=[0.5],
+            entity_filters=["acme"],
+            embedding_id_filters=["emb-1"],
+            time_range={"from_unix": 1, "to_unix": 2},
+            read_consistency="all",
+            return_graph=False,
+        )
+    finally:
+        await client.close()
+    body = spy.call_args.kwargs["json"]
+    assert body["query_embedding"] == [0.5]
+    assert body["entity_filters"] == ["acme"]
+    assert body["embedding_id_filters"] == ["emb-1"]
+    assert body["time_range"] == {"from_unix": 1, "to_unix": 2}
+    assert body["read_consistency"] == "all"
+    assert body["return_graph"] is False

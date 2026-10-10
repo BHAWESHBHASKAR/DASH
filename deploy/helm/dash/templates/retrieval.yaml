@@ -1,14 +1,14 @@
 {{- /*
-Retrieval workload. Renders Service + StatefulSet. The StatefulSet
-(vs Deployment) is required because redb persistence is per-pod
-RWO; a Deployment with a shared RWO PVC cannot schedule >1 replica.
+Retrieval workload: Service + StatefulSet. Every replica has its own
+PVC and follows the single ingestion pod via WAL replication. Scale manually;
+there is no HPA.
 */ -}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "dash.componentName" (list . "retrieval") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: retrieval
@@ -21,13 +21,13 @@ spec:
     port: {{ .Values.service.ports.http }}
     targetPort: http
     protocol: TCP
-    appProtocol: http
+    appProtocol: {{ ternary "https" "http" .Values.tls.enabled }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "dash.componentName" (list . "retrieval") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: retrieval
@@ -42,17 +42,23 @@ spec:
     metadata:
       labels:
         {{- include "dash.retrievalSelectorLabels" . | nindent 8 }}
-      {{- with .Values.podLabels }}
-      {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.podAnnotations }}
-      annotations:
+        {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the rendered ConfigMap or chart-managed Secrets
+        # change: envFrom is read only at container start, so without this
+        # a `helm upgrade` that changes config.* or secret.* did nothing
+        # until the pods happened to restart.
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "dash.retrievalServiceAccountName" . }}
       automountServiceAccountToken: false
-      {{- with .Values.imagePullSecrets }}
+      {{- if .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- include "dash.imagePullSecrets" . | nindent 8 }}
       {{- end }}
@@ -71,51 +77,53 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+      {{- include "dash.initDataDirs" (list . (include "dash.retrievalImage" .) "/var/lib/dash/state /var/lib/dash/segments /var/lib/dash/audit") | nindent 6 }}
       containers:
       - name: retrieval
         image: {{ include "dash.retrievalImage" . | quote }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        # Matches the image ENTRYPOINT; DASH_BIN selects the binary.
         command: ["/opt/dash/bin/dash-entrypoint"]
         args: ["--serve"]
         env:
         - name: DASH_BIN
           value: "retrieval"
-        - name: DASH_HEALTHCHECK_URL
-          value: "http://127.0.0.1:8080{{ .Values.probes.liveness.path }}"
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config
         - secretRef:
-            name: {{ include "dash.fullname" . }}-retrieval-secrets
+            name: {{ include "dash.retrievalSecretName" . }}
         ports:
         - name: http
           containerPort: 8080
           protocol: TCP
         resources:
-          {{- $r := merge (deepCopy .Values.resources) (default (dict) .Values.resources.retrieval) }}
-          {{- $req := dig "requests" (dict) $r }}
-          {{- $lim := dig "limits" (dict) $r }}
-          requests:
-            {{- toYaml $req | nindent 12 }}
-          limits:
-            {{- toYaml $lim | nindent 12 }}
+          {{- include "dash.resources" (list . "retrieval") | nindent 10 }}
         startupProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.startup.path }}"]
+          httpGet:
+            path: {{ .Values.probes.startup.path }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
           initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
           failureThreshold: {{ .Values.probes.startup.failureThreshold }}
         livenessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.liveness.path }}"]
+          httpGet:
+            path: {{ .Values.probes.liveness.path }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
+          initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
         readinessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8080{{ .Values.probes.readiness.path }}"]
+          httpGet:
+            path: {{ .Values.probes.readiness.path }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
@@ -125,19 +133,23 @@ spec:
         volumeMounts:
         - name: data
           mountPath: {{ .Values.config.persistencePath }}
+        # Writable scratch space. /opt/dash is NOT mounted over: it holds
+        # the image's binaries and entrypoint.
         - name: tmp
           mountPath: /tmp
-        - name: home
-          mountPath: /opt/dash
+        {{- include "dash.tlsVolumeMount" . | nindent 8 }}
+        {{- include "dash.encryptionVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
-      - name: home
-        emptyDir:
-          medium: Memory
-          sizeLimit: 32Mi
+      {{- include "dash.tlsVolume" . | nindent 6 }}
+      {{- include "dash.encryptionVolume" . | nindent 6 }}
+      {{- if not .Values.persistence.enabled }}
+      - name: data
+        emptyDir: {}
+      {{- end }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
   - metadata:

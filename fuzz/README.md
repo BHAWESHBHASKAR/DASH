@@ -12,6 +12,7 @@ and `cargo test --workspace` invocations are not affected.
 
 | File | Target name | Public surface exercised |
 | --- | --- | --- |
+| `fuzz_targets/fuzz_http_request.rs` | `fuzz_http_request` | `dash_http::parse_request_bytes` (the strict HTTP/1.1 request parser shared by all services); asserts no `Transfer-Encoding` is accepted and the body always equals `Content-Length` |
 | `fuzz_targets/fuzz_jwt.rs` | `fuzz_jwt` | `auth::verify_hs256_token_for_tenant` |
 | `fuzz_targets/fuzz_openai_embeddings.rs` | `fuzz_openai_embeddings` | `retrieval::openai_embeddings::handle_openai_embeddings` |
 | `fuzz_targets/fuzz_ranking.rs` | `fuzz_ranking` | `ranking::score_claim`, `ranking::bm25_score` |
@@ -41,6 +42,7 @@ in the bounded-score contract.
 From the repo root:
 
 ```sh
+cargo +nightly fuzz run fuzz_http_request -- -max_total_time=60
 cargo +nightly fuzz run fuzz_jwt                       # one process, infinite
 cargo +nightly fuzz run fuzz_openai_embeddings -- -max_total_time=60
 cargo +nightly fuzz run fuzz_ranking -- -max_total_time=60

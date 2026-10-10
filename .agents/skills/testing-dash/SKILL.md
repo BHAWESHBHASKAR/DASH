@@ -25,7 +25,7 @@ cd deploy/container && docker compose -f docker-compose.yml up -d --build
 
 ## Environment prerequisites
 
-- Rust `>=1.97` (edition 2024 workspace).
+- Rust `1.99.0` (pinned in `rust-toolchain.toml`; edition 2024 workspace).
 - `docker compose` v2.
 - Python 3.9+ with `pip`.
 - Node.js 18+ with `npm`.

@@ -5,6 +5,13 @@ Status: Design — ready for the next-session sprint
 Owner: TBD
 Estimated effort: 5-7 focused days
 
+> **Correction note (2026-10-09).** This design was written before implementation. PR 1 and PR 2 shipped
+> (commit `6a242d8`: `Arc<DiskBackedStore>`, default-on persistence when a WAL path is configured); PR 3
+> (replication) did not ship as described: replication today is WAL polling from ingestion to retrieval. The
+> environment variable named `DASH_DASH_PERSISTENCE_PATH` / `DASH_PERSISTENCE_PATH` in the sections below never
+> existed; the real variables are `DASH_INGEST_PERSISTENCE_PATH` and `DASH_RETRIEVAL_PERSISTENCE_PATH`. See
+> `docs-site/docs/concepts/persistence.md` for current behavior. The text below is unchanged.
+
 ## Why this is the #1 follow-up
 
 The current `InMemoryStore` in `pkg/store` holds every claim, evidence

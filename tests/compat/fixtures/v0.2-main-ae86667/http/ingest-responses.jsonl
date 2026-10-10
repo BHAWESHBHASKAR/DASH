@@ -1,0 +1,20 @@
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 1, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c01", "required_acks": 1}, "index": 0, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 2, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c02", "required_acks": 1}, "index": 1, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 3, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c03", "required_acks": 1}, "index": 2, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 4, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c04", "required_acks": 1}, "index": 3, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 5, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c05", "required_acks": 1}, "index": 4, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 6, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c06", "required_acks": 1}, "index": 5, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 7, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c07", "required_acks": 1}, "index": 6, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 8, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c08", "required_acks": 1}, "index": 7, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 9, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c09", "required_acks": 1}, "index": 8, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 10, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c10", "required_acks": 1}, "index": 9, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 11, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c11", "required_acks": 1}, "index": 10, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_snapshot_records": 53, "checkpoint_triggered": true, "checkpoint_truncated_wal_records": 53, "claims_total": 12, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c12", "required_acks": 1}, "index": 11, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 12, "commit_status": "replication_quorum_met", "ingested_claim_id": "a-c04", "required_acks": 1}, "index": 12, "status": 200}
+{"body": {"ack_count": 1, "batch_size": 3, "checkpoint_triggered": false, "claims_total": 15, "commit_id": "compat-batch-1", "commit_status": "replication_quorum_met", "idempotent_replay": false, "ingested_claim_ids": ["a-b1", "a-b2", "a-b3"], "required_acks": 1}, "index": 13, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 16, "commit_status": "replication_quorum_met", "ingested_claim_id": "b-c1", "required_acks": 1}, "index": 14, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 17, "commit_status": "replication_quorum_met", "ingested_claim_id": "b-c2", "required_acks": 1}, "index": 15, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 18, "commit_status": "replication_quorum_met", "ingested_claim_id": "b-c3", "required_acks": 1}, "index": 16, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 19, "commit_status": "replication_quorum_met", "ingested_claim_id": "b-c4", "required_acks": 1}, "index": 17, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 20, "commit_status": "replication_quorum_met", "ingested_claim_id": "h-c1", "required_acks": 1}, "index": 18, "status": 200}
+{"body": {"ack_count": 1, "checkpoint_triggered": false, "claims_total": 21, "commit_status": "replication_quorum_met", "ingested_claim_id": "h-c2", "required_acks": 1}, "index": 19, "status": 200}

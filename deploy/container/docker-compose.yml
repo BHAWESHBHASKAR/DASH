@@ -1,42 +1,49 @@
 name: dash
 
-# Common settings for every service. Anchored here and merged into each
-# service via YAML's `<<:` merge key so the runtime config stays DRY.
+# Quickstart:
+#   scripts/generate-secrets.sh       # writes deploy/container/.env (mode 0600)
+#   docker compose -f deploy/container/docker-compose.yml up -d --build
+#
+# Every secret below is required (`:?`); compose refuses to start without
+# them. Published ports bind to 127.0.0.1 by default. To expose the API on
+# other interfaces set DASH_PUBLISH_ADDR (for example 0.0.0.0) and put TLS in
+# front of it. The control plane is not started by default; enable it with
+# `--profile control-plane`.
+#
+# State: each service has its own named volume (dash-ingestion-state,
+# dash-retrieval-state, dash-control-plane-state). The segment-maintenance
+# daemon works on the ingestion segment directory and mounts the ingestion
+# volume. Upgrading from the single shared `dash-state` volume: see
+# deploy/container/README.md.
+
+# Hardening shared by every service. Anchored here and merged into each
+# service via YAML's `<<:` merge key.
 x-rest-base: &rest-base
   restart: unless-stopped
   init: true
   security_opt:
     - no-new-privileges:true
   cap_drop: [ALL]
-  cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
   user: "10001:10001"
-  read_only: false
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777,noexec,nosuid,nodev
   stop_grace_period: 30s
 
-# Default env vars that every service inherits. The merge key is reused
-# inside each service's `environment` block to layer service-specific
-# vars on top of these defaults.
+# Settings that ingestion and retrieval both honor. Secrets are NOT shared
+# here; each service lists only the secrets it needs.
 x-base-env: &base-env
   RUST_LOG: ${RUST_LOG:-info,dash=debug}
   DASH_STRICT_SECRETS: "1"
-  DASH_HOME: /opt/dash
-  DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
-  DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
-  DASH_RETRIEVAL_PERSISTENCE_PATH: /var/lib/dash/state/retrieval.redb
-  # WAL durability knobs that ingestion and retrieval both honor.
-  # Override per-service if you need to tune.
+  # Durability knobs read by the ingestion WAL writer.
   DASH_INGEST_WAL_SYNC_EVERY_RECORDS: "1"
   DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: "1"
   DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: "250"
   DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: "false"
   DASH_INGEST_WAL_SYNC_INTERVAL_MS: "1000"
-  DASH_INGEST_HTTP_WORKERS: "8"
-  DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
-  DASH_INGEST_TRANSPORT_RUNTIME: std
-  DASH_RETRIEVAL_HTTP_WORKERS: "8"
-  DASH_RETRIEVAL_TRANSPORT_RUNTIME: std
   DASH_CHECKPOINT_MAX_WAL_RECORDS: "50000"
   DASH_CHECKPOINT_MAX_WAL_BYTES: "52428800"
+  DASH_EMBEDDING_PROVIDER: ${DASH_EMBEDDING_PROVIDER:-hash}
 
 services:
   ingestion:
@@ -45,23 +52,29 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: runtime
-    image: dash/ingestion:latest
+      args:
+        SERVICE: ingestion
+    image: dash-ingestion:local
     container_name: dash-ingestion
     command: ["--serve"]
     ports:
-      - "8081:8081"
+      - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8081:8081"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-ingestion-state:/var/lib/dash
     environment:
       <<: *base-env
       DASH_BIN: ingestion
-      DASH_HEALTHCHECK_URL: http://127.0.0.1:8081/health
       DASH_INGEST_BIND: 0.0.0.0:8081
+      DASH_INGEST_HTTP_WORKERS: "8"
+      DASH_INGEST_HTTP_QUEUE_CAPACITY: "512"
       DASH_INGEST_WAL_PATH: /var/lib/dash/wal/ingestion.wal
+      DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/state/ingestion.redb
       DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
       DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "0"
-      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:?DASH_INGEST_API_KEY must be set (see deploy/container/.env.example)}
-      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:?DASH_INGEST_JWT_HS256_SECRET must be set}
+      DASH_INGEST_AUDIT_LOG_PATH: /var/lib/dash/audit/ingestion.audit.jsonl
+      DASH_INGEST_API_KEY: ${DASH_INGEST_API_KEY:?DASH_INGEST_API_KEY must be set (run scripts/generate-secrets.sh)}
+      DASH_INGEST_JWT_HS256_SECRET: ${DASH_INGEST_JWT_HS256_SECRET:?DASH_INGEST_JWT_HS256_SECRET must be set (run scripts/generate-secrets.sh)}
+      DASH_INGEST_REPLICATION_TOKEN: ${DASH_INGEST_REPLICATION_TOKEN:?DASH_INGEST_REPLICATION_TOKEN must be set (run scripts/generate-secrets.sh)}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -77,24 +90,34 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: runtime
-    image: dash/retrieval:latest
+      args:
+        SERVICE: retrieval
+    image: dash-retrieval:local
     container_name: dash-retrieval
     command: ["--serve"]
     ports:
-      - "8080:8080"
+      - "${DASH_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-retrieval-state:/var/lib/dash
     environment:
       <<: *base-env
       DASH_BIN: retrieval
-      DASH_HEALTHCHECK_URL: http://127.0.0.1:8080/health
       DASH_RETRIEVAL_BIND: 0.0.0.0:8080
+      DASH_RETRIEVAL_HTTP_WORKERS: "8"
+      DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY: "512"
+      DASH_RETRIEVAL_PERSISTENCE_PATH: /var/lib/dash/state/retrieval.redb
       DASH_RETRIEVAL_SEGMENT_DIR: /var/lib/dash/segments/retrieval
+      DASH_RETRIEVAL_AUDIT_LOG_PATH: /var/lib/dash/audit/retrieval.audit.jsonl
       DASH_RETRIEVAL_REPLICATION_SOURCE_URL: http://ingestion:8081
+      # Plain http on the compose network: acknowledges that the token and WAL
+      # stream are unencrypted there. docker-compose.tls.yml switches to
+      # native TLS and withdraws it (docs/operations/tls.md).
+      DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
       DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: "250"
       DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: /var/lib/dash/state/retrieval-replication.offset
-      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:?DASH_RETRIEVAL_API_KEY must be set (see deploy/container/.env.example)}
-      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:?DASH_RETRIEVAL_JWT_HS256_SECRET must be set}
+      DASH_RETRIEVAL_REPLICATION_TOKEN: ${DASH_RETRIEVAL_REPLICATION_TOKEN:?DASH_RETRIEVAL_REPLICATION_TOKEN must be set (run scripts/generate-secrets.sh)}
+      DASH_RETRIEVAL_API_KEY: ${DASH_RETRIEVAL_API_KEY:?DASH_RETRIEVAL_API_KEY must be set (run scripts/generate-secrets.sh)}
+      DASH_RETRIEVAL_JWT_HS256_SECRET: ${DASH_RETRIEVAL_JWT_HS256_SECRET:?DASH_RETRIEVAL_JWT_HS256_SECRET must be set (run scripts/generate-secrets.sh)}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 30s
@@ -107,28 +130,33 @@ services:
     mem_limit: 2g
     pids_limit: 2048
 
+  # Optional. Start with: docker compose --profile control-plane up -d
   control-plane:
     <<: *rest-base
+    profiles: ["control-plane"]
     build:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: runtime
-    image: dash/control-plane:latest
+      args:
+        SERVICE: control-plane
+    image: dash-control-plane:local
     container_name: dash-control-plane
     command: ["--serve"]
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-control-plane-state:/var/lib/dash
     environment:
-      <<: *base-env
+      RUST_LOG: ${RUST_LOG:-info,dash=debug}
+      DASH_STRICT_SECRETS: "1"
       DASH_BIN: control-plane
-      DASH_HEALTHCHECK_URL: http://127.0.0.1:8090/v1/control-plane/health
       DASH_CONTROL_PLANE_BIND: 0.0.0.0:8090
       DASH_CONTROL_PLANE_NODE_ID: control-plane
       DASH_CONTROL_PLANE_STATE_PATH: /var/lib/dash/state/control-plane.csv
       DASH_CONTROL_PLANE_STATE_SHA256_PATH: /var/lib/dash/state/control-plane.csv.sha256
       DASH_CONTROL_PLANE_LEASE_PATH: /var/lib/dash/state/control-plane.lease
+      DASH_CONTROL_PLANE_TOKEN: ${DASH_CONTROL_PLANE_TOKEN:?DASH_CONTROL_PLANE_TOKEN must be set (run scripts/generate-secrets.sh)}
     healthcheck:
       test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 10s
@@ -144,22 +172,27 @@ services:
       context: ../..
       dockerfile: deploy/container/Dockerfile
       target: runtime
-    image: dash/segment-maintenance:latest
+      args:
+        SERVICE: segment-maintenance-daemon
+    image: dash-segment-maintenance:local
     container_name: dash-segment-maintenance
     # segment-maintenance-daemon runs its own loop; no command override
     # is needed (and no --serve flag is passed).
+    #
+    # It maintains the ingestion segment directory, so it belongs to the
+    # ingestion trust domain and mounts the ingestion volume (and nothing else).
     volumes:
-      - dash-state:/var/lib/dash
+      - dash-ingestion-state:/var/lib/dash
     environment:
-      <<: *base-env
+      RUST_LOG: ${RUST_LOG:-info,dash=debug}
       DASH_BIN: segment-maintenance-daemon
       DASH_INGEST_SEGMENT_DIR: /var/lib/dash/segments/ingestion
       DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: "30000"
       DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS: "60000"
-    # Long-running daemon with no HTTP endpoint; rely on logs + liveness
-    # via the process exit code rather than an HTTP probe.
+    # Long-running daemon with no HTTP endpoint; dash-healthcheck checks
+    # that the process is alive.
     healthcheck:
-      test: ["CMD-SHELL", "pidof segment-maintenance-daemon >/dev/null || exit 1"]
+      test: ["CMD", "/opt/dash/bin/dash-healthcheck"]
       interval: 60s
       timeout: 5s
       retries: 3
@@ -170,7 +203,17 @@ services:
     mem_limit: 512m
     pids_limit: 256
 
+# One named volume per service so a compromised container cannot rewrite
+# another service's WAL, audit log, lease or state. Retrieval follows
+# ingestion over HTTP and never reads its files; the control plane shares
+# nothing with the data plane.
 volumes:
-  dash-state:
-    name: dash-state
+  dash-ingestion-state:
+    name: dash-ingestion-state
+    driver: local
+  dash-retrieval-state:
+    name: dash-retrieval-state
+    driver: local
+  dash-control-plane-state:
+    name: dash-control-plane-state
     driver: local

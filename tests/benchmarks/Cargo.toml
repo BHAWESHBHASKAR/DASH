@@ -2,6 +2,8 @@
 name = "benchmark-smoke"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "perf_bench"
@@ -14,6 +16,14 @@ path = "src/bin/mem_profile.rs"
 [[bin]]
 name = "load_test"
 path = "src/bin/load_test.rs"
+
+[[bin]]
+name = "cold_start"
+path = "src/bin/cold_start.rs"
+
+[[bin]]
+name = "fulltext_bench"
+path = "src/bin/fulltext_bench.rs"
 
 [[bench]]
 name = "criterion_benches"

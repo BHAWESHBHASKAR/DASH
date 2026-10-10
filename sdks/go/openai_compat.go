@@ -22,7 +22,7 @@ import "time"
 //
 //	import (
 //		openai "github.com/openai/openai-go"
-//		"github.com/anomalyco/dash-go"
+//		"github.com/BHAWESHBHASKAR/DASH/sdks/go"
 //	)
 //
 //	cfg := dash.NewOpenAICompatibleConfig("http://localhost:8080", "sk-live-...")

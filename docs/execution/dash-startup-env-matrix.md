@@ -1,7 +1,9 @@
 # DASH Startup Env Matrix
 
 Date: 2026-02-17  
-Status: active
+Status: **superseded** (corrected 2026-10-09)
+
+> This matrix predates 0.3.0 and is no longer maintained. The authoritative list is the [configuration reference](../../docs-site/docs/reference/configuration.md), which is checked against the code by `scripts/check_config_docs.sh`. In particular: the API-key and JWT variables below are not optional any more (a service refuses to start without a credential unless `DASH_INSECURE_DEV_MODE=1`), strict secret validation is on by default, and the `*_TRANSPORT_RUNTIME` selectors were removed from this table because no code reads them.
 
 ## Ingestion Service
 
@@ -10,7 +12,6 @@ Status: active
 | `DASH_INGEST_BIND` | no | `127.0.0.1:8081` | bind address for HTTP ingestion transport (`/v1/ingest`) | `EME_INGEST_BIND` |
 | `DASH_INGEST_HTTP_WORKERS` | no | auto (`min(available_parallelism, 32)`, fallback `4`) | ingestion HTTP worker pool size | `EME_INGEST_HTTP_WORKERS` |
 | `DASH_INGEST_HTTP_QUEUE_CAPACITY` | no | `workers * 64` | bounded ingestion worker-queue capacity; when full, requests are rejected with `503` and backpressure metrics increment | `EME_INGEST_HTTP_QUEUE_CAPACITY` |
-| `DASH_INGEST_TRANSPORT_RUNTIME` | no | `std` | transport runtime selector (`std` or `axum`) | `EME_INGEST_TRANSPORT_RUNTIME` |
 | `DASH_INGEST_BATCH_MAX_ITEMS` | no | `128` | max items accepted by `POST /v1/ingest/batch` | `EME_INGEST_BATCH_MAX_ITEMS` |
 | `DASH_INGEST_REPLICATION_SOURCE_URL` | no | unset | when set, ingestion runs follower pull replication loop from this leader base URL (`http://host:port`) | `EME_INGEST_REPLICATION_SOURCE_URL` |
 | `DASH_INGEST_REPLICATION_POLL_INTERVAL_MS` | no | `500` | follower replication poll interval for WAL delta pulls | `EME_INGEST_REPLICATION_POLL_INTERVAL_MS` |
@@ -51,11 +52,14 @@ Status: active
 | `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` | no | `false` | when `true`, bypasses ingestion startup WAL durability guardrails; use only for controlled stress benchmarks | `EME_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` |
 | `DASH_CHECKPOINT_MAX_WAL_RECORDS` | no | unset | checkpoint trigger by WAL record count | `EME_CHECKPOINT_MAX_WAL_RECORDS` |
 | `DASH_CHECKPOINT_MAX_WAL_BYTES` | no | unset | checkpoint trigger by WAL file bytes | `EME_CHECKPOINT_MAX_WAL_BYTES` |
-| `DASH_INGEST_ANN_MAX_NEIGHBORS_BASE` | no | `12` | ANN base-layer max neighbors for ingestion-side index build | `EME_INGEST_ANN_MAX_NEIGHBORS_BASE` |
-| `DASH_INGEST_ANN_MAX_NEIGHBORS_UPPER` | no | `6` | ANN upper-layer max neighbors for ingestion-side index build | `EME_INGEST_ANN_MAX_NEIGHBORS_UPPER` |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_FACTOR` | no | `12` | ANN search expansion multiplier (used at retrieval-time candidate expansion budget) | `EME_INGEST_ANN_SEARCH_EXPANSION_FACTOR` |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_MIN` | no | `64` | ANN minimum expansion budget clamp | `EME_INGEST_ANN_SEARCH_EXPANSION_MIN` |
-| `DASH_INGEST_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | ANN maximum expansion budget clamp | `EME_INGEST_ANN_SEARCH_EXPANSION_MAX` |
+| `DASH_INGEST_ANN_MAX_NEIGHBORS_BASE` | no | `16` | HNSW connectivity (M) for the ingestion-side vector index | `EME_INGEST_ANN_MAX_NEIGHBORS_BASE` |
+| `DASH_INGEST_ANN_SEARCH_EXPANSION_MIN` | no | `128` | HNSW search beam floor (ef_search) | `EME_INGEST_ANN_SEARCH_EXPANSION_MIN` |
+| `DASH_INGEST_ANN_EXPANSION_ADD` | no | `128` | HNSW construction beam (ef_construction) | none |
+| `DASH_INGEST_VECTOR_FLAT_THRESHOLD` | no | `8192` | exact flat scan up to this many vectors per tenant, HNSW above | none |
+| `DASH_INGEST_VECTOR_RERANK` | no | `50` | HNSW candidates re-scored exactly in f32 (`0` disables) | none |
+| `DASH_INGEST_VECTOR_INDEX_PERSIST` | no | on | save the vector indexes and load them at startup instead of rebuilding | none |
+| `DASH_INGEST_VECTOR_INDEX_PATH` | no | `<WAL path>.vindex` | saved vector index file | none |
+| `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS` | no | `300000` | periodic save interval; `0` saves only after checkpoints and at shutdown | none |
 
 Ingestion segment lifecycle daemon note:
 
@@ -69,7 +73,6 @@ Ingestion segment lifecycle daemon note:
 | `DASH_RETRIEVAL_BIND` | no | `127.0.0.1:8080` | bind address for HTTP transport | `EME_RETRIEVAL_BIND` |
 | `DASH_RETRIEVAL_HTTP_WORKERS` | no | auto (`min(available_parallelism, 32)`, fallback `4`) | retrieval HTTP worker pool size | `EME_RETRIEVAL_HTTP_WORKERS` |
 | `DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY` | no | `workers * 64` | bounded retrieval worker-queue capacity; when full, requests are rejected with `503` and backpressure metrics increment | `EME_RETRIEVAL_HTTP_QUEUE_CAPACITY` |
-| `DASH_RETRIEVAL_TRANSPORT_RUNTIME` | no | `std` | transport runtime selector (`std` or `axum`) | `EME_RETRIEVAL_TRANSPORT_RUNTIME` |
 | `DASH_RETRIEVAL_API_KEY` | no | unset | optional API key for `GET/POST /v1/retrieve` (`X-API-Key` or `Authorization: Bearer`) | `EME_RETRIEVAL_API_KEY` |
 | `DASH_RETRIEVAL_API_KEYS` | no | unset | optional comma-separated API key set (rotation overlap) accepted in addition to `DASH_RETRIEVAL_API_KEY` | `EME_RETRIEVAL_API_KEYS` |
 | `DASH_RETRIEVAL_REVOKED_API_KEYS` | no | unset | optional comma-separated revoked API keys denied even if configured in scopes or key set | `EME_RETRIEVAL_REVOKED_API_KEYS` |
@@ -95,11 +98,14 @@ Ingestion segment lifecycle daemon note:
 | `DASH_ROUTER_REPLICA_COUNT` | no | inferred from placement file | optional replica count override for routing plan | `EME_ROUTER_REPLICA_COUNT` |
 | `DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` | no | unset (`0` / disabled) | optional live placement reload interval for in-process route re-resolution (no-restart failover) | `EME_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS` |
 | `DASH_RETRIEVAL_WAL_PATH` | no | unset | WAL path for startup replay mode | `EME_RETRIEVAL_WAL_PATH` |
-| `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` | no | `12` | ANN base-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` |
-| `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` | no | `6` | ANN upper-layer max neighbors used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_UPPER` |
-| `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_FACTOR` | no | `12` | ANN search expansion multiplier | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_FACTOR` |
-| `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` | no | `64` | ANN minimum expansion budget clamp | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` |
-| `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | ANN maximum expansion budget clamp | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MAX` |
+| `DASH_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` | no | `16` | HNSW connectivity (M) used after replay/build | `EME_RETRIEVAL_ANN_MAX_NEIGHBORS_BASE` |
+| `DASH_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` | no | `128` | HNSW search beam floor (ef_search) | `EME_RETRIEVAL_ANN_SEARCH_EXPANSION_MIN` |
+| `DASH_RETRIEVAL_ANN_EXPANSION_ADD` | no | `128` | HNSW construction beam (ef_construction) | none |
+| `DASH_RETRIEVAL_VECTOR_FLAT_THRESHOLD` | no | `8192` | exact flat scan up to this many vectors per tenant, HNSW above | none |
+| `DASH_RETRIEVAL_VECTOR_RERANK` | no | `50` | HNSW candidates re-scored exactly in f32 (`0` disables) | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_PERSIST` | no | on | save the vector indexes and load them at startup instead of rebuilding (needs `DASH_RETRIEVAL_WAL_PATH`) | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_PATH` | no | `<WAL path>.vindex` | saved vector index file | none |
+| `DASH_RETRIEVAL_VECTOR_INDEX_SAVE_INTERVAL_MS` | no | `300000` | periodic save interval; `0` saves only at shutdown | none |
 
 Runtime note:
 
@@ -111,11 +117,8 @@ Runtime note:
 | Variable | Required | Default | Description | Legacy Fallback |
 | --- | --- | --- | --- | --- |
 | `DASH_BENCH_GUARD_MAX_REGRESSION_PCT` | no | `50` | max allowed DASH avg latency increase for history guard | `EME_BENCH_GUARD_MAX_REGRESSION_PCT` |
-| `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE` | no | `12` | benchmark run-time ANN base neighbor cap override | none |
-| `DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER` | no | `6` | benchmark run-time ANN upper neighbor cap override | none |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR` | no | `12` | benchmark run-time ANN search expansion multiplier | none |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_MIN` | no | `64` | benchmark run-time ANN search minimum expansion clamp | none |
-| `DASH_BENCH_ANN_SEARCH_EXPANSION_MAX` | no | `4096` | benchmark run-time ANN search maximum expansion clamp | none |
+| `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE` | no | `16` | benchmark run-time HNSW connectivity override | none |
+| `DASH_BENCH_ANN_SEARCH_EXPANSION_MIN` | no | `128` | benchmark run-time HNSW search beam floor override | none |
 | `DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT` | no | `95` | large profile minimum candidate reduction gate (%) | none |
 | `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS` | no | `120` | large profile max DASH avg latency gate (ms) | none |
 | `DASH_CONCURRENCY_INGEST_WAL_SYNC_EVERY_RECORDS` | no | `1` | ingestion transport concurrency benchmark WAL sync threshold override | none |
@@ -126,11 +129,8 @@ Runtime note:
 | `DASH_CONCURRENCY_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` | no | `false` | ingestion transport concurrency benchmark unsafe WAL durability override (`true` for stress modes) | none |
 | `DASH_CI_INCLUDE_LARGE_GUARD` | no | `false` | when `true`, runs large profile history guard in CI | `EME_CI_INCLUDE_LARGE_GUARD` |
 | `DASH_CI_LARGE_GUARD_ITERATIONS` | no | unset (benchmark default) | override iterations for large CI guard run | none |
-| `DASH_CI_LARGE_ANN_MAX_NEIGHBORS_BASE` | no | benchmark/default fallback (`12`) | large CI guard ANN base neighbor override | none |
-| `DASH_CI_LARGE_ANN_MAX_NEIGHBORS_UPPER` | no | benchmark/default fallback (`6`) | large CI guard ANN upper neighbor override | none |
-| `DASH_CI_LARGE_ANN_SEARCH_EXPANSION_FACTOR` | no | benchmark/default fallback (`12`) | large CI guard ANN search factor override | none |
-| `DASH_CI_LARGE_ANN_SEARCH_EXPANSION_MIN` | no | benchmark/default fallback (`64`) | large CI guard ANN search min override | none |
-| `DASH_CI_LARGE_ANN_SEARCH_EXPANSION_MAX` | no | benchmark/default fallback (`4096`) | large CI guard ANN search max override | none |
+| `DASH_CI_LARGE_ANN_MAX_NEIGHBORS_BASE` | no | benchmark/default fallback (`16`) | large CI guard HNSW connectivity override | none |
+| `DASH_CI_LARGE_ANN_SEARCH_EXPANSION_MIN` | no | benchmark/default fallback (`128`) | large CI guard HNSW search beam override | none |
 | `DASH_CI_LARGE_MIN_CANDIDATE_REDUCTION_PCT` | no | benchmark/default fallback (`95`) | large CI guard min candidate reduction gate (%) | none |
 | `DASH_CI_LARGE_MAX_DASH_LATENCY_MS` | no | benchmark/default fallback (`120`) | large CI guard max DASH avg latency gate (ms) | none |
 | `DASH_CI_INCLUDE_HYBRID_GUARD` | no | `false` | when `true`, runs hybrid profile history guard in CI | `EME_CI_INCLUDE_HYBRID_GUARD` |

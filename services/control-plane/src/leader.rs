@@ -1,17 +1,88 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long a caller waits for the cross-process lease file lock before
+/// giving up with an error (rather than blocking forever on a wedged peer).
+const FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest disagreement between the wall clock and this process's monotonic
+/// elapsed time that is treated as ordinary slew and followed.
+const CLOCK_RESYNC_BOUND_MS: u64 = 5_000;
+
+/// How long a larger disagreement must persist before it is adopted as a
+/// real clock correction rather than ignored as a transient spike.
+const CLOCK_STEP_PERSIST: Duration = Duration::from_secs(60);
+
+/// Clock used for lease arithmetic: wall-clock based (the lease is shared
+/// between hosts) but never backwards, and not latched by transient spikes.
+///
+/// Readings follow the wall clock while it agrees with the monotonic clock
+/// to within [`CLOCK_RESYNC_BOUND_MS`]. A bigger jump is ignored (time keeps
+/// advancing with the monotonic clock) until it has persisted for
+/// [`CLOCK_STEP_PERSIST`], at which point it is adopted. A backwards step is
+/// never followed (readings hold or advance monotonically), so after a
+/// permanent backwards correction readings run ahead of the wall clock.
+#[derive(Debug, Default)]
+struct LeaseClock {
+    last_ms: u64,
+    base_wall_ms: u64,
+    base_mono: Option<Instant>,
+    out_of_bound_since: Option<Instant>,
+}
+
+impl LeaseClock {
+    fn observe(&mut self, wall_ms: u64, mono: Instant) -> u64 {
+        let Some(base_mono) = self.base_mono else {
+            self.base_wall_ms = wall_ms;
+            self.base_mono = Some(mono);
+            self.last_ms = wall_ms;
+            return wall_ms;
+        };
+        let elapsed = mono.saturating_duration_since(base_mono).as_millis() as u64;
+        let computed = self.base_wall_ms.saturating_add(elapsed);
+        let adopt = if wall_ms.abs_diff(computed) <= CLOCK_RESYNC_BOUND_MS {
+            self.out_of_bound_since = None;
+            true
+        } else {
+            let since = *self.out_of_bound_since.get_or_insert(mono);
+            mono.saturating_duration_since(since) >= CLOCK_STEP_PERSIST
+        };
+        let candidate = if adopt { wall_ms } else { computed };
+        let reading = candidate.max(self.last_ms);
+        if adopt {
+            self.base_wall_ms = reading;
+            self.base_mono = Some(mono);
+            self.out_of_bound_since = None;
+        }
+        self.last_ms = reading;
+        reading
+    }
+}
 
 /// On-disk lease record used for simple leader election across
 /// control-plane replicas. The process whose `node_id` matches the
 /// non-expired lease is the leader.
+///
+/// `epoch` is the **fencing token**: it strictly increases every time the
+/// lease is acquired by a new holder (or re-acquired after lapsing), and is
+/// unrelated to the placement epochs. Downstream systems should reject
+/// writes that carry a token lower than the highest they have seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRecord {
     pub node_id: String,
     pub epoch: u64,
     pub expires_at_ms: u64,
+    /// Random per-process id of the holder. The holder identity is
+    /// `node_id` plus `instance_id`, so two processes that were started with
+    /// the same node id are never both leader. Empty for records written by
+    /// older versions (which no live process matches).
+    pub instance_id: String,
 }
 
 impl LeaseRecord {
@@ -20,21 +91,49 @@ impl LeaseRecord {
     }
 }
 
+/// Result of a successful acquisition attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Acquisition {
+    pub record: LeaseRecord,
+    /// `true` when leadership was newly obtained (new fencing token) as
+    /// opposed to an in-place extension of a lease this node already held.
+    /// Callers must reload persisted state when this is set.
+    pub newly_acquired: bool,
+}
+
 /// File-backed leader lease. Not a consensus protocol, but good enough
 /// for the single-shared-volume deployments DASH targets in this phase.
 ///
-/// Leases are written atomically (temp file + rename) so concurrent
-/// acquisitions from different control-plane processes do not corrupt
-/// the lease file, although the last atomic rename wins.
+/// Cross-process safety: every read-check-write sequence runs while holding
+/// an exclusive advisory lock (`flock`) on `<lease>.lock`, and the lease file
+/// itself is replaced via temp file + fsync + rename + directory fsync.
+///
+/// Clock assumption: expiry is compared on the wall clock because the lease
+/// is shared between processes (and hosts) where monotonic clocks are not
+/// comparable. All nodes sharing the volume must keep their clocks within
+/// `safety_margin_ms` of each other (NTP/chrony). The margin works in both
+/// directions: a holder stops acting as leader `margin` before the recorded
+/// expiry, and a challenger waits `margin` after it. Within one process the
+/// clock reading never goes backwards.
 #[derive(Debug)]
 pub struct LeaderLease {
     node_id: String,
+    instance_id: String,
+    /// Set by `DASH_CONTROL_PLANE_LEASE_RESET=1`: discard one implausible
+    /// (forged or corrupt) lease record instead of refusing to run.
+    reset_requested: std::sync::atomic::AtomicBool,
     lease_path: PathBuf,
     lease_duration_ms: u64,
     renewal_interval_ms: u64,
-    // Serializes in-process renewals; cross-process safety comes from
-    // the atomic write and the freshness check on every read.
+    safety_margin_ms: u64,
+    // Serializes in-process callers; cross-process safety comes from the
+    // advisory file lock taken inside this guard.
     lock: Mutex<()>,
+    clock: Mutex<LeaseClock>,
+    /// Test-only wall clock shared between lease instances, so tests move
+    /// time explicitly instead of sleeping.
+    #[cfg(test)]
+    test_wall_ms: Option<std::sync::Arc<AtomicU64>>,
 }
 
 impl LeaderLease {
@@ -46,10 +145,16 @@ impl LeaderLease {
     ) -> Self {
         Self {
             node_id: node_id.into(),
+            instance_id: dash_common::random_hex(8),
+            reset_requested: std::sync::atomic::AtomicBool::new(false),
             lease_path: lease_path.into(),
             lease_duration_ms,
             renewal_interval_ms,
+            safety_margin_ms: 0,
             lock: Mutex::new(()),
+            clock: Mutex::new(LeaseClock::default()),
+            #[cfg(test)]
+            test_wall_ms: None,
         }
     }
 
@@ -60,10 +165,84 @@ impl LeaderLease {
             node_id, lease_path, // 30-second lease, 10-second renewal interval.
             30_000, 10_000,
         )
+        .with_safety_margin_ms(1_000)
+    }
+
+    /// Configure the clock-skew safety margin (clamped to half the lease
+    /// duration so a lease can never be shorter than its own margin).
+    pub fn with_safety_margin_ms(mut self, margin_ms: u64) -> Self {
+        self.safety_margin_ms = margin_ms.min(self.lease_duration_ms / 2);
+        self
+    }
+
+    /// Read wall-clock time from `clock` (milliseconds since the epoch)
+    /// instead of the system clock. Tests only.
+    #[cfg(test)]
+    fn with_test_wall_clock(mut self, clock: std::sync::Arc<AtomicU64>) -> Self {
+        self.test_wall_ms = Some(clock);
+        self
     }
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Random id of this process' lease handle (see [`LeaseRecord::instance_id`]).
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Override the instance id (tests that model a process restart).
+    pub fn with_instance_id(mut self, instance_id: impl Into<String>) -> Self {
+        self.instance_id = instance_id.into();
+        self
+    }
+
+    /// Allow discarding one implausible lease record (expiry far in the
+    /// future or an absurd epoch), the documented admin recovery from a
+    /// forged or corrupted lease (`DASH_CONTROL_PLANE_LEASE_RESET=1`).
+    pub fn with_lease_reset(self, reset: bool) -> Self {
+        self.reset_requested
+            .store(reset, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    fn holds(&self, record: &LeaseRecord) -> bool {
+        record.node_id == self.node_id && record.instance_id == self.instance_id
+    }
+
+    /// True when `record` could not have been written by a healthy cluster:
+    /// it expires further ahead than one lease plus the safety margin and a
+    /// clock-skew allowance, or carries an absurd fencing token.
+    fn is_implausible(&self, record: &LeaseRecord, now: u64) -> bool {
+        let horizon = now
+            .saturating_add(self.lease_duration_ms)
+            .saturating_add(self.safety_margin_ms)
+            .saturating_add(LEASE_HORIZON_SLACK_MS);
+        record.expires_at_ms > horizon || record.epoch > MAX_PLAUSIBLE_EPOCH
+    }
+
+    fn implausible_error(&self, record: &LeaseRecord) -> String {
+        format!(
+            "lease file '{}' holds an implausible record (node '{}', epoch {}, expires_at_ms {}); \
+             it may be forged or corrupt. Inspect it and restart with \
+             DASH_CONTROL_PLANE_LEASE_RESET=1 to discard it",
+            self.lease_path.display(),
+            record.node_id,
+            record.epoch,
+            record.expires_at_ms
+        )
+    }
+
+    /// Read the lease for a read-only check, refusing implausible records.
+    fn read_trusted(&self, now: u64) -> Result<Option<LeaseRecord>, String> {
+        let record = read_lease(&self.lease_path)?;
+        if let Some(record) = &record
+            && self.is_implausible(record, now)
+        {
+            return Err(self.implausible_error(record));
+        }
+        Ok(record)
     }
 
     pub fn lease_duration_ms(&self) -> u64 {
@@ -74,115 +253,358 @@ impl LeaderLease {
         self.renewal_interval_ms
     }
 
-    /// Attempt to become leader by writing a fresh lease.
+    pub fn safety_margin_ms(&self) -> u64 {
+        self.safety_margin_ms
+    }
+
+    /// Attempt to become leader.
     ///
-    /// `epoch` is typically the highest placement epoch the caller knows
-    /// so the lease embeds a monotonically increasing value.
-    pub fn try_acquire(&self, epoch: u64) -> Result<bool, String> {
-        if self.node_id.is_empty() {
-            return Err("leader lease node_id must not be empty".to_string());
+    /// The `_placement_epoch` argument is accepted for call-site
+    /// compatibility but deliberately ignored: the lease epoch (fencing
+    /// token) is derived solely from the previous lease record.
+    pub fn try_acquire(&self, _placement_epoch: u64) -> Result<bool, String> {
+        Ok(self.acquire()?.is_some())
+    }
+
+    /// Attempt to become leader, returning the acquired record.
+    pub fn acquire(&self) -> Result<Option<Acquisition>, String> {
+        self.validate_node_id()?;
+        let _guard = self.guard()?;
+        let _file_lock = self.lock_file()?;
+        let now = self.now_ms()?;
+        self.try_acquire_locked(now)
+    }
+
+    /// Acquisition logic. Must only be called while holding both the
+    /// in-process guard and the cross-process file lock (this is what
+    /// `renew` previously got wrong by re-entering the non-reentrant mutex).
+    fn try_acquire_locked(&self, now: u64) -> Result<Option<Acquisition>, String> {
+        let mut existing = read_lease(&self.lease_path)?;
+        // Highest fencing token ever issued from this lease path. It survives
+        // deletion or truncation of the lease file, so tokens never go back.
+        let mut floor = read_epoch_floor(&self.epoch_floor_path())?;
+        let implausible_record = existing
+            .as_ref()
+            .filter(|record| self.is_implausible(record, now))
+            .cloned();
+        let implausible_floor = floor > MAX_PLAUSIBLE_EPOCH;
+        if implausible_record.is_some() || implausible_floor {
+            if !self
+                .reset_requested
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(match &implausible_record {
+                    Some(record) => self.implausible_error(record),
+                    None => format!(
+                        "lease epoch floor '{}' holds an implausible value ({floor}); it may be \
+                         forged or corrupt. Inspect it and restart with \
+                         DASH_CONTROL_PLANE_LEASE_RESET=1 to discard it",
+                        self.epoch_floor_path().display()
+                    ),
+                });
+            }
+            eprintln!(
+                "control-plane: DASH_CONTROL_PLANE_LEASE_RESET=1: discarding implausible lease state"
+            );
+            // A forged huge epoch never becomes the floor: implausible values
+            // restart the sequence, plausible ones are kept.
+            if implausible_floor {
+                floor = 0;
+            }
+            if let Some(record) = implausible_record {
+                let epoch = if record.epoch > MAX_PLAUSIBLE_EPOCH {
+                    0
+                } else {
+                    record.epoch
+                };
+                // Treat it as an expired record of nobody.
+                existing = Some(LeaseRecord {
+                    node_id: String::new(),
+                    epoch,
+                    expires_at_ms: 0,
+                    instance_id: String::new(),
+                });
+            }
         }
-        let now = now_ms();
-        let _guard = self.lock.lock().unwrap();
-        let can_acquire = match read_lease(&self.lease_path) {
-            Ok(Some(record)) => record.is_expired_at(now) || record.node_id == self.node_id,
-            Ok(None) => true,
-            Err(_) => true,
+        let (epoch, newly_acquired) = match &existing {
+            None => (next_epoch(floor)?, true),
+            Some(record) if self.holds(record) => {
+                if record.epoch >= floor
+                    && now < record.expires_at_ms.saturating_add(self.safety_margin_ms)
+                {
+                    // Still ours and nobody may take it yet: extend in place.
+                    (record.epoch, false)
+                } else {
+                    // We let it lapse; treat as a fresh acquisition.
+                    (next_epoch(record.epoch.max(floor))?, true)
+                }
+            }
+            Some(record) => {
+                if now < record.expires_at_ms.saturating_add(self.safety_margin_ms) {
+                    return Ok(None);
+                }
+                (next_epoch(record.epoch.max(floor))?, true)
+            }
         };
-        if !can_acquire {
-            return Ok(false);
+        let record = LeaseRecord {
+            node_id: self.node_id.clone(),
+            epoch,
+            expires_at_ms: now.saturating_add(self.lease_duration_ms),
+            instance_id: self.instance_id.clone(),
+        };
+        // Floor first: a crash between the two writes can only leave the
+        // floor ahead of the lease, never behind it.
+        if epoch > floor {
+            write_file_atomic(&self.epoch_floor_path(), &format!("{epoch}\n"))?;
         }
-        write_lease(
-            &self.lease_path,
-            &LeaseRecord {
-                node_id: self.node_id.clone(),
-                epoch,
-                expires_at_ms: now + self.lease_duration_ms,
-            },
-        )?;
-        Ok(true)
+        write_lease(&self.lease_path, &record)?;
+        Ok(Some(Acquisition {
+            record,
+            newly_acquired,
+        }))
     }
 
     /// Renew the lease if this process is still the leader.
     ///
     /// Returns `true` when this node is still the leader after renewal.
-    pub fn renew(&self, epoch: u64) -> Result<bool, String> {
-        if self.node_id.is_empty() {
-            return Err("leader lease node_id must not be empty".to_string());
-        }
-        let _guard = self.lock.lock().unwrap();
-        let now = now_ms();
+    /// `_placement_epoch` is ignored (see [`try_acquire`](Self::try_acquire)).
+    pub fn renew(&self, _placement_epoch: u64) -> Result<bool, String> {
+        Ok(self.renew_detailed()?.is_some())
+    }
+
+    /// Like [`renew`](Self::renew) but returns the resulting record. When the
+    /// lease had lapsed and was re-acquired, `newly_acquired` is set.
+    pub fn renew_detailed(&self) -> Result<Option<Acquisition>, String> {
+        self.validate_node_id()?;
+        let _guard = self.guard()?;
+        let _file_lock = self.lock_file()?;
+        let now = self.now_ms()?;
         match read_lease(&self.lease_path)? {
-            Some(record) if record.node_id == self.node_id => {
-                if record.is_expired_at(now) {
-                    // We let it lapse; re-acquire.
-                    return self.try_acquire(epoch);
-                }
-                write_lease(
-                    &self.lease_path,
-                    &LeaseRecord {
-                        node_id: self.node_id.clone(),
-                        epoch,
-                        expires_at_ms: now + self.lease_duration_ms,
-                    },
-                )?;
-                Ok(true)
+            Some(record) if self.holds(&record) => {
+                // Both the extend and the lapsed-re-acquire cases are handled
+                // by the locked helper; no second lock is taken.
+                self.try_acquire_locked(now)
             }
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 
-    /// Check whether this process currently holds a non-expired lease.
+    /// Check whether this process currently holds a non-expired lease. A
+    /// holder stops reporting leadership `safety_margin_ms` before expiry.
     pub fn is_leader(&self) -> Result<bool, String> {
-        let now = now_ms();
-        match read_lease(&self.lease_path)? {
-            Some(record) => Ok(!record.is_expired_at(now) && record.node_id == self.node_id),
+        let now = self.now_ms()?;
+        match self.read_trusted(now)? {
+            Some(record) => Ok(self.holds(&record)
+                && now.saturating_add(self.safety_margin_ms) < record.expires_at_ms),
             None => Ok(false),
+        }
+    }
+
+    /// The fencing token of the lease this node currently holds, if any.
+    pub fn fencing_token(&self) -> Result<Option<u64>, String> {
+        let now = self.now_ms()?;
+        match self.read_trusted(now)? {
+            Some(record)
+                if self.holds(&record)
+                    && now.saturating_add(self.safety_margin_ms) < record.expires_at_ms =>
+            {
+                Ok(Some(record.epoch))
+            }
+            _ => Ok(None),
         }
     }
 
     /// Return the current leader information, or `None` if there is no
     /// valid lease.
     pub fn current_leader(&self) -> Result<Option<LeaseRecord>, String> {
-        let now = now_ms();
-        match read_lease(&self.lease_path)? {
+        let now = self.now_ms()?;
+        match self.read_trusted(now)? {
             Some(record) if !record.is_expired_at(now) => Ok(Some(record)),
             _ => Ok(None),
         }
     }
 
-    /// Run a background renewal loop. This blocks the calling thread and
-    /// only returns if renewal fails repeatedly.
-    pub fn run_renewal_loop(&self, get_epoch: impl Fn() -> u64) -> Result<(), String> {
-        let interval = std::time::Duration::from_millis(self.renewal_interval_ms);
+    fn validate_node_id(&self) -> Result<(), String> {
+        if self.node_id.is_empty() {
+            return Err("leader lease node_id must not be empty".to_string());
+        }
+        if self.node_id.contains([',', '\n', '\r']) {
+            return Err("leader lease node_id must not contain ',' or newlines".to_string());
+        }
+        Ok(())
+    }
+
+    fn guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.lock
+            .lock()
+            .map_err(|_| "leader lease lock poisoned by a panicked thread".to_string())
+    }
+
+    fn lock_file(&self) -> Result<FileLockGuard, String> {
+        FileLockGuard::acquire(&lock_path_for(&self.lease_path))
+    }
+
+    /// Wall-clock milliseconds, never decreasing within this process and not
+    /// latched by transient forward spikes (see [`LeaseClock`]).
+    fn now_ms(&self) -> Result<u64, String> {
+        #[cfg(test)]
+        if let Some(clock) = &self.test_wall_ms {
+            return Ok(self.now_ms_from(clock.load(Ordering::SeqCst), Instant::now()));
+        }
+        let wall = ms_since_epoch(SystemTime::now())?;
+        Ok(self.now_ms_from(wall, Instant::now()))
+    }
+
+    /// [`now_ms`](Self::now_ms) with the clock readings injected.
+    fn now_ms_from(&self, wall_ms: u64, mono: Instant) -> u64 {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(wall_ms, mono)
+    }
+
+    fn epoch_floor_path(&self) -> PathBuf {
+        let mut name = self.lease_path.clone().into_os_string();
+        name.push(".epoch");
+        PathBuf::from(name)
+    }
+}
+
+/// Exponential backoff used by the maintenance loop when a follower keeps
+/// failing to acquire.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl Backoff {
+    pub fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max: max.max(base),
+            current: base,
+        }
+    }
+
+    /// Delay to wait before the next attempt; doubles up to the maximum.
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = (self.current.saturating_mul(2)).min(self.max);
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        self.current = self.base;
+    }
+}
+
+fn next_epoch(previous: u64) -> Result<u64, String> {
+    previous
+        .checked_add(1)
+        .ok_or_else(|| "leader lease epoch overflow".to_string())
+}
+
+fn ms_since_epoch(time: SystemTime) -> Result<u64, String> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .map_err(|_| "system clock is set before the UNIX epoch".to_string())
+}
+
+/// Temp file next to `lease_path` with a random suffix.
+fn tmp_path_for(lease_path: &Path) -> PathBuf {
+    let mut name = lease_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "lease".into());
+    name.push(format!(
+        ".lease-tmp-{}-{}",
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        dash_common::random_hex(8)
+    ));
+    lease_path.with_file_name(name)
+}
+
+fn lock_path_for(lease_path: &Path) -> PathBuf {
+    let mut name = lease_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "lease".into());
+    name.push(".lock");
+    lease_path.with_file_name(name)
+}
+
+/// Exclusive advisory lock on a sidecar file, released on drop.
+struct FileLockGuard {
+    file: File,
+}
+
+impl FileLockGuard {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_private_dir(parent)?;
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        harden_open_options(&mut options);
+        let file = options
+            .open(path)
+            .map_err(|err| format!("failed opening lease lock '{}': {err}", path.display()))?;
+        let deadline = Instant::now() + FILE_LOCK_TIMEOUT;
         loop {
-            std::thread::sleep(interval);
-            if !self.renew(get_epoch())? {
-                // If we are no longer leader, stop renewing. The caller
-                // can decide to re-acquire or exit.
-                return Err("leader lease lost during renewal".to_string());
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out waiting for lease lock '{}'",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(TryLockError::Error(err)) => {
+                    return Err(format!(
+                        "failed locking lease lock '{}': {err}",
+                        path.display()
+                    ));
+                }
             }
         }
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_millis() as u64
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
-    if !path.exists() {
-        return Ok(None);
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "lease file '{}' is a symbolic link; refusing to follow it",
+            path.display()
+        ));
     }
-    let bytes = fs::read(path)
-        .map_err(|err| format!("failed reading lease file '{}': {err}", path.display()))?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "failed reading lease file '{}': {err}",
+                path.display()
+            ));
+        }
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
-    // The lease file is a single line: node_id,epoch,expires_at_ms
+    // The lease file is a single line: node_id,epoch,expires_at_ms[,instance_id]
+    // (the instance id is absent in files written by older versions).
     let text = String::from_utf8(bytes)
         .map_err(|_| format!("lease file '{}' is not valid UTF-8", path.display()))?;
     let line = text.lines().next().unwrap_or("").trim();
@@ -190,7 +612,7 @@ fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
         return Ok(None);
     }
     let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() != 3 {
+    if !(3..=4).contains(&parts.len()) {
         return Err(format!(
             "lease file '{}' has invalid format (expected node_id,epoch,expires_at_ms)",
             path.display()
@@ -210,31 +632,131 @@ fn read_lease(path: &Path) -> Result<Option<LeaseRecord>, String> {
         node_id,
         epoch,
         expires_at_ms,
+        instance_id: parts.get(3).map(|id| id.to_string()).unwrap_or_default(),
     }))
 }
 
-fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
+/// Allowance for clock skew and differing lease durations when judging
+/// whether a lease record expires implausibly far ahead.
+const LEASE_HORIZON_SLACK_MS: u64 = 60_000;
+/// Fencing tokens above this are treated as forged (a real one increments by
+/// one per leadership change).
+const MAX_PLAUSIBLE_EPOCH: u64 = 1 << 53;
+
+/// Owner-only creation mode and no symlink following for files we create.
+fn harden_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
     {
-        fs::create_dir_all(parent).map_err(|err| {
-            format!(
-                "failed creating lease parent dir '{}': {err}",
-                parent.display()
-            )
-        })?;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let line = format!(
-        "{},{},{}",
-        record.node_id, record.epoch, record.expires_at_ms
-    );
-    let tmp_path = path.with_extension(format!(
-        "lease-tmp-{}-{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("leader")
-    ));
+    #[cfg(not(unix))]
     {
-        let mut file = fs::File::create(&tmp_path).map_err(|err| {
+        let _ = options;
+    }
+}
+
+/// Create `dir` (and missing parents) with mode 0700; for an existing
+/// directory only verify the mode and warn once when it is group or world
+/// writable.
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).map_err(|err| {
+        format!(
+            "failed creating lease parent dir '{}': {err}",
+            dir.display()
+        )
+    })?;
+    if let Some(warning) = dir_permission_warning(dir) {
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+        let first_time = WARNED
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .map(|mut warned| warned.insert(dir.to_path_buf()))
+            .unwrap_or(false);
+        if first_time {
+            eprintln!("WARNING: {warning}");
+        }
+    }
+    Ok(())
+}
+
+/// A warning when `dir` is writable by group or others (anyone who can write
+/// there can replace the lease or plant files next to it).
+fn dir_permission_warning(dir: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(dir).ok()?.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Some(format!(
+                "lease directory '{}' is group/world writable (mode {:o}); restrict it to the \
+                 control-plane user (chmod 0700)",
+                dir.display(),
+                mode & 0o7777
+            ));
+        }
+    }
+    let _ = dir;
+    None
+}
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Durably replace the lease: write a temp file, fsync it, rename over the
+/// lease, then fsync the directory so the rename survives a crash.
+fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
+    write_file_atomic(
+        path,
+        &format!(
+            "{},{},{},{}\n",
+            record.node_id, record.epoch, record.expires_at_ms, record.instance_id
+        ),
+    )
+}
+
+/// Reads the epoch floor sidecar (`0` when it does not exist yet).
+fn read_epoch_floor(path: &Path) -> Result<u64, String> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(format!(
+            "lease epoch floor '{}' is a symbolic link; refusing to follow it",
+            path.display()
+        ));
+    }
+    match fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Ok(0),
+        Ok(text) => text.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "lease epoch floor '{}' is not a valid number",
+                path.display()
+            )
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(format!(
+            "failed reading lease epoch floor '{}': {err}",
+            path.display()
+        )),
+    }
+}
+
+fn write_file_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    ensure_private_dir(&parent)?;
+    let line = contents;
+    // Unguessable name, created exclusively (never reusing or following an
+    // existing path) with owner-only permissions. The epoch floor sidecar is
+    // written through the same path.
+    let tmp_path = tmp_path_for(path);
+    let write_result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        harden_open_options(&mut options);
+        let mut file = options.open(&tmp_path).map_err(|err| {
             format!(
                 "failed creating lease temp file '{}': {err}",
                 tmp_path.display()
@@ -246,25 +768,42 @@ fn write_lease(path: &Path, record: &LeaseRecord) -> Result<(), String> {
                 tmp_path.display()
             )
         })?;
-        file.write_all(b"\n").map_err(|err| {
+        file.sync_all().map_err(|err| {
             format!(
-                "failed writing lease temp file '{}': {err}",
+                "failed syncing lease temp file '{}': {err}",
                 tmp_path.display()
             )
-        })?;
+        })
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
-    fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
             "failed renaming lease temp file to '{}': {err}",
             path.display()
-        )
-    })?;
-    Ok(())
+        ));
+    }
+    File::open(&parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|err| {
+            format!(
+                "failed syncing lease directory '{}': {err}",
+                parent.display()
+            )
+        })
 }
+
+#[cfg(test)]
+mod hardening_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn leader_lease_acquire_and_renew() {
@@ -289,12 +828,16 @@ mod tests {
     fn leader_lease_transfers_after_expiry() {
         let dir = temp_dir("lease-expiry");
         let path = dir.join("lease.txt");
-        let lease_a = LeaderLease::new("node-a", &path, 50, 10);
+        // Injected clock: expiry is driven explicitly, not by sleeping.
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+        let lease_a =
+            LeaderLease::new("node-a", &path, 50, 10).with_test_wall_clock(Arc::clone(&clock));
         assert!(lease_a.try_acquire(1).unwrap());
 
-        // Wait for the lease to expire.
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let lease_b = LeaderLease::new("node-b", &path, 1_000, 100);
+        // Move past the lease and its safety margin.
+        clock.fetch_add(200, Ordering::SeqCst);
+        let lease_b =
+            LeaderLease::new("node-b", &path, 1_000, 100).with_test_wall_clock(Arc::clone(&clock));
         assert!(lease_b.try_acquire(2).unwrap());
         assert!(!lease_a.is_leader().unwrap());
         assert!(lease_b.is_leader().unwrap());
@@ -306,6 +849,276 @@ mod tests {
         let path = dir.join("lease.txt");
         let result = LeaderLease::new("", &path, 1_000, 100).try_acquire(1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn renew_after_lapse_returns_instead_of_deadlocking() {
+        let dir = temp_dir("lease-renew-lapsed");
+        let path = dir.join("lease.txt");
+        let (tx, rx) = mpsc::channel();
+        // Injected clock: the lease lapses when the test says so, not after a
+        // sleep that a slow disk can stretch past the lease length.
+        let clock = Arc::new(AtomicU64::new(1_800_000_000_000));
+        std::thread::spawn(move || {
+            let lease =
+                LeaderLease::new("node-a", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
+            assert!(lease.try_acquire(1).unwrap());
+            clock.fetch_add(350, Ordering::SeqCst);
+            // Previously: renew() held self.lock and re-entered try_acquire(),
+            // which locked the same std Mutex again and hung forever.
+            let renewed = lease.renew(1);
+            let _ = tx.send((renewed, lease.fencing_token()));
+        });
+        let (renewed, token) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("renew() must not deadlock after the lease lapsed");
+        assert!(renewed.unwrap());
+        // Re-acquiring a lapsed lease mints a new fencing token.
+        assert_eq!(token.unwrap(), Some(2));
+    }
+
+    #[test]
+    fn epoch_strictly_increases_across_holders_and_ignores_placement_epoch() {
+        // Driven by an injected clock: acquiring writes and syncs several
+        // files, and on a slow disk that can take longer than a short lease,
+        // so asserting "still valid right after acquiring" must not depend on
+        // real elapsed time.
+        let dir = temp_dir("lease-epoch");
+        let path = dir.join("lease.txt");
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let a = LeaderLease::new("node-a", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
+        let b = LeaderLease::new("node-b", &path, 300, 10).with_test_wall_clock(Arc::clone(&clock));
+
+        // A huge placement epoch must not leak into the fencing token.
+        assert!(a.try_acquire(9_999).unwrap());
+        assert_eq!(a.fencing_token().unwrap(), Some(1));
+
+        clock.store(base + 350, Ordering::SeqCst);
+        assert!(b.try_acquire(0).unwrap());
+        assert_eq!(b.fencing_token().unwrap(), Some(2));
+
+        clock.store(base + 700, Ordering::SeqCst);
+        assert!(a.try_acquire(0).unwrap());
+        assert_eq!(a.fencing_token().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn renewal_by_current_holder_keeps_epoch() {
+        let dir = temp_dir("lease-keep-epoch");
+        let lease = LeaderLease::new("node-a", dir.join("lease.txt"), 5_000, 100);
+        let first = lease.acquire().unwrap().unwrap();
+        assert!(first.newly_acquired);
+        let second = lease.renew_detailed().unwrap().unwrap();
+        assert!(!second.newly_acquired);
+        assert_eq!(first.record.epoch, second.record.epoch);
+        assert!(second.record.expires_at_ms >= first.record.expires_at_ms);
+    }
+
+    #[test]
+    fn concurrent_acquisition_has_exactly_one_winner() {
+        for round in 0..20 {
+            let dir = temp_dir(&format!("lease-race-{round}"));
+            let path = dir.join("lease.txt");
+            let contenders = 12;
+            let barrier = Arc::new(Barrier::new(contenders));
+            let handles: Vec<_> = (0..contenders)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        // Separate instances model separate processes: they
+                        // share nothing but the lease file.
+                        let lease = LeaderLease::new(format!("node-{i}"), path, 10_000, 1_000);
+                        barrier.wait();
+                        lease.try_acquire(0).unwrap()
+                    })
+                })
+                .collect();
+            let winners = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count();
+            assert_eq!(winners, 1, "round {round}: expected a single leader");
+            assert_eq!(read_lease(&path).unwrap().unwrap().epoch, 1);
+        }
+    }
+
+    #[test]
+    fn safety_margin_delays_takeover_and_early_stops_holder() {
+        // Time is moved explicitly (no sleeps), so the result cannot depend
+        // on how slowly a loaded runner schedules threads.
+        let dir = temp_dir("lease-margin");
+        let path = dir.join("lease.txt");
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let a = LeaderLease::new("node-a", &path, 400, 50)
+            .with_safety_margin_ms(150)
+            .with_test_wall_clock(Arc::clone(&clock));
+        let b = LeaderLease::new("node-b", &path, 400, 50)
+            .with_safety_margin_ms(150)
+            .with_test_wall_clock(Arc::clone(&clock));
+        assert!(a.try_acquire(0).unwrap());
+        assert!(a.is_leader().unwrap());
+
+        // Lease expires at base + 400. The holder stops 150 ms early
+        // (base + 250), so at +300 it already considers itself deposed...
+        clock.store(base + 300, Ordering::SeqCst);
+        assert!(!a.is_leader().unwrap());
+        // ...but a challenger must wait out expiry + margin (base + 550).
+        clock.store(base + 450, Ordering::SeqCst);
+        assert!(!b.try_acquire(0).unwrap(), "takeover inside the margin");
+        clock.store(base + 549, Ordering::SeqCst);
+        assert!(
+            !b.try_acquire(0).unwrap(),
+            "takeover just before the margin ends"
+        );
+        clock.store(base + 600, Ordering::SeqCst);
+        assert!(b.try_acquire(0).unwrap());
+    }
+
+    #[test]
+    fn corrupt_lease_file_is_an_error_not_a_silent_reset() {
+        let dir = temp_dir("lease-corrupt");
+        let path = dir.join("lease.txt");
+        fs::write(&path, "garbage").unwrap();
+        let err = LeaderLease::new("node-a", &path, 1_000, 100)
+            .try_acquire(1)
+            .expect_err("corrupt lease must not reset the fencing token");
+        assert!(err.contains("invalid format"));
+    }
+
+    #[test]
+    fn poisoned_lock_returns_error_instead_of_panicking() {
+        let dir = temp_dir("lease-poison");
+        let lease = Arc::new(LeaderLease::new(
+            "node-a",
+            dir.join("lease.txt"),
+            1_000,
+            100,
+        ));
+        let poisoner = Arc::clone(&lease);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock.lock().unwrap();
+            panic!("poison the lease lock");
+        })
+        .join();
+        let err = lease.try_acquire(1).expect_err("must be a graceful error");
+        assert!(err.contains("poisoned"));
+        assert!(lease.renew(1).is_err());
+    }
+
+    #[test]
+    fn clock_before_unix_epoch_is_an_error() {
+        let before_epoch = UNIX_EPOCH - Duration::from_secs(5);
+        let err = ms_since_epoch(before_epoch).expect_err("pre-epoch clock must not panic");
+        assert!(err.contains("before the UNIX epoch"));
+    }
+
+    #[test]
+    fn forward_clock_spike_is_not_latched() {
+        let dir = temp_dir("lease-spike");
+        let lease = LeaderLease::new("node-a", dir.join("lease.txt"), 1_000, 100);
+        let t0 = Instant::now();
+        let wall0 = 1_700_000_000_000u64;
+        assert_eq!(lease.now_ms_from(wall0, t0), wall0);
+        // A wall-clock spike of ten hours is ignored: time keeps advancing
+        // with the monotonic clock only.
+        let spiked = lease.now_ms_from(wall0 + 36_000_000, t0 + Duration::from_secs(1));
+        assert_eq!(spiked, wall0 + 1_000);
+        // Once the wall clock is sane again the reading follows it, not the
+        // spike (the old latch would still report wall0 + 10h here).
+        let back = lease.now_ms_from(wall0 + 2_000, t0 + Duration::from_secs(2));
+        assert_eq!(back, wall0 + 2_000);
+    }
+
+    #[test]
+    fn persistent_clock_step_is_adopted_and_never_goes_backwards() {
+        let dir = temp_dir("lease-step");
+        let lease = LeaderLease::new("node-a", dir.join("lease.txt"), 1_000, 100);
+        let t0 = Instant::now();
+        let wall0 = 1_700_000_000_000u64;
+        lease.now_ms_from(wall0, t0);
+        let step = 3_600_000u64; // the clock was corrected forward an hour
+        let mut last = wall0;
+        let mut adopted_at = None;
+        for secs in 1..=120u64 {
+            let value =
+                lease.now_ms_from(wall0 + step + secs * 1_000, t0 + Duration::from_secs(secs));
+            assert!(value >= last, "went backwards at {secs}s");
+            last = value;
+            if value >= wall0 + step && adopted_at.is_none() {
+                adopted_at = Some(secs);
+            }
+        }
+        assert!(adopted_at.is_some(), "a persistent step must be adopted");
+        // A small backwards wobble never moves the reading backwards.
+        let wobble = lease.now_ms_from(last - 500, t0 + Duration::from_secs(121));
+        assert!(wobble >= last);
+    }
+
+    #[test]
+    fn epoch_never_restarts_after_the_lease_file_is_deleted_or_emptied() {
+        let dir = temp_dir("lease-epoch-floor");
+        let path = dir.join("lease.txt");
+        let base: u64 = 1_800_000_000_000;
+        let clock = Arc::new(AtomicU64::new(base));
+        let lease = |node: &str| {
+            LeaderLease::new(node, &path, 300, 10).with_test_wall_clock(Arc::clone(&clock))
+        };
+        let a = lease("node-a");
+        assert!(a.try_acquire(0).unwrap());
+        assert_eq!(a.fencing_token().unwrap(), Some(1));
+        clock.store(base + 350, Ordering::SeqCst);
+        let b = lease("node-b");
+        assert!(b.try_acquire(0).unwrap());
+        assert_eq!(b.fencing_token().unwrap(), Some(2));
+
+        fs::remove_file(&path).unwrap();
+        let c = lease("node-c");
+        let acquired = c.acquire().unwrap().unwrap();
+        assert!(
+            acquired.record.epoch > 2,
+            "fencing token went backwards to {}",
+            acquired.record.epoch
+        );
+
+        clock.store(base + 700, Ordering::SeqCst);
+        fs::write(&path, "").unwrap();
+        let d = lease("node-d");
+        let again = d.acquire().unwrap().unwrap();
+        assert!(again.record.epoch > acquired.record.epoch);
+        assert!(dir.join("lease.txt.epoch").exists());
+    }
+
+    #[test]
+    fn write_leaves_no_temp_files_and_round_trips() {
+        let dir = temp_dir("lease-tmp");
+        let path = dir.join("lease.txt");
+        let lease = LeaderLease::new("node-a", &path, 1_000, 100);
+        assert!(lease.try_acquire(0).unwrap());
+        assert!(lease.renew(0).unwrap());
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("lease-tmp")),
+            "{names:?}"
+        );
+        assert_eq!(read_lease(&path).unwrap().unwrap().node_id, "node-a");
+    }
+
+    #[test]
+    fn backoff_doubles_then_caps_and_resets() {
+        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(350));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(200));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(350));
+        assert_eq!(backoff.next_delay(), Duration::from_millis(350));
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), Duration::from_millis(100));
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

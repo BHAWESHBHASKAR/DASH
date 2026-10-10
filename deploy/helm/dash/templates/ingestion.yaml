@@ -1,10 +1,17 @@
-{{- /* Ingestion workload - mirror of retrieval on port 8081. */ -}}
+{{- /*
+Ingestion workload: the single writer (WAL + redb). One replica, or with
+failover.enabled failover.replicas pods of which the control plane names
+one leader; the Service routes to the leader only (readiness
+/v1/ready/leader). Do not scale it by hand or autoscale it.
+*/ -}}
+{{- $failover := .Values.failover.enabled -}}
+{{- $peers := printf "%s-peers" (include "dash.componentName" (list . "ingestion")) -}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "dash.componentName" (list . "ingestion") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingestion
@@ -17,20 +24,54 @@ spec:
     port: {{ .Values.service.ports.http }}
     targetPort: http
     protocol: TCP
-    appProtocol: http
+    appProtocol: {{ ternary "https" "http" .Values.tls.enabled }}
+{{- if $failover }}
+---
+# Stable per-pod DNS names for replication between ingestion pods and for the
+# failover heartbeat's advertised URL. Lists followers too (they are not ready
+# by design: only the leader passes /v1/ready/leader).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $peers }}
+  namespace: {{ include "dash.namespace" . }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dash.ingestionSelectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8081
+    targetPort: http
+    protocol: TCP
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "dash.componentName" (list . "ingestion") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingestion
 spec:
-  serviceName: {{ include "dash.componentName" (list . "ingestion") }}
-  replicas: {{ .Values.replicas.ingestion }}
+  {{- if $failover }}
+  serviceName: {{ $peers }}
+  replicas: {{ .Values.failover.replicas | int }}
+  # Followers never become ready (only the leader passes the probe), so pods
+  # start in parallel and are updated by deleting them (see values.yaml).
   podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  {{- else }}
+  serviceName: {{ include "dash.componentName" (list . "ingestion") }}
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
@@ -38,17 +79,23 @@ spec:
     metadata:
       labels:
         {{- include "dash.ingestionSelectorLabels" . | nindent 8 }}
-      {{- with .Values.podLabels }}
-      {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.podAnnotations }}
-      annotations:
+        {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the rendered ConfigMap or chart-managed Secrets
+        # change: envFrom is read only at container start, so without this
+        # a `helm upgrade` that changes config.* or secret.* did nothing
+        # until the pods happened to restart.
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: {{ include "dash.ingestionServiceAccountName" . }}
       automountServiceAccountToken: false
-      {{- with .Values.imagePullSecrets }}
+      {{- if .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- include "dash.imagePullSecrets" . | nindent 8 }}
       {{- end }}
@@ -67,73 +114,104 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      initContainers:
+      {{- include "dash.initDataDirs" (list . (include "dash.ingestionImage" .) "/var/lib/dash/wal /var/lib/dash/state /var/lib/dash/segments /var/lib/dash/audit") | nindent 6 }}
       containers:
       - name: ingestion
         image: {{ include "dash.ingestionImage" . | quote }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
+        # Matches the image ENTRYPOINT; DASH_BIN selects the binary.
         command: ["/opt/dash/bin/dash-entrypoint"]
         args: ["--serve"]
         env:
         - name: DASH_BIN
           value: "ingestion"
-        - name: DASH_HEALTHCHECK_URL
-          value: "http://127.0.0.1:8081{{ .Values.probes.liveness.path }}"
+        {{- if $failover }}
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: DASH_NODE_ID
+          value: "$(POD_NAME)"
+        - name: DASH_INGEST_FAILOVER_ADVERTISE_URL
+          value: {{ printf "%s://$(POD_NAME).%s.%s.svc.cluster.local:8081" (ternary "https" "http" .Values.tls.enabled) $peers (include "dash.namespace" .) | quote }}
+        - name: DASH_CONTROL_PLANE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "dash.controlPlaneSecretName" . }}
+              key: DASH_CONTROL_PLANE_TOKEN
+        {{- end }}
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config
         - secretRef:
-            name: {{ include "dash.fullname" . }}-ingestion-secrets
+            name: {{ include "dash.ingestionSecretName" . }}
         ports:
         - name: http
           containerPort: 8081
           protocol: TCP
         resources:
-          {{- $r := merge (deepCopy .Values.resources) (default (dict) .Values.resources.ingestion) }}
-          {{- $req := dig "requests" (dict) $r }}
-          {{- $lim := dig "limits" (dict) $r }}
-          requests:
-            {{- toYaml $req | nindent 12 }}
-          limits:
-            {{- toYaml $lim | nindent 12 }}
+          {{- include "dash.resources" (list . "ingestion") | nindent 10 }}
         startupProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.startup.path }}"]
+          httpGet:
+            path: {{ .Values.probes.startup.path }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
           initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.startup.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
           failureThreshold: {{ .Values.probes.startup.failureThreshold }}
         livenessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.liveness.path }}"]
+          httpGet:
+            path: {{ .Values.probes.liveness.path }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
+          initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
           periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
         readinessProbe:
-          exec:
-            command: ["wget", "-qO-", "http://localhost:8081{{ .Values.probes.readiness.path }}"]
+          httpGet:
+            # With failover only the leader is ready: the Service follows it.
+            path: {{ ternary "/v1/ready/leader" .Values.probes.readiness.path $failover }}
+            port: http
+            scheme: {{ include "dash.probeScheme" . }}
+          {{- if $failover }}
+          # Probe often: the Service must move to a new leader (and away from
+          # a deposed one) within seconds, not tens of seconds.
+          periodSeconds: {{ .Values.failover.readinessPeriodSeconds }}
+          timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          successThreshold: 1
+          failureThreshold: 1
+          {{- else }}
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
         securityContext:
           {{- toYaml .Values.containerSecurityContext | nindent 12 }}
         volumeMounts:
         - name: data
           mountPath: {{ .Values.config.persistencePath }}
+        # Writable scratch space. /opt/dash is NOT mounted over: it holds
+        # the image's binaries and entrypoint.
         - name: tmp
           mountPath: /tmp
-        - name: home
-          mountPath: /opt/dash
+        {{- include "dash.tlsVolumeMount" . | nindent 8 }}
+        {{- include "dash.encryptionVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
-      - name: home
-        emptyDir:
-          medium: Memory
-          sizeLimit: 32Mi
+      {{- include "dash.tlsVolume" . | nindent 6 }}
+      {{- include "dash.encryptionVolume" . | nindent 6 }}
+      {{- if not .Values.persistence.enabled }}
+      - name: data
+        emptyDir: {}
+      {{- end }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
   - metadata:

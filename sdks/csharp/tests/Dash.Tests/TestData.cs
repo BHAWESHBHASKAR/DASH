@@ -38,13 +38,23 @@ internal static class TestData
     }
     """;
 
+    // Shape emitted by render_retrieve_response_json in
+    // services/retrieval/src/transport/payload.rs (numeric score, nullable
+    // optional fields, extra fields the SDK must tolerate).
     public const string SampleRetrieveResponseJson = """
     {
-      "hits": [
+      "results": [
         {
           "claim_id": "claim-1",
           "canonical_text": "Acme Co. was acquired in 2024.",
-          "score": { "overall": 0.93, "semantic": 0.95, "lexical": 0.80 },
+          "score": 0.930000,
+          "claim_confidence": 0.870000,
+          "confidence_band": "high",
+          "dominant_stance": "supports",
+          "contradiction_risk": null,
+          "graph_score": 0.410000,
+          "support_path_count": 2,
+          "contradiction_chain_depth": null,
           "supports": 4,
           "contradicts": 1,
           "citations": [
@@ -52,7 +62,7 @@ internal static class TestData
               "evidence_id": "ev-1",
               "source_id": "source://reuters",
               "stance": "supports",
-              "source_quality": 0.88,
+              "source_quality": 0.880000,
               "chunk_id": "chunk-7",
               "span_start": 120,
               "span_end": 168,
@@ -60,24 +70,42 @@ internal static class TestData
               "extraction_model": "extractor-v5",
               "ingested_at": 1735689700000
             }
-          ]
+          ],
+          "event_time_unix": 1735689600,
+          "temporal_match_mode": null,
+          "temporal_in_range": null,
+          "claim_type": "factual",
+          "valid_from": null,
+          "valid_to": null,
+          "created_at": 1735689601,
+          "updated_at": null,
+          "some_future_field": { "ignored": true }
         }
-      ]
+      ],
+      "graph": {
+        "nodes": [],
+        "edges": [
+          { "from_claim_id": "claim-1", "to_claim_id": "claim-2", "relation": "supports", "strength": 0.500000 }
+        ]
+      },
+      "read_policy": "one",
+      "read_quorum_met": true,
+      "serving_replica": null
     }
     """;
 
+    public const string MinimalRetrieveResponseJson = """{ "results": [ { "claim_id": "c", "canonical_text": "t", "score": 1 } ] }""";
+
+    // Shape of IngestApiResponse in services/ingestion/src/api.rs.
     public const string SampleIngestResponseJson = """
     {
-      "bundles_ingested": 1,
-      "claims_ingested": 2,
-      "evidence_ingested": 3
-    }
-    """;
-
-    public const string SampleDeleteResponseJson = """
-    {
-      "claims_deleted": 5,
-      "evidence_deleted": 9
+      "ingested_claim_id": "c-1",
+      "claims_total": 7,
+      "commit_epoch": 12,
+      "ack_count": 1,
+      "required_acks": 1,
+      "commit_status": "committed",
+      "checkpoint_triggered": false
     }
     """;
 
@@ -86,6 +114,70 @@ internal static class TestData
       "status": "ok",
       "version": "0.4.0",
       "details": { "uptime_seconds": 12345 }
+    }
+    """;
+
+    // DELETE responses, shaped like docs-site/docs/reference/api.md (Deletes).
+    public const string SampleDeleteClaimResponseJson = """
+    {
+      "deleted": true,
+      "scope": "claim",
+      "tenant_id": "t1",
+      "claim_id": "c1",
+      "claims_deleted": 1,
+      "evidence_deleted": 2,
+      "edges_deleted": 1,
+      "vectors_deleted": 1,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteEvidenceResponseJson = """
+    {
+      "deleted": true,
+      "scope": "evidence",
+      "tenant_id": "t1",
+      "evidence_id": "ev-1",
+      "claims_deleted": 0,
+      "evidence_deleted": 3,
+      "edges_deleted": 0,
+      "vectors_deleted": 0,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteTenantResponseJson = """
+    {
+      "deleted": true,
+      "scope": "tenant",
+      "tenant_id": "t1",
+      "claims_deleted": 5,
+      "evidence_deleted": 9,
+      "edges_deleted": 4,
+      "vectors_deleted": 5,
+      "claims_total": 0,
+      "checkpoint_triggered": true,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteNothingResponseJson = """
+    {
+      "deleted": false,
+      "scope": "claim",
+      "tenant_id": "t1",
+      "claim_id": "missing",
+      "claims_deleted": 0,
+      "evidence_deleted": 0,
+      "edges_deleted": 0,
+      "vectors_deleted": 0,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
     }
     """;
 

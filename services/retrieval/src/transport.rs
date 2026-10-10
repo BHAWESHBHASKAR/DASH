@@ -1,12 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -28,26 +26,32 @@ use crate::api::{
     RetrieveStorageMergeSnapshot, STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE,
     STORAGE_PROMOTION_BOUNDARY_REPLAY_ONLY, STORAGE_PROMOTION_BOUNDARY_SEGMENT_FULLY_PROMOTED,
     STORAGE_PROMOTION_BOUNDARY_SEGMENT_PLUS_WAL_DELTA, TimeRange,
-    build_retrieve_planner_debug_snapshot, execute_api_query_with_storage_snapshot,
+    build_retrieve_planner_debug_snapshot, execute_api_query_with_segment_prefilter,
+    execute_api_query_with_storage_snapshot, resolve_segment_prefilter,
     segment_prefilter_cache_metrics_snapshot,
 };
 mod audit;
 mod authz;
+#[cfg(test)]
+mod authz_matrix_tests;
 mod debug_render;
 mod http;
 mod payload;
-use audit::{AuditEvent, append_audit_record};
 #[cfg(test)]
-use audit::{audit_chain_states, is_sha256_hex};
-pub(crate) use authz::{AuthDecision, AuthPolicy, Role, authorize_request_for_tenant};
+use audit::is_sha256_hex;
+use audit::{AuditEvent, append_audit_record, audit_gate};
+pub use authz::initialize_auth_policy;
+pub(crate) use authz::{
+    AuthDecision, Role, authorize_request_any_tenant, authorize_request_for_tenant,
+    authorize_request_ops, shared_auth_policy,
+};
+use dash_common::AuthPolicy;
 use debug_render::{
     evaluate_storage_divergence_warning, promotion_boundary_state_metric_value,
     render_placement_debug_json, render_planner_debug_json, render_storage_visibility_debug_json,
     resolve_storage_divergence_warn_delta_count, resolve_storage_divergence_warn_ratio,
 };
-use http::{
-    parse_request_line, read_http_request, render_response_text, split_target, write_response,
-};
+use http::{query_encoding_is_invalid, render_response_text, server_config, split_target};
 #[cfg(test)]
 use payload::build_retrieve_request_from_json;
 #[cfg(test)]
@@ -58,8 +62,6 @@ use payload::{
 };
 
 const METRICS_WINDOW_SIZE: usize = 2048;
-const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
-const SOCKET_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_HTTP_WORKERS: usize = 4;
 const DEFAULT_HTTP_QUEUE_CAPACITY_PER_WORKER: usize = 64;
 const DEFAULT_STORAGE_DIVERGENCE_WARN_DELTA_COUNT: usize = 1_000;
@@ -71,6 +73,9 @@ pub(crate) struct TransportBackpressureMetrics {
     pub(crate) queue_depth: AtomicUsize,
     pub(crate) queue_capacity: usize,
     pub(crate) queue_full_reject_total: AtomicU64,
+    /// Requests that failed while being read (408/413/431/400/...), by status class.
+    pub(crate) read_error_4xx_total: AtomicU64,
+    pub(crate) read_error_5xx_total: AtomicU64,
 }
 
 impl TransportBackpressureMetrics {
@@ -79,6 +84,8 @@ impl TransportBackpressureMetrics {
             queue_depth: AtomicUsize::new(0),
             queue_capacity,
             queue_full_reject_total: AtomicU64::new(0),
+            read_error_4xx_total: AtomicU64::new(0),
+            read_error_5xx_total: AtomicU64::new(0),
         }
     }
 
@@ -89,13 +96,40 @@ impl TransportBackpressureMetrics {
     pub(crate) fn observe_dequeued(&self) {
         let _ = self
             .queue_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 Some(value.saturating_sub(1))
             });
     }
 
     pub(crate) fn observe_rejected(&self) {
         self.queue_full_reject_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_read_error(&self, status: u16) {
+        let counter = if status >= 500 {
+            &self.read_error_5xx_total
+        } else {
+            &self.read_error_4xx_total
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl dash_http::ServerHooks for TransportBackpressureMetrics {
+    fn on_enqueued(&self) {
+        self.observe_enqueued();
+    }
+
+    fn on_dequeued(&self) {
+        self.observe_dequeued();
+    }
+
+    fn on_reject(&self, _reason: dash_http::RejectReason) {
+        self.observe_rejected();
+    }
+
+    fn on_read_error(&self, status: u16) {
+        self.observe_read_error(status);
     }
 }
 
@@ -214,6 +248,44 @@ struct PlacementReloadSnapshot {
     last_error: Option<String>,
 }
 
+/// Upper bounds (ms) of the per-route latency histogram buckets.
+const LATENCY_BUCKETS_MS: [f64; 12] = [
+    1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+];
+
+/// Fixed-bucket latency histogram (non-cumulative counts per bucket; the
+/// last slot is the overflow / `+Inf` bucket).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RouteLatencyHistogram {
+    buckets: [u64; LATENCY_BUCKETS_MS.len() + 1],
+    sum_ms: f64,
+    count: u64,
+}
+
+impl RouteLatencyHistogram {
+    fn observe(&mut self, latency_ms: f64) {
+        let idx = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|bound| latency_ms <= *bound)
+            .unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.buckets[idx] += 1;
+        self.sum_ms += latency_ms;
+        self.count += 1;
+    }
+}
+
+/// Stable route label for the latency histograms.
+fn route_metric_label(path: &str) -> &'static str {
+    match path {
+        "/v1/retrieve" => "retrieve",
+        "/v1/embeddings" => "embeddings",
+        "/ready" | "/v1/ready" => "ready",
+        "/metrics" => "metrics",
+        "/debug/planner" | "/debug/storage-visibility" | "/debug/placement" => "debug",
+        _ => "other",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TransportMetrics {
     started_at: Instant,
@@ -224,6 +296,11 @@ pub(crate) struct TransportMetrics {
     retrieve_success_total: u64,
     retrieve_client_error_total: u64,
     retrieve_server_error_total: u64,
+    /// Subsets of the 4xx total, so auth/rate-limit rejections are visible
+    /// separately from malformed requests.
+    retrieve_auth_denied_total: u64,
+    retrieve_rate_limited_total: u64,
+    route_latency: std::collections::BTreeMap<&'static str, RouteLatencyHistogram>,
     auth_success_total: u64,
     auth_failure_total: u64,
     authz_denied_total: u64,
@@ -280,6 +357,9 @@ impl Default for TransportMetrics {
             retrieve_success_total: 0,
             retrieve_client_error_total: 0,
             retrieve_server_error_total: 0,
+            retrieve_auth_denied_total: 0,
+            retrieve_rate_limited_total: 0,
+            route_latency: std::collections::BTreeMap::new(),
             auth_success_total: 0,
             auth_failure_total: 0,
             authz_denied_total: 0,
@@ -353,6 +433,11 @@ impl TransportMetrics {
         }
     }
 
+    /// Record one retrieve request. Latency and visibility-lag windows only
+    /// receive samples from requests that actually executed (2xx): auth,
+    /// validation and routing failures finish in microseconds and would
+    /// drag the percentiles toward zero. They are counted per status class
+    /// instead.
     fn observe_retrieve(
         &mut self,
         status: u16,
@@ -361,17 +446,58 @@ impl TransportMetrics {
         ingest_to_visible_lag_ms: Option<f64>,
     ) {
         self.retrieve_requests_total += 1;
-        self.retrieve_last_result_count = result_count;
-        Self::push_window(&mut self.retrieve_latency_ms_window, latency_ms);
-        if let Some(value) = ingest_to_visible_lag_ms {
-            Self::push_window(&mut self.ingest_to_visible_lag_ms_window, value);
-        }
-
         match status {
-            200..=299 => self.retrieve_success_total += 1,
-            400..=499 => self.retrieve_client_error_total += 1,
+            200..=299 => {
+                self.retrieve_last_result_count = result_count;
+                Self::push_window(&mut self.retrieve_latency_ms_window, latency_ms);
+                if let Some(value) = ingest_to_visible_lag_ms {
+                    Self::push_window(&mut self.ingest_to_visible_lag_ms_window, value);
+                }
+                self.retrieve_success_total += 1;
+            }
+            400..=499 => {
+                self.retrieve_client_error_total += 1;
+                match status {
+                    401 | 403 => self.retrieve_auth_denied_total += 1,
+                    429 => self.retrieve_rate_limited_total += 1,
+                    _ => {}
+                }
+            }
             _ => self.retrieve_server_error_total += 1,
         }
+    }
+
+    fn observe_route_latency(&mut self, path: &str, latency_ms: f64) {
+        self.route_latency
+            .entry(route_metric_label(path))
+            .or_default()
+            .observe(latency_ms);
+    }
+
+    fn render_route_latency_histograms(&self) -> String {
+        let mut out = String::from("# TYPE dash_http_request_duration_ms histogram\n");
+        for (route, hist) in &self.route_latency {
+            let mut cumulative = 0u64;
+            for (idx, bound) in LATENCY_BUCKETS_MS.iter().enumerate() {
+                cumulative += hist.buckets[idx];
+                out.push_str(&format!(
+                    "dash_http_request_duration_ms_bucket{{route=\"{route}\",le=\"{bound}\"}} {cumulative}\n"
+                ));
+            }
+            out.push_str(&format!(
+                "dash_http_request_duration_ms_bucket{{route=\"{route}\",le=\"+Inf\"}} {}\n",
+                hist.count
+            ));
+            out.push_str(&format!(
+                "dash_http_request_duration_ms_sum{{route=\"{route}\"}} {:.4}\n",
+                hist.sum_ms
+            ));
+            out.push_str(&format!(
+                "dash_http_request_duration_ms_count{{route=\"{route}\"}} {}\n",
+                hist.count
+            ));
+        }
+        out
     }
 
     fn observe_auth_success(&mut self) {
@@ -555,13 +681,23 @@ impl TransportMetrics {
             .as_ref()
             .map(|metrics| metrics.queue_full_reject_total.load(Ordering::Relaxed))
             .unwrap_or(0);
+        let (read_error_4xx, read_error_5xx) = self
+            .transport_backpressure
+            .as_ref()
+            .map(|metrics| {
+                (
+                    metrics.read_error_4xx_total.load(Ordering::Relaxed),
+                    metrics.read_error_5xx_total.load(Ordering::Relaxed),
+                )
+            })
+            .unwrap_or((0, 0));
         let (disk_unavailable, disk_recovering) = match disk_status {
             store::DiskStatus::Unavailable { .. } => (1, 0),
             store::DiskStatus::Recovering => (0, 1),
             store::DiskStatus::Available => (0, 0),
         };
 
-        format!(
+        let mut rendered = format!(
             "# TYPE dash_http_requests_total counter\n\
 dash_http_requests_total {}\n\
 # TYPE dash_health_requests_total counter\n\
@@ -592,6 +728,9 @@ dash_retrieve_transport_queue_capacity {}\n\
 dash_retrieve_transport_queue_depth {}\n\
 # TYPE dash_retrieve_transport_queue_full_reject_total counter\n\
 dash_retrieve_transport_queue_full_reject_total {}\n\
+# TYPE dash_retrieve_transport_read_error_total counter\n\
+dash_retrieve_transport_read_error_total{{status_class=\"4xx\"}} {}\n\
+dash_retrieve_transport_read_error_total{{status_class=\"5xx\"}} {}\n\
 # TYPE dash_retrieve_placement_enabled gauge\n\
 dash_retrieve_placement_enabled {}\n\
 # TYPE dash_retrieve_placement_route_reject_total counter\n\
@@ -723,6 +862,8 @@ dash_transport_uptime_seconds {:.4}\n",
             transport_queue_capacity,
             transport_queue_depth,
             transport_queue_full_reject_total,
+            read_error_4xx,
+            read_error_5xx,
             placement_enabled,
             self.placement_route_reject_total,
             placement_last_shard_id,
@@ -781,7 +922,16 @@ dash_transport_uptime_seconds {:.4}\n",
             disk_unavailable,
             disk_recovering,
             uptime_seconds
-        )
+        );
+        rendered.push_str(&format!(
+            "# TYPE dash_retrieve_auth_denied_total counter\n\
+dash_retrieve_auth_denied_total {}\n\
+# TYPE dash_retrieve_rate_limited_total counter\n\
+dash_retrieve_rate_limited_total {}\n",
+            self.retrieve_auth_denied_total, self.retrieve_rate_limited_total
+        ));
+        rendered.push_str(&self.render_route_latency_histograms());
+        rendered
     }
 }
 
@@ -797,24 +947,6 @@ pub(crate) fn resolve_http_queue_capacity(worker_count: usize) -> usize {
     .unwrap_or(default_capacity)
 }
 
-const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: retrieval worker queue full";
-
-pub(crate) fn backpressure_rejection_response() -> HttpResponse {
-    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
-}
-
-fn write_backpressure_response(mut stream: TcpStream) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-    let response = backpressure_rejection_response();
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response.content_type,
-        response.body.len(),
-        response.body
-    );
-    stream.write_all(response.as_bytes())
-}
-
 pub fn serve_http(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
     let shutdown = dash_common::ShutdownSignal::install();
     serve_http_with_workers(store, bind_addr, DEFAULT_HTTP_WORKERS, shutdown)
@@ -826,6 +958,8 @@ pub fn serve_http_with_workers(
     worker_count: usize,
     shutdown: std::sync::Arc<dash_common::ShutdownSignal>,
 ) -> std::io::Result<()> {
+    let tls = dash_common::tls::listener_tls_from_env(&dash_common::tls::RETRIEVAL_TLS_ENV)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
     let listener = TcpListener::bind(bind_addr)?;
     let worker_count = worker_count.max(1);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
@@ -834,95 +968,37 @@ pub fn serve_http_with_workers(
     if let Ok(mut guard) = metrics.lock() {
         guard.set_transport_backpressure_metrics(Arc::clone(&backpressure_metrics));
     }
-    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
-        |reason| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid placement routing configuration: {reason}"),
-            )
-        },
-    )?));
-    let (tx, rx) = mpsc::sync_channel::<TcpStream>(queue_capacity);
-    let rx = Arc::new(Mutex::new(rx));
-
-    std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let metrics = Arc::clone(&metrics);
-            let rx = Arc::clone(&rx);
-            let placement_routing = Arc::clone(&placement_routing);
-            let backpressure_metrics = Arc::clone(&backpressure_metrics);
-            let store = Arc::clone(&store);
-            scope.spawn(move || {
-                loop {
-                    let stream = {
-                        let guard = match rx.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => break,
-                        };
-                        match guard.recv() {
-                            Ok(stream) => {
-                                backpressure_metrics.observe_dequeued();
-                                stream
-                            }
-                            Err(_) => break,
-                        }
-                    };
-                    if let Err(err) =
-                        handle_connection(&store, stream, &metrics, &placement_routing)
-                    {
-                        eprintln!("retrieval transport error: {err}");
-                    }
-                }
-            });
-        }
-
-        // Set the listener non-blocking so we can interleave
-        // accept() calls with shutdown-flag polling. The 50ms
-        // sleep caps shutdown latency at ~50ms p99 and bounds
-        // CPU usage in the idle case.
-        listener
-            .set_nonblocking(true)
-            .expect("set listener non-blocking");
-        loop {
-            if shutdown.is_triggered() {
-                eprintln!("retrieval: shutdown signal received, draining in-flight requests");
-                break;
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    backpressure_metrics.observe_enqueued();
-                    match tx.try_send(stream) {
-                        Ok(()) => {}
-                        Err(mpsc::TrySendError::Full(stream)) => {
-                            backpressure_metrics.observe_dequeued();
-                            backpressure_metrics.observe_rejected();
-                            if let Err(err) = write_backpressure_response(stream) {
-                                eprintln!(
-                                    "retrieval transport backpressure response failed: {err}"
-                                );
-                            }
-                        }
-                        Err(mpsc::TrySendError::Disconnected(_)) => {
-                            backpressure_metrics.observe_dequeued();
-                            eprintln!("retrieval transport worker queue closed");
-                            break;
-                        }
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                Err(err) => {
-                    eprintln!("retrieval transport accept error: {err}");
-                    break;
-                }
-            }
-        }
-        drop(tx);
+    let placement_routing = new_placement_routing()?;
+    let handler: dash_http::Handler = Arc::new(move |request| {
+        handle_connection_request(
+            &store,
+            &HttpRequest::from(request),
+            &metrics,
+            &placement_routing,
+        )
+        .into()
     });
+    let handler = dash_observe::http::instrument(SERVICE_NAME, http_route_label, handler);
+    let mut config = server_config(worker_count, queue_capacity);
+    config.tls = tls;
+    dash_http::serve(
+        listener,
+        config,
+        handler,
+        dash_http::default_health_classifier,
+        &|| shutdown.is_triggered(),
+        backpressure_metrics,
+    )
+}
 
-    Ok(())
+fn new_placement_routing() -> std::io::Result<SharedPlacementRouting> {
+    let state = PlacementRoutingState::from_env().map_err(|reason| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid placement routing configuration: {reason}"),
+        )
+    })?;
+    Ok(Arc::new(Mutex::new(state)))
 }
 
 pub fn serve_http_once(store: Arc<RwLock<InMemoryStore>>, bind_addr: &str) -> std::io::Result<()> {
@@ -935,66 +1011,32 @@ pub fn serve_http_once_with_listener(
     listener: TcpListener,
 ) -> std::io::Result<()> {
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
-    let placement_routing = Arc::new(Mutex::new(PlacementRoutingState::from_env().map_err(
-        |reason| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid placement routing configuration: {reason}"),
-            )
-        },
-    )?));
-    let (stream, _) = listener.accept()?;
-    handle_connection(&store, stream, &metrics, &placement_routing)
+    let placement_routing = new_placement_routing()?;
+    let handler: dash_http::Handler = Arc::new(move |request| {
+        handle_connection_request(
+            &store,
+            &HttpRequest::from(request),
+            &metrics,
+            &placement_routing,
+        )
+        .into()
+    });
+    let handler = dash_observe::http::instrument(SERVICE_NAME, http_route_label, handler);
+    dash_http::serve_once(
+        &listener,
+        &server_config(1, 1),
+        &handler,
+        &TransportBackpressureMetrics::default(),
+    )
 }
 
 pub fn handle_http_request_bytes(
     store: &InMemoryStore,
     raw_request: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let request_text =
-        std::str::from_utf8(raw_request).map_err(|_| "request must be valid UTF-8".to_string())?;
-    let (header_block, body) = request_text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "missing HTTP header terminator".to_string())?;
-
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing request line".to_string())?;
-    let (method, target) = parse_request_line(request_line)?;
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "invalid HTTP header".to_string())?;
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-    }
-
-    let content_length = match headers.get("content-length") {
-        Some(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| "invalid content-length header".to_string())?,
-        None => 0,
-    };
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(format!(
-            "content-length exceeds max body size ({MAX_HTTP_BODY_BYTES} bytes)"
-        ));
-    }
-    if content_length != body.len() {
-        return Err("content-length does not match body size".to_string());
-    }
-
-    let request = HttpRequest {
-        method,
-        target,
-        headers,
-        body: body.as_bytes().to_vec(),
-    };
+    let request = dash_http::parse_request_bytes(raw_request, &server_config(1, 1))
+        .map_err(|err| err.message)?;
+    let request = HttpRequest::from(request);
     let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
     let mut placement_routing = PlacementRoutingState::from_env()?;
     let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
@@ -1016,23 +1058,12 @@ pub fn handle_http_request_bytes(
     Ok(render_response_text(&response).into_bytes())
 }
 
-fn handle_connection(
+fn handle_connection_request(
     store: &Arc<RwLock<InMemoryStore>>,
-    mut stream: TcpStream,
+    request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: &SharedPlacementRouting,
-) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(SOCKET_TIMEOUT_SECS)))?;
-
-    let request = match read_http_request(&mut stream) {
-        Ok(Some(request)) => request,
-        Ok(None) => return Ok(()),
-        Err(err) => {
-            return write_response(&mut stream, HttpResponse::bad_request(&err));
-        }
-    };
-
+) -> HttpResponse {
     let (routing_snapshot, reload_snapshot) = match placement_routing.lock() {
         Ok(mut guard) => {
             if let Some(state) = guard.as_mut() {
@@ -1043,26 +1074,24 @@ fn handle_connection(
             }
         }
         Err(_) => {
-            return write_response(
-                &mut stream,
-                HttpResponse::internal_server_error(
-                    "failed to acquire retrieval placement routing lock",
-                ),
+            return HttpResponse::internal_server_error(
+                "failed to acquire retrieval placement routing lock",
             );
         }
     };
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_placement_reload_snapshot(&reload_snapshot);
     }
-    let store_guard = store.read().unwrap_or_else(|p| p.into_inner());
-    let response = handle_request_with_metrics_and_reload(
-        &store_guard,
-        &request,
+    // The store lock is taken only for the short in-memory read sections inside
+    // the handler (never across embedding calls) and is released before the
+    // response is written to the socket.
+    handle_request_with_metrics_and_reload(
+        &**store,
+        request,
         metrics,
         routing_snapshot.as_ref(),
         Some(&reload_snapshot),
-    );
-    write_response(&mut stream, response)
+    )
 }
 
 #[cfg(test)]
@@ -1080,9 +1109,8 @@ pub(crate) fn handle_request_with_metrics(
     let mut placement_routing = match PlacementRoutingState::from_env() {
         Ok(runtime) => runtime,
         Err(reason) => {
-            return HttpResponse::internal_server_error(&format!(
-                "placement routing configuration error: {reason}"
-            ));
+            eprintln!("retrieval placement routing configuration error: {reason}");
+            return HttpResponse::internal_server_error("placement_config_invalid");
         }
     };
     let (routing_snapshot, reload_snapshot) = if let Some(state) = placement_routing.as_mut() {
@@ -1113,30 +1141,115 @@ fn handle_request_with_metrics_and_routing(
     handle_request_with_metrics_and_reload(store, request, metrics, placement_routing, None)
 }
 
-fn handle_request_with_metrics_and_reload(
-    store: &InMemoryStore,
+fn handle_request_with_metrics_and_reload<S: StoreAccess + ?Sized>(
+    store: &S,
     request: &HttpRequest,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
     placement_reload: Option<&PlacementReloadSnapshot>,
 ) -> HttpResponse {
-    let (path, query) = split_target(&request.target);
-    let auth_policy = AuthPolicy::from_env(
-        env_with_fallback("DASH_RETRIEVAL_API_KEY", "EME_RETRIEVAL_API_KEY"),
-        env_with_fallback("DASH_RETRIEVAL_API_KEYS", "EME_RETRIEVAL_API_KEYS"),
-        env_with_fallback(
-            "DASH_RETRIEVAL_REVOKED_API_KEYS",
-            "EME_RETRIEVAL_REVOKED_API_KEYS",
-        ),
-        env_with_fallback(
-            "DASH_RETRIEVAL_ALLOWED_TENANTS",
-            "EME_RETRIEVAL_ALLOWED_TENANTS",
-        ),
-        env_with_fallback(
-            "DASH_RETRIEVAL_API_KEY_SCOPES",
-            "EME_RETRIEVAL_API_KEY_SCOPES",
-        ),
+    let auth_policy = shared_auth_policy();
+    // Audit context (actor fingerprint, request id) for every event emitted
+    // while this request is handled on this thread.
+    let _audit_ctx = dash_common::audit::enter_context(dash_common::audit::context_from_headers(
+        &request.headers,
+    ));
+    let path_only = request.target.split('?').next().unwrap_or_default();
+    if path_only == "/v1/retrieve" {
+        let audit_log_path = env_with_fallback(
+            "DASH_RETRIEVAL_AUDIT_LOG_PATH",
+            "EME_RETRIEVAL_AUDIT_LOG_PATH",
+        );
+        if let Err(err) = audit_gate(audit_log_path.as_deref()) {
+            eprintln!("retrieval audit fail-closed gate rejected request: {err}");
+            return HttpResponse {
+                status: 503,
+                content_type: "application/json",
+                body: "{\"error\":\"audit log unavailable\"}".to_string(),
+                retry_after_secs: None,
+            };
+        }
+    }
+    let mut response = handle_request_with_policy(
+        store,
+        request,
+        metrics,
+        placement_routing,
+        placement_reload,
+        &auth_policy,
     );
+    if request.method == "GET" && path_only == "/metrics" && response.status == 200 {
+        append_shared_metrics(&mut response.body);
+    }
+    response
+}
+
+/// Service name used for the shared HTTP metrics and `dash_build_info`.
+pub(crate) const SERVICE_NAME: &str = "retrieval";
+
+/// Families shared with the other services, appended to `/metrics`: audit
+/// counters, storage (WAL, checkpoint, vector index), embedding provider,
+/// HTTP request metrics, process metrics and build info.
+pub(crate) fn append_shared_metrics(body: &mut String) {
+    body.push_str(&dash_common::audit::render_prometheus_counters());
+    body.push_str(&store::observe::render_prometheus());
+    body.push_str(&embeddings::metrics::render_prometheus());
+    body.push_str(&dash_observe::http::render_service_metrics(
+        SERVICE_NAME,
+        env!("CARGO_PKG_VERSION"),
+    ));
+}
+
+/// Bounded route label for the shared HTTP metrics.
+pub(crate) fn http_route_label(_method: &str, path: &str) -> &'static str {
+    match path {
+        "/v1/retrieve" => "retrieve",
+        "/v1/embeddings" => "embeddings",
+        "/health" | "/v1/health" => "health",
+        "/live" | "/v1/live" => "live",
+        "/ready" | "/v1/ready" => "ready",
+        "/metrics" => "metrics",
+        p if p.starts_with("/debug/") => "debug",
+        _ => "other",
+    }
+}
+
+fn handle_request_with_policy<S: StoreAccess + ?Sized>(
+    store: &S,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_reload: Option<&PlacementReloadSnapshot>,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
+    let started_at = Instant::now();
+    let response = route_request(
+        store,
+        request,
+        metrics,
+        placement_routing,
+        placement_reload,
+        auth_policy,
+    );
+    let (path, _) = split_target(&request.target);
+    if let Ok(mut guard) = metrics.lock() {
+        guard.observe_route_latency(&path, started_at.elapsed().as_secs_f64() * 1000.0);
+    }
+    response
+}
+
+fn route_request<S: StoreAccess + ?Sized>(
+    store: &S,
+    request: &HttpRequest,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    placement_reload: Option<&PlacementReloadSnapshot>,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
+    let (path, query) = split_target(&request.target);
+    if query_encoding_is_invalid(&request.target) {
+        return HttpResponse::bad_request("invalid percent-encoding in query");
+    }
     let audit_log_path = env_with_fallback(
         "DASH_RETRIEVAL_AUDIT_LOG_PATH",
         "EME_RETRIEVAL_AUDIT_LOG_PATH",
@@ -1166,242 +1279,179 @@ fn handle_request_with_metrics_and_reload(
         // configured.
         ("GET", "/ready") | ("GET", "/v1/ready") => {
             if let Err(poisoned) = metrics.lock() {
-                return HttpResponse::internal_server_error(
-                    format!("metrics mutex poisoned: {poisoned}").as_str(),
-                );
+                eprintln!("retrieval /ready: metrics mutex poisoned: {poisoned}");
+                return HttpResponse::internal_server_error("metrics_unavailable");
             }
-            match store.disk_status() {
+            // Replication follower health: a dead, stale or lagging follower
+            // means this node serves outdated data, so it must leave the
+            // load balancer. Only applies when a follower is attached.
+            let replication_status = store.replication_status();
+            if let Some(follower) = replication_status.as_ref()
+                && let Err(reason) = follower.readiness()
+            {
+                return HttpResponse {
+                    status: 503,
+                    content_type: "application/json",
+                    body: format!(
+                        "{{\"status\":\"not_ready\",\"reason\":\"{reason}\",\"replication\":{}}}",
+                        follower.to_json()
+                    ),
+                    retry_after_secs: None,
+                };
+            }
+            let ready_body = match replication_status.as_ref() {
+                Some(follower) => format!(
+                    "{{\"status\":\"ready\",\"replication\":{}}}",
+                    follower.to_json()
+                ),
+                None => "{\"status\":\"ready\"}".to_string(),
+            };
+            let store_view = store.read_store();
+            let disk_status = store_view.disk_status();
+            match disk_status {
                 store::DiskStatus::Available | store::DiskStatus::Recovering => {
-                    HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                    HttpResponse::ok_json(ready_body)
                 }
                 store::DiskStatus::Unavailable { reason } => {
                     if persistence_path_configured() {
-                        HttpResponse::error_with_status(
-                            503,
-                            &format!(
-                                "{{\"status\":\"not_ready\",\"reason\":\"disk unavailable: {reason}\"}}"
-                            ),
-                        )
+                        eprintln!("retrieval /ready: disk unavailable: {reason}");
+                        HttpResponse {
+                            status: 503,
+                            content_type: "application/json",
+                            body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
+                                .to_string(),
+                            retry_after_secs: None,
+                        }
                     } else {
-                        HttpResponse::ok_json("{\"status\":\"ready\"}".to_string())
+                        HttpResponse::ok_json(ready_body)
                     }
                 }
             }
         }
         ("GET", "/metrics") => {
-            let body = if let Ok(guard) = metrics.lock() {
-                guard.render_prometheus(placement_routing, store.disk_status())
+            if !auth_policy.metrics_public()
+                && let Some(denied) = deny_unless_allowed(
+                    authorize_request_ops(request, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "metrics",
+                    None,
+                    false,
+                )
+            {
+                return denied;
+            }
+            let mut body = if let Ok(guard) = metrics.lock() {
+                guard.render_prometheus(placement_routing, store.read_store().disk_status())
             } else {
                 "dash_transport_metrics_unavailable 1\n".to_string()
             };
+            if let Some(follower) = store.replication_status() {
+                body.push_str(&follower.render_prometheus());
+            }
             HttpResponse::ok_text(body)
         }
-        ("GET", "/debug/placement") => HttpResponse::ok_json(render_placement_debug_json(
-            placement_routing,
-            placement_reload,
-            &query,
-        )),
+        ("GET", "/debug/placement") => {
+            if let Some(denied) = deny_unless_allowed(
+                authorize_request_ops(request, auth_policy, Role::ReadOnly),
+                metrics,
+                audit_log_path.as_deref(),
+                "debug_placement",
+                None,
+                false,
+            ) {
+                return denied;
+            }
+            HttpResponse::ok_json(render_placement_debug_json(
+                placement_routing,
+                placement_reload,
+                &query,
+            ))
+        }
         ("GET", "/debug/planner") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::ReadOnly,
+                if let Some(denied) = deny_unless_allowed(
+                    authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_planner",
+                    Some(&tenant_id),
+                    false,
                 ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_planner",
-                            Some(&tenant_id),
-                            200,
-                            "success",
-                            "planner debug snapshot generated",
-                        );
-                        HttpResponse::ok_json(render_planner_debug_json(&snapshot))
-                    }
+                    return denied;
                 }
+                let snapshot = build_retrieve_planner_debug_snapshot(&store.read_store(), &req);
+                emit_audit_event(
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_planner",
+                    Some(&tenant_id),
+                    200,
+                    "success",
+                    "planner debug snapshot generated",
+                );
+                HttpResponse::ok_json(render_planner_debug_json(&snapshot))
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
         ("GET", "/debug/storage-visibility") => match build_retrieve_request_from_query(&query) {
             Ok(req) => {
                 let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::ReadOnly,
+                if let Some(denied) = deny_unless_allowed(
+                    authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::ReadOnly),
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_storage_visibility",
+                    Some(&tenant_id),
+                    false,
                 ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let snapshot = build_retrieve_planner_debug_snapshot(store, &req);
-                        let (_, merge_snapshot) =
-                            execute_api_query_with_storage_snapshot(store, req.clone());
-                        let warn_delta_count = resolve_storage_divergence_warn_delta_count();
-                        let warn_ratio = resolve_storage_divergence_warn_ratio();
-                        let (warn, reason, ratio) = evaluate_storage_divergence_warning(
-                            &snapshot,
-                            warn_delta_count,
-                            warn_ratio,
-                        );
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
-                            guard.observe_storage_merge_execution(&merge_snapshot);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "debug_storage_visibility",
-                            Some(&tenant_id),
-                            200,
-                            if warn { "warning" } else { "success" },
-                            reason
-                                .as_deref()
-                                .unwrap_or("storage visibility snapshot generated"),
-                        );
-                        HttpResponse::ok_json(render_storage_visibility_debug_json(
-                            &snapshot,
-                            &merge_snapshot,
-                            warn_delta_count,
-                            warn_ratio,
-                            warn,
-                            reason.as_deref(),
-                            ratio,
-                        ))
-                    }
+                    return denied;
                 }
+                let snapshot = build_retrieve_planner_debug_snapshot(&store.read_store(), &req);
+                let (_, merge_snapshot) =
+                    execute_api_query_with_storage_snapshot(&store.read_store(), req.clone());
+                let warn_delta_count = resolve_storage_divergence_warn_delta_count();
+                let warn_ratio = resolve_storage_divergence_warn_ratio();
+                let (warn, reason, ratio) =
+                    evaluate_storage_divergence_warning(&snapshot, warn_delta_count, warn_ratio);
+                if let Ok(mut guard) = metrics.lock() {
+                    guard.observe_storage_visibility_debug(&snapshot, ratio, warn);
+                    guard.observe_storage_merge_execution(&merge_snapshot);
+                }
+                emit_audit_event(
+                    metrics,
+                    audit_log_path.as_deref(),
+                    "debug_storage_visibility",
+                    Some(&tenant_id),
+                    200,
+                    if warn { "warning" } else { "success" },
+                    reason
+                        .as_deref()
+                        .unwrap_or("storage visibility snapshot generated"),
+                );
+                HttpResponse::ok_json(render_storage_visibility_debug_json(
+                    &snapshot,
+                    &merge_snapshot,
+                    warn_delta_count,
+                    warn_ratio,
+                    warn,
+                    reason.as_deref(),
+                    ratio,
+                ))
             }
             Err(err) => HttpResponse::bad_request(&err),
         },
         ("GET", "/v1/retrieve") => match build_retrieve_transport_request_from_query(&query) {
-            Ok(transport_req) => {
-                let mut req = transport_req.request;
-                if let Err(err) = embed_query_if_missing(&mut req) {
-                    return HttpResponse::bad_request(&err);
-                }
-                let tenant_id = req.tenant_id.clone();
-                match authorize_request_for_tenant(
-                    request,
-                    &tenant_id,
-                    &auth_policy,
-                    Role::Retrieve,
-                ) {
-                    AuthDecision::Unauthorized(reason) => {
-                        observe_auth_failure(metrics);
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_retrieve(401, 0.0, 0, None);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            401,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::unauthorized(reason)
-                    }
-                    AuthDecision::Forbidden(reason) => {
-                        observe_authz_denied(metrics);
-                        if let Ok(mut guard) = metrics.lock() {
-                            guard.observe_retrieve(403, 0.0, 0, None);
-                        }
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            403,
-                            "denied",
-                            reason,
-                        );
-                        HttpResponse::forbidden(reason)
-                    }
-                    AuthDecision::Allowed => {
-                        observe_auth_success(metrics);
-                        let response = execute_retrieve_and_observe(
-                            store,
-                            req,
-                            transport_req.read_consistency,
-                            metrics,
-                            placement_routing,
-                        );
-                        let (outcome, reason) = if response.status < 400 {
-                            ("success", "retrieve accepted")
-                        } else {
-                            ("error", "retrieve rejected")
-                        };
-                        emit_audit_event(
-                            metrics,
-                            audit_log_path.as_deref(),
-                            "retrieve",
-                            Some(&tenant_id),
-                            response.status,
-                            outcome,
-                            reason,
-                        );
-                        response
-                    }
-                }
-            }
+            Ok(transport_req) => handle_authorized_retrieve(
+                store,
+                request,
+                transport_req,
+                auth_policy,
+                metrics,
+                placement_routing,
+                audit_log_path.as_deref(),
+            ),
             Err(err) => {
                 if let Ok(mut guard) = metrics.lock() {
                     guard.observe_retrieve(400, 0.0, 0, None);
@@ -1433,77 +1483,15 @@ fn handle_request_with_metrics_and_reload(
                 }
             };
             match build_retrieve_transport_request_from_json(body) {
-                Ok(transport_req) => {
-                    let mut req = transport_req.request;
-                    if let Err(err) = embed_query_if_missing(&mut req) {
-                        return HttpResponse::bad_request(&err);
-                    }
-                    let tenant_id = req.tenant_id.clone();
-                    match authorize_request_for_tenant(
-                        request,
-                        &tenant_id,
-                        &auth_policy,
-                        Role::Retrieve,
-                    ) {
-                        AuthDecision::Unauthorized(reason) => {
-                            observe_auth_failure(metrics);
-                            if let Ok(mut guard) = metrics.lock() {
-                                guard.observe_retrieve(401, 0.0, 0, None);
-                            }
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                401,
-                                "denied",
-                                reason,
-                            );
-                            HttpResponse::unauthorized(reason)
-                        }
-                        AuthDecision::Forbidden(reason) => {
-                            observe_authz_denied(metrics);
-                            if let Ok(mut guard) = metrics.lock() {
-                                guard.observe_retrieve(403, 0.0, 0, None);
-                            }
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                403,
-                                "denied",
-                                reason,
-                            );
-                            HttpResponse::forbidden(reason)
-                        }
-                        AuthDecision::Allowed => {
-                            observe_auth_success(metrics);
-                            let response = execute_retrieve_and_observe(
-                                store,
-                                req,
-                                transport_req.read_consistency,
-                                metrics,
-                                placement_routing,
-                            );
-                            let (outcome, reason) = if response.status < 400 {
-                                ("success", "retrieve accepted")
-                            } else {
-                                ("error", "retrieve rejected")
-                            };
-                            emit_audit_event(
-                                metrics,
-                                audit_log_path.as_deref(),
-                                "retrieve",
-                                Some(&tenant_id),
-                                response.status,
-                                outcome,
-                                reason,
-                            );
-                            response
-                        }
-                    }
-                }
+                Ok(transport_req) => handle_authorized_retrieve(
+                    store,
+                    request,
+                    transport_req,
+                    auth_policy,
+                    metrics,
+                    placement_routing,
+                    audit_log_path.as_deref(),
+                ),
                 Err(err) => {
                     if let Ok(mut guard) = metrics.lock() {
                         guard.observe_retrieve(400, 0.0, 0, None);
@@ -1513,38 +1501,56 @@ fn handle_request_with_metrics_and_reload(
             }
         }
         ("POST", "/v1/embeddings") => {
-            // OpenAI-compatible embeddings endpoint. No auth required at the
-            // HTTP layer (it accepts only the request body); a future
-            // version will wire JWT/API-key checks here.
+            // OpenAI-compatible embeddings endpoint. Requires valid
+            // credentials (and the retrieve role) before any provider call so
+            // anonymous callers cannot spend provider quota.
             //
-            // The embedding backend is selected at request time from the
+            // The embedding backend is selected from the
             // DASH_EMBEDDING_PROVIDER env var. The default is `hash`
             // (deterministic, no network) which is suitable for
             // testing and for environments that have not yet wired up
             // a real embedding model. Production deployments should
             // set `DASH_EMBEDDING_PROVIDER=ollama` or `=openai` so the
             // vectors are semantically meaningful.
+            if let Some(denied) = deny_unless_allowed(
+                authorize_request_any_tenant(request, auth_policy, Role::Retrieve),
+                metrics,
+                audit_log_path.as_deref(),
+                "embeddings",
+                None,
+                false,
+            ) {
+                return denied;
+            }
             let body = match std::str::from_utf8(&request.body) {
                 Ok(text) => text,
-                Err(_) => return HttpResponse::bad_request("request body must be valid UTF-8"),
+                Err(_) => {
+                    let err = crate::openai_embeddings::OpenAIErrorResponse::invalid_param(
+                        "request body must be valid UTF-8",
+                        "body",
+                        "invalid_request_body",
+                    );
+                    return HttpResponse::json_with_status(
+                        400,
+                        serde_json::to_string(&err).unwrap_or_default(),
+                    );
+                }
             };
-            let provider = embeddings::select_embedding_provider_from_env();
             match crate::openai_embeddings::handle_openai_embeddings_with_provider(
                 body,
-                provider.as_ref(),
+                embedding_provider().as_ref(),
             ) {
                 Ok(resp) => {
                     let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".to_string());
                     HttpResponse::ok_json(body)
                 }
                 Err(err) => {
+                    let (status, err) = classify_openai_embeddings_error(err);
                     let body = serde_json::to_string(&err)
                         .unwrap_or_else(|_| "{\"error\":\"internal\"}".to_string());
-                    HttpResponse {
-                        status: 400,
-                        content_type: "application/json",
-                        body,
-                    }
+                    let mut response = HttpResponse::json_with_status(status, body);
+                    response.retry_after_secs = err.retry_after_secs;
+                    response
                 }
             }
         }
@@ -1563,6 +1569,29 @@ fn handle_request_with_metrics_and_reload(
             HttpResponse::method_not_allowed("only GET is supported")
         }
         _ => HttpResponse::not_found("unknown path"),
+    }
+}
+
+/// Maps an embeddings-endpoint error to an HTTP status. Client errors stay
+/// 400; provider failures carry a short code (details were logged where the
+/// failure happened) and become 503/502.
+fn classify_openai_embeddings_error(
+    err: crate::openai_embeddings::OpenAIErrorResponse,
+) -> (u16, crate::openai_embeddings::OpenAIErrorResponse) {
+    if err.error.kind != "server_error" {
+        return (400, err);
+    }
+    match err.error.code.as_deref() {
+        Some("embedding_unavailable") => {
+            let retry = err.retry_after_secs.unwrap_or(1);
+            let mut err = err;
+            err.retry_after_secs = Some(retry);
+            (503, err)
+        }
+        _ => (
+            502,
+            crate::openai_embeddings::OpenAIErrorResponse::server_error("embedding_provider_error"),
+        ),
     }
 }
 
@@ -1604,6 +1633,139 @@ fn observe_authz_denied(metrics: &Arc<Mutex<TransportMetrics>>) {
     }
 }
 
+/// Turn a non-`Allowed` decision into a response, recording auth metrics and
+/// an audit event. Returns `None` (after counting the success) when allowed.
+fn deny_unless_allowed(
+    decision: AuthDecision,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    audit_log_path: Option<&str>,
+    action: &str,
+    tenant_id: Option<&str>,
+    observe_retrieve: bool,
+) -> Option<HttpResponse> {
+    let (status, reason, response) = match decision {
+        AuthDecision::Allowed => {
+            // Only tenant-scoped requests count towards the auth success
+            // counter; operational endpoints (metrics, debug) do not.
+            if tenant_id.is_some() {
+                observe_auth_success(metrics);
+            }
+            return None;
+        }
+        AuthDecision::Unauthorized(reason) => {
+            observe_auth_failure(metrics);
+            (401, reason, HttpResponse::unauthorized(reason))
+        }
+        AuthDecision::Forbidden(reason) => {
+            observe_authz_denied(metrics);
+            (403, reason, HttpResponse::forbidden(reason))
+        }
+        AuthDecision::RateLimited { retry_after_secs } => {
+            observe_authz_denied(metrics);
+            (
+                429,
+                "rate limit exceeded",
+                HttpResponse::too_many_requests("rate limit exceeded", retry_after_secs),
+            )
+        }
+    };
+    if observe_retrieve && let Ok(mut guard) = metrics.lock() {
+        guard.observe_retrieve(status, 0.0, 0, None);
+    }
+    emit_audit_event(
+        metrics,
+        audit_log_path,
+        action,
+        tenant_id,
+        status,
+        "denied",
+        reason,
+    );
+    Some(response)
+}
+
+/// Shared tail of `GET`/`POST /v1/retrieve`: authorize first, and only then
+/// spend an embedding provider call on the query.
+fn handle_authorized_retrieve<S: StoreAccess + ?Sized>(
+    store: &S,
+    request: &HttpRequest,
+    transport_req: RetrieveTransportRequest,
+    auth_policy: &AuthPolicy,
+    metrics: &Arc<Mutex<TransportMetrics>>,
+    placement_routing: Option<&PlacementRoutingRuntime>,
+    audit_log_path: Option<&str>,
+) -> HttpResponse {
+    let mut req = transport_req.request;
+    let tenant_id = req.tenant_id.clone();
+    if let Some(denied) = deny_unless_allowed(
+        authorize_request_for_tenant(request, &tenant_id, auth_policy, Role::Retrieve),
+        metrics,
+        audit_log_path,
+        "retrieve",
+        Some(&tenant_id),
+        true,
+    ) {
+        return denied;
+    }
+    // Embedding happens only after authorization and before any store lock.
+    let query_vector = match embed_query_if_missing(&mut req) {
+        Ok(true) => QueryVectorSource::Generated,
+        Ok(false) => QueryVectorSource::Client,
+        Err(failure) => return failure.into_response(),
+    };
+    let response = execute_retrieve_and_observe(
+        store,
+        req,
+        query_vector,
+        transport_req.read_consistency,
+        metrics,
+        placement_routing,
+    );
+    let (outcome, reason) = if response.status < 400 {
+        ("success", "retrieve accepted")
+    } else {
+        ("error", "retrieve rejected")
+    };
+    emit_audit_event(
+        metrics,
+        audit_log_path,
+        "retrieve",
+        Some(&tenant_id),
+        response.status,
+        outcome,
+        reason,
+    );
+    response
+}
+
+type SharedEmbeddingProvider = Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread provider injected by tests so they never touch the
+    /// process-wide environment.
+    static PROVIDER_OVERRIDE: std::cell::RefCell<Option<SharedEmbeddingProvider>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Embedding provider shared by requests. It is rebuilt only when the
+/// provider-related environment changes, instead of on every request.
+fn embedding_provider() -> SharedEmbeddingProvider {
+    #[cfg(test)]
+    if let Some(provider) = PROVIDER_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return provider;
+    }
+    PROVIDER_CACHE.get()
+}
+
+static PROVIDER_CACHE: embeddings::SharedProviderCache = embeddings::SharedProviderCache::new();
+
+/// How many times the request path has constructed an embedding provider.
+#[cfg(test)]
+fn embedding_provider_build_count() -> u64 {
+    PROVIDER_CACHE.build_count()
+}
+
 fn emit_audit_event(
     metrics: &Arc<Mutex<TransportMetrics>>,
     audit_log_path: Option<&str>,
@@ -1641,24 +1803,64 @@ fn emit_audit_event(
     }
 }
 
+/// Embedding failure for the retrieve path: HTTP status, short machine code
+/// and (for 503) the `Retry-After` seconds.
+struct QueryEmbedFailure {
+    status: u16,
+    code: &'static str,
+    retry_after_secs: Option<u64>,
+}
+
+impl QueryEmbedFailure {
+    fn into_response(self) -> HttpResponse {
+        let mut response = HttpResponse::error_with_status(self.status, self.code);
+        response.retry_after_secs = self.retry_after_secs.or(response.retry_after_secs);
+        response
+    }
+}
+
 /// Embed the retrieve query text using the configured `DASH_EMBEDDING_PROVIDER`
 /// when the caller did not supply an explicit `query_embedding`. This makes
 /// semantic retrieval work out of the box for SDKs and curl clients.
-fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<(), String> {
+/// Returns whether the vector was generated here.
+fn embed_query_if_missing(req: &mut RetrieveApiRequest) -> Result<bool, QueryEmbedFailure> {
     if req.query_embedding.is_some() {
-        return Ok(());
+        return Ok(false);
     }
-    let provider = embeddings::select_embedding_provider_from_env();
-    let vectors = provider
-        .embed(std::slice::from_ref(&req.query))
-        .map_err(|e| format!("embedding failed: {e}"))?;
+    let provider = embedding_provider();
+    let vectors = crate::openai_embeddings::embed_texts_checked(
+        provider.as_ref(),
+        std::slice::from_ref(&req.query),
+    )
+    .map_err(|err| {
+        let (status, err) = classify_openai_embeddings_error(err);
+        let code = match err.error.code.as_deref() {
+            Some("embedding_unavailable") => "embedding_unavailable",
+            _ => "embedding_provider_error",
+        };
+        QueryEmbedFailure {
+            status,
+            code,
+            retry_after_secs: err.retry_after_secs,
+        }
+    })?;
     req.query_embedding = vectors.into_iter().next();
-    Ok(())
+    Ok(true)
 }
 
-fn execute_retrieve_and_observe(
-    store: &InMemoryStore,
-    req: RetrieveApiRequest,
+/// Where the query vector of a retrieve request came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryVectorSource {
+    /// Sent by the client as `query_embedding`.
+    Client,
+    /// Generated by the configured embedding provider from `query`.
+    Generated,
+}
+
+fn execute_retrieve_and_observe<S: StoreAccess + ?Sized>(
+    store: &S,
+    mut req: RetrieveApiRequest,
+    query_vector: QueryVectorSource,
     read_consistency: ReadConsistencyPolicy,
     metrics: &Arc<Mutex<TransportMetrics>>,
     placement_routing: Option<&PlacementRoutingRuntime>,
@@ -1685,11 +1887,37 @@ fn execute_retrieve_and_observe(
 
     let started_at = Instant::now();
     let tenant_id = req.tenant_id.clone();
-    let (response, merge_snapshot) = execute_api_query_with_storage_snapshot(store, req);
+    // Resolve the segment prefilter (may read segment files) BEFORE taking
+    // the store read lock, so a slow refresh never stalls a store writer.
+    let segment_base = resolve_segment_prefilter(&tenant_id);
+    let store_view = store.read_store();
+    if let Some(vector) = req.query_embedding.as_deref()
+        && let Err(err) = store_view.validate_query_vector(&tenant_id, vector)
+    {
+        if query_vector == QueryVectorSource::Generated {
+            // The provider's vector does not fit this tenant (its vectors
+            // were sent by clients with another dimension). The client sent
+            // only text, so answer from the lexical signals, as 0.2 did,
+            // instead of rejecting a request that is not at fault.
+            req.query_embedding = None;
+        } else {
+            drop(store_view);
+            let message = match err {
+                store::StoreError::InvalidVector(detail) => format!("query_embedding: {detail}"),
+                _ => "query_embedding is invalid".to_string(),
+            };
+            if let Ok(mut guard) = metrics.lock() {
+                guard.observe_retrieve(400, 0.0, 0, None);
+            }
+            return HttpResponse::bad_request(&message);
+        }
+    }
+    let (response, merge_snapshot) =
+        execute_api_query_with_segment_prefilter(&store_view, req, segment_base);
     let latency_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let result_count = response.results.len();
-    let ingest_to_visible_lag_ms =
-        estimate_ingest_to_visible_lag_ms(store, &tenant_id, &response.results);
+    let ingest_to_visible_lag_ms = estimate_ingest_to_visible_lag_ms(&response.results);
+    drop(store_view);
 
     if let Ok(mut guard) = metrics.lock() {
         guard.observe_retrieve(200, latency_ms, result_count, ingest_to_visible_lag_ms);
@@ -2027,62 +2255,41 @@ fn ensure_local_read_route(
 }
 
 fn map_read_route_error(error: &ReadRouteError) -> (u16, String) {
-    match error {
-        ReadRouteError::Placement(reason) => (
-            503,
-            format!("placement route rejected read request: {reason:?}"),
-        ),
-        ReadRouteError::WrongNode {
-            local_node_id,
-            target_node_id,
-            shard_id,
-            epoch,
-            role: _,
-        } => (
-            503,
-            format!(
-                "placement route rejected read request: local node '{local_node_id}' is not selected for shard {shard_id} at epoch {epoch} (target replica: '{target_node_id}')"
-            ),
-        ),
-        ReadRouteError::ConsistencyUnavailable {
-            policy,
-            shard_id,
-            readable_replicas,
-            required_replicas,
-            total_replicas,
-        } => (
-            503,
-            format!(
-                "placement route rejected read request: read_consistency={} requires {required_replicas} readable replicas for shard {shard_id}, but observed {readable_replicas}/{total_replicas}",
-                policy.as_str()
-            ),
-        ),
-    }
+    // Topology details (node ids, replica counts) stay in the log; clients
+    // only get a short code.
+    eprintln!("retrieval read route rejected: {error:?}");
+    let code = match error {
+        ReadRouteError::Placement(_) => "placement_unavailable",
+        ReadRouteError::WrongNode { .. } => "wrong_node",
+        ReadRouteError::ConsistencyUnavailable { .. } => "read_consistency_unavailable",
+    };
+    (503, code.to_string())
 }
 
-fn estimate_ingest_to_visible_lag_ms(
-    store: &InMemoryStore,
-    tenant_id: &str,
-    results: &[EvidenceNode],
-) -> Option<f64> {
-    if results.is_empty() {
-        return None;
-    }
-    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    let claims = store.claims_for_tenant(tenant_id);
-    let event_time_by_claim_id: HashMap<String, i64> = claims
-        .into_iter()
-        .filter_map(|claim| claim.event_time_unix.map(|ts| (claim.claim_id, ts)))
-        .collect();
+/// Freshness lag of the returned evidence: the mean of `now - ingested_at`
+/// over results that carry an evidence ingest timestamp (epoch millis, set at
+/// ingest time). Results without one are skipped; claim `event_time_unix` is
+/// NOT used because it is when the fact happened, not when it was ingested.
+fn estimate_ingest_to_visible_lag_ms(results: &[EvidenceNode]) -> Option<f64> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    ingest_lag_ms_at(results, now_ms)
+}
 
-    let mut lag_values: Vec<f64> = Vec::new();
-    for node in results {
-        if let Some(event_unix) = event_time_by_claim_id.get(&node.claim_id)
-            && now_unix >= *event_unix
-        {
-            lag_values.push((now_unix - *event_unix) as f64 * 1000.0);
-        }
-    }
+fn ingest_lag_ms_at(results: &[EvidenceNode], now_ms: i64) -> Option<f64> {
+    let lag_values: Vec<f64> = results
+        .iter()
+        .filter_map(|node| {
+            let newest = node
+                .citations
+                .iter()
+                .filter_map(|citation| citation.ingested_at)
+                .max()?;
+            (now_ms >= newest).then(|| (now_ms - newest) as f64)
+        })
+        .collect();
     if lag_values.is_empty() {
         return None;
     }
@@ -2102,6 +2309,8 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) content_type: &'static str,
     pub(crate) body: String,
+    /// Emitted as a `Retry-After` header (429 responses).
+    pub(crate) retry_after_secs: Option<u64>,
 }
 
 impl HttpResponse {
@@ -2110,6 +2319,7 @@ impl HttpResponse {
             status: 200,
             content_type: "application/json",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -2118,6 +2328,7 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
+            retry_after_secs: None,
         }
     }
 
@@ -2126,6 +2337,7 @@ impl HttpResponse {
             status: 400,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2134,6 +2346,7 @@ impl HttpResponse {
             status: 401,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2142,6 +2355,7 @@ impl HttpResponse {
             status: 403,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2150,6 +2364,7 @@ impl HttpResponse {
             status: 405,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2158,6 +2373,7 @@ impl HttpResponse {
             status: 404,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
@@ -2166,32 +2382,86 @@ impl HttpResponse {
             status: 500,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
         }
     }
 
-    fn service_unavailable(message: &str) -> Self {
+    fn too_many_requests(message: &str, retry_after_secs: u64) -> Self {
         Self {
-            status: 503,
+            status: 429,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: Some(retry_after_secs),
+        }
+    }
+
+    fn json_with_status(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body,
+            retry_after_secs: None,
         }
     }
 
     fn error_with_status(status: u16, message: &str) -> Self {
-        match status {
-            400 => Self::bad_request(message),
-            401 => Self::unauthorized(message),
-            403 => Self::forbidden(message),
-            404 => Self::not_found(message),
-            405 => Self::method_not_allowed(message),
-            503 => Self::service_unavailable(message),
-            _ => Self::internal_server_error(message),
+        if status == 429 {
+            return Self::too_many_requests(message, 1);
         }
+        Self {
+            status,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// Access to the shared store that lets the handler take the read lock only
+/// for the sections that need it, instead of for the whole request.
+trait StoreAccess {
+    fn read_store(&self) -> StoreView<'_>;
+
+    /// Replication follower attached to this store, if any.
+    fn replication_status(&self) -> Option<Arc<crate::replication::FollowerStatus>> {
+        None
+    }
+}
+
+enum StoreView<'a> {
+    Borrowed(&'a InMemoryStore),
+    Guard(std::sync::RwLockReadGuard<'a, InMemoryStore>),
+}
+
+impl std::ops::Deref for StoreView<'_> {
+    type Target = InMemoryStore;
+    fn deref(&self) -> &InMemoryStore {
+        match self {
+            StoreView::Borrowed(store) => store,
+            StoreView::Guard(guard) => guard,
+        }
+    }
+}
+
+impl StoreAccess for InMemoryStore {
+    fn read_store(&self) -> StoreView<'_> {
+        StoreView::Borrowed(self)
+    }
+}
+
+impl StoreAccess for RwLock<InMemoryStore> {
+    fn read_store(&self) -> StoreView<'_> {
+        StoreView::Guard(self.read().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn replication_status(&self) -> Option<Arc<crate::replication::FollowerStatus>> {
+        crate::replication::status_for_store_ptr(self as *const Self as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::authz::policy_from_parts as test_auth_policy;
     use super::*;
     use indexer::{Segment, Tier, persist_segments_atomic};
     use metadata_router::{
@@ -2209,6 +2479,7 @@ mod tests {
     };
 
     fn sample_store() -> InMemoryStore {
+        ensure_dev_mode_env();
         let mut store = InMemoryStore::new();
         store
             .ingest_bundle(
@@ -2273,9 +2544,23 @@ mod tests {
         file.flush().expect("placement file should flush");
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    /// Tests that exercise handlers without configuring credentials run in
+    /// explicit dev mode (the only way to get an unauthenticated service).
+    #[allow(unused_unsafe)]
+    pub(super) fn ensure_dev_mode_env() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+            std::env::set_var("DASH_STRICT_SECRETS", "0");
+        });
+    }
+
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        LOCK.get_or_init(|| {
+            ensure_dev_mode_env();
+            Mutex::new(())
+        })
     }
 
     #[allow(unused_unsafe)]
@@ -2406,6 +2691,50 @@ mod tests {
     }
 
     #[test]
+    fn invalid_percent_encoding_in_query_is_a_400_not_a_dropped_parameter() {
+        let store = sample_store();
+        for bad in [
+            "stance_mode=%FF",
+            "entity_filters=%FF",
+            "top_k=%zz",
+            "query=%4",
+            "%zz=1",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&query=company+x&{bad}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_eq!(response.status, 400, "{bad}: {}", response.body);
+            assert!(
+                response.body.contains("invalid percent-encoding in query"),
+                "{bad}: {}",
+                response.body
+            );
+        }
+        // Valid encodings, `+` and bare flags are unchanged.
+        for good in [
+            "stance_mode=balanced",
+            "query=company%20x",
+            "query=company+x&flag",
+            "entity_filters=a%2Cb",
+        ] {
+            let request = HttpRequest {
+                method: "GET".to_string(),
+                target: format!("/v1/retrieve?tenant_id=tenant-a&top_k=1&query=x&{good}"),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+            let response = handle_request(&store, &request);
+            assert_ne!(response.status, 400, "{good}: {}", response.body);
+        }
+        assert!(!query_encoding_is_invalid("/x?a=b+c&d=%41&e"));
+        assert!(query_encoding_is_invalid("/x?a=%"));
+    }
+
+    #[test]
     fn handle_request_get_returns_json_payload() {
         let store = sample_store();
         let request = HttpRequest {
@@ -2479,7 +2808,8 @@ mod tests {
         let response =
             handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
         assert_eq!(response.status, 503);
-        assert!(response.body.contains("local node 'node-b'"));
+        assert!(response.body.contains("wrong_node"));
+        assert!(!response.body.contains("node-b") && !response.body.contains("node-a"));
 
         let metrics_request = HttpRequest {
             method: "GET".to_string(),
@@ -2557,7 +2887,8 @@ mod tests {
         let response =
             handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
         assert_eq!(response.status, 503);
-        assert!(response.body.contains("read_consistency=quorum"));
+        assert!(response.body.contains("read_consistency_unavailable"));
+        assert!(!response.body.contains("node-"));
     }
 
     #[test]
@@ -2601,7 +2932,8 @@ mod tests {
         let response =
             handle_request_with_metrics_and_routing(&store, &request, &metrics, Some(&routing));
         assert_eq!(response.status, 503);
-        assert!(response.body.contains("read_consistency=all"));
+        assert!(response.body.contains("read_consistency_unavailable"));
+        assert!(!response.body.contains("node-"));
     }
 
     #[test]
@@ -3314,6 +3646,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             queue_depth: AtomicUsize::new(3),
             queue_capacity: 8,
             queue_full_reject_total: AtomicU64::new(11),
+            ..TransportBackpressureMetrics::default()
         });
         {
             let mut guard = metrics.lock().expect("metrics lock should be available");
@@ -3413,7 +3746,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             None,
@@ -3434,8 +3767,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy =
-            AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
+        let policy = test_auth_policy(None, None, None, None, Some("scope-a:tenant-a".to_string()));
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Retrieve),
             AuthDecision::Forbidden("tenant is not allowed for this API key")
@@ -3450,7 +3782,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             None,
@@ -3471,7 +3803,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::new(),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
+        let policy = test_auth_policy(Some("secret".to_string()), None, None, None, None);
         assert_eq!(
             authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Retrieve),
             AuthDecision::Unauthorized("missing or invalid API key")
@@ -3486,7 +3818,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("x-api-key".to_string(), "new-key".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             Some("old-key".to_string()),
             Some("new-key,old-key-2".to_string()),
             None,
@@ -3507,7 +3839,7 @@ tenant-a,0,12,node-a,follower,healthy\n",
             headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
             body: Vec::new(),
         };
-        let policy = AuthPolicy::from_env(
+        let policy = test_auth_policy(
             None,
             None,
             Some("scope-a".to_string()),
@@ -3533,10 +3865,6 @@ tenant-a,0,12,node-a,follower,healthy\n",
             nanos
         ));
         let audit_path_str = audit_path.to_string_lossy().to_string();
-        if let Ok(mut states) = audit_chain_states().lock() {
-            states.remove(&audit_path_str);
-        }
-
         append_audit_record(
             &audit_path_str,
             1_700_000_000_001,
@@ -3592,5 +3920,641 @@ tenant-a,0,12,node-a,follower,healthy\n",
         assert_eq!(second_prev, first_hash);
 
         let _ = std::fs::remove_file(audit_path);
+    }
+
+    fn json_post(target: &str, body: &str) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            target: target.to_string(),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn sample_store_with_vector() -> InMemoryStore {
+        let mut store = sample_store();
+        store
+            .upsert_claim_vector("c1", vec![1.0, 0.0, 0.0])
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn retrieve_rejects_invalid_query_embedding_with_specific_400() {
+        let store = sample_store_with_vector();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let cases = [
+            ("[1.0, 0.0]", "dimension mismatch"),
+            ("[0.0, 0.0, 0.0]", "non-zero norm"),
+        ];
+        for (vector, expected) in cases {
+            let body = format!(
+                r#"{{"tenant_id":"tenant-a","query":"company x","top_k":1,"query_embedding":{vector}}}"#
+            );
+            let response =
+                handle_request_with_metrics(&store, &json_post("/v1/retrieve", &body), &metrics);
+            assert_eq!(response.status, 400, "{vector}: {}", response.body);
+            assert!(response.body.contains(expected), "{}", response.body);
+            assert!(response.body.contains("query_embedding"));
+        }
+        let ok = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":1,"query_embedding":[1.0,0.0,0.0]}"#,
+            ),
+            &metrics,
+        );
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        assert!(ok.body.contains("\"claim_id\":\"c1\""));
+    }
+
+    /// A text-only query on a tenant whose vectors have another dimension
+    /// than the embedding provider's (vectors sent by clients) is answered
+    /// from the lexical signals, as 0.2 did, not rejected: the client sent
+    /// no vector, so it is not at fault (found by the upgrade compat tests).
+    #[test]
+    fn text_query_on_a_tenant_with_another_vector_dimension_is_answered_lexically() {
+        let store = sample_store_with_vector();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let response = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+            ),
+            &metrics,
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(
+            response.body.contains("\"claim_id\":\"c1\""),
+            "{}",
+            response.body
+        );
+    }
+
+    #[test]
+    fn retrieve_top_k_bound_is_configurable() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let prev = std::env::var_os("DASH_RETRIEVAL_MAX_TOP_K");
+        set_env_var_for_tests("DASH_RETRIEVAL_MAX_TOP_K", "3");
+        let over = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":4}"#,
+            ),
+            &metrics,
+        );
+        let at = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":3}"#,
+            ),
+            &metrics,
+        );
+        restore_env_var_for_tests("DASH_RETRIEVAL_MAX_TOP_K", prev.as_deref());
+        assert_eq!(over.status, 400);
+        assert!(over.body.contains("top_k must be <= 3"));
+        assert_eq!(at.status, 200);
+    }
+
+    #[test]
+    fn slow_segment_refresh_does_not_block_store_writer() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "dash-retrieve-lockfree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tenant_dir = indexer::resolve_tenant_dir(&root, "tenant-a");
+        persist_segments_atomic(
+            &tenant_dir,
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: vec!["c1".into()],
+            }],
+        )
+        .unwrap();
+        crate::api::set_segment_load_delay_for_tests(&tenant_dir, Duration::from_millis(800));
+        let prev = std::env::var_os("DASH_RETRIEVAL_SEGMENT_DIR");
+        set_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", root.to_str().unwrap());
+
+        let store = Arc::new(RwLock::new(sample_store()));
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let reader = {
+            let (store, metrics) = (Arc::clone(&store), Arc::clone(&metrics));
+            thread::spawn(move || {
+                let request = json_post(
+                    "/v1/retrieve",
+                    r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+                );
+                handle_request_with_metrics_and_reload(&*store, &request, &metrics, None, None)
+            })
+        };
+        // Let the reader reach the (slow) segment refresh.
+        thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        drop(store.write().unwrap());
+        let writer_wait = started.elapsed();
+
+        let response = reader.join().unwrap();
+        restore_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", prev.as_deref());
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(
+            writer_wait < Duration::from_millis(400),
+            "store writer was blocked {writer_wait:?} behind a segment refresh"
+        );
+    }
+
+    #[test]
+    fn validation_and_auth_failures_do_not_pollute_latency_window() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        // Validation failure: counted, but no latency sample.
+        let bad = handle_request_with_metrics(
+            &store,
+            &json_post("/v1/retrieve", r#"{"tenant_id":"tenant-a","query":""}"#),
+            &metrics,
+        );
+        assert_eq!(bad.status, 400);
+        {
+            let guard = metrics.lock().unwrap();
+            assert_eq!(guard.retrieve_requests_total, 1);
+            assert_eq!(guard.retrieve_client_error_total, 1);
+            assert!(guard.retrieve_latency_ms_window.is_empty());
+        }
+        let ok = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+            ),
+            &metrics,
+        );
+        assert_eq!(ok.status, 200);
+        let mut guard = metrics.lock().unwrap();
+        assert_eq!(guard.retrieve_latency_ms_window.len(), 1);
+        // Auth / rate-limit rejections have their own counters.
+        guard.observe_retrieve(401, 0.0, 0, None);
+        guard.observe_retrieve(429, 0.0, 0, None);
+        assert_eq!(guard.retrieve_latency_ms_window.len(), 1);
+        assert_eq!(guard.retrieve_auth_denied_total, 1);
+        assert_eq!(guard.retrieve_rate_limited_total, 1);
+        let rendered = guard.render_prometheus(None, &store::DiskStatus::Available);
+        assert!(rendered.contains("dash_retrieve_auth_denied_total 1"));
+        assert!(rendered.contains("dash_retrieve_rate_limited_total 1"));
+    }
+
+    #[test]
+    fn route_latency_histograms_render_cumulative_buckets() {
+        let mut metrics = TransportMetrics::default();
+        metrics.observe_route_latency("/v1/retrieve", 0.4);
+        metrics.observe_route_latency("/v1/retrieve", 7.0);
+        metrics.observe_route_latency("/v1/retrieve", 9_000.0);
+        metrics.observe_route_latency("/v1/embeddings", 30.0);
+        let rendered = metrics.render_prometheus(None, &store::DiskStatus::Available);
+        assert!(rendered.contains("# TYPE dash_http_request_duration_ms histogram"));
+        assert!(
+            rendered
+                .contains("dash_http_request_duration_ms_bucket{route=\"retrieve\",le=\"1\"} 1")
+        );
+        assert!(
+            rendered
+                .contains("dash_http_request_duration_ms_bucket{route=\"retrieve\",le=\"10\"} 2")
+        );
+        assert!(
+            rendered
+                .contains("dash_http_request_duration_ms_bucket{route=\"retrieve\",le=\"5000\"} 2")
+        );
+        assert!(
+            rendered
+                .contains("dash_http_request_duration_ms_bucket{route=\"retrieve\",le=\"+Inf\"} 3")
+        );
+        assert!(rendered.contains("dash_http_request_duration_ms_count{route=\"retrieve\"} 3"));
+        assert!(
+            rendered
+                .contains("dash_http_request_duration_ms_bucket{route=\"embeddings\",le=\"50\"} 1")
+        );
+        assert!(
+            rendered.contains("dash_http_request_duration_ms_sum{route=\"embeddings\"} 30.0000")
+        );
+    }
+
+    #[test]
+    fn routed_requests_populate_route_histograms() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let _ = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+            ),
+            &metrics,
+        );
+        let guard = metrics.lock().unwrap();
+        assert_eq!(
+            guard.route_latency.get("retrieve").map(|h| h.count),
+            Some(1)
+        );
+    }
+
+    fn node_with_ingest(ingested_at: &[Option<i64>]) -> EvidenceNode {
+        let store = sample_store();
+        let response = execute_api_query_with_storage_snapshot(
+            &store,
+            RetrieveApiRequest {
+                tenant_id: "tenant-a".into(),
+                query: "company x".into(),
+                query_embedding: None,
+                entity_filters: vec![],
+                embedding_id_filters: vec![],
+                top_k: 1,
+                stance_mode: StanceMode::Balanced,
+                return_graph: false,
+                time_range: None,
+            },
+        )
+        .0;
+        let mut node = response.results.into_iter().next().unwrap();
+        let template = node.citations[0].clone();
+        node.citations = ingested_at
+            .iter()
+            .map(|ts| CitationNode {
+                ingested_at: *ts,
+                ..template.clone()
+            })
+            .collect();
+        node
+    }
+
+    #[test]
+    fn ingest_lag_uses_evidence_ingest_time_not_event_time() {
+        let now_ms = 1_700_000_100_000;
+        // Newest evidence ingested 250 ms ago.
+        let node = node_with_ingest(&[Some(now_ms - 5_000), Some(now_ms - 250)]);
+        assert_eq!(ingest_lag_ms_at(&[node], now_ms), Some(250.0));
+        // No ingest timestamp: no sample rather than a fabricated one.
+        let node = node_with_ingest(&[None]);
+        assert_eq!(ingest_lag_ms_at(&[node], now_ms), None);
+        // Future timestamps (clock skew) are skipped.
+        let node = node_with_ingest(&[Some(now_ms + 10_000)]);
+        assert_eq!(ingest_lag_ms_at(&[node], now_ms), None);
+    }
+
+    fn embeddings_request(body: &str) -> HttpRequest {
+        json_post("/v1/embeddings", body)
+    }
+
+    fn ready_request() -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_string(),
+            target: "/ready".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// ROB-12: `/ready` is one JSON document and never carries the raw
+    /// follower error; quarantine counts are numbers.
+    #[test]
+    fn ready_json_is_single_encoded_and_has_no_raw_errors() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let store = Arc::new(RwLock::new(sample_store()));
+        let config = crate::replication::ReplicationFollowerConfig::new("http://10.9.8.7:8081");
+        let status = Arc::new(crate::replication::FollowerStatus::new(&config));
+        crate::replication::attach_status_for_tests(&store, &status, 4);
+        status.record_failure(
+            "failed requesting replication source 'http://10.9.8.7:8081': refused /var/lib/x"
+                .to_string(),
+        );
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let response =
+            handle_request_with_metrics_and_reload(&*store, &ready_request(), &metrics, None, None);
+        assert_eq!(response.status, 503, "{}", response.body);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert!(value["replication"].is_object(), "{}", response.body);
+        assert_eq!(value["replication"]["last_error"], "source_unreachable");
+        assert_eq!(value["replication"]["skipped_records_total"], 4);
+        for leaked in ["10.9.8.7", "http://", "refused", "/var/lib", "\\\""] {
+            assert!(
+                !response.body.contains(leaked),
+                "{leaked}: {}",
+                response.body
+            );
+        }
+
+        // Once the follower is healthy the quarantine count is still a number.
+        status.record_success();
+        let response =
+            handle_request_with_metrics_and_reload(&*store, &ready_request(), &metrics, None, None);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert_eq!(value["status"], "ready");
+        assert_eq!(value["replication"]["skipped_records_total"], 4);
+        assert!(value["replication"]["last_error"].is_null());
+    }
+
+    #[test]
+    fn ready_reports_disk_unavailable_without_the_failure_reason() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("dash-ready-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"file").expect("blocker file");
+        let store = sample_store().attach_disk(blocker.join("store.redb"));
+        assert!(matches!(
+            store.disk_status(),
+            store::DiskStatus::Unavailable { .. }
+        ));
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let previous = std::env::var_os("DASH_RETRIEVAL_PERSISTENCE_PATH");
+        set_env_var_for_tests(
+            "DASH_RETRIEVAL_PERSISTENCE_PATH",
+            &blocker.join("store.redb").to_string_lossy(),
+        );
+        let response = handle_request_with_metrics(&store, &ready_request(), &metrics);
+        restore_env_var_for_tests("DASH_RETRIEVAL_PERSISTENCE_PATH", previous.as_deref());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(response.status, 503, "{}", response.body);
+        let value: serde_json::Value = serde_json::from_str(&response.body).expect("valid JSON");
+        assert_eq!(value["reason"], "disk_unavailable");
+        assert!(
+            !response.body.contains("dash-ready-disk"),
+            "{}",
+            response.body
+        );
+    }
+
+    /// PERF-07: requests share one provider; only a change of a variable in
+    /// the provider environment signature builds a new one.
+    #[test]
+    fn requests_reuse_one_provider_until_the_environment_signature_changes() {
+        let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("DASH_OLLAMA_MODEL");
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let embed = || {
+            handle_request_with_metrics(
+                &store,
+                &embeddings_request(r#"{"input":"hello","model":"m"}"#),
+                &metrics,
+            )
+            .status
+        };
+
+        set_env_var_for_tests("DASH_OLLAMA_MODEL", "model-a");
+        assert_eq!(embed(), 200);
+        let after_warmup = embedding_provider_build_count();
+        for _ in 0..50 {
+            assert_eq!(embed(), 200);
+        }
+        assert_eq!(
+            embedding_provider_build_count(),
+            after_warmup,
+            "unchanged environment must not rebuild the provider"
+        );
+
+        set_env_var_for_tests("DASH_OLLAMA_MODEL", "model-b");
+        for _ in 0..50 {
+            assert_eq!(embed(), 200);
+        }
+        assert_eq!(
+            embedding_provider_build_count(),
+            after_warmup + 1,
+            "a signature change must cause exactly one rebuild"
+        );
+        restore_env_var_for_tests("DASH_OLLAMA_MODEL", previous.as_deref());
+    }
+
+    #[test]
+    fn embeddings_route_rejects_empty_text_and_too_many_inputs() {
+        ensure_dev_mode_env();
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let empty = handle_request_with_metrics(
+            &store,
+            &embeddings_request(r#"{"input":["ok",""],"model":"m"}"#),
+            &metrics,
+        );
+        assert_eq!(empty.status, 400);
+        assert!(empty.body.contains("\"error\":{"));
+        assert!(empty.body.contains("\"param\":\"input\""));
+        assert!(empty.body.contains("\"code\":\"empty_input\""));
+
+        let many = format!(
+            r#"{{"input":[{}],"model":"m"}}"#,
+            vec!["\"a\""; 2049].join(",")
+        );
+        let too_many = handle_request_with_metrics(&store, &embeddings_request(&many), &metrics);
+        assert_eq!(too_many.status, 400);
+        assert!(too_many.body.contains("\"code\":\"too_many_inputs\""));
+    }
+
+    #[test]
+    fn embeddings_route_token_arrays_are_rejected_unless_enabled() {
+        let _guard = crate::openai_embeddings::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        ensure_dev_mode_env();
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let prev = std::env::var_os("DASH_EMBEDDING_ALLOW_TOKEN_IDS");
+        restore_env_var_for_tests("DASH_EMBEDDING_ALLOW_TOKEN_IDS", None);
+        let rejected = handle_request_with_metrics(
+            &store,
+            &embeddings_request(r#"{"input":[[1,2,3]],"model":"m"}"#),
+            &metrics,
+        );
+        set_env_var_for_tests("DASH_EMBEDDING_ALLOW_TOKEN_IDS", "1");
+        let accepted = handle_request_with_metrics(
+            &store,
+            &embeddings_request(r#"{"input":[[1,2,3],[4]],"model":"m"}"#),
+            &metrics,
+        );
+        let flat = handle_request_with_metrics(
+            &store,
+            &embeddings_request(r#"{"input":[1,2,3],"model":"m"}"#),
+            &metrics,
+        );
+        restore_env_var_for_tests("DASH_EMBEDDING_ALLOW_TOKEN_IDS", prev.as_deref());
+        assert_eq!(rejected.status, 400);
+        assert!(
+            rejected
+                .body
+                .contains("\"code\":\"unsupported_input_type\"")
+        );
+        assert!(rejected.body.contains("tokenizer"));
+        assert_eq!(accepted.status, 200, "{}", accepted.body);
+        assert!(accepted.body.contains("\"index\":1"));
+        assert!(accepted.body.contains("\"prompt_tokens\":4"));
+        assert_eq!(flat.status, 200, "{}", flat.body);
+    }
+
+    struct FailingProvider(embeddings::EmbeddingError);
+    impl embeddings::EmbeddingProvider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, embeddings::EmbeddingError> {
+            let leak = "boom at http://127.0.0.1:11434/api/embed /var/lib/secret".to_string();
+            Err(match &self.0 {
+                embeddings::EmbeddingError::Timeout(s) => embeddings::EmbeddingError::Timeout(*s),
+                embeddings::EmbeddingError::Io(_) => embeddings::EmbeddingError::Io(leak),
+                embeddings::EmbeddingError::Parse(_) => embeddings::EmbeddingError::Parse(leak),
+                embeddings::EmbeddingError::Overloaded => embeddings::EmbeddingError::Overloaded,
+                embeddings::EmbeddingError::Http {
+                    status,
+                    retry_after_secs,
+                    ..
+                } => embeddings::EmbeddingError::Http {
+                    status: *status,
+                    retry_after_secs: *retry_after_secs,
+                    body: leak,
+                },
+                _ => embeddings::EmbeddingError::Http {
+                    retry_after_secs: None,
+                    status: 500,
+                    body: leak,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn embeddings_and_retrieve_provider_failures_return_short_codes_without_internals() {
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let cases = [
+            (
+                embeddings::EmbeddingError::Timeout(5),
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Parse(String::new()),
+                502,
+                "embedding_provider_error",
+            ),
+            (
+                embeddings::EmbeddingError::Io("connection refused".into()),
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 429,
+                    body: String::new(),
+                    retry_after_secs: Some(4),
+                },
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 500,
+                    body: String::new(),
+                    retry_after_secs: None,
+                },
+                503,
+                "embedding_unavailable",
+            ),
+            (
+                embeddings::EmbeddingError::Http {
+                    status: 400,
+                    body: String::new(),
+                    retry_after_secs: None,
+                },
+                502,
+                "embedding_provider_error",
+            ),
+            (
+                embeddings::EmbeddingError::Overloaded,
+                503,
+                "embedding_unavailable",
+            ),
+        ];
+        for (error, status, code) in cases {
+            let provider: SharedEmbeddingProvider = Arc::new(FailingProvider(error));
+            PROVIDER_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(provider));
+            let embeddings_response = handle_request_with_metrics(
+                &store,
+                &embeddings_request(r#"{"input":"hello","model":"m"}"#),
+                &metrics,
+            );
+            let retrieve = handle_request_with_metrics(
+                &store,
+                &json_post(
+                    "/v1/retrieve",
+                    r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+                ),
+                &metrics,
+            );
+            PROVIDER_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            for r in [&embeddings_response, &retrieve] {
+                assert_eq!(r.status, status, "{}", r.body);
+                assert!(r.body.contains(code), "{}", r.body);
+                assert_eq!(
+                    r.retry_after_secs.is_some(),
+                    status == 503,
+                    "503 carries Retry-After, 502 does not"
+                );
+                for leaked in ["127.0.0.1", "http", "/var/lib", "boom"] {
+                    assert!(!r.body.contains(leaked), "{}", r.body);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn placement_rejection_does_not_leak_topology() {
+        let (status, message) = map_read_route_error(&ReadRouteError::WrongNode {
+            local_node_id: "node-secret-a".to_string(),
+            target_node_id: "node-secret-b".to_string(),
+            shard_id: 7,
+            epoch: 3,
+            role: ReplicaRole::Follower,
+        });
+        assert_eq!(status, 503);
+        assert_eq!(message, "wrong_node");
+    }
+
+    #[test]
+    fn error_responses_never_contain_filesystem_paths() {
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let store = sample_store();
+        let metrics = Arc::new(Mutex::new(TransportMetrics::default()));
+        let root = std::env::temp_dir().join("dash-retrieve-corrupt-segments");
+        let tenant_dir = indexer::resolve_tenant_dir(&root, "tenant-a");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(tenant_dir.join("manifest.json"), b"{not json").unwrap();
+        let prev = std::env::var_os("DASH_RETRIEVAL_SEGMENT_DIR");
+        set_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", root.to_str().unwrap());
+        let response = handle_request_with_metrics(
+            &store,
+            &json_post(
+                "/v1/retrieve",
+                r#"{"tenant_id":"tenant-a","query":"company x","top_k":1}"#,
+            ),
+            &metrics,
+        );
+        restore_env_var_for_tests("DASH_RETRIEVAL_SEGMENT_DIR", prev.as_deref());
+        let _ = std::fs::remove_dir_all(&root);
+        let tmp = std::env::temp_dir().to_string_lossy().to_string();
+        assert!(!response.body.contains(&tmp), "{}", response.body);
+        assert!(!response.body.contains("manifest"), "{}", response.body);
     }
 }

@@ -1,18 +1,27 @@
 plugins {
     kotlin("jvm") version "1.9.24"
-    id("io.github.gradle-nexus.publish-plugin") version "1.3.0"
+    `maven-publish`
 }
 
 group = "dev.dash"
 version = "0.2.0"
 
+// Target Java 17 bytecode with whatever JDK (17+) is installed; avoids
+// requiring toolchain auto-provisioning.
 java {
-    toolchain {
-        languageVersion.set(JavaLanguageVersion.of(17))
-    }
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    kotlinOptions.jvmTarget = "17"
 }
 
 repositories {
+    // dash-java is built from ../java in this repository and is not yet on
+    // Maven Central. Run `mvn -q install -DskipTests` in sdks/java first so
+    // it resolves from the local Maven repository.
+    mavenLocal()
     mavenCentral()
 }
 
@@ -36,10 +45,6 @@ tasks.test {
     }
 }
 
-kotlin {
-    jvmToolchain(17)
-}
-
 publishing {
     publications {
         create<MavenPublication>("maven") {
@@ -47,7 +52,7 @@ publishing {
             pom {
                 name.set("dash-kotlin")
                 description.set("Kotlin coroutine wrappers around the DASH Java SDK")
-                url.set("https://github.com/dash-retrieval/dash")
+                url.set("https://github.com/BHAWESHBHASKAR/DASH")
                 licenses {
                     license {
                         name.set("Apache-2.0")
@@ -60,7 +65,7 @@ publishing {
                     }
                 }
                 scm {
-                    url.set("https://github.com/dash-retrieval/dash")
+                    url.set("https://github.com/BHAWESHBHASKAR/DASH")
                 }
             }
         }

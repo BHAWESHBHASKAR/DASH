@@ -3,3 +3,23 @@
 # documented local-dev placeholders, not real secrets.
 01b33f1cf63efa4f988e17d568fc5b5acb3a21d1:.agents/skills/testing-dash/SKILL.md:curl-auth-header:50
 01b33f1cf63efa4f988e17d568fc5b5acb3a21d1:.agents/skills/testing-dash/SKILL.md:curl-auth-header:68
+
+# Test-only API key fixture in the auth policy unit tests (cell-test-api-key-*),
+# never a deployed credential.
+f6bfa26cd3e91558aa74b42e6498040086232d2e:services/common/src/policy.rs:generic-api-key:1248
+f6bfa26cd3e91558aa74b42e6498040086232d2e:services/common/src/policy.rs:generic-api-key:1267
+
+# Test-only fixtures on the hardening branch: fake API keys in unit, compat and
+# config tests, and the throwaway RSA keys the JWT tests sign with
+# (pkg/auth/src/test_keys.rs). None is a deployed credential.
+121e6f34338b9f377b05d82a9af49965ce826b63:pkg/config/tests/validate.rs:generic-api-key:42
+2f50d00ab3ab83af408a23ea0fd28640e74f7109:scripts/compat/run_scenario.py:generic-api-key:40
+2f50d00ab3ab83af408a23ea0fd28640e74f7109:scripts/compat/run_scenario.py:generic-api-key:41
+7ce8b203e46b7d8ed3564f34d5e7caff7b665f68:services/common/src/policy/review_tests.rs:generic-api-key:107
+7ce8b203e46b7d8ed3564f34d5e7caff7b665f68:services/common/src/policy/review_tests.rs:generic-api-key:198
+7ce8b203e46b7d8ed3564f34d5e7caff7b665f68:services/common/src/policy/review_tests.rs:generic-api-key:336
+7ce8b203e46b7d8ed3564f34d5e7caff7b665f68:services/common/src/policy/review_tests.rs:generic-api-key:44
+7ce8b203e46b7d8ed3564f34d5e7caff7b665f68:services/common/src/policy/review_tests.rs:generic-api-key:61
+e599c3a33bfe791d9e64c9341656f6f911b66562:pkg/auth/src/test_keys.rs:private-key:3
+e599c3a33bfe791d9e64c9341656f6f911b66562:pkg/auth/src/test_keys.rs:private-key:35
+e599c3a33bfe791d9e64c9341656f6f911b66562:services/common/src/policy/hardening_tests.rs:generic-api-key:306

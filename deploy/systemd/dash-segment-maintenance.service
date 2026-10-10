@@ -1,6 +1,7 @@
 [Unit]
 Description=DASH Segment Maintenance Daemon
-After=network.target
+After=network.target dash-ingestion.service
+Requires=dash-ingestion.service
 
 [Service]
 Type=simple
@@ -11,11 +12,48 @@ EnvironmentFile=/etc/dash/segment-maintenance.env
 ExecStart=/opt/dash/bin/segment-maintenance-daemon
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=30
+
+# The daemon works only on the ingestion segment directory, which
+# dash-ingestion.service (StateDirectory=dash/ingestion) creates. Nothing
+# else under /var/lib/dash is writable for this unit.
+ReadWritePaths=/var/lib/dash/ingestion/segments
+
+# Sandboxing
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/dash
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LimitNOFILE=65536
+
+# Encryption at rest (docs/operations/encryption.md). Keep the key file
+# under /etc/dash/encryption (directory 0700, file 0400, owner root) and let
+# systemd hand it to the service: LoadCredential copies it to
+# /run/credentials/dash-segment-maintenance.service/dash-kek, readable by this service only (mode
+# 0400), and the env file points DASH_ENCRYPTION_KEY_FILE there. Needs
+# systemd 247 or later.
+#LoadCredential=dash-kek:/etc/dash/encryption/active.key
 
 [Install]
 WantedBy=multi-user.target

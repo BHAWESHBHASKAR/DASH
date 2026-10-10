@@ -169,6 +169,24 @@ if [[ -f "${SNAPSHOT_SOURCE}" ]]; then
   echo "[restore] snapshot restored: ${WAL_SNAPSHOT_TARGET}"
 fi
 
+# Files of a checkpoint whose snapshot was not published (see
+# backup_state_bundle.sh): restored next to the WAL under the target name.
+PENDING_SOURCE_DIR="$(dirname "${WAL_SOURCE}")/pending"
+if [[ -d "${PENDING_SOURCE_DIR}" ]]; then
+  WAL_SOURCE_NAME="$(basename "${WAL_SOURCE}")"
+  for pending_source in "${PENDING_SOURCE_DIR}"/*; do
+    [[ -f "${pending_source}" ]] || continue
+    pending_name="$(basename "${pending_source}")"
+    pending_target="${WAL_PATH}${pending_name#"${WAL_SOURCE_NAME}"}"
+    ensure_writable_target "${pending_target}"
+    if [[ "${FORCE_OVERWRITE}" == "true" && -f "${pending_target}" ]]; then
+      rm -f "${pending_target}"
+    fi
+    cp -p "${pending_source}" "${pending_target}"
+    echo "[restore] pending checkpoint file restored: ${pending_target}"
+  done
+fi
+
 SEGMENT_SOURCE="${ROOT_CANDIDATE}/data/segments"
 if [[ -d "${SEGMENT_SOURCE}" ]]; then
   if [[ -z "${SEGMENT_DIR}" ]]; then

@@ -1,11 +1,14 @@
 [workspace]
 members = [
   "pkg/auth",
+  "pkg/config",
   "pkg/embeddings",
   "pkg/encryption",
   "pkg/schema",
   "pkg/ranking",
   "pkg/graph",
+  "pkg/http",
+  "pkg/observe",
   "pkg/store",
   "services/control-plane",
   "services/ingestion",
@@ -13,12 +16,23 @@ members = [
   "services/indexer",
   "services/metadata-router",
   "tests/benchmarks",
+  "tests/compat",
+  "tests/e2e",
+  "tests/tls-fixtures",
+  "tools/audit-verify",
+  "tools/crash-test",
+  "tools/loadgen",
+  "tools/wal-inspect",
 ]
+# Standalone benchmark crate with its own workspace (P2 engine spike).
+exclude = ["spikes/engine"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+publish = false
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -34,11 +48,11 @@ anyhow = "1.0"
 jsonwebtoken = { version = "10", default-features = true, features = ["aws_lc_rs"] }
 base64 = "0.22"
 redb = "2"
-bincode = "1.3"
 uuid = { version = "1.10", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 usearch = { version = "2", default-features = false }
 

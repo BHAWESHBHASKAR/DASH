@@ -2,6 +2,8 @@
 name = "store"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
+publish.workspace = true
 
 [features]
 # Historical GPU compute path. The code is feature-gated so it can be
@@ -19,12 +21,18 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 redb = { workspace = true }
-bincode = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 usearch = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+dash-observe = { path = "../observe", default-features = false }
+unicode-segmentation = "1.12"
+rust-stemmers = "1.2"
+encryption = { path = "../encryption" }
 
 [dev-dependencies]
 tempfile = "3"
+embeddings = { path = "../embeddings" }
 serde_json = { workspace = true }

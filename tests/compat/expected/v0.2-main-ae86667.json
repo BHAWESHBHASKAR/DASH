@@ -1,0 +1,71 @@
+{
+  "comment": "Retrieve answers of the current code on the 0.2 fixture that differ BY DESIGN from what the 0.2 build answered (http/retrieve-responses.jsonl). 0.3.0 changed ranking on purpose (CHANGELOG 0.3.0): an edge 'from supports to' credits the target claim instead of its author, support and contradiction bonuses saturate, a re-ingested evidence id is stored once instead of twice, and the 'empty ANN result, scan every vector' fallback is gone. Scores, stance counts and citation multiplicity are therefore not compared for this fixture; claim order is, except for the requests listed here (index into dataset/retrieve.jsonl). Ranking now also uses a BM25 full-text index (Unicode word segmentation, stemming, stop words dropped from queries) and blends cosine with normalised BM25 for hybrid queries (CHANGELOG Unreleased, ADR 0003 section 12). Any other difference fails the test.",
+  "scores_comparable": false,
+  "requests": {
+    "0": {
+      "claims": [
+        "a-c01",
+        "a-c12",
+        "a-c05",
+        "a-b1",
+        "a-c04"
+      ],
+      "why": "hybrid query ranked with the BM25 full-text index: a-c04 ('Analysts now expect Company X shares to fall') shares 'company' and 'x' with the query and replaces a-c08 (no query term, only a vector candidate); the blend of cosine and normalised BM25 puts a-c05 (nearer in vector space) above a-b1"
+    },
+    "1": {
+      "claims": [
+        "a-c02",
+        "a-c06",
+        "a-c09"
+      ],
+      "why": "support_only: in 0.2 a-c02's own outgoing 'contradicts' edge (a-c02 -> a-c01) counted against a-c02; 0.3 credits the target, so a-c02 has one support and one contradiction, passes the stance filter, and a-b1 drops out of the top 3"
+    },
+    "2": {
+      "claims": [
+        "a-c03",
+        "a-c10",
+        "a-c07",
+        "a-b3",
+        "a-b2",
+        "a-c06",
+        "a-c11",
+        "a-c02",
+        "a-c04",
+        "a-c09"
+      ],
+      "why": "hybrid query: the same ten claims; two adjacent pairs swap (a-c10/a-c07, a-b3/a-b2) under the blend of cosine and normalised BM25. None of the four shares a term with 'merger regulators', so the vector part and the priors order them"
+    },
+    "4": {
+      "claims": [
+        "a-c01",
+        "a-b1",
+        "a-c12",
+        "a-c06",
+        "a-c10"
+      ],
+      "why": "hybrid query with a time range: a-c10 replaces a-b2 in fifth place; neither matches a query term ('2025' only matches a-c01), so the blend of cosine and the priors decides"
+    },
+    "7": {
+      "claims": [
+        "a-c01",
+        "a-c04",
+        "a-c10",
+        "a-c03",
+        "a-b3"
+      ],
+      "why": "text-only query ranked by BM25: Unicode word segmentation splits 'X-Y' into 'x' and 'y', so a-c03 ('Regulators opened an inquiry into the X-Y merger') matches two query terms; a-c02 and a-c06 drop out of the top 5 (a-c06 only shares 'company', the most frequent term); 'acquired' is stemmed and 'in' is a stop word"
+    },
+    "8": {
+      "claims": [
+        "a-c09"
+      ],
+      "why": "text-only query on a tenant whose vectors have another dimension than the provider's: 0.2 scanned every vector with the mismatched query vector and filled top_k with claims that match no query term; 0.3 drops that vector, so the query is lexical only and returns only the claim that matches a query term (a-c09). A claim with no query term and no vector similarity is never a candidate, with or without a segment directory"
+    },
+    "9": {
+      "claims": [
+        "a-c04"
+      ],
+      "why": "same as request 8: only the lexical match a-c04; 0.2's other results match no query term and came from the mismatched-vector scan"
+    }
+  }
+}
