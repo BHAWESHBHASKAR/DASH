@@ -165,7 +165,15 @@ The ingestion service adds:
   ingest-to-readable latency (WAL flush + visibility)
 - WAL, checkpoint, batch and replication gauges and counters (see the ingestion `/metrics` output for the exact names)
 
-A Grafana dashboard with these panels is on the roadmap.
+Every service (the control plane included) also exports the shared families:
+`dash_http_server_requests_total{component,route,method,code}`, the
+`dash_http_server_request_duration_seconds` histogram, the in-flight gauge,
+WAL/checkpoint/vector-index histograms, embedding provider metrics, `process_*`
+and `dash_build_info`. The full list, the request-id behaviour (`X-Request-Id`)
+and the log format are in the
+[observability reference](../../docs-site/docs/operations/observability.md);
+alerts with a runbook each, SLO recording rules and Grafana dashboards are in
+`deploy/observability/` ([runbooks](runbooks/README.md), [SLOs](slos.md)).
 
 ## Common operational tasks
 
