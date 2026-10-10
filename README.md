@@ -164,11 +164,11 @@ The generic `delete` call that the Java, Kotlin and C# SDKs used to expose (it t
 
 ## Tests
 
-Counts are static (computed 2026-10-09: the Rust figure with `cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'`, the SDK figures by counting test declarations); they are not a pass/fail report. CI is the source of truth for what passes.
+Counts are static (computed 2026-10-10: the Rust figure with `cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'`, the SDK figures by counting test declarations); they are not a pass/fail report. CI is the source of truth for what passes.
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1264 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1293 |
 | Python SDK | 77 |
 | Go SDK | 98 |
 | TypeScript SDK | 77 |
