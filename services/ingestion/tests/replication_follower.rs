@@ -944,18 +944,29 @@ fn checkpoints_on_the_leader_are_crossed_without_a_resync() {
         follower.metric("dash_ingest_replication_generation") == Some(start_generation)
     });
     let mut expected = Vec::new();
+    let mut previous = start_generation;
+    let mut switches = 0u64;
     for i in 0..5u64 {
         let id = format!("s{i}");
         leader.ingest(&id);
         expected.push(id);
+        // No checkpoint starts while the previous snapshot is still being
+        // written, so on a slow machine an ingest can stay in the current
+        // generation. The decision is made before the ingest returns, so
+        // the frame read here is stable until the next ingest.
         let (generation, total) = leader.frame();
+        if generation != previous {
+            switches += 1;
+            previous = generation;
+        }
         wait_until("follower switched", Duration::from_secs(10), || {
             follower.metric("dash_ingest_replication_generation") == Some(generation)
                 && follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
                 && follower.metric("dash_ingest_replication_generation_switches_total")
-                    == Some(i + 1)
+                    == Some(switches)
         });
     }
+    assert!(switches >= 1, "the first ingest always checkpoints");
     assert_eq!(
         follower.metric("dash_ingest_replication_resync_total"),
         Some(0),
