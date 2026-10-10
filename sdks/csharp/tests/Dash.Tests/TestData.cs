@@ -117,6 +117,70 @@ internal static class TestData
     }
     """;
 
+    // DELETE responses, shaped like docs-site/docs/reference/api.md (Deletes).
+    public const string SampleDeleteClaimResponseJson = """
+    {
+      "deleted": true,
+      "scope": "claim",
+      "tenant_id": "t1",
+      "claim_id": "c1",
+      "claims_deleted": 1,
+      "evidence_deleted": 2,
+      "edges_deleted": 1,
+      "vectors_deleted": 1,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteEvidenceResponseJson = """
+    {
+      "deleted": true,
+      "scope": "evidence",
+      "tenant_id": "t1",
+      "evidence_id": "ev-1",
+      "claims_deleted": 0,
+      "evidence_deleted": 3,
+      "edges_deleted": 0,
+      "vectors_deleted": 0,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteTenantResponseJson = """
+    {
+      "deleted": true,
+      "scope": "tenant",
+      "tenant_id": "t1",
+      "claims_deleted": 5,
+      "evidence_deleted": 9,
+      "edges_deleted": 4,
+      "vectors_deleted": 5,
+      "claims_total": 0,
+      "checkpoint_triggered": true,
+      "checkpoint_deferred": false
+    }
+    """;
+
+    public const string SampleDeleteNothingResponseJson = """
+    {
+      "deleted": false,
+      "scope": "claim",
+      "tenant_id": "t1",
+      "claim_id": "missing",
+      "claims_deleted": 0,
+      "evidence_deleted": 0,
+      "edges_deleted": 0,
+      "vectors_deleted": 0,
+      "claims_total": 41,
+      "checkpoint_triggered": false,
+      "checkpoint_deferred": false
+    }
+    """;
+
     public static readonly object OpenAIStyleErrorBody = new
     {
         error = new
