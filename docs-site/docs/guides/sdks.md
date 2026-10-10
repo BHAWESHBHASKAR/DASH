@@ -11,11 +11,11 @@ Six client SDKs live under `sdks/` in the repository. None is published to a pac
 | TypeScript (`dash-ts`) | `sdks/typescript` | 0.2.0 | yes | yes | no | ESM, Node 18+. |
 | Java | `sdks/java` | 0.2.0 | yes | yes | yes | Ingest targets the ingestion service through a separate base URL. `delete` was removed. |
 | Kotlin | `sdks/kotlin` | 0.2.0 | yes | yes | yes | Suspend API wrapping the Java client. `delete` was removed. |
-| C# | `sdks/csharp` | 0.2.0 | yes | yes | yes | Ingest uses the `IngestionBaseUrl` option. `DeleteAsync` was removed. |
+| C# | `sdks/csharp` | 0.2.0 | yes | yes | yes | Ingest and the scoped deletes (`DeleteClaimAsync`, `DeleteEvidenceAsync`, `DeleteTenantAsync`) use the `IngestionBaseUrl` option. The generic `DeleteAsync` was removed. |
 
 In 0.3.0 the Java, Kotlin and C# SDKs were fixed and unified at version 0.2.0 (see the [changelog](../about/changelog.md)): response bodies are read once, models follow the server contract, ingest targets the ingestion service, and retries are limited to idempotent requests or requests with an `Idempotency-Key`. The Python, TypeScript and Go SDKs send and decode the full retrieve contract (`query_embedding`, `entity_filters`, `embedding_id_filters`, `time_range`, `read_consistency`, `return_graph` and the graph and confidence fields), and all default `top_k` to 5 like the server. The unit tests use mock servers with server-shaped fixtures; no test in CI runs an SDK against a live DASH. For ingest from Python, Go or TypeScript, call `POST /v1/ingest` directly.
 
-Static test counts (declarations, including live-integration tests that need a running server): Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 50.
+Static test counts (declarations, including live-integration tests that need a running server): Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 63.
 
 ## Authentication
 
@@ -62,7 +62,7 @@ Each SDK has a README with install-from-source instructions and examples:
 - Kotlin: `sdks/kotlin/README.md` (coroutines).
 - C#: `sdks/csharp/README.md` (`DashClient`, sync and async methods).
 
-Where an SDK README shows an unpublished package registry install command or the phrase "byte-for-byte compatible", read it with the caveats above. There is no `delete` call in any SDK.
+Where an SDK README shows an unpublished package registry install command or the phrase "byte-for-byte compatible", read it with the caveats above. There is no generic `delete` call in any SDK; deletes are the scoped claim, evidence and tenant methods, which call the ingestion service.
 
 ## OpenAI clients
 

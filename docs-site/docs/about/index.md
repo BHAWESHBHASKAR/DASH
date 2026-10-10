@@ -17,7 +17,7 @@ DASH is a pre-1.0 evidence-first vector database (not yet production-ready) that
 | **Language** | Rust (services), Python / Go / TypeScript / Java / C# (SDKs) |
 | **Source** | <https://github.com/BHAWESHBHASKAR/DASH> |
 | **Issues** | <https://github.com/BHAWESHBHASKAR/DASH/issues> |
-| **Test count** | 807 Rust (`cargo test --workspace -- --list`) plus SDK test declarations: Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 50 (static counts; see the README) |
+| **Test count** | 807 Rust (`cargo test --workspace -- --list`) plus SDK test declarations: Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 63 (static counts; see the README) |
 | **First release** | 2026-06-15 |
 
 ## Why we built it
