@@ -1,5 +1,8 @@
 use super::*;
 
+/// How often idle replication exports are looked for and deleted.
+const EXPORT_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(super) fn serve_http_with_workers(
     runtime: IngestionRuntime,
     bind_addr: &str,
@@ -14,6 +17,7 @@ pub(super) fn serve_http_with_workers(
     let wal_async_flush_interval = runtime.wal_async_flush_interval();
     let segment_maintenance_interval = runtime.segment_maintenance_interval();
     let vector_index_persistence = runtime.vector_index_persistence();
+    let replication_exports = runtime.replication_exports();
     let replication_pull = ReplicationPullConfig::from_env();
     let runtime = Arc::new(Mutex::new(runtime));
     if let Some(config) = replication_pull.as_ref()
@@ -28,6 +32,7 @@ pub(super) fn serve_http_with_workers(
     let (flush_shutdown_tx, flush_shutdown_rx) = mpsc::channel::<()>();
     let (segment_shutdown_tx, segment_shutdown_rx) = mpsc::channel::<()>();
     let (replication_shutdown_tx, replication_shutdown_rx) = mpsc::channel::<()>();
+    let (exports_shutdown_tx, exports_shutdown_rx) = mpsc::channel::<()>();
 
     let result = std::thread::scope(|scope| {
         if let Some(async_interval) = wal_async_flush_interval {
@@ -75,6 +80,20 @@ pub(super) fn serve_http_with_workers(
                 );
             });
         }
+        if let Some(exports) = replication_exports.clone() {
+            // Exports for resyncing followers are deleted once idle, even
+            // when no further resync comes along to prune them.
+            scope.spawn(move || {
+                exports.prune();
+                loop {
+                    match exports_shutdown_rx.recv_timeout(EXPORT_PRUNE_INTERVAL) {
+                        Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    exports.prune();
+                }
+            });
+        }
         if let Some(replication_pull) = replication_pull.clone() {
             let runtime = Arc::clone(&runtime);
             scope.spawn(move || {
@@ -98,6 +117,7 @@ pub(super) fn serve_http_with_workers(
                 flush_shutdown_tx.clone(),
                 segment_shutdown_tx.clone(),
                 replication_shutdown_tx.clone(),
+                exports_shutdown_tx.clone(),
             ],
             vector_index_persistence: vector_index_persistence.clone(),
         });
@@ -119,6 +139,7 @@ pub(super) fn serve_http_with_workers(
         let _ = flush_shutdown_tx.send(());
         let _ = segment_shutdown_tx.send(());
         let _ = replication_shutdown_tx.send(());
+        let _ = exports_shutdown_tx.send(());
         if let Some(persistence) = vector_index_persistence.as_ref() {
             persistence.stop();
         }

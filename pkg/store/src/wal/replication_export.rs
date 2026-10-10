@@ -36,6 +36,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -237,6 +238,17 @@ impl ReplicationExportChunk {
     }
 }
 
+/// See [`ReplicationExportStore::stats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplicationExportStats {
+    pub built_total: u64,
+    pub reused_total: u64,
+    pub chunks_served_total: u64,
+    pub bytes_served_total: u64,
+    pub retained: usize,
+    pub retained_bytes: u64,
+}
+
 /// Outcome of [`ReplicationExportStore::read_chunk`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkRead {
@@ -255,6 +267,10 @@ pub struct ReplicationExportStore {
     /// Serialises `begin`, so concurrent resyncs share one export.
     build: Mutex<()>,
     last_access: Mutex<HashMap<String, Instant>>,
+    built_total: AtomicU64,
+    reused_total: AtomicU64,
+    chunks_served_total: AtomicU64,
+    bytes_served_total: AtomicU64,
     retained: usize,
     idle_ttl: Duration,
 }
@@ -274,6 +290,10 @@ impl ReplicationExportStore {
             dir: Self::dir_for_wal(wal_path),
             build: Mutex::new(()),
             last_access: Mutex::new(HashMap::new()),
+            built_total: AtomicU64::new(0),
+            reused_total: AtomicU64::new(0),
+            chunks_served_total: AtomicU64::new(0),
+            bytes_served_total: AtomicU64::new(0),
             retained: EXPORTS_RETAINED,
             idle_ttl: EXPORT_IDLE_TTL,
         };
@@ -290,6 +310,19 @@ impl ReplicationExportStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Counters since start, plus what is on disk now.
+    pub fn stats(&self) -> ReplicationExportStats {
+        let manifests = self.manifests();
+        ReplicationExportStats {
+            built_total: self.built_total.load(Ordering::Relaxed),
+            reused_total: self.reused_total.load(Ordering::Relaxed),
+            chunks_served_total: self.chunks_served_total.load(Ordering::Relaxed),
+            bytes_served_total: self.bytes_served_total.load(Ordering::Relaxed),
+            retained: manifests.len(),
+            retained_bytes: manifests.iter().map(|m| m.total_bytes).sum(),
+        }
     }
 
     fn export_path(&self, id: &str) -> PathBuf {
@@ -389,6 +422,7 @@ impl ReplicationExportStore {
                 && Some(latest.export_id.as_str()) != avoid
             {
                 self.touch(&latest.export_id);
+                self.reused_total.fetch_add(1, Ordering::Relaxed);
                 return Ok(latest);
             }
             let mut out = BufWriter::new(File::create(&wal_tmp)?);
@@ -418,6 +452,7 @@ impl ReplicationExportStore {
             }
         };
         self.touch(&id);
+        self.built_total.fetch_add(1, Ordering::Relaxed);
         self.prune();
         Ok(manifest)
     }
@@ -621,6 +656,9 @@ impl ReplicationExportStore {
         }
         let data = String::from_utf8(buf)
             .map_err(|_| StoreError::Parse("replication export holds invalid UTF-8".to_string()))?;
+        self.chunks_served_total.fetch_add(1, Ordering::Relaxed);
+        self.bytes_served_total
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(ChunkRead::Chunk(ReplicationExportChunk {
             export_id: manifest.export_id,
             offset,

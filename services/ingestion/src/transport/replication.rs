@@ -1146,14 +1146,42 @@ dash_ingest_replication_commit_status_evicted_total {}\n",
             return String::new();
         };
         let wal = lock_wal(wal);
-        format!(
+        let mut text = format!(
             "# TYPE dash_ingest_replication_group_too_large_total counter\n\
 dash_ingest_replication_group_too_large_total {}\n\
 # TYPE dash_ingest_replication_view_skipped_lines gauge\n\
-dash_ingest_replication_view_skipped_lines {}\n",
+dash_ingest_replication_view_skipped_lines {}\n\
+# TYPE dash_ingest_replication_closed_generation_retained gauge\n\
+dash_ingest_replication_closed_generation_retained {}\n",
             wal.replication_group_too_large_total(),
             wal.replication_skipped_lines(),
-        )
+            wal.closed_generation().is_some() as u8,
+        );
+        drop(wal);
+        if let Some(exports) = self.replication_exports.as_ref() {
+            let stats = exports.stats();
+            text.push_str(&format!(
+                "# TYPE dash_ingest_replication_exports_built_total counter\n\
+dash_ingest_replication_exports_built_total {}\n\
+# TYPE dash_ingest_replication_exports_reused_total counter\n\
+dash_ingest_replication_exports_reused_total {}\n\
+# TYPE dash_ingest_replication_export_chunks_served_total counter\n\
+dash_ingest_replication_export_chunks_served_total {}\n\
+# TYPE dash_ingest_replication_export_bytes_served_total counter\n\
+dash_ingest_replication_export_bytes_served_total {}\n\
+# TYPE dash_ingest_replication_exports_retained gauge\n\
+dash_ingest_replication_exports_retained {}\n\
+# TYPE dash_ingest_replication_exports_retained_bytes gauge\n\
+dash_ingest_replication_exports_retained_bytes {}\n",
+                stats.built_total,
+                stats.reused_total,
+                stats.chunks_served_total,
+                stats.bytes_served_total,
+                stats.retained,
+                stats.retained_bytes,
+            ));
+        }
+        text
     }
 }
 

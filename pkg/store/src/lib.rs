@@ -60,8 +60,8 @@ pub use wal::{
     EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
     EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, GENERATION_TRANSITIONS_KEPT,
     GenerationTransition, HttpExportSource, LocalExportSource, ReplicationExportChunk,
-    ReplicationExportFile, ReplicationExportManifest, ReplicationExportStore, download_export,
-    hash_file, valid_export_id,
+    ReplicationExportFile, ReplicationExportManifest, ReplicationExportStats,
+    ReplicationExportStore, download_export, hash_file, valid_export_id,
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,

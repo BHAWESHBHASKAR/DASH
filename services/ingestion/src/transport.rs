@@ -1182,6 +1182,11 @@ impl IngestionRuntime {
         }
     }
 
+    /// The export store (persistent mode only), for the pruning thread.
+    pub(super) fn replication_exports(&self) -> Option<Arc<store::ReplicationExportStore>> {
+        self.replication_exports.clone()
+    }
+
     /// The export store and the WAL it exports, for serving a chunked
     /// export without holding the runtime lock.
     fn replication_export_handles(

@@ -39,7 +39,7 @@ pub use replication_export::{
     EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
     EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, HttpExportSource,
     LocalExportSource, ReplicationExportChunk, ReplicationExportFile, ReplicationExportManifest,
-    ReplicationExportStore, download_export, hash_file, valid_export_id,
+    ReplicationExportStats, ReplicationExportStore, download_export, hash_file, valid_export_id,
 };
 use replication_index::{ReplicationFilter, ReplicationIndex};
 
