@@ -201,12 +201,37 @@ catches a leak. The nightly soak runs 30 minutes with
 `--preload 20000 --id-space 20000 --checkpoint-every 20000
 --max-rss-growth-mib 256`.
 
-Keep checkpoints on in a soak. Without them the WAL only grows and the
-ingestion RSS grows with it: in a 3-minute update-only run on 2,000 claims
-with no checkpoint, RSS went from 118 MiB to 712 MiB over 33,000 updates,
-while the same workload with a checkpoint every 5,000 or 20,000 WAL records
-levelled off at about 200 MiB. This was seen once and has not been traced to
-its source yet; that work is still open.
+**Memory under repeated updates (resolved).** An earlier soak found the
+ingestion RSS growing with the WAL when checkpoints were off (118 MiB to
+712 MiB in a 3-minute update-only run on 2,000 claims). Two causes were
+measured and fixed:
+
+* Every replication poll from a follower read the whole WAL file into memory,
+  filtered it and copied the requested frame out of it. The leader's memory
+  per poll (and its latency) grew with the log; with the e2e retrieval
+  follower polling every 100 ms this dominated the RSS. The WAL now indexes
+  each line once, as it is appended, and a frame reads only the lines it
+  ships (`pkg/store/src/wal/replication_index.rs`).
+* redb 2.6.3 grew its page cache without bound when the same keys were
+  written over and over (fixed upstream in 2.6.4, which DASH now uses).
+
+The same run (`--preload 2000 --id-space 2000 --ingest-percent 100 --dim 384
+--concurrency 16`, no checkpoints, 180 s, release build, shared 4-vCPU VM):
+
+| Build | Updates | Ingestion RSS first / peak / last | Ingest throughput |
+|---|---|---|---|
+| before | 51,602 | 102 / 851 / 838 MiB | 287/s, p99 487 ms |
+| after | 100,475 | 32 / 38 / 37 MiB | 558/s, p99 117 ms |
+
+`pkg/store/tests/memory_bounded_updates.rs` guards both (heap and per-poll
+peak with a counting allocator). With checkpoints on, the RSS still moves
+between about 70 and 140 MiB in this run: each checkpoint builds the
+snapshot in memory and forces every follower to resync, which makes the
+leader build a full export (see `docs/operations/replication-limits.md`).
+That cost follows the data set size, not the WAL length. Without
+checkpoints the WAL still grows on disk and restart replay time grows with
+it, so production deployments should set `DASH_CHECKPOINT_MAX_WAL_BYTES` or
+`DASH_CHECKPOINT_MAX_WAL_RECORDS` (both unset by default).
 
 ### Reference numbers
 

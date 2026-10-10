@@ -32,6 +32,17 @@ chunked export: the export is not paginated, so the limit is a hard ceiling
 on the dataset size a follower can bootstrap from. Followers also hold the
 whole export in memory while applying it.
 
+## Leader cost of a poll
+
+A delta frame (`/internal/replication/wal`) reads only the WAL lines appended
+since the previous poll plus the lines of the frame itself (and fewer than 64
+lines before it): the leader indexes each line once as it is appended and
+keeps one byte offset per 64 lines. A caught-up follower costs no file reads,
+and the leader's memory per poll is bounded by the frame size, not by the WAL
+length. A full export is different: the leader reads the snapshot and the
+whole WAL into memory to build it, and every checkpoint (a new WAL
+generation) sends each follower through one.
+
 ## Commit group size
 
 The leader never ends a delta frame inside a commit group (a batch or a

@@ -86,6 +86,18 @@ to [Semantic Versioning](https://semver.org/).
 
 ### Fixed (found by the harness)
 
+- **Ingestion memory grew with the WAL when checkpoints were off.** Every
+  replication poll read the whole WAL file into memory to cut one frame out of
+  it, so the leader's RSS and per-poll latency grew with the log (a 3-minute
+  update-only soak on 2,000 claims went from 102 MiB to 851 MiB). The WAL now
+  indexes each line once as it is appended (one byte offset per 64 lines) and
+  a frame reads only the lines it ships; frames are identical to the old ones.
+  The same soak now stays at 32 to 38 MiB and ingests about twice as fast.
+  `FileWal::replication_read_bytes_total` reports the bytes read for frames.
+- **redb updated to 2.6.4**, which fixes unbounded page-cache growth when the
+  same keys are rewritten (measured on the store write path: live heap 5.1 to
+  8.9 MiB over 145,000 updates of 500 claims with 2.6.3, flat with 2.6.4).
+
 - **`/ready` ignored failed WAL writes.** With the redb mirror disabled or
   still healthy, an ingestion node whose WAL volume was full answered every
   write with 500 but kept reporting ready, so the load balancer kept sending
