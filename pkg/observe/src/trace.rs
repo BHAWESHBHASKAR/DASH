@@ -97,7 +97,7 @@ fn parse_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
         _ => None,
     };
     let mut out = [0u8; N];
-    for (i, pair) in raw.chunks_exact(2).enumerate() {
+    for (i, pair) in raw.as_chunks::<2>().0.iter().enumerate() {
         out[i] = (digit(pair[0])? << 4) | digit(pair[1])?;
     }
     Some(out)
@@ -598,7 +598,7 @@ struct Recording {
 }
 
 impl Recording {
-    fn finish(mut self: Box<Self>) {
+    fn finish(mut self) {
         let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.data.end_unix_nanos = self.data.start_unix_nanos.saturating_add(elapsed);
         let tracer = Arc::clone(&self.tracer);
@@ -664,7 +664,7 @@ impl DetachedSpan {
 impl Drop for DetachedSpan {
     fn drop(&mut self) {
         if let Some(rec) = self.recording.take() {
-            rec.finish();
+            (*rec).finish();
         }
     }
 }

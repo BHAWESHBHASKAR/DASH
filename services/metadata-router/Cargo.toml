@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 dash-http = { path = "../../pkg/http" }
+dash-observe = { path = "../../pkg/observe", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -1381,6 +1381,11 @@ pub(super) fn run_replication_pull_tick(
     runtime: &SharedRuntime,
     config: &ReplicationPullConfig,
 ) -> u64 {
+    // One trace per pull tick (subject to the sampler and
+    // DASH_OTEL_BACKGROUND_SAMPLE_RATIO); pulls and acks carry its
+    // traceparent to the leader.
+    let mut span = dash_observe::trace::background_root("replication.poll");
+    span.set_attr("dash.component", "ingestion");
     let outcome = match catch_unwind(AssertUnwindSafe(|| pull_tick(runtime, config))) {
         Ok(outcome) => outcome,
         Err(panic) => {
@@ -1399,6 +1404,10 @@ pub(super) fn run_replication_pull_tick(
             ))
         }
     };
+    if outcome.is_err() {
+        span.set_error("replication poll failed");
+    }
+    drop(span);
     let mut guard = runtime
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1540,8 +1549,15 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
         delta_frame.next_offset = delta_frame.from_offset + keep;
     }
     let commit_ids = extract_batch_commit_ids_from_wal_lines(&delta_frame.wal_lines)?;
-    apply_guarded(runtime, |rt| rt.apply_replication_delta_frame(&delta_frame))
-        .map_err(|err| format!("replication delta apply failed: {err:?}"))?;
+    {
+        let mut span = dash_observe::trace::span("replication.apply");
+        span.set_attr("dash.replication.records", delta_frame.wal_lines.len());
+        let applied = apply_guarded(runtime, |rt| rt.apply_replication_delta_frame(&delta_frame));
+        if applied.is_err() {
+            span.set_error("replicated frame could not be applied");
+        }
+        applied.map_err(|err| format!("replication delta apply failed: {err:?}"))?;
+    }
     acknowledge_replication_commits(config, &commit_ids)
         .map_err(|err| format!("replication delta commit ack failed: {err}"))
 }

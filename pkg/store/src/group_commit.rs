@@ -153,7 +153,12 @@ pub struct CommitTicket {
 impl CommitTicket {
     /// Blocks until the batch holding this entry is durable (`Ok`) or failed.
     pub fn wait(self) -> Result<(), GroupCommitError> {
-        self.rx.recv().unwrap_or(Err(GroupCommitError::Stopped))
+        let mut span = dash_observe::trace::span("wal.group_commit_wait");
+        let result = self.rx.recv().unwrap_or(Err(GroupCommitError::Stopped));
+        if result.is_err() {
+            span.set_error("group commit failed");
+        }
+        result
     }
 }
 
@@ -161,6 +166,8 @@ struct Entry {
     lines: Vec<String>,
     bytes: usize,
     done: mpsc::SyncSender<Result<(), GroupCommitError>>,
+    /// Trace context of the enqueuing request (tracing on only).
+    trace: Option<dash_observe::trace::SpanContext>,
 }
 
 #[derive(Default)]
@@ -255,7 +262,12 @@ impl GroupCommitter {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(GroupCommitError::Overloaded { capacity });
         }
-        state.entries.push_back(Entry { lines, bytes, done });
+        state.entries.push_back(Entry {
+            lines,
+            bytes,
+            done,
+            trace: dash_observe::trace::current(),
+        });
         state.queued_bytes += bytes;
         drop(state);
         self.shared.work_ready.notify_one();
@@ -354,15 +366,33 @@ fn run_committer<L: GroupCommitLog>(shared: &Shared, log: &Mutex<L>) {
 
         let mut lines = Vec::with_capacity(batch.iter().map(|e| e.lines.len()).sum());
         let mut waiters = Vec::with_capacity(batch.len());
+        let mut traced = Vec::new();
         for entry in batch {
             lines.extend(entry.lines);
             waiters.push(entry.done);
+            if let Some(ctx) = entry.trace.filter(|ctx| ctx.sampled) {
+                traced.push(ctx);
+            }
         }
+        // The batch's write and fsync belong to the first traced request
+        // and are linked from the others (bounded by MAX_LINKS).
+        let mut batch_span = dash_observe::trace::detached_child(
+            "wal.group_commit",
+            traced.first(),
+            traced.get(1..).unwrap_or_default(),
+        );
+        batch_span.set_attr("dash.wal.batch_entries", waiters.len());
+        batch_span.set_attr("dash.wal.batch_bytes", batch_bytes);
         let outcome = {
+            let _context = batch_span.enter();
             let mut log = lock_log(log);
             log.commit_lines(&lines)
                 .map_err(|err| (err, log.poisoned_reason()))
         };
+        if outcome.is_err() {
+            batch_span.set_error("group commit batch failed");
+        }
+        drop(batch_span);
 
         let counters = &shared.counters;
         let entries = waiters.len() as u64;

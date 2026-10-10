@@ -1486,6 +1486,7 @@ impl InMemoryStore {
 
         // BM25 of every candidate (zero when it shares no query term), and
         // the query's BM25 upper bound that maps it into [0, 1).
+        let bm25_span = dash_observe::trace::span("retrieve.bm25");
         let text_index = self.text_indexes.get(&req.tenant_id);
         let bm25_max = text_index
             .map(|index| index.max_score(&query_terms))
@@ -1494,7 +1495,10 @@ impl InMemoryStore {
             Some(index) => index.score_many(&query_terms, &candidates),
             None => vec![0.0; candidates.len()],
         };
+        drop(bm25_span);
         let dense_similarities = query_vector.map(|vector| {
+            let mut vector_span = dash_observe::trace::span("retrieve.vector_score");
+            vector_span.set_attr("dash.retrieve.candidates", candidates.len());
             let candidate_vectors: Vec<(String, &[f32])> = candidates
                 .iter()
                 .filter_map(|claim_id| {
@@ -1510,6 +1514,9 @@ impl InMemoryStore {
                 .into_iter()
                 .collect::<HashMap<String, f32>>()
         });
+        // Signals, priors and the hybrid blend per candidate, then the sort.
+        let mut fuse_span = dash_observe::trace::span("retrieve.fuse");
+        fuse_span.set_attr("dash.retrieve.candidates", candidates.len());
         for (position, claim_id) in candidates.iter().enumerate() {
             let Some(claim) = self.claims.get(claim_id) else {
                 continue;
@@ -1623,7 +1630,9 @@ impl InMemoryStore {
         }
 
         ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
-        ranked.into_iter().take(req.top_k).collect()
+        ranked.truncate(req.top_k);
+        fuse_span.set_attr("dash.retrieve.results", ranked.len());
+        ranked
     }
 
     /// All claims of a tenant, sorted by `claim_id`. Uses the per-tenant
@@ -2014,6 +2023,32 @@ impl InMemoryStore {
         top_k: usize,
         allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Candidates {
+        let mut span = dash_observe::trace::span("retrieve.candidates");
+        let candidates = self.candidate_claim_ids_untraced(
+            tenant_id,
+            query,
+            time_range,
+            query_vector,
+            top_k,
+            allowed_claim_ids,
+        );
+        if span.is_recording() {
+            span.set_attr("dash.retrieve.top_k", top_k);
+            span.set_attr("dash.retrieve.hybrid", query_vector.is_some());
+            span.set_attr("dash.retrieve.candidates", candidates.ids.len());
+        }
+        candidates
+    }
+
+    fn candidate_claim_ids_untraced(
+        &self,
+        tenant_id: &str,
+        query: &str,
+        time_range: (Option<i64>, Option<i64>),
+        query_vector: Option<&[f32]>,
+        top_k: usize,
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> Candidates {
         let (from_unix, to_unix) = time_range;
         let has_time = from_unix.is_some() || to_unix.is_some();
         let passes = |claim_id: &str| {
@@ -2082,6 +2117,29 @@ impl InMemoryStore {
     /// and less exact on small allowed sets); otherwise the HNSW runs with
     /// the filter as a predicate.
     fn vector_candidates(
+        &self,
+        tenant_id: &str,
+        query_vector: &[f32],
+        top_n: usize,
+        time_range: (Option<i64>, Option<i64>),
+        allowed_claim_ids: Option<&HashSet<String>>,
+    ) -> Vec<String> {
+        let mut span = dash_observe::trace::span("retrieve.vector_search");
+        let found = self.vector_candidates_untraced(
+            tenant_id,
+            query_vector,
+            top_n,
+            time_range,
+            allowed_claim_ids,
+        );
+        if span.is_recording() {
+            span.set_attr("dash.retrieve.depth", top_n);
+            span.set_attr("dash.retrieve.candidates", found.len());
+        }
+        found
+    }
+
+    fn vector_candidates_untraced(
         &self,
         tenant_id: &str,
         query_vector: &[f32],

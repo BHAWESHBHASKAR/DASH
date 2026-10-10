@@ -200,6 +200,7 @@ pub fn execute_api_query_with_storage_snapshot(
 /// shared store lock must call it BEFORE taking the lock and pass the result
 /// to [`execute_api_query_with_segment_prefilter`].
 pub fn resolve_segment_prefilter(tenant_id: &str) -> Option<HashSet<String>> {
+    let _span = dash_observe::trace::span("retrieve.segment_prefilter");
     build_segment_prefilter_claim_ids(tenant_id)
 }
 
@@ -237,7 +238,12 @@ pub fn execute_api_query_with_segment_prefilter(
     req: RetrieveApiRequest,
     segment_base: Option<HashSet<String>>,
 ) -> (RetrieveApiResponse, RetrieveStorageMergeSnapshot) {
-    let planner = build_planner_context(store, &req, segment_base);
+    let planner = {
+        let mut span = dash_observe::trace::span("retrieve.plan");
+        let planner = build_planner_context(store, &req, segment_base);
+        span.set_attr("dash.retrieve.short_circuit", planner.short_circuit_empty);
+        planner
+    };
     let mut merge_snapshot =
         build_storage_merge_snapshot(&planner, &[], STORAGE_EXECUTION_MODE_MEMORY_INDEX, 0);
     if planner.short_circuit_empty {
@@ -348,6 +354,7 @@ pub fn execute_api_query_with_segment_prefilter(
         .collect();
 
     let graph = if req.return_graph {
+        let _graph_span = dash_observe::trace::span("retrieve.graph");
         let graph_reasoning_config = graph_reasoning_config_from_env();
         let selected: std::collections::HashSet<String> =
             nodes.iter().map(|n| n.claim_id.clone()).collect();

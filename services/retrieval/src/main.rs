@@ -16,6 +16,9 @@ const DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS: u64 = 300_000;
 fn main() {
     dash_common::init_logging();
     dash_observe::process::mark_start();
+    // OpenTelemetry trace export (off unless DASH_OTEL_ENABLED or an OTLP
+    // endpoint is set); the guard flushes queued spans on a normal exit.
+    let _tracing = dash_observe::otlp::init_from_env("dash-retrieval");
     dash_config::startup_check(dash_config::Service::Retrieval);
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass

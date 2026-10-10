@@ -670,6 +670,33 @@ fn http_request(
     target: &ControlPlaneUrl,
     options: &PlacementSourceOptions,
 ) -> Result<HttpClientResponse, String> {
+    let mut span = dash_observe::trace::client_span("control_plane.http_request");
+    if span.is_recording() {
+        span.set_attr(
+            "http.request.method",
+            if method == "GET" { "GET" } else { "POST" },
+        );
+    }
+    let result = http_request_inner(method, target, options);
+    if span.is_recording() {
+        match &result {
+            Ok(response) => {
+                span.set_attr("http.response.status_code", response.status);
+                if response.status >= 500 {
+                    span.set_error("control plane answered with a server error");
+                }
+            }
+            Err(_) => span.set_error("control-plane request failed"),
+        }
+    }
+    result
+}
+
+fn http_request_inner(
+    method: &str,
+    target: &ControlPlaneUrl,
+    options: &PlacementSourceOptions,
+) -> Result<HttpClientResponse, String> {
     let authority = target.authority.as_str();
     let path = target.path.as_str();
     if options.bearer_token.is_some()
@@ -716,6 +743,12 @@ fn http_request(
     }
     if let Some(token) = options.bearer_token.as_deref() {
         request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if let Some((traceparent, tracestate)) = dash_observe::trace::outgoing_headers() {
+        request.push_str(&format!("traceparent: {traceparent}\r\n"));
+        if let Some(state) = tracestate.as_deref() {
+            request.push_str(&format!("tracestate: {state}\r\n"));
+        }
     }
     request.push_str("\r\n");
     stream
@@ -1476,6 +1509,47 @@ mod hardening_tests {
             .unwrap_err();
         assert!(err.contains("not the leader"), "{err}");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn control_plane_requests_carry_the_trace_context_of_a_client_span() {
+        use dash_observe::trace;
+        let sink = trace::CollectingSink::new();
+        trace::install(trace::TracerConfig::default(), sink.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            head
+        });
+        let parent = "00-6af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let server = trace::server_span("POST unit", Some(parent), Some("v=1"));
+        let response =
+            control_plane_post(&url, "/v1/control-plane/ingest/heartbeat", &quick_options())
+                .unwrap();
+        drop(server);
+        trace::uninstall();
+        assert_eq!(response.status, 200);
+        let head = handle.join().unwrap();
+        let trace_id = trace::TraceId::from_hex("6af7651916cd43dd8448eb211c80319c").unwrap();
+        let client = sink
+            .spans_of(&trace_id)
+            .into_iter()
+            .find(|s| s.name == "control_plane.http_request")
+            .expect("client span");
+        assert_eq!(client.kind, trace::SpanKind::Client);
+        let expected = trace::format_traceparent(&trace_id, &client.span_id, true);
+        assert!(
+            head.contains(&format!("traceparent: {expected}\r\n")),
+            "{head}"
+        );
+        assert!(head.contains("tracestate: v=1\r\n"), "{head}");
     }
 
     fn dead_control_plane_url() -> String {

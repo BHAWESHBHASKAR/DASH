@@ -789,7 +789,24 @@ impl Follower {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
+            // One trace per poll (subject to the sampler and
+            // DASH_OTEL_BACKGROUND_SAMPLE_RATIO); the pull request carries
+            // its traceparent to the leader.
+            let mut span = dash_observe::trace::background_root("replication.poll");
             let result = catch_unwind(AssertUnwindSafe(|| self.poll_once()));
+            if span.is_recording() {
+                span.set_attr("dash.component", "retrieval");
+                let outcome = match &result {
+                    Ok(Ok(PollOutcome::MoreAvailable)) => "more_available",
+                    Ok(Ok(PollOutcome::Idle)) => "idle",
+                    Ok(Err(_)) | Err(_) => "error",
+                };
+                span.set_attr("dash.replication.outcome", outcome);
+                if outcome == "error" {
+                    span.set_error("replication poll failed");
+                }
+            }
+            drop(span);
             let delay = match result {
                 Ok(Ok(PollOutcome::MoreAvailable)) => {
                     self.status.record_success();
@@ -967,6 +984,16 @@ impl Follower {
     /// be applied means this follower diverged from the leader; the WAL
     /// append is rolled back and the follower rebuilds from a full resync.
     fn apply_delta(&mut self, lines: &[String]) -> Result<(), String> {
+        let mut span = dash_observe::trace::span("replication.apply");
+        span.set_attr("dash.replication.records", lines.len());
+        let result = self.apply_delta_inner(lines);
+        if result.is_err() {
+            span.set_error("replicated frame could not be applied");
+        }
+        result
+    }
+
+    fn apply_delta_inner(&mut self, lines: &[String]) -> Result<(), String> {
         for line in lines {
             store::check_replicated_line(line)
                 .map_err(|err| format!("failed to apply replicated record: {err:?}"))?;
@@ -1056,6 +1083,15 @@ impl Follower {
     /// chunks (resumable, checksummed). Falls back to the single-response
     /// export when the leader does not serve chunks.
     fn resync(&mut self) -> Result<PollOutcome, String> {
+        let mut span = dash_observe::trace::span("replication.resync");
+        let result = self.resync_inner();
+        if result.is_err() {
+            span.set_error("replication resync failed");
+        }
+        result
+    }
+
+    fn resync_inner(&mut self) -> Result<PollOutcome, String> {
         let paths = self.download_paths();
         let base = self.config.source_base_url.clone();
         let token = self.config.token.clone();

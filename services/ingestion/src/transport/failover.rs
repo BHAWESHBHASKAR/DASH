@@ -903,6 +903,10 @@ pub(crate) fn heartbeat_tick(
     pull: &ReplicationPullConfig,
     options: &PlacementSourceOptions,
 ) {
+    // One trace per heartbeat (subject to the sampler and
+    // DASH_OTEL_BACKGROUND_SAMPLE_RATIO); the control plane's server span
+    // joins it through the propagated traceparent.
+    let mut span = dash_observe::trace::background_root("failover.heartbeat");
     let query = match runtime.lock() {
         Ok(mut guard) => guard.failover_heartbeat_query(pull),
         Err(_) => return,
@@ -928,7 +932,10 @@ pub(crate) fn heartbeat_tick(
     };
     match result {
         Ok(reply) => guard.apply_heartbeat_reply(&reply, sent_at),
-        Err(err) => guard.observe_heartbeat_failure(err),
+        Err(err) => {
+            span.set_error("heartbeat failed");
+            guard.observe_heartbeat_failure(err);
+        }
     }
 }
 
