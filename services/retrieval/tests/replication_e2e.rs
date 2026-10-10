@@ -1597,8 +1597,11 @@ fn fresh_follower_resyncs_through_a_chunked_export() {
     // Chunks are bounded by the response limit as well.
     config.max_response_bytes = 64 * 1024;
     let node = start_volatile(config, InMemoryStore::new());
+    // The follower swaps the rebuilt store in before it updates its status
+    // counters, so wait for both rather than reading the status the moment
+    // the claims appear.
     wait_until("resynced", Duration::from_secs(20), || {
-        node.claim_ids() == expected
+        node.claim_ids() == expected && node.status().synced_once
     });
     let status = node.status();
     assert_eq!(status.resyncs_total, 1, "{status:?}");
