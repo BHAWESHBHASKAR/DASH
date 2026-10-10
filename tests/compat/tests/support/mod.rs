@@ -15,9 +15,12 @@ use store::{AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, StoreLoadStat
 /// old release must parse and apply (nothing quarantined).
 pub fn load_strict(state: &ScratchState) -> (InMemoryStore, StoreLoadStats, FileWal) {
     let wal = FileWal::open(state.wal()).expect("open fixture WAL");
-    let (store, stats) =
-        InMemoryStore::load_from_wal_with_policy(&wal, AnnTuningConfig::default(), ReplayPolicy::Strict)
-            .expect("strict replay of the fixture");
+    let (store, stats) = InMemoryStore::load_from_wal_with_policy(
+        &wal,
+        AnnTuningConfig::default(),
+        ReplayPolicy::Strict,
+    )
+    .expect("strict replay of the fixture");
     (store, stats, wal)
 }
 
@@ -122,7 +125,11 @@ fn expected_overrides(fixture: &Fixture) -> ExpectedOverrides {
 /// description of every other difference (empty when there is none).
 pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<String> {
     let recorded = fixture.read_jsonl("http/retrieve-responses.jsonl");
-    assert_eq!(recorded.len(), actual.len(), "one answer per dataset request");
+    assert_eq!(
+        recorded.len(),
+        actual.len(),
+        "one answer per dataset request"
+    );
     let overrides = expected_overrides(fixture);
     let mut diffs = Vec::new();
     for (index, (expected, (status, body))) in recorded.iter().zip(actual).enumerate() {
@@ -136,7 +143,10 @@ pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<
         if expected_status != 200 {
             continue;
         }
-        let old = expected["body"]["results"].as_array().cloned().unwrap_or_default();
+        let old = expected["body"]["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let new = body["results"].as_array().cloned().unwrap_or_default();
         let old_ids: Vec<String> = old
             .iter()
@@ -162,7 +172,9 @@ pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<
             }
             None => {
                 if old_ids != new_ids {
-                    diffs.push(format!("request {index}: claims {new_ids:?}, old build {old_ids:?}"));
+                    diffs.push(format!(
+                        "request {index}: claims {new_ids:?}, old build {old_ids:?}"
+                    ));
                     continue;
                 }
                 if overrides.scores_comparable {

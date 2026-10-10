@@ -21,13 +21,23 @@ fn the_current_control_plane_takes_over_an_old_lease_with_a_higher_fencing_token
         let lease = LeaderLease::with_defaults("cp-new-1", &lease_path);
         // The fixture's lease expired long ago: it parses and names no
         // current leader.
-        assert_eq!(lease.current_leader().expect("old lease parses"), None, "{}", fixture.label);
+        assert_eq!(
+            lease.current_leader().expect("old lease parses"),
+            None,
+            "{}",
+            fixture.label
+        );
         let fields: Vec<&str> = old_text.trim().split(',').collect();
         assert_eq!(fields[0], "cp-old-1", "{}", fixture.label);
         let old_epoch: u64 = fields[1].parse().expect("epoch");
         match fixture.era {
             Era::V0_2 => {
-                assert_eq!(fields.len(), 3, "{}: node_id,epoch,expires_at_ms", fixture.label);
+                assert_eq!(
+                    fields.len(),
+                    3,
+                    "{}: node_id,epoch,expires_at_ms",
+                    fixture.label
+                );
                 assert!(old_readers::v0_2_reads_lease(&old_text).is_ok());
             }
             Era::V0_3 => assert_eq!(fields.len(), 4, "{}: plus instance_id", fixture.label),
@@ -55,7 +65,10 @@ fn the_current_control_plane_takes_over_an_old_lease_with_a_higher_fencing_token
         );
     }
     let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
-    assert!(guide.contains("leader.lease.epoch"), "the guide names the lease files to remove");
+    assert!(
+        guide.contains("leader.lease.epoch"),
+        "the guide names the lease files to remove"
+    );
 }
 
 #[test]
@@ -73,8 +86,16 @@ fn persisted_placement_state_loads_unchanged() {
         let served = served["body"]["placements"].as_array().expect("placements");
         assert_eq!(placements.len(), served.len(), "{}", fixture.label);
         for (loaded, old) in placements.iter().zip(served) {
-            assert_eq!(loaded.tenant_id, old["tenant_id"].as_str().unwrap_or(""), "{}", fixture.label);
-            assert_eq!(u64::from(loaded.shard_id), old["shard_id"].as_u64().unwrap_or(u64::MAX));
+            assert_eq!(
+                loaded.tenant_id,
+                old["tenant_id"].as_str().unwrap_or(""),
+                "{}",
+                fixture.label
+            );
+            assert_eq!(
+                u64::from(loaded.shard_id),
+                old["shard_id"].as_u64().unwrap_or(u64::MAX)
+            );
             assert_eq!(loaded.epoch, old["epoch"].as_u64().unwrap_or(u64::MAX));
             assert_eq!(
                 loaded.replicas.len(),

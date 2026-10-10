@@ -212,7 +212,12 @@ pub fn ingest_requests() -> Vec<Value> {
 }
 
 /// Raw HTTP/1.1 request bytes for one dataset row.
-pub fn raw_request(method: &str, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> Vec<u8> {
+pub fn raw_request(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    headers: &[(&str, &str)],
+) -> Vec<u8> {
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let mut out = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
@@ -278,10 +283,16 @@ pub mod old_readers {
         let line = text.lines().next().unwrap_or("").trim();
         let parts: Vec<&str> = line.split(',').collect();
         if parts.len() != 3 {
-            return Err("lease file has invalid format (expected node_id,epoch,expires_at_ms)".into());
+            return Err(
+                "lease file has invalid format (expected node_id,epoch,expires_at_ms)".into(),
+            );
         }
-        let epoch = parts[1].parse::<u64>().map_err(|_| "invalid epoch".to_string())?;
-        let expires = parts[2].parse::<u64>().map_err(|_| "invalid expires_at_ms".to_string())?;
+        let epoch = parts[1]
+            .parse::<u64>()
+            .map_err(|_| "invalid epoch".to_string())?;
+        let expires = parts[2]
+            .parse::<u64>()
+            .map_err(|_| "invalid expires_at_ms".to_string())?;
         Ok((parts[0].to_string(), epoch, expires))
     }
 
@@ -290,7 +301,14 @@ pub mod old_readers {
     /// at `main` ae86667): the second line must be `needs_resync=`.
     pub fn v0_2_parses_delta_header(body: &str) -> Result<(), String> {
         let mut lines = body.lines();
-        for key in ["status", "needs_resync", "from_offset", "next_offset", "total_records", "records"] {
+        for key in [
+            "status",
+            "needs_resync",
+            "from_offset",
+            "next_offset",
+            "total_records",
+            "records",
+        ] {
             let line = lines.next().ok_or_else(|| format!("missing {key}"))?;
             let (found, _) = line
                 .split_once('=')

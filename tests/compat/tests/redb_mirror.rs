@@ -42,9 +42,18 @@ fn rows_carry_the_header_of_the_release_that_wrote_them() {
         let state = fixture.scratch_state();
         let claims = raw_rows(&state.redb(), CLAIMS);
         let evidence = raw_rows(&state.redb(), EVIDENCE);
-        assert!(!claims.is_empty() && !evidence.is_empty(), "{}", fixture.label);
+        assert!(
+            !claims.is_empty() && !evidence.is_empty(),
+            "{}",
+            fixture.label
+        );
         for value in claims.values().chain(evidence.values()) {
-            assert_eq!(headered(value), fixture.era != Era::V0_2, "{}", fixture.label);
+            assert_eq!(
+                headered(value),
+                fixture.era != Era::V0_2,
+                "{}",
+                fixture.label
+            );
         }
     }
 }
@@ -61,7 +70,11 @@ fn every_old_row_decodes_with_the_current_codec() {
                     .get_claim(&claim.claim_id)
                     .expect("decode claim row")
                     .expect("claim row present");
-                assert_eq!(row, claim, "{}: claim row equals the WAL state", fixture.label);
+                assert_eq!(
+                    row, claim,
+                    "{}: claim row equals the WAL state",
+                    fixture.label
+                );
                 let blob = disk
                     .get_evidence_blob(&claim.claim_id)
                     .expect("decode evidence blob")
@@ -87,11 +100,24 @@ fn bulk_load_from_an_old_redb_plus_wal_serves_the_recorded_answers() {
     for fixture in FIXTURES {
         let state = fixture.scratch_state();
         let mut wal = FileWal::open(state.wal()).expect("open WAL");
-        let (store, _) =
-            InMemoryStore::load_from_disk_and_wal(state.redb(), &mut wal, AnnTuningConfig::default())
-                .expect("load redb + WAL");
-        assert_eq!(store.disk_status(), &DiskStatus::Available, "{}", fixture.label);
-        assert_eq!(store.claims_len(), fixture.expected_claims_total(), "{}", fixture.label);
+        let (store, _) = InMemoryStore::load_from_disk_and_wal(
+            state.redb(),
+            &mut wal,
+            AnnTuningConfig::default(),
+        )
+        .expect("load redb + WAL");
+        assert_eq!(
+            store.disk_status(),
+            &DiskStatus::Available,
+            "{}",
+            fixture.label
+        );
+        assert_eq!(
+            store.claims_len(),
+            fixture.expected_claims_total(),
+            "{}",
+            fixture.label
+        );
         let answers = run_retrieves(&store, Some(&state.segments()));
         let diffs = diff_against_recorded(fixture, &answers);
         assert!(diffs.is_empty(), "{}:\n{}", fixture.label, diffs.join("\n"));
@@ -102,7 +128,10 @@ fn bulk_load_from_an_old_redb_plus_wal_serves_the_recorded_answers() {
 /// header, untouched rows stay legacy, and the mixed file still loads.
 #[test]
 fn changed_rows_are_rewritten_with_the_header_and_mixed_files_load() {
-    let fixture = FIXTURES.iter().find(|f| f.era == Era::V0_2).expect("0.2 fixture");
+    let fixture = FIXTURES
+        .iter()
+        .find(|f| f.era == Era::V0_2)
+        .expect("0.2 fixture");
     let state = fixture.scratch_state();
     {
         let (store, _, _) = load_strict(&state);
@@ -133,9 +162,18 @@ fn changed_rows_are_rewritten_with_the_header_and_mixed_files_load() {
     }
     let claims = raw_rows(&state.redb(), CLAIMS);
     let evidence = raw_rows(&state.redb(), EVIDENCE);
-    assert!(headered(&claims["a-c01"]), "updated claim row rewritten in the current format");
-    assert!(headered(&evidence["a-c01"]), "updated evidence blob rewritten");
-    assert!(!headered(&claims["a-c02"]), "untouched rows are left as they were");
+    assert!(
+        headered(&claims["a-c01"]),
+        "updated claim row rewritten in the current format"
+    );
+    assert!(
+        headered(&evidence["a-c01"]),
+        "updated evidence blob rewritten"
+    );
+    assert!(
+        !headered(&claims["a-c02"]),
+        "untouched rows are left as they were"
+    );
     // A mixed file loads.
     let disk = DiskBackedStore::new(state.redb()).expect("open");
     let a01: Claim = disk.get_claim("a-c01").expect("decode").expect("row");
@@ -150,11 +188,15 @@ fn changed_rows_are_rewritten_with_the_header_and_mixed_files_load() {
 /// A full rewrite (what a follower resync does) leaves no legacy row.
 #[test]
 fn a_full_rewrite_migrates_every_row() {
-    let fixture = FIXTURES.iter().find(|f| f.era == Era::V0_2).expect("0.2 fixture");
+    let fixture = FIXTURES
+        .iter()
+        .find(|f| f.era == Era::V0_2)
+        .expect("0.2 fixture");
     let state = fixture.scratch_state();
     let (store, _, _) = load_strict(&state);
     let mut live = store.clone_detached().attach_disk(state.redb());
-    live.replace_state_from(store).expect("rewrite redb from state");
+    live.replace_state_from(store)
+        .expect("rewrite redb from state");
     drop(live);
     for (key, value) in raw_rows(&state.redb(), CLAIMS)
         .into_iter()
@@ -182,7 +224,11 @@ fn a_0_2_build_cannot_decode_rows_the_current_code_wrote() {
             );
         }
     }
-    let guide = std::fs::read_to_string(dash_compat::repo_root().join("docs/operations/upgrades.md"))
-        .expect("guide");
-    assert!(guide.contains("delete the redb file"), "the guide documents the redb downgrade rule");
+    let guide =
+        std::fs::read_to_string(dash_compat::repo_root().join("docs/operations/upgrades.md"))
+            .expect("guide");
+    assert!(
+        guide.contains("delete the redb file"),
+        "the guide documents the redb downgrade rule"
+    );
 }

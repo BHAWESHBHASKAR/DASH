@@ -3956,7 +3956,11 @@ tenant-a,0,12,node-a,follower,healthy\n",
             &metrics,
         );
         assert_eq!(response.status, 200, "{}", response.body);
-        assert!(response.body.contains("\"claim_id\":\"c1\""), "{}", response.body);
+        assert!(
+            response.body.contains("\"claim_id\":\"c1\""),
+            "{}",
+            response.body
+        );
     }
 
     #[test]

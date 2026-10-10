@@ -26,7 +26,11 @@ fn old_audit_chains_verify_and_the_current_writer_continues_them() {
             match fixture.era {
                 Era::V0_2 => {
                     assert_eq!(before.v2_records, 0, "{}: {file}", fixture.label);
-                    assert_eq!(before.legacy_records, before.chained_records, "{}", fixture.label);
+                    assert_eq!(
+                        before.legacy_records, before.chained_records,
+                        "{}",
+                        fixture.label
+                    );
                 }
                 Era::V0_3 => {
                     assert_eq!(before.legacy_records, 0, "{}: {file}", fixture.label);
@@ -49,10 +53,24 @@ fn old_audit_chains_verify_and_the_current_writer_continues_them() {
             .expect("append to the old chain");
             let after = verify_file(path_str, &opts)
                 .unwrap_or_else(|e| panic!("{}: {file} after append: {e:?}", fixture.label));
-            assert_eq!(after.last_seq, before.last_seq + 1, "{}: {file}", fixture.label);
-            assert_eq!(after.chained_records, before.chained_records + 1, "{}", fixture.label);
+            assert_eq!(
+                after.last_seq,
+                before.last_seq + 1,
+                "{}: {file}",
+                fixture.label
+            );
+            assert_eq!(
+                after.chained_records,
+                before.chained_records + 1,
+                "{}",
+                fixture.label
+            );
             assert_eq!(after.v2_records, before.v2_records + 1, "{}", fixture.label);
-            assert_eq!(after.restarts, before.restarts, "{}: no chain restart", fixture.label);
+            assert_eq!(
+                after.restarts, before.restarts,
+                "{}: no chain restart",
+                fixture.label
+            );
             let last_line = std::fs::read_to_string(&path)
                 .expect("read")
                 .lines()
@@ -60,7 +78,12 @@ fn old_audit_chains_verify_and_the_current_writer_continues_them() {
                 .expect("line")
                 .to_string();
             let record: serde_json::Value = serde_json::from_str(&last_line).expect("json");
-            assert_eq!(record["prev_hash"], before.last_hash.as_str(), "{}", fixture.label);
+            assert_eq!(
+                record["prev_hash"],
+                before.last_hash.as_str(),
+                "{}",
+                fixture.label
+            );
         }
     }
 }
@@ -100,7 +123,10 @@ fn v0_2_ingestion_append(path: &std::path::Path, action: &str, ts: u64) {
 /// `audit-verify` from 0.3.)
 #[test]
 fn a_chain_continued_by_0_2_after_a_rollback_still_verifies() {
-    let fixture = FIXTURES.iter().find(|f| f.era == Era::V0_2).expect("0.2 fixture");
+    let fixture = FIXTURES
+        .iter()
+        .find(|f| f.era == Era::V0_2)
+        .expect("0.2 fixture");
     let state = fixture.scratch_state();
     let path = state.path().join("audit-ingestion.jsonl");
     let path_str = path.to_str().expect("utf-8");

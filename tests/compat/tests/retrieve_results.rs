@@ -39,7 +39,11 @@ fn answers_are_unchanged_with_the_old_segment_directory_configured() {
         let without = run_retrieves(&store, None);
         for (index, request) in requests.iter().enumerate() {
             let (status, body) = &with[index];
-            assert_eq!(*status, without[index].0, "{} request {index}", fixture.label);
+            assert_eq!(
+                *status, without[index].0,
+                "{} request {index}",
+                fixture.label
+            );
             if request["body"].get("query_embedding").is_some() {
                 assert_eq!(
                     body["results"], without[index].1["results"],

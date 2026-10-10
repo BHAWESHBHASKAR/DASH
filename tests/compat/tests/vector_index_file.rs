@@ -26,7 +26,11 @@ fn load_with_index(state: &dash_compat::ScratchState) -> (InMemoryStore, VectorI
     (store, stats.vector_index)
 }
 
-fn assert_recorded_answers(fixture: &dash_compat::Fixture, state: &dash_compat::ScratchState, store: &InMemoryStore) {
+fn assert_recorded_answers(
+    fixture: &dash_compat::Fixture,
+    state: &dash_compat::ScratchState,
+    store: &InMemoryStore,
+) {
     let answers = run_retrieves(store, Some(&state.segments()));
     let diffs = diff_against_recorded(fixture, &answers);
     assert!(diffs.is_empty(), "{}:\n{}", fixture.label, diffs.join("\n"));
@@ -45,11 +49,19 @@ fn a_saved_index_of_the_current_format_loads_and_serves_the_same_answers() {
         let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         assert_eq!(version, VECTOR_INDEX_FORMAT_VERSION, "{}", fixture.label);
         let (store, restore) = load_with_index(&state);
-        assert!(restore.is_loaded(), "{}: {}", fixture.label, restore.describe());
+        assert!(
+            restore.is_loaded(),
+            "{}: {}",
+            fixture.label,
+            restore.describe()
+        );
         assert_recorded_answers(fixture, &state, &store);
         checked += 1;
     }
-    assert!(checked > 0, "at least one fixture carries a persisted index");
+    assert!(
+        checked > 0,
+        "at least one fixture carries a persisted index"
+    );
 }
 
 #[test]
@@ -66,7 +78,12 @@ fn a_release_without_the_file_starts_by_building_and_then_saves_it() {
             .save(&state.vindex())
             .expect("save");
         let (store, restore) = load_with_index(&state);
-        assert!(restore.is_loaded(), "{}: {}", fixture.label, restore.describe());
+        assert!(
+            restore.is_loaded(),
+            "{}: {}",
+            fixture.label,
+            restore.describe()
+        );
         assert_recorded_answers(fixture, &state, &store);
     }
 }

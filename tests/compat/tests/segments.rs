@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use dash_compat::{Era, FIXTURES};
 use indexer::{
-    CompactionSchedulerConfig, SegmentPublishOptions, legacy_tenant_dir_name, load_current_segments,
-    maintain_segment_root_strict, publish_claims_to_dir, read_tenant_marker, resolve_tenant_dir,
-    tenant_dir_name,
+    CompactionSchedulerConfig, SegmentPublishOptions, legacy_tenant_dir_name,
+    load_current_segments, maintain_segment_root_strict, publish_claims_to_dir, read_tenant_marker,
+    resolve_tenant_dir, tenant_dir_name,
 };
 use support::load_strict;
 
@@ -43,8 +43,10 @@ fn every_old_manifest_and_segment_file_verifies() {
                 dir.display()
             );
             tenant_dirs += 1;
-            let in_segments: BTreeSet<String> =
-                segments.iter().flat_map(|s| s.claim_ids.iter().cloned()).collect();
+            let in_segments: BTreeSet<String> = segments
+                .iter()
+                .flat_map(|s| s.claim_ids.iter().cloned())
+                .collect();
             // Every segment claim id is a claim the store knows, unless the
             // tenant was deleted after the publish (0.3 republishes the
             // tenant's segments on delete, so the set stays consistent).
@@ -72,7 +74,11 @@ fn the_maintenance_pass_accepts_an_old_segment_root() {
         let state = fixture.scratch_state();
         let stats = maintain_segment_root_strict(&state.segments(), Duration::from_secs(3600))
             .expect("maintenance over an old root");
-        assert!(stats.tenant_manifests_found >= 2, "{}: {stats:?}", fixture.label);
+        assert!(
+            stats.tenant_manifests_found >= 2,
+            "{}: {stats:?}",
+            fixture.label
+        );
     }
 }
 
@@ -123,7 +129,12 @@ fn a_legacy_tenant_directory_is_left_alone_and_the_tenant_republished() {
         let ids: BTreeSet<String> = segments.into_iter().flat_map(|s| s.claim_ids).collect();
         let want: BTreeSet<String> = claims.into_iter().map(|c| c.claim_id).collect();
         assert_eq!(ids, want, "{}", fixture.label);
-        assert_eq!(list_files(&legacy), legacy_before, "{}: legacy dir untouched", fixture.label);
+        assert_eq!(
+            list_files(&legacy),
+            legacy_before,
+            "{}: legacy dir untouched",
+            fixture.label
+        );
     }
 }
 

@@ -19,7 +19,13 @@ use support::load_strict;
 fn every_fixture_directory_is_registered() {
     let mut on_disk: Vec<String> = fs::read_dir(dash_compat::fixtures_dir())
         .expect("fixtures dir")
-        .map(|entry| entry.expect("entry").file_name().to_string_lossy().to_string())
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
         .collect();
     on_disk.sort();
     let mut registered: Vec<String> = FIXTURES.iter().map(|f| f.label.to_string()).collect();
@@ -30,7 +36,10 @@ fn every_fixture_directory_is_registered() {
     );
     for fixture in FIXTURES {
         let meta = fs::read_to_string(fixture.path("FIXTURE.txt")).expect("FIXTURE.txt");
-        assert!(meta.contains(&format!("label: {}", fixture.label)), "{meta}");
+        assert!(
+            meta.contains(&format!("label: {}", fixture.label)),
+            "{meta}"
+        );
         assert!(meta.contains("commit: "), "{meta}");
     }
 }
@@ -51,7 +60,8 @@ fn old_wal_and_snapshot_replay_strictly_without_quarantine() {
             match fixture.era {
                 // 0.2 wrote only unchecksummed records.
                 Era::V0_2 => assert_eq!(
-                    inspection.legacy_records, inspection.valid_records,
+                    inspection.legacy_records,
+                    inspection.valid_records,
                     "{}: {}",
                     fixture.label,
                     path.display()
@@ -62,8 +72,16 @@ fn old_wal_and_snapshot_replay_strictly_without_quarantine() {
         let (store, stats, _) = load_strict(&state);
         assert_eq!(stats.replay.quarantined_records, 0, "{}", fixture.label);
         assert_eq!(stats.replay.dependent_skipped, 0, "{}", fixture.label);
-        assert!(stats.replay.snapshot_records > 0, "{}: snapshot replayed", fixture.label);
-        assert!(stats.replay.wal_records > 0, "{}: WAL tail replayed", fixture.label);
+        assert!(
+            stats.replay.snapshot_records > 0,
+            "{}: snapshot replayed",
+            fixture.label
+        );
+        assert!(
+            stats.replay.wal_records > 0,
+            "{}: WAL tail replayed",
+            fixture.label
+        );
         assert_eq!(
             store.claims_len(),
             fixture.expected_claims_total(),
@@ -141,7 +159,10 @@ fn assert_fields_match(label: &str, what: &str, expected: &Value, actual: &Value
             (Some(a), Some(b)) => (a - b).abs() < 1e-6,
             _ => want == got,
         };
-        assert!(same, "{label}: {what}.{key} is {got}, was written as {want}");
+        assert!(
+            same,
+            "{label}: {what}.{key} is {got}, was written as {want}"
+        );
     }
 }
 
@@ -173,14 +194,23 @@ fn upgraded_store_holds_exactly_the_data_that_was_written() {
             let rows = store.evidence_for_claim(claim_id);
             let ids: Vec<String> = rows.iter().map(|e| e.evidence_id.clone()).collect();
             let unique: BTreeSet<String> = ids.iter().cloned().collect();
-            assert_eq!(ids.len(), unique.len(), "{}: duplicate evidence {ids:?}", fixture.label);
+            assert_eq!(
+                ids.len(),
+                unique.len(),
+                "{}: duplicate evidence {ids:?}",
+                fixture.label
+            );
             let want_ids: BTreeSet<String> = expected
                 .evidence
                 .keys()
                 .filter(|(claim, _)| claim == claim_id)
                 .map(|(_, id)| id.clone())
                 .collect();
-            assert_eq!(unique, want_ids, "{}: evidence of {claim_id}", fixture.label);
+            assert_eq!(
+                unique, want_ids,
+                "{}: evidence of {claim_id}",
+                fixture.label
+            );
             for row in rows {
                 let want = &expected.evidence[&(claim_id.clone(), row.evidence_id.clone())];
                 let got = serde_json::to_value(&row).expect("serialize evidence");
@@ -200,8 +230,15 @@ fn upgraded_store_holds_exactly_the_data_that_was_written() {
         }
         assert_eq!(edges, expected.edges, "{}: edges", fixture.label);
         for (claim_id, dim) in &expected.vectors {
-            let tenant = expected.claims[claim_id]["tenant_id"].as_str().expect("tenant");
-            assert_eq!(store.tenant_vector_dim(tenant), Some(*dim), "{}", fixture.label);
+            let tenant = expected.claims[claim_id]["tenant_id"]
+                .as_str()
+                .expect("tenant");
+            assert_eq!(
+                store.tenant_vector_dim(tenant),
+                Some(*dim),
+                "{}",
+                fixture.label
+            );
         }
     }
 }
@@ -220,7 +257,11 @@ fn a_wal_without_a_generation_file_gets_one_on_first_open() {
         let first = FileWal::open(state.wal()).expect("open").generation();
         assert!(state.generation_file().exists(), "{}", fixture.label);
         let second = FileWal::open(state.wal()).expect("reopen").generation();
-        assert_eq!(first, second, "{}: the generation is stable across restarts", fixture.label);
+        assert_eq!(
+            first, second,
+            "{}: the generation is stable across restarts",
+            fixture.label
+        );
     }
 }
 
@@ -235,7 +276,12 @@ fn a_checkpoint_rewrites_everything_in_the_current_format_and_reloads() {
             generation_before = wal.generation();
             claims_before = store.claims_len();
             store.checkpoint_and_compact(&mut wal).expect("checkpoint");
-            assert_ne!(wal.generation(), generation_before, "{}: new lineage", fixture.label);
+            assert_ne!(
+                wal.generation(),
+                generation_before,
+                "{}: new lineage",
+                fixture.label
+            );
         }
         let kinds = record_kinds(&state.snapshot());
         assert!(!kinds.is_empty(), "{}", fixture.label);
@@ -246,7 +292,11 @@ fn a_checkpoint_rewrites_everything_in_the_current_format_and_reloads() {
                 fixture.label
             );
         }
-        assert!(record_kinds(&state.wal()).is_empty(), "{}: WAL truncated", fixture.label);
+        assert!(
+            record_kinds(&state.wal()).is_empty(),
+            "{}: WAL truncated",
+            fixture.label
+        );
         let inspection = inspect_wal_file(state.snapshot()).expect("inspect");
         assert_eq!(inspection.legacy_records, 0, "{}", fixture.label);
         assert_eq!(inspection.checksum_failures(), 0, "{}", fixture.label);
@@ -268,11 +318,20 @@ fn a_checkpoint_rewrites_everything_in_the_current_format_and_reloads() {
 /// the backup taken before the upgrade (docs/operations/upgrades.md).
 #[test]
 fn a_0_2_build_cannot_read_what_the_current_code_writes() {
-    let fixture = FIXTURES.iter().find(|f| f.era == Era::V0_2).expect("0.2 fixture");
+    let fixture = FIXTURES
+        .iter()
+        .find(|f| f.era == Era::V0_2)
+        .expect("0.2 fixture");
     let state = fixture.scratch_state();
     // Before the upgrade touches anything, 0.2 can read its own files.
-    for kind in record_kinds(&state.wal()).iter().chain(&record_kinds(&state.snapshot())) {
-        assert!(old_readers::V0_2_WAL_KINDS.contains(&kind.as_str()), "{kind}");
+    for kind in record_kinds(&state.wal())
+        .iter()
+        .chain(&record_kinds(&state.snapshot()))
+    {
+        assert!(
+            old_readers::V0_2_WAL_KINDS.contains(&kind.as_str()),
+            "{kind}"
+        );
     }
     {
         let (store, _, mut wal) = load_strict(&state);
@@ -282,7 +341,10 @@ fn a_0_2_build_cannot_read_what_the_current_code_writes() {
         .into_iter()
         .filter(|kind| !old_readers::V0_2_WAL_KINDS.contains(&kind.as_str()))
         .count();
-    assert!(unreadable > 0, "a checkpointed snapshot is unreadable by 0.2");
+    assert!(
+        unreadable > 0,
+        "a checkpointed snapshot is unreadable by 0.2"
+    );
     let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
     assert!(
         guide.contains("restore the backup taken before the upgrade"),
@@ -319,13 +381,24 @@ fn after_a_checkpoint_no_tombstone_is_left_for_an_older_reader() {
         }
         let wal = FileWal::open(state.wal()).expect("reopen");
         let store = InMemoryStore::load_from_wal(&wal).expect("reload");
-        assert!(store.claims_for_tenant("tenant-hash").is_empty(), "{}", fixture.label);
         assert!(
-            store.claims_for_tenant("tenant-a").iter().all(|c| c.claim_id != "a-c06"),
+            store.claims_for_tenant("tenant-hash").is_empty(),
             "{}",
             fixture.label
         );
-        let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
-        assert!(guide.contains("checkpoint before the downgrade"), "guide documents it");
+        assert!(
+            store
+                .claims_for_tenant("tenant-a")
+                .iter()
+                .all(|c| c.claim_id != "a-c06"),
+            "{}",
+            fixture.label
+        );
+        let guide =
+            fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
+        assert!(
+            guide.contains("checkpoint before the downgrade"),
+            "guide documents it"
+        );
     }
 }
