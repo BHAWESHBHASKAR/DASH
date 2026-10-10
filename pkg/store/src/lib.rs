@@ -4,10 +4,10 @@ use std::{
 };
 
 use graph::summarize_incoming_edges;
-use ranking::{RankSignals, bm25_score, score_claim_with_bm25};
+use ranking::{RankSignals, hybrid_relevance, lexical_relevance, prior_score, ranked_score};
 use schema::{
     Citation, Claim, ClaimEdge, Evidence, Relation, RetrievalRequest, RetrievalResult, Stance,
-    StanceMode, ValidationError, tokenize, validate_claim, validate_edge, validate_evidence,
+    StanceMode, ValidationError, validate_claim, validate_edge, validate_evidence,
 };
 
 #[macro_use]
@@ -23,11 +23,13 @@ mod gpu;
 mod group_commit;
 mod metrics;
 pub mod observe;
+pub mod text_index;
 pub mod vector_index;
 mod vector_persist;
 mod wal;
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
+use text_index::{QueryTerms, TenantTextIndex, analyze_query};
 pub use vector_index::AnnTuningConfig;
 use vector_index::{TenantVectorIndex, exact_top_k};
 pub use vector_persist::{
@@ -35,11 +37,12 @@ pub use vector_persist::{
     VectorIndexSnapshot,
 };
 
-#[derive(Default)]
-pub(crate) struct Bm25Context {
-    doc_freq: HashMap<String, usize>,
-    total_docs: usize,
-    avg_doc_len: f32,
+/// The claims a retrieve scores and the BM25 of each one that shares a
+/// query term (see [`InMemoryStore::candidate_claim_ids`]).
+struct Candidates {
+    /// Sorted by claim id.
+    ids: Vec<String>,
+    query_terms: QueryTerms,
 }
 
 pub use group_commit::{
@@ -304,12 +307,12 @@ pub struct InMemoryStore {
     defer_vector_index: bool,
     tenant_vector_dims: HashMap<String, usize>,
     tenant_claim_ids: HashMap<String, HashSet<String>>,
-    inverted_index: HashMap<String, HashMap<String, HashSet<String>>>,
+    /// Per-tenant full-text index (BM25 over analysed `canonical_text`).
+    text_indexes: HashMap<String, TenantTextIndex>,
     entity_index: HashMap<String, HashMap<String, HashSet<String>>>,
     embedding_index: HashMap<String, HashMap<String, HashSet<String>>>,
     temporal_index: HashMap<String, BTreeMap<i64, HashSet<String>>>,
     batch_commits: HashMap<String, BatchCommitMetadata>,
-    claim_tokens: HashMap<String, Vec<String>>,
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
     wal: WalEventRing,
@@ -434,12 +437,11 @@ impl InMemoryStore {
             defer_vector_index: false,
             tenant_vector_dims: self.tenant_vector_dims.clone(),
             tenant_claim_ids: self.tenant_claim_ids.clone(),
-            inverted_index: self.inverted_index.clone(),
+            text_indexes: self.text_indexes.clone(),
             entity_index: self.entity_index.clone(),
             embedding_index: self.embedding_index.clone(),
             temporal_index: self.temporal_index.clone(),
             batch_commits: self.batch_commits.clone(),
-            claim_tokens: self.claim_tokens.clone(),
             ann_tuning: self.ann_tuning.clone(),
             vector_backend_runtime: self.vector_backend_runtime,
             wal: self.wal.clone(),
@@ -1426,7 +1428,7 @@ impl InMemoryStore {
             req.top_k,
             allowed_claim_ids,
         );
-        let candidate_count = candidates.len();
+        let candidate_count = candidates.ids.len();
         (
             self.score_and_rank_candidate_claim_ids(req, query_vector, candidates),
             candidate_count,
@@ -1466,7 +1468,7 @@ impl InMemoryStore {
         &self,
         req: &RetrievalRequest,
         query_vector: Option<&[f32]>,
-        candidates: Vec<String>,
+        candidates: Candidates,
     ) -> Vec<RetrievalResult> {
         // DATA-05: a malformed query vector (non-finite, zero norm, wrong
         // dimension) must not silently degrade into NaN scores or a
@@ -1477,8 +1479,22 @@ impl InMemoryStore {
         {
             return Vec::new();
         }
+        let Candidates {
+            ids: candidates,
+            query_terms,
+        } = candidates;
         let mut ranked: Vec<RetrievalResult> = Vec::new();
-        let bm25_context = self.bm25_context_for_tenant(&req.tenant_id, &req.query);
+
+        // BM25 of every candidate (zero when it shares no query term), and
+        // the query's BM25 upper bound that maps it into [0, 1).
+        let text_index = self.text_indexes.get(&req.tenant_id);
+        let bm25_max = text_index
+            .map(|index| index.max_score(&query_terms))
+            .unwrap_or(0.0);
+        let bm25: Vec<f64> = match text_index {
+            Some(index) => index.score_many(&query_terms, &candidates),
+            None => vec![0.0; candidates.len()],
+        };
         let dense_similarities = query_vector.map(|vector| {
             let candidate_vectors: Vec<(String, &[f32])> = candidates
                 .iter()
@@ -1495,9 +1511,8 @@ impl InMemoryStore {
                 .into_iter()
                 .collect::<HashMap<String, f32>>()
         });
-
-        for claim_id in candidates {
-            let Some(claim) = self.claims.get(&claim_id) else {
+        for (position, claim_id) in candidates.iter().enumerate() {
+            let Some(claim) = self.claims.get(claim_id) else {
                 continue;
             };
 
@@ -1562,53 +1577,26 @@ impl InMemoryStore {
                 evidence.iter().map(|e| e.source_quality).sum::<f32>() / evidence.len() as f32
             };
 
-            let bm25 = self
-                .claim_tokens
-                .get(&claim.claim_id)
-                .map(|tokens| {
-                    bm25_score(
-                        &req.query,
-                        tokens,
-                        &bm25_context.doc_freq,
-                        bm25_context.total_docs,
-                        bm25_context.avg_doc_len,
-                    )
-                })
-                .unwrap_or(0.0);
-
-            let dense_similarity = dense_similarities
-                .as_ref()
-                .and_then(|scores| scores.get(&claim.claim_id))
-                .copied()
-                .unwrap_or(0.0);
-
-            let lexical_score = score_claim_with_bm25(
-                &req.query,
+            let priors = prior_score(
                 claim,
                 avg_quality,
                 RankSignals {
                     supports: signal_supports,
                     contradicts: signal_contradicts,
                 },
-                bm25,
             );
-
-            let score = if query_vector.is_some() {
-                // Semantic-first retrieval: dense similarity is the
-                // PRIMARY signal (cosine in [-1, 1] -> mapped to
-                // [0, 1] via the embedding backend). The lexical/BM25
-                // score is a small tie-breaker when dense similarities
-                // are tied. This replaces the historical 0.35 additive
-                // weight with semantic-primary scoring, which is the
-                // right default when the caller explicitly provides
-                // a query vector.
-                let dense_primary = (dense_similarity + 1.0) * 0.5;
-                dense_primary + (lexical_score * 0.1)
+            let text_relevance = if bm25_max > 0.0 {
+                (bm25[position] / bm25_max) as f32
             } else {
-                // Lexical-only retrieval: historical behavior
-                // (dense_similarity is 0.0 when no query_vector).
-                lexical_score + (dense_similarity * 0.35)
+                0.0
             };
+            let relevance = if let Some(scores) = dense_similarities.as_ref() {
+                // Hybrid: calibrated blend, vector similarity first.
+                hybrid_relevance(scores.get(claim_id).copied(), text_relevance)
+            } else {
+                lexical_relevance(text_relevance)
+            };
+            let score = ranked_score(relevance, priors);
 
             let citations = evidence
                 .iter()
@@ -1737,9 +1725,9 @@ impl InMemoryStore {
 
     pub fn index_stats(&self) -> StoreIndexStats {
         let inverted_terms = self
-            .inverted_index
+            .text_indexes
             .values()
-            .map(|tenant_index| tenant_index.len())
+            .map(TenantTextIndex::term_count)
             .sum();
         let entity_terms = self
             .entity_index
@@ -1777,6 +1765,7 @@ impl InMemoryStore {
         to_unix: Option<i64>,
     ) -> usize {
         self.candidate_claim_ids(tenant_id, query, (from_unix, to_unix), None, 5, None)
+            .ids
             .len()
     }
 
@@ -1815,6 +1804,7 @@ impl InMemoryStore {
             req.top_k,
             allowed_claim_ids,
         )
+        .ids
         .len()
     }
 
@@ -1827,9 +1817,14 @@ impl InMemoryStore {
         if query_vector.is_empty() {
             return 0;
         }
-        let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-        self.vector_candidates(tenant_id, query_vector, vector_top_n, (None, None), None)
-            .len()
+        self.vector_candidates(
+            tenant_id,
+            query_vector,
+            candidate_depth(top_k),
+            (None, None),
+            None,
+        )
+        .len()
     }
 
     pub fn ann_vector_top_candidates(
@@ -1994,16 +1989,19 @@ impl InMemoryStore {
     /// The claims of `tenant_id` a retrieve scores, sorted by claim id. This
     /// is the single relevance rule of every retrieve path:
     ///
-    /// - a claim sharing at least one token with `query` (the tenant's
-    ///   inverted index) is a lexical candidate;
-    /// - with a valid `query_vector`, the `top_k * 20` (clamped to
-    ///   100..=5000) nearest claims are vector candidates;
+    /// - the `top_k * 20` (clamped to 100..=5000) claims with the highest
+    ///   BM25 for `query` in the tenant's full-text index (see
+    ///   [`text_index`]) are lexical candidates; only claims sharing at least
+    ///   one analysed query term have a BM25 above zero, and the time range
+    ///   and `allowed_claim_ids` are applied before the top is taken;
+    /// - with a valid `query_vector`, the same number of nearest claims are
+    ///   vector candidates;
     /// - nothing else is: a claim with no query term and no vector
     ///   similarity is never returned, even when fewer than `top_k` claims
     ///   match. Recency, confidence, source quality and graph signals only
     ///   rank candidates, they never make a claim one.
     ///
-    /// A query without any token (empty or punctuation only) puts no lexical
+    /// A query without any word (empty or punctuation only) puts no lexical
     /// constraint on the pool: every claim passing the filters is a
     /// candidate (the HTTP API rejects an empty query).
     ///
@@ -2016,57 +2014,59 @@ impl InMemoryStore {
         query_vector: Option<&[f32]>,
         top_k: usize,
         allowed_claim_ids: Option<&HashSet<String>>,
-    ) -> Vec<String> {
+    ) -> Candidates {
         let (from_unix, to_unix) = time_range;
+        let has_time = from_unix.is_some() || to_unix.is_some();
+        let passes = |claim_id: &str| {
+            allowed_claim_ids.is_none_or(|allowed| allowed.contains(claim_id))
+                && (!has_time
+                    || self
+                        .claims
+                        .get(claim_id)
+                        .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix)))
+        };
         let mut candidates: HashSet<String> = HashSet::new();
-        let query_tokens = tokenize(query);
+        let query_terms = analyze_query(query);
+        let top_n = candidate_depth(top_k);
 
-        if query_tokens.is_empty() {
+        if query_terms.is_empty() {
             if let Some(ids) = self.tenant_claim_ids.get(tenant_id) {
-                candidates.extend(ids.iter().cloned());
+                candidates.extend(ids.iter().filter(|id| passes(id)).cloned());
             }
-        } else if let Some(tenant_index) = self.inverted_index.get(tenant_id) {
-            for token in query_tokens {
-                if let Some(ids) = tenant_index.get(&token) {
-                    candidates.extend(ids.iter().cloned());
-                }
-            }
+        } else if let Some(index) = self.text_indexes.get(tenant_id) {
+            let filter: Option<&dyn Fn(&str) -> bool> = if has_time || allowed_claim_ids.is_some() {
+                Some(&passes)
+            } else {
+                None
+            };
+            candidates.extend(
+                index
+                    .search(&query_terms, top_n, filter)
+                    .into_iter()
+                    .map(|(claim_id, _)| claim_id),
+            );
         }
 
         if let Some(vector) = query_vector {
-            let vector_top_n = (top_k.saturating_mul(20)).clamp(100, 5000);
-            for claim_id in self.vector_candidates(
-                tenant_id,
-                vector,
-                vector_top_n,
-                time_range,
-                allowed_claim_ids,
-            ) {
+            for claim_id in
+                self.vector_candidates(tenant_id, vector, top_n, time_range, allowed_claim_ids)
+            {
                 candidates.insert(claim_id);
             }
         }
 
-        if from_unix.is_some() || to_unix.is_some() {
-            candidates.retain(|claim_id| {
-                self.claims
-                    .get(claim_id)
-                    .is_some_and(|claim| claim_matches_time_range(claim, from_unix, to_unix))
-            });
-        }
-        if let Some(allowed_ids) = allowed_claim_ids {
-            candidates = candidates.intersection(allowed_ids).cloned().collect();
-        }
-
-        let mut out: Vec<String> = candidates
+        let mut ids: Vec<String> = candidates
             .into_iter()
             .filter(|claim_id| {
-                self.claims
-                    .get(claim_id)
-                    .is_some_and(|claim| claim.tenant_id == tenant_id)
+                passes(claim_id)
+                    && self
+                        .claims
+                        .get(claim_id)
+                        .is_some_and(|claim| claim.tenant_id == tenant_id)
             })
             .collect();
-        out.sort_unstable();
-        out
+        ids.sort_unstable();
+        Candidates { ids, query_terms }
     }
 
     /// Vector candidates for `tenant_id`: the `top_n` claim ids most similar
@@ -2187,43 +2187,6 @@ impl InMemoryStore {
         }
 
         score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
-    }
-
-    fn bm25_context_for_tenant(&self, tenant_id: &str, query: &str) -> Bm25Context {
-        let total_docs = self
-            .tenant_claim_ids
-            .get(tenant_id)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-        if total_docs == 0 {
-            return Bm25Context::default();
-        }
-
-        let mut total_len = 0usize;
-        for claim_id in self.tenant_claim_ids.get(tenant_id).into_iter().flatten() {
-            total_len += self
-                .claim_tokens
-                .get(claim_id)
-                .map(|tokens| tokens.len())
-                .unwrap_or(0);
-        }
-        let avg_doc_len = (total_len as f32 / total_docs as f32).max(1.0);
-
-        let mut doc_freq = HashMap::new();
-        if let Some(index) = self.inverted_index.get(tenant_id) {
-            for token in tokenize(query) {
-                doc_freq.insert(
-                    token.clone(),
-                    index.get(&token).map(|ids| ids.len()).unwrap_or(0),
-                );
-            }
-        }
-
-        Bm25Context {
-            doc_freq,
-            total_docs,
-            avg_doc_len,
-        }
     }
 
     fn snapshot_records(&self) -> Vec<PersistedRecord> {
@@ -2772,22 +2735,10 @@ impl InMemoryStore {
             .or_default()
             .insert(claim.claim_id.clone());
 
-        let tokens = tokenize(&claim.canonical_text);
-        self.claim_tokens
-            .insert(claim.claim_id.clone(), tokens.clone());
-        let token_index = self
-            .inverted_index
+        self.text_indexes
             .entry(claim.tenant_id.clone())
-            .or_default();
-        let mut seen = HashSet::new();
-        for token in tokens {
-            if seen.insert(token.clone()) {
-                token_index
-                    .entry(token)
-                    .or_default()
-                    .insert(claim.claim_id.clone());
-            }
-        }
+            .or_default()
+            .insert(&claim.claim_id, &claim.canonical_text);
 
         let entity_index = self
             .entity_index
@@ -2842,32 +2793,13 @@ impl InMemoryStore {
             self.tenant_claim_ids.remove(&claim.tenant_id);
         }
 
-        if let Some(tokens) = self.claim_tokens.remove(&claim.claim_id)
-            && let Some(token_index) = self.inverted_index.get_mut(&claim.tenant_id)
-        {
-            let mut seen = HashSet::new();
-            let mut remove_tokens = Vec::new();
-            for token in tokens {
-                if !seen.insert(token.clone()) {
-                    continue;
-                }
-                if let Some(ids) = token_index.get_mut(&token) {
-                    ids.remove(&claim.claim_id);
-                    if ids.is_empty() {
-                        remove_tokens.push(token);
-                    }
-                }
-            }
-            for token in remove_tokens {
-                token_index.remove(&token);
-            }
+        let mut drop_text_index = false;
+        if let Some(index) = self.text_indexes.get_mut(&claim.tenant_id) {
+            index.remove(&claim.claim_id, &claim.canonical_text);
+            drop_text_index = index.is_empty();
         }
-        if self
-            .inverted_index
-            .get(&claim.tenant_id)
-            .is_some_and(|index| index.is_empty())
-        {
-            self.inverted_index.remove(&claim.tenant_id);
+        if drop_text_index {
+            self.text_indexes.remove(&claim.tenant_id);
         }
 
         let mut remove_entity_index = false;
@@ -2987,6 +2919,12 @@ fn score_query_candidate_vectors_cpu(
             Some((claim_id.clone(), score))
         })
         .collect()
+}
+
+/// How many lexical and how many vector candidates a retrieve of `top_k`
+/// considers: `top_k * 20`, clamped to 100..=5000.
+pub fn candidate_depth(top_k: usize) -> usize {
+    top_k.saturating_mul(20).clamp(100, 5000)
 }
 
 fn value_in_time_range(value: i64, from_unix: Option<i64>, to_unix: Option<i64>) -> bool {

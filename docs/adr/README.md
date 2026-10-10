@@ -2,7 +2,7 @@
 
 | ADR | Title | Status |
 |---|---|---|
-| [0003](0003-storage-engine-indexes.md) | Storage engine indexes: vector (usearch), text (tantivy), filtering, durability | Proposed (measured by the P2 engine spike; vector index implemented in P2 step 1, see section 10) |
+| [0003](0003-storage-engine-indexes.md) | Storage engine indexes: vector (usearch), text (tantivy), filtering, durability | Proposed (measured by the P2 engine spike; vector index implemented in P2 step 1, see section 10; text index built in-tree with BM25 instead of tantivy, see section 12) |
 | [0004](0004-per-tenant-write-partitioning.md) | Per-tenant write partitioning of the ingestion runtime lock | Deferred (design recorded; superseded in direction by ADR-06) |
 
 ADRs 0001 and 0002 are not present in this repository. The master plan

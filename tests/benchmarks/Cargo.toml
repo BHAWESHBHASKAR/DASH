@@ -21,6 +21,10 @@ path = "src/bin/load_test.rs"
 name = "cold_start"
 path = "src/bin/cold_start.rs"
 
+[[bin]]
+name = "fulltext_bench"
+path = "src/bin/fulltext_bench.rs"
+
 [[bench]]
 name = "criterion_benches"
 harness = false

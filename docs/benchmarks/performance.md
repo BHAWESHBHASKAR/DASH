@@ -225,6 +225,70 @@ cold start is now bounded by parsing the text WAL (about 2x faster at 50k,
 about 3x at 100k). Catch-up re-inserts the vectors written after the last save
 one by one, about 0.7 ms each at 384-d. ADR 0003 section 11 has the design.
 
+## Full-text index (2026-10-10)
+
+`pkg/store/src/text_index.rs` (ADR 0003 section 12). Two measurements: retrieval quality on a labelled set, and
+cost at 100,000 claims.
+
+### Quality: nDCG@10 and recall@10
+
+`cargo test -p store --test relevance_eval -- --nocapture`. The set (`pkg/store/tests/relevance/mod.rs`) is generated
+deterministically: 24 topics with their own entities, nouns, inflected verbs and three aspects each, 16 claims per topic,
+64 distractor claims made of words every topic uses, about a third of the claims also naming a noun of another topic,
+mixed case and punctuation; 72 queries (aspect, entity with stop words, upper-case keywords) using other surface forms
+than the claims, with graded judgements (2 = topic and aspect or entity, 1 = topic). Gain `2^grade - 1`; recall@10 is
+capped (`hits / min(10, relevant)`). Claims carry no evidence or edges; confidence varies from 0.5 to 1.0, so the prior
+signals add noise that the judgements do not reward.
+
+| System | nDCG@10 | recall@10 |
+|---|---|---|
+| Previous shared-word rule (candidates share an ASCII token; overlap + raw BM25 + priors) | 0.7686 | 0.6597 |
+| Previous hybrid score (`(cos + 1) / 2 + 0.1 * old lexical`, 200 nearest vectors) | 0.7657 | 0.6417 |
+| BM25 alone (`TenantTextIndex::search`) | **0.8744** | **0.8375** |
+| Vector alone (exact cosine, 384-d hash embeddings) | 0.3106 | 0.2222 |
+| `InMemoryStore::retrieve` (BM25 candidates, normalised BM25 + priors) | 0.8634 | 0.8264 |
+| `InMemoryStore::retrieve_semantic` (hybrid blend, hash-embedding query vector) | 0.7950 | 0.6819 |
+
+The test fails when BM25, the store's lexical or its hybrid retrieve drops 0.02 below these values, or when either new
+path stops beating the path it replaced. Hybrid is below BM25 alone here because the hash embedder is a development
+stand-in (vector alone 0.31) and the blend keeps the semantic-first guarantee (cosine weighs as much as normalised BM25);
+with a real embedding model the vector part is expected to help, but that is not measured. The set is synthetic; numbers
+on a real corpus are not measured either.
+
+### Cost at 100,000 claims
+
+`cargo run --release -p benchmark-smoke --bin fulltext_bench -- 100000 1000 64`. Corpus as in the ADR 0003 text spike:
+Zipf (s = 1.0) over 50k words, 30 to 60 words per claim (4.5M words), one tenant; 1,000 OR queries per cell taken from a
+random claim ("natural": Zipf-weighted, head words dominate; "midtail": words of rank >= 100); top_k 10. Release build,
+4 vCPUs on a shared VM, one run. The previous rule is re-implemented in the binary (union of posting sets, composite
+score of every candidate, statistics recomputed per query) and run on the first 100 queries of each cell.
+
+| | |
+|---|---|
+| Index build (insert of 100k claims) | 1.26 s, 12.6 us per claim |
+| Store ingest of the same claims (no vectors, includes the index) | 1.53 s, 15.3 us per claim (index insert is 82 % of it) |
+| Index heap | 54.9 MB, 549 B per claim (12 B per posting: slot + term frequency, plus terms and the id table) |
+| Store RSS growth for the claims (claim rows, all indexes) | 125.6 MB, 1,286 B per claim |
+| Delete (index only) | 220 us per claim (posting lists of head terms are shifted); a tenant erasure drops the index at once |
+
+Query latency p50 / p95 / p99 in microseconds:
+
+| Mix, terms | Index top-200 | Store retrieve (text only) | Previous rule | Previous rule, avg candidates |
+|---|---|---|---|---|
+| natural, 1 | 190 / 1,230 / 1,471 | 444 / 1,505 / 1,833 | 8,946 / 701,081 / 758,385 | 25,909 |
+| natural, 3 | 930 / 1,508 / 1,671 | 1,305 / 1,887 / 2,059 | 347,210 / 784,449 / 847,841 | 48,064 |
+| natural, 6 | 1,260 / 1,868 / 2,338 | 1,687 / 2,330 / 2,669 | 791,880 / 921,301 / 943,413 | 73,049 |
+| midtail, 1 | 90 / 192 / 236 | 273 / 433 / 484 | 1,938 / 22,919 / 28,785 | 709 |
+| midtail, 3 | 148 / 246 / 295 | 408 / 537 / 650 | 13,676 / 33,435 / 46,414 | 1,750 |
+| midtail, 6 | 193 / 305 / 381 | 501 / 637 / 741 | 26,380 / 59,032 / 82,546 | 3,356 |
+
+Hybrid retrieve (natural, 3 terms, 64-d random vectors, HNSW): 2,881 / 3,841 / 4,610 us.
+
+The index is not persisted: the WAL replay at startup rebuilds it, which adds the build time above (about 1.3 s per
+100k claims of this length) to a replay that costs about 9 s per 100k claims with 384-d vectors. The index scores
+term-at-a-time over whole posting lists (no block-max WAND), so queries dominated by head terms cost about 1-2 ms at
+100k; the tantivy spike measured 0.07-0.3 ms p50 on the same corpus shape.
+
 ## Known bottlenecks
 
 The numbers above point to three dominant cost centers in the

@@ -6,6 +6,52 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (full-text relevance: BM25 index; ADR 0003 section 12)
+
+- **Lexical retrieval uses a per-tenant BM25 full-text index**
+  (`pkg/store/src/text_index.rs`) instead of the shared-word rule. Text is
+  split with the Unicode word rules (UAX #29) and lowercased; ASCII words
+  are stemmed (English Snowball); stop words are dropped from queries unless
+  nothing else remains. Lexical candidates are the `top_k * 20` claims
+  (clamped to 100..5000) with the highest BM25, chosen after the time range
+  and allowed-claim filters, instead of every claim sharing a token; vector
+  candidates are unchanged. The segment and in-memory paths still apply the
+  same rule, so answers do not depend on the segment directory.
+- **Behaviour changes a client can see.** Accented and non-Latin words are
+  now searchable (the old tokenizer kept ASCII letters and digits only, so
+  `café` became `caf` and `東京` was dropped); punctuation splits words
+  (`X-Y` matches `x` and `y`, `Company-Y` no longer becomes `companyy`);
+  inflected forms match (`acquire` finds `acquired`); a query that only
+  shares a stop word with a claim no longer matches it. Scores changed:
+  lexical relevance is BM25 divided by the query's BM25 upper bound, hybrid
+  relevance is `2/3 * (cosine + 1) / 2 + 1/3 * normalised BM25`, and the
+  prior signals (confidence, source quality, saturated support and
+  contradiction) are added at half weight. The response shape is unchanged.
+  The API reference documents the rule (`POST /v1/retrieve`, "Which claims
+  are returned" and "Terms and ranking").
+- **Quality gate.** A labelled relevance set (448 claims, 72 queries with
+  graded judgements, generated deterministically in
+  `pkg/store/tests/relevance/`) reports nDCG@10 / recall@10 for the old
+  rule (0.769 / 0.660), BM25 alone (0.874 / 0.838), hash-embedding vectors
+  alone (0.311 / 0.222), the store's lexical retrieve (0.863 / 0.826) and
+  hybrid retrieve (0.795 / 0.682, old hybrid 0.766 / 0.642);
+  `pkg/store/tests/relevance_eval.rs` fails below recorded floors.
+- **Cost** (release, 100,000 claims of 30 to 60 words, 4 vCPUs,
+  `tests/benchmarks/src/bin/fulltext_bench.rs`): text-only retrieve p50
+  0.27 to 1.7 ms (the previous rule: 2 ms to 0.8 s on the same queries);
+  index build 12.6 us per claim (1.26 s per 100k, added to the WAL replay);
+  index heap 549 B per claim; delete 220 us per claim. Details in
+  `docs/benchmarks/performance.md` ("Full-text index").
+- The index is rebuilt by the WAL replay at startup and kept in step by
+  ingest, re-upsert, claim and tenant tombstones, replication apply and
+  resync; it is not persisted. New dependencies: `unicode-segmentation`
+  (MIT or Apache-2.0) and `rust-stemmers` (MIT or BSD-3-Clause); `cargo
+  deny` passes. No new configuration.
+- Compat: `tests/compat/expected/*.json` list the requests whose order
+  changed with BM25 and why; a new `scores_changed` field states that scores
+  of the 0.3.0-dev fixture changed by design while claim order, stance
+  counts and citations are still compared.
+
 ### Added (observability: metrics, request ids, alerts, runbooks, SLOs)
 
 - **`dash-observe` crate** (`pkg/observe`): lock-free Prometheus histograms,
