@@ -88,7 +88,7 @@ fn hand_written_prose_sections_survive_generation() {
         "Adapter commands are operator-controlled",
         "Tenant directories under the segment root",
         "Provider outages (breaker open",
-        "**No service calls it**",
+        "each node encrypts what it stores with its own key",
         "scripts/generate-secrets.sh",
     ] {
         assert!(page.contains(needle), "lost prose: {needle}");

@@ -193,14 +193,16 @@ The provider clients use HTTPS (rustls) where the URL is `https://`, do not foll
 
 Network providers (`ollama`, `openai`) are wrapped in a circuit breaker and a concurrency cap (`DASH_EMBEDDING_MAX_CONCURRENCY`, `DASH_EMBEDDING_QUEUE_WAIT_MS`, `DASH_EMBEDDING_BREAKER_THRESHOLD`, `DASH_EMBEDDING_BREAKER_RESET_MS`). Provider outages (breaker open, timeout, connection error, 429, 5xx, concurrency cap) answer 503 `embedding_unavailable` with `Retry-After` (the upstream's value when present, otherwise 1). Unusable provider output (non-finite values, wrong dimensions, malformed payload, other 4xx) answers 502 `embedding_provider_error` (retrieval) or `embedding_upstream_error` (ingestion).
 
-### Encryption (library only)
+### Encryption at rest
 
-`DASH_ENCRYPTION_PROVIDER` (`none` or `env`) and `DASH_ENCRYPTION_MASTER_KEY` (64 hex characters or base64 of 32 bytes) are read by `pkg/encryption::provider_from_env` (also under the `EME_` names). **No service calls it**, so setting them has no effect on stored data. Encryption at rest is planned (P4).
+Off by default. Read by the ingestion and retrieval services, the `segment-maintenance-daemon` and `wal-inspect`. Envelope encryption (AES-256-GCM): every file gets its own data key, wrapped by the key in `DASH_ENCRYPTION_KEY_FILE`. Replication frames and exports on the wire stay plaintext (protect them with TLS); each node encrypts what it stores with its own key. See `docs/operations/encryption.md` and ADR 0005.
 
 | Variable | Default | Type | Description | Notes |
 |---|---|---|---|---|
-| `DASH_ENCRYPTION_PROVIDER` | `none` | `none` \| `env` | Read by `pkg/encryption::provider_from_env`. **No service calls it**, so setting it has no effect on stored data. Encryption at rest is planned (P4). | Not read by any service. |
-| `DASH_ENCRYPTION_MASTER_KEY` | unset | secret | 64 hex characters or base64 of 32 bytes, for provider `env`. Not used by any service yet. | Not read by any service. |
+| `DASH_ENCRYPTION_KEY_FILE` | unset | path | Path of the active key-encryption key: 64 hex characters (`openssl rand -hex 32`) or 32 raw bytes. **Setting it turns encryption at rest on**: new WAL, snapshot, export, vector index, segment files and redb values are encrypted under per-file data keys wrapped by this key. The file must not be accessible to other users or writable by the group (mode `0600`/`0400`; group read is tolerated for Kubernetes `fsGroup`). Unset: encryption off, and a service refuses to start if it finds encrypted files. | DASH only. Read by ingestion, retrieval, tools. |
+| `DASH_ENCRYPTION_PREVIOUS_KEY_FILES` | unset | list (`,`) | Comma-separated paths of retired key files that still decrypt (key rotation). Files written under them stay readable; new files use `DASH_ENCRYPTION_KEY_FILE`. Requires `DASH_ENCRYPTION_KEY_FILE`. | DASH only. Read by ingestion, retrieval, tools. |
+
+Audit logs, `<wal>.gen*` files, export manifests and redb keys (tenant, claim and evidence ids) are not encrypted. Rotation: make the new key active, list the old one in `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, restart, then run `wal-inspect rewrap <dir>` (or let checkpoints rewrite the files) before removing the old key.
 
 ### Container and compose variables
 

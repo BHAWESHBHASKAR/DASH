@@ -143,6 +143,37 @@ fn main() {
         edges: vec![],
     };
 
+    {
+        let wal_path = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH");
+        let disk_disabled = env_with_fallback(
+            "DASH_INGEST_PERSISTENCE_DISABLE",
+            "EME_INGEST_PERSISTENCE_DISABLE",
+        )
+        .as_deref()
+            == Some("1");
+        let redb = (!disk_disabled && wal_path.is_some()).then(|| {
+            std::path::PathBuf::from(
+                env_with_fallback(
+                    "DASH_INGEST_PERSISTENCE_PATH",
+                    "EME_INGEST_PERSISTENCE_PATH",
+                )
+                .unwrap_or_else(|| "./data/dash-ingestion.redb".to_string()),
+            )
+        });
+        init_encryption(
+            "ingestion",
+            store::EncryptionStatePaths {
+                vector_index: wal_path
+                    .as_deref()
+                    .and_then(parse_vector_index_persistence)
+                    .map(|p| p.path().to_path_buf()),
+                wal: wal_path.map(std::path::PathBuf::from),
+                redb,
+                segment_dirs: segment_dir.iter().map(std::path::PathBuf::from).collect(),
+            },
+        );
+    }
+
     if let Some(wal_path) = env_with_fallback("DASH_INGEST_WAL_PATH", "EME_INGEST_WAL_PATH") {
         let wal_async_flush_interval_ms = resolve_wal_async_flush_interval_ms(
             wal_sync_every_records,
@@ -414,6 +445,27 @@ fn main() {
                 ),
                 Err(err) => tracing::error!("ingestion failed: {err:?}"),
             }
+        }
+    }
+}
+
+/// Installs the encryption keyring from `DASH_ENCRYPTION_KEY_FILE` (ADR
+/// 0005) and checks the data already on disk before anything is opened:
+/// encrypted files without a usable key stop the service (fail closed).
+fn init_encryption(service: &str, paths: store::EncryptionStatePaths) {
+    match store::init_encryption_from_env(&paths) {
+        Ok(Some(keyring)) => tracing::info!(
+            "{service} encryption at rest: on (provider {}, active key id {}, {} key id(s) configured)",
+            keyring.provider_name(),
+            keyring.active_key_id(),
+            keyring.key_ids().len()
+        ),
+        Ok(None) => tracing::info!(
+            "{service} encryption at rest: off (set DASH_ENCRYPTION_KEY_FILE to enable it)"
+        ),
+        Err(reason) => {
+            tracing::error!("{service} startup refused: encryption at rest: {reason}");
+            std::process::exit(2);
         }
     }
 }
