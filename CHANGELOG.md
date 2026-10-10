@@ -6,6 +6,53 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (encryption at rest, SEC-16, ADR 0005)
+
+- **Encryption at rest, off by default.** Setting `DASH_ENCRYPTION_KEY_FILE`
+  (a 32-byte key as 64 hex characters, mode `0600`/`0400`) encrypts the WAL,
+  snapshot, closed generations, quarantine and truncation sidecars,
+  replication exports and the follower's download part file, the persisted
+  vector index, segment files and manifests, and every redb value, with
+  AES-256-GCM under per-file data keys wrapped by the key (envelope
+  encryption). Nonces never repeat under a key. Line files keep one encrypted
+  line per record, so a torn final record is still truncated and a damaged
+  interior record is still a hard error naming the line. See
+  `docs/operations/encryption.md` and `docs/adr/0005-encryption-at-rest.md`.
+- **Fail closed:** a service that finds encrypted files without a key, or
+  under a key id it does not have, exits with status 2 before opening any
+  file and names the file and the key id.
+- **Migration:** plaintext data from earlier releases is read with a key
+  configured; the live WAL is rewritten encrypted on open, the snapshot,
+  vector index, segments and redb values on their next rewrite.
+- **Key rotation:** `DASH_ENCRYPTION_PREVIOUS_KEY_FILES` keeps retired keys
+  for decryption; new files use the active key, the redb data key is
+  rewrapped on open, and `wal-inspect rewrap <dir>` moves remaining file
+  headers to the active key without re-encrypting data. `wal-inspect keys
+  <dir>` lists the key id of every file.
+- **Deployment:** Helm values `encryption.enabled`, `encryption.secretName`,
+  `encryption.keyName`, `encryption.previousKeyNames`; Compose overlay
+  `deploy/container/docker-compose.encryption.yml`; systemd `LoadCredential=`
+  examples. `crash-test --encryption` and loadgen `--server-env` exercise it.
+- **Tests:** round trips and tampering for every file type, torn tails at every
+  byte offset, wrong and missing keys, rotation, migration of the 0.2 and 0.3
+  compat fixtures, encrypted replication (export, chunked resync, closed
+  generations), and a plaintext canary that drives the real services and scans
+  every file under the state directories.
+
+### Changed (encryption at rest)
+
+- `pkg/encryption` was rewritten: the unused `EncryptionProvider` /
+  `EnvProvider` API and the `DASH_ENCRYPTION_PROVIDER` /
+  `DASH_ENCRYPTION_MASTER_KEY` settings (never read by any service) are
+  removed. Keys come from files, not environment variables.
+- Opening a WAL reads (and, when encrypted, decrypts) the file once and the
+  first replay reuses those lines; cold start of a plaintext WAL got faster
+  too. Measured cost of encryption: about 6% lower ingest throughput and about
+  20% longer cold start (`docs/operations/encryption.md`).
+- Audit logs, identifiers used as redb keys and segment directory names, and
+  replication on the wire stay plaintext (use TLS for the wire). There is no
+  per-tenant key and no crypto-shredding; no cloud KMS provider ships (the
+  `KekProvider` interface is documented).
 ### Changed (full-text relevance: BM25 index; ADR 0003 section 12)
 
 - **Lexical retrieval uses a per-tenant BM25 full-text index**

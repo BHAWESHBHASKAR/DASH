@@ -16,7 +16,7 @@ truncated, a damaged interior record is a hard error), replication, or the exist
 
 | Topic | Decision |
 |---|---|
-| Cipher | AES-256-GCM (RustCrypto `aes-gcm` 0.10, already in the dependency graph and allowed by `deny.toml`; uses AES-NI/CLMUL when the CPU has them). No new third-party crate except `zeroize` (already in the graph). Subkeys use HMAC-SHA256 (`hmac`, `sha2`, already workspace dependencies). |
+| Cipher | AES-256-GCM (RustCrypto `aes-gcm` 0.10, already in the dependency graph and allowed by `deny.toml`; uses AES-NI and carry-less multiply on x86-64 when the CPU has them). No new third-party crate except `zeroize` (already in the graph). Subkeys use HMAC-SHA256 (`hmac`, `sha2`, already workspace dependencies). |
 | Key hierarchy | Envelope encryption. Every file (WAL file, snapshot, closed generation, export, vector index, segment file, quarantine file, part file) and every redb database gets its own random 256-bit data-encryption key (DEK). The DEK is stored in the file header, wrapped (AES-256-GCM) by a key-encryption key (KEK). The header names the KEK by id. |
 | KEK providers | `KekProvider` trait (`pkg/encryption`): `active_key_id`, `wrap`, `unwrap(key_id, ...)`. One implementation ships: `LocalKekProvider`, 32-byte keys read from files (`DASH_ENCRYPTION_KEY_FILE`, plus `DASH_ENCRYPTION_PREVIOUS_KEY_FILES` for rotation) with a permission check. A cloud KMS provider implements the same three calls with the KMS's encrypt/decrypt API (section 6); none ships, to avoid adding an SDK. |
 | Nonces | Never repeat under a key. Whole files written once (format B) use the file's fresh DEK with a chunk counter nonce. Appended records (format A, redb values) use a per-write-session subkey `HMAC-SHA256(DEK, "dash-record-subkey-v1" ‖ salt)` with a fresh random 128-bit salt per session and a strictly increasing in-memory 64-bit counter as nonce; the salt is stored with every record. A counter is never reset under a subkey (a rollback truncates the file, the counter keeps increasing). |
@@ -37,7 +37,7 @@ truncated, a damaged interior record is a hard error), replication, or the exist
 
 ```text
 u8  version (1)
-u8  key id length, then the KEK id (ASCII [A-Za-z0-9._:-], 1..=128 bytes)
+u8  key id length, then the KEK id (ASCII [A-Za-z0-9._:/-], 1..=128 bytes)
 16  file id (random)
 u16 wrapped DEK length (LE), then the wrapped DEK
 ```
@@ -130,8 +130,10 @@ together with `DASH_ENCRYPTION_KEY_FILE` would be a configuration error.
 
 ## 7. Consequences
 
-* WAL files grow by about a third (base64) plus 44 bytes per line; snapshot likewise. Measured
-  ingest throughput and cold start are in `docs/operations/encryption.md`.
+* WAL files grow by about a third (base64 of the record plus 40 bytes of salt, counter and tag,
+  and a 4-byte line prefix); snapshot likewise (215 MB to 293 MB for 50k claims with 384-d
+  vectors). Measured ingest throughput (about -6%) and cold start (about +20%) are in
+  `docs/operations/encryption.md`.
 * Downgrading to a release without encryption cannot read encrypted files. Disable encryption
   only after the data has been rewritten in plaintext (not provided; restore from a plaintext
   backup or rebuild by replication from a plaintext node).

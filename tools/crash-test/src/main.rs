@@ -719,6 +719,7 @@ mod tests {
             "--env",
             "A=b=c",
             "--keep-state",
+            "--encryption",
         ]))
         .unwrap();
         assert_eq!(cfg.cycles, 7);
@@ -728,6 +729,8 @@ mod tests {
         assert_eq!(cfg.fresh_every, 5);
         assert_eq!(cfg.envs, vec![("A".to_string(), "b=c".to_string())]);
         assert!(cfg.keep_state);
+        assert!(cfg.encryption);
+        assert!(!parse_args(&args(&[])).unwrap().encryption);
     }
 
     #[test]

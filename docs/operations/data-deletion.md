@@ -42,6 +42,7 @@ served with the deleted vectors).
 | redb mirror (`DASH_*_PERSISTENCE_PATH`) | the 200 response (same write as memory; a redb failure detaches the mirror and is logged, the WAL stays authoritative) |
 | Persisted vector index (`<WAL path>.vindex`) | the next save (periodic, after a checkpoint, at shutdown); until then the file may still hold the vectors, but they are removed on load |
 | Segment files | the manifest stops listing the claim ids immediately; unreferenced segment files are pruned by segment maintenance after `DASH_INGEST_SEGMENT_GC_MIN_STALE_AGE_MS`. Segment files hold claim ids only, no text. |
+| Closed generation (`<wal>.closed.<gen>`, kept for followers) | the checkpoint after the next one replaces it |
 | Leader WAL | the next checkpoint (`DASH_CHECKPOINT_MAX_WAL_RECORDS` / `DASH_CHECKPOINT_MAX_WAL_BYTES`): the snapshot is written from the current state, which no longer holds the rows, and the WAL is truncated. Until then the original records **and** the tombstone are in the WAL. |
 | Follower WALs and redb files | the follower applies the tombstone when it pulls it; its own WAL keeps the original records until the follower resyncs after a leader checkpoint (generation change) |
 | `<wal>.quarantine`, `<wal>.truncated-*` sidecars | never automatically: they are operator-managed recovery files |
@@ -62,8 +63,11 @@ into them. For an erasure request:
   tenant or claim ids;
 - after restoring any backup older than the erasure, replay the deletes
   (they are idempotent) before serving traffic;
-- expire or re-encrypt backups according to your retention policy; encryption
-  at rest is not provided by DASH today.
+- expire backups according to your retention policy. With encryption at rest
+  ([encryption.md](encryption.md)) backups hold ciphertext, but the data keys
+  are per file, not per tenant: deleting a key cannot erase a single tenant
+  (no crypto-shredding); destroying the key erases the whole node and every
+  backup taken under it.
 
 ## Compatibility
 
