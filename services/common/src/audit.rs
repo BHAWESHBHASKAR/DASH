@@ -1408,7 +1408,10 @@ mod tests {
         );
         assert!(lines >= burst as usize, "{lines}");
         let dropped = denials_dropped_total() - before;
-        assert!(dropped >= (700 - ceiling.min(700)) as u64, "{dropped} dropped");
+        assert!(
+            dropped >= (700 - ceiling.min(700)) as u64,
+            "{dropped} dropped"
+        );
         assert!(dropped > 0, "nothing was throttled");
         assert!(render_prometheus_counters().contains("dash_audit_denials_dropped_total"));
         // Non-denial records are never throttled.
