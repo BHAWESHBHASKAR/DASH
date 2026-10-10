@@ -138,12 +138,22 @@ across generation changes. With `--env DASH_INGEST_MIN_SYNC_REPLICAS=0` the
 same run measures asynchronous replication: lost acknowledged writes are
 counted (`acked_lost`) instead of failing the run.
 
-Measured on a 4-vCPU development VM with debug builds:
+Measured on a 4-vCPU development VM:
 
-| Run | Cycles | Acknowledged requests | Lost | Failover (p50 / max) | Rejoin (p50 / max) |
-|---|---|---|---|---|---|
-| synchronous, `--checkpoint-every 30` | 25 | 413 | 0 | 2.68 s / 2.89 s | 3.6 s / 5.8 s |
-| asynchronous (`MIN_SYNC_REPLICAS=0`) | 3 | 337 | 4 | 2.59 s / 2.59 s | 2.4 s / 4.3 s |
+| Run | Build | Cycles | Acknowledged requests | Lost | Failover (p50 / max) | Rejoin (p50 / max) |
+|---|---|---|---|---|---|---|
+| synchronous, `--checkpoint-every 30` | release | 8 x 15 | 4417 | 0 | 2.6 to 2.7 s / 2.86 s (one outlier of 13.4 s) | 0.5 to 0.8 s / 2.1 s |
+| synchronous, `--checkpoint-every 30` | debug | 25 | 413 | 0 | 2.68 s / 2.89 s | 3.6 s / 5.8 s |
+| asynchronous (`MIN_SYNC_REPLICAS=0`) | debug | 3 | 337 | 4 | 2.59 s / 2.59 s | 2.4 s / 4.3 s |
+
+The outlier happened once in 120 release-build failovers and its cause was
+not captured; the harness now prints the control plane's and the nodes'
+failover log lines for any failover slower than three lease windows. Two
+bugs were found with this harness before these runs: followers in a WAL
+generation the dead leader never reported were not eligible (several
+checkpoints between two heartbeats), which once lost an acknowledged write
+and twice blocked the promotion; followers now report every recent
+checkpoint crossing and leaders their recent checkpoint chain.
 
 Failover time is measured from the SIGKILL to the first `/v1/ready/leader`
 200 on a follower; with these settings the floor is lease + grace = 2.5 s.

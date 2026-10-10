@@ -56,8 +56,9 @@ to [Semantic Versioning](https://semver.org/).
   ingestion tests of the write gate, demotion, fencing checkpoint, term checks
   and synchronous writes, the e2e scenario `s14_leader_failover` (SIGKILL of
   the leader under synchronous load; SIGSTOP and resume of the leader) and
-  `crash-test --failover` (25 randomized leader kills with checkpoints: 0 of
-  413 acknowledged requests lost, failover p50 2.68 s with a 2 s lease).
+  `crash-test --failover` (120 randomized leader kills with checkpoints in
+  release builds: 0 of 4417 acknowledged requests lost, failover p50 about
+  2.65 s with a 2 s lease and 0.5 s grace).
 
 ### Fixed
 

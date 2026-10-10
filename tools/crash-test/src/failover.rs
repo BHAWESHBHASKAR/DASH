@@ -121,9 +121,18 @@ fn cycle(
 
     let others: Vec<usize> = (0..cluster.nodes.len()).filter(|i| *i != leader).collect();
     let new_leader = cluster.wait_leader(&others, Duration::from_secs(60));
-    totals
-        .failover_ms
-        .push(killed_at.elapsed().as_millis() as u64);
+    let failover_ms = killed_at.elapsed().as_millis() as u64;
+    totals.failover_ms.push(failover_ms);
+    let window = cluster.opts.lease_ms + cluster.opts.grace_ms;
+    if failover_ms > 3 * window {
+        // Slow failover: show what the control plane and the nodes said.
+        eprintln!("cycle {n}: slow failover ({failover_ms} ms):");
+        for line in cluster.logs().lines().filter(|line| {
+            line.starts_with("control-plane: ") || line.starts_with("ingestion failover: ")
+        }) {
+            eprintln!("  {line}");
+        }
+    }
 
     let state = state_of(cluster, new_leader);
     for outcome in &outcomes {
