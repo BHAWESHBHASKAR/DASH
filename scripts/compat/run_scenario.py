@@ -98,6 +98,7 @@ def wait_health(base, proc, what, request=None):
             if status == 200:
                 return
         except OSError:
+            # Not accepting connections yet; keep polling until the deadline.
             pass
         time.sleep(0.1)
     raise SystemExit(f"{what} did not become healthy")
