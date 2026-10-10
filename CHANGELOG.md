@@ -6,6 +6,61 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (replication across checkpoints, follower throughput)
+
+- **Followers cross leader checkpoints without a full resync.** A checkpoint
+  now records a transition (closed generation, its replication view length,
+  new generation) in `<wal>.gen.transitions` and keeps the closed
+  generation's WAL as `<wal>.closed.<generation>` until the next checkpoint.
+  A follower still inside the closed generation is served the rest of it
+  from that file; at its end the leader moves the follower to offset 0 of
+  the new generation (`switch_from=` in the frame, only for followers that
+  send `gen_switch=1`) and the follower compacts its own WAL the same way.
+  Followers that missed a whole generation, are ahead of its end, or follow
+  a rolled-back or reset lineage resync as before. `/ready` and the metrics
+  count `generation_switches_total`. Safety argument and tests:
+  `docs/operations/replication-limits.md`.
+- **Full resyncs are chunked.** `GET /internal/replication/export/begin`
+  freezes the leader's state (snapshot handle plus a copy of the WAL's
+  replication lines, under the WAL lock only) into
+  `<wal>.exports/<id>.export` and answers a manifest with its SHA-256;
+  `/internal/replication/export/chunk` serves whole lines of it, at most 32
+  MiB per request, straight from the file. Followers download into
+  `<wal>.resync.part`, resume an interrupted download with the same export
+  id, verify the checksum, remove their cursor, replace snapshot and WAL from
+  the file (streaming) and write the cursor again, so a crash in between
+  ends in a resync that reuses the download. A data set larger than the
+  64 MiB response limit can now be replicated; previously a follower could
+  never bootstrap from it. New settings
+  `DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES` and
+  `DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES` (default 4 MiB). The
+  single-response `/internal/replication/export` is still served, and
+  followers fall back to it when a leader has no chunked export.
+- **Follower apply keeps up with the leader.** A frame is mirrored to the
+  follower WAL with one write and one fsync (it was one fsync per record),
+  applied to the live store in place, whole commit groups per write-lock
+  hold (it was staged on a full copy of the store per frame), and its redb
+  writes go into one transaction (it was one durable transaction per write).
+  In an update-heavy soak the retrieval follower's lag went from up to
+  178,032 WAL records (71 s to catch up after the load stopped) to at most
+  1,008 (0.15 s); numbers in `docs/operations/testing-durability.md`. A
+  record that parses but cannot be applied now sends the follower into a
+  full resync instead of retrying the frame forever.
+- **Leader writes batch their redb mirror writes.** An atomic bundle, a
+  batch and a delete write their redb mutations in one transaction; with
+  the follower changes, leader ingest throughput in the same soak went from
+  647.6/s to 1,293.8/s.
+- **Automatic checkpoints are on by default.** The ingestion service
+  checkpoints once its WAL reaches 256 MiB unless
+  `DASH_CHECKPOINT_MAX_WAL_BYTES` says otherwise; `0` turns the size
+  threshold off (`DASH_CHECKPOINT_MAX_WAL_RECORDS` also accepts `0`).
+  Justification in `docs/operations/replication-limits.md`; upgrade note in
+  `docs/operations/upgrades.md`.
+- **`loadgen` reports follower lag.** Every interval and at the end of the
+  run it samples the retrieval follower's lag in WAL records against the
+  leader's live position, and it measures how long the follower takes to
+  catch up after the load stops (`--catch-up-timeout-secs`).
+
 ### Added (P7 upgrade and rollback compatibility)
 
 - **Upgrade compatibility tests** (`tests/compat`, crate `dash-compat`, part
