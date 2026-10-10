@@ -50,6 +50,8 @@
 #                             DASH_E2E_UPGRADE_FROM_REF is set)
 #   DASH_E2E_UPGRADE_FROM_REF git ref whose chart is installed first and then
 #                             upgraded to the working-tree chart
+#   DASH_E2E_UPGRADE_FROM_OPTIONAL=1  skip (with a warning) instead of failing
+#                             when the chart at that ref does not install
 #   DASH_E2E_REUSE_CLUSTER=1  reuse an existing cluster with the same name
 #   DASH_E2E_KEEP_CLUSTER=1   do not delete the cluster at the end
 #   DASH_E2E_TIMEOUT          seconds for each rollout / replication wait
@@ -104,6 +106,7 @@ export KUBECONFIG="${WORK_DIR}/kubeconfig"
 START_TS="$(date +%s)"
 CURRENT_STEP="setup"
 CLUSTER_CREATED=0
+SKIPPED=""
 declare -A PF_PID=()
 declare -A PF_PORT=()
 
@@ -212,7 +215,7 @@ on_exit() {
   # Generated secrets and keys never outlive the run.
   rm -rf "${WORK_DIR}/secrets" "${WORK_DIR}/tls" "${WORK_DIR}/backup"
   if [[ "${rc}" -eq 0 ]]; then
-    log "PASSED (phases: ${PHASES}) in $(( $(date +%s) - START_TS ))s"
+    log "PASSED (phases: ${PHASES}${SKIPPED:+; skipped:${SKIPPED}}) in $(( $(date +%s) - START_TS ))s"
   else
     echo "[kind-e2e] FAILED; diagnostics in ${ARTIFACT_DIR}" >&2
   fi
@@ -231,7 +234,41 @@ create_cluster() {
     fail "kind cluster ${CLUSTER} already exists (delete it, or set DASH_E2E_REUSE_CLUSTER=1)"
   fi
   CLUSTER_CREATED=1
-  kind create cluster --name "${CLUSTER}" --image "${KIND_NODE_IMAGE}" \
+  local config="${WORK_DIR}/kind-config.yaml"
+  cat > "${config}" <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+EOF
+  # Kubernetes 1.35 refuses to start the kubelet on cgroup v1 hosts unless
+  # told otherwise. CI runners use cgroup v2; this keeps older hosts usable.
+  if [[ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)" != "cgroup2fs" ]]; then
+    log "host uses cgroup v1: setting failCgroupV1=false on the kubelet"
+    cat >> "${config}" <<'EOF'
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    failCgroupV1: false
+EOF
+  fi
+  # Some sandboxed VMs forbid lowering oom_score_adj even for root; runc then
+  # fails every pod sandbox ("can't get final child's PID from pipe").
+  # restrict_oom_score_adj makes containerd clamp instead of failing.
+  local restrict_oom="${DASH_E2E_RESTRICT_OOM_SCORE_ADJ:-0}"
+  if [[ "$(id -u)" -eq 0 ]] && ! (echo -1 > /proc/self/oom_score_adj) 2>/dev/null; then
+    restrict_oom=1
+  fi
+  if [[ "${restrict_oom}" == "1" ]]; then
+    log "oom_score_adj cannot be lowered here: setting containerd restrict_oom_score_adj=true"
+    cat >> "${config}" <<'EOF'
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri"]
+      restrict_oom_score_adj = true
+EOF
+  fi
+  kind create cluster --name "${CLUSTER}" --image "${KIND_NODE_IMAGE}" --config "${config}" \
     --kubeconfig "${KUBECONFIG}" --wait "${TIMEOUT}s" \
     || fail "kind create cluster failed"
   kubectl wait --for=condition=Ready nodes --all --timeout="${TIMEOUT}s" >/dev/null \
@@ -605,7 +642,7 @@ phase_core() {
     [[ "$(pod_uid "${NS_CORE}" "${p}")" != "${entry#*=}" ]] \
       || fail "${p} was not restarted by a helm upgrade that changed the ConfigMap"
   done
-  [[ "$(kubectl -n "${NS_CORE}" exec "${REL_CORE}-retrieval-0" -- printenv DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS)" == "300" ]] \
+  [[ "$(kubectl -n "${NS_CORE}" exec "${REL_CORE}-retrieval-0" -c retrieval -- printenv DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS)" == "300" ]] \
     || fail "retrieval-0 does not run with the upgraded configuration"
   forward_core
   [[ "${RETRIEVAL_REPLICAS}" == "3" ]] || fail "expected 3 retrieval replicas after the upgrade"
@@ -634,7 +671,26 @@ phase_upgrade_from() {
 
   step "upgrade-from: install the ${UPGRADE_FROM_REF} chart"
   create_namespace "${ns}"
-  helm_deploy install "${ns}" "${rel}" "${old_chart}/deploy/helm/dash" --set replicas.retrieval=1
+  # A base chart that cannot install on its own is not something the
+  # upgrade under test can fix; with DASH_E2E_UPGRADE_FROM_OPTIONAL=1 that
+  # case is reported and the phase is skipped instead of failing.
+  if ! helm install "${rel}" "${old_chart}/deploy/helm/dash" --namespace "${ns}" \
+      -f "${CI_VALUES}" -f "${SECRET_VALUES}" --set "namespace.name=${ns}" \
+      --set replicas.retrieval=1 --wait --timeout "${TIMEOUT}s"; then
+    if [[ "${DASH_E2E_UPGRADE_FROM_OPTIONAL:-0}" == "1" ]]; then
+      log "WARNING: the chart at ${UPGRADE_FROM_REF} does not install on its own; skipping the upgrade-from phase"
+      SKIPPED+=" upgrade-from"
+      if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+        echo "::warning::kind e2e: the chart at ${UPGRADE_FROM_REF} does not install; upgrade-from phase skipped"
+      fi
+      kubectl -n "${ns}" get pods -o wide || true
+      helm uninstall "${rel}" --namespace "${ns}" --wait --timeout "${TIMEOUT}s" >/dev/null 2>&1 || true
+      delete_namespace "${ns}"
+      return 0
+    fi
+    fail "helm install of the ${UPGRADE_FROM_REF} chart failed"
+  fi
+  wait_release "${ns}" "${rel}"
   pf_start ing "${ns}" "svc/${rel}-ingestion" 80
   pf_start ret0 "${ns}" "pod/${rel}-retrieval-0" 8080
   wait_http_ok ing /v1/ready
