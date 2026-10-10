@@ -307,16 +307,18 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
 
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build ingestion, wal-inspect and crash-test
         run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
@@ -330,7 +332,7 @@ jobs:
 
       - name: Upload crash-test summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: crash-test-pr
           path: crash-test.json

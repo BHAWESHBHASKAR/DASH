@@ -50,16 +50,18 @@ jobs:
       CRASH_CYCLES: ${{ github.event.inputs.crash_cycles || '1000' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
 
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Release build of the services and tools
         run: cargo build --release -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
@@ -99,7 +101,7 @@ jobs:
 
       - name: Upload crash reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: crash-reports
           path: reports/
@@ -114,16 +116,18 @@ jobs:
       contents: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
 
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build service binaries
         run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect
@@ -147,16 +151,18 @@ jobs:
       SOAK_MINUTES: ${{ github.event.inputs.soak_minutes || '30' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
 
       - name: Install the pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
 
       - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Release build of the services and loadgen
         run: cargo build --release -p ingestion -p retrieval -p control-plane -p wal-inspect -p loadgen
@@ -168,7 +174,7 @@ jobs:
           mkdir -p reports
           target/release/loadgen --duration-secs "$((SOAK_MINUTES * 60))" --warmup-secs 30 \
             --concurrency 8 --ingest-percent 30 --dim 384 \
-            --preload 20000 --id-space 20000 --checkpoint-every 50000 \
+            --preload 20000 --id-space 20000 --checkpoint-every 20000 \
             --report-every-secs 60 --max-rss-growth-mib 256 --max-error-rate 0 \
             --json-out reports/soak.json 2>&1 | grep -v ' INFO \| WARN ' | tee reports/soak.log
 
@@ -191,7 +197,7 @@ jobs:
 
       - name: Upload soak and load reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: soak-load-reports
           path: reports/
