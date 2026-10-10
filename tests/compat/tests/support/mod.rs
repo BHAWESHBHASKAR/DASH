@@ -83,7 +83,12 @@ fn result_summary(result: &Value) -> Value {
 /// By-design differences between the current answers and the old build's
 /// for one fixture (`tests/compat/expected/<label>.json`, optional).
 struct ExpectedOverrides {
+    /// Stance counts, citations and scores are compared.
     scores_comparable: bool,
+    /// Scores changed by design for every request (the `scores_changed`
+    /// reason is set): stance counts and citations are still compared, the
+    /// score values are not.
+    scores_changed: bool,
     claims: std::collections::BTreeMap<usize, Vec<String>>,
 }
 
@@ -94,6 +99,7 @@ fn expected_overrides(fixture: &Fixture) -> ExpectedOverrides {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return ExpectedOverrides {
             scores_comparable: true,
+            scores_changed: false,
             claims: Default::default(),
         };
     };
@@ -113,8 +119,20 @@ fn expected_overrides(fixture: &Fixture) -> ExpectedOverrides {
             .collect();
         claims.insert(index.parse().expect("request index"), ids);
     }
+    let scores_changed = match value.get("scores_changed") {
+        None => false,
+        Some(reason) => {
+            assert!(
+                reason.as_str().is_some_and(|why| !why.is_empty()),
+                "{}: scores_changed must say why",
+                path.display()
+            );
+            true
+        }
+    };
     ExpectedOverrides {
         scores_comparable: value["scores_comparable"].as_bool().unwrap_or(true),
+        scores_changed,
         claims,
     }
 }
@@ -182,6 +200,9 @@ pub fn diff_against_recorded(fixture: &Fixture, actual: &[(u16, Value)]) -> Vec<
                         let (os, ns) = (result_summary(o), result_summary(n));
                         if os != ns {
                             diffs.push(format!("request {index}: result {ns}, old build {os}"));
+                        }
+                        if overrides.scores_changed {
+                            continue;
                         }
                         let (Some(old_score), Some(new_score)) =
                             (o["score"].as_f64(), n["score"].as_f64())

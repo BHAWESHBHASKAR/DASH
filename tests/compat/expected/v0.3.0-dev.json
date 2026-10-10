@@ -1,7 +1,61 @@
 {
-  "comment": "Retrieve answers of the current code on the 0.3.0-dev fixture that differ BY DESIGN from what that build answered (http/retrieve-responses.jsonl). The fixture was recorded with a segment directory configured, and that build's segment candidate path filled top_k of a text-only query with claims that match no query term (scored only by confidence, source quality and graph signals). Retrieval now applies one relevance rule on every path: a claim with no query term and no vector similarity is never returned. Scores of the remaining results are unchanged. Delete this file when the fixture is replaced by the one of the tagged 0.3.0 release.",
+  "comment": "Retrieve answers of the current code on the 0.3.0-dev fixture that differ BY DESIGN from what that build answered (http/retrieve-responses.jsonl). The fixture was recorded with a segment directory configured, and that build's segment candidate path filled top_k of a text-only query with claims that match no query term (scored only by confidence, source quality and graph signals). Retrieval now applies one relevance rule on every path: a claim with no query term and no vector similarity is never returned. Ranking also uses a BM25 full-text index now (see scores_changed), so some orders listed here changed by design. Delete this file when the fixture is replaced by the one of the tagged 0.3.0 release.",
   "scores_comparable": true,
   "requests": {
+    "0": {
+      "claims": [
+        "a-c01",
+        "a-c12",
+        "a-b1",
+        "a-c04",
+        "a-c08"
+      ],
+      "why": "hybrid query ranked with the BM25 full-text index: a-c04 ('Analysts now expect Company X shares to fall') shares 'company' and 'x' with the query and replaces a-c05, which shares no query term"
+    },
+    "2": {
+      "claims": [
+        "a-c03",
+        "a-c10",
+        "a-c07",
+        "a-b3",
+        "a-b2",
+        "a-c02",
+        "a-c11",
+        "a-c04",
+        "a-c09",
+        "a-b1"
+      ],
+      "why": "hybrid query: the same ten claims; three adjacent pairs swap (a-c10/a-c07, a-b3/a-b2, a-c02/a-c11) under the blend of cosine and normalised BM25. None of them shares a term with 'merger regulators', so the vector part and the priors order them"
+    },
+    "4": {
+      "claims": [
+        "a-c01",
+        "a-b1",
+        "a-c12",
+        "a-c10",
+        "a-b2"
+      ],
+      "why": "hybrid query with a time range: a-c10 and a-b2 swap; neither matches a query term ('2025' only matches a-c01), so the blend of cosine and the priors decides"
+    },
+    "5": {
+      "claims": [
+        "a-b2",
+        "a-c10",
+        "a-c02",
+        "a-c03"
+      ],
+      "why": "hybrid query: a-c02 and a-c03 swap; neither shares a term with 'Batch claim logistics', so the blend of cosine and the priors decides"
+    },
+    "7": {
+      "claims": [
+        "a-c01",
+        "a-c04",
+        "a-c10",
+        "a-c03",
+        "a-b3"
+      ],
+      "why": "text-only query ranked by BM25: Unicode word segmentation splits 'X-Y' into 'x' and 'y', so a-c03 ('Regulators opened an inquiry into the X-Y merger') matches two query terms and replaces a-c02, which only shares 'company' and 'y'"
+    },
     "8": {
       "claims": [
         "a-c09"
@@ -14,5 +68,6 @@
       ],
       "why": "same as request 8: only the lexical match a-c04; a-c10 and a-c12 were segment padding"
     }
-  }
+  },
+  "scores_changed": "Every score changed by design: lexical relevance is BM25 from the full-text index divided by the query's BM25 upper bound, hybrid relevance blends cosine with that value (2/3 and 1/3 of the cosine mapped to [0, 1] and of normalised BM25), and the prior signals (confidence, source quality, support, contradiction) are added at half weight (CHANGELOG Unreleased, ADR 0003 section 12). Claim order, stance counts and citations are still compared."
 }
