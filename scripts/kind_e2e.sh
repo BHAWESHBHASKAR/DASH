@@ -27,7 +27,9 @@
 #        replicas) and check every pod rolled and no data was lost;
 #   6. optional: install the chart from an older git ref and `helm upgrade`
 #      it to the working-tree chart (DASH_E2E_UPGRADE_FROM_REF);
-#   7. TLS: installs with tls.enabled=true and a self-signed CA generated
+#   7. raw manifests: `kubectl apply -k deploy/k8s` (image swapped for the
+#      e2e image), then ingest -> retrieve on every retrieval pod;
+#   8. TLS: installs with tls.enabled=true and a self-signed CA generated
 #      here (no cert-manager), then ingest -> retrieve over HTTPS, which
 #      also proves mutually authenticated replication.
 #   On failure, pod logs, `kubectl describe` output and events are written
@@ -45,8 +47,9 @@
 #                             built from the Dockerfile unless SKIP_BUILD=1
 #   DASH_E2E_BUILD_ARGS       extra arguments for `docker buildx build`
 #                             (whitespace-separated)
-#   DASH_E2E_PHASES           space-separated subset of: core upgrade-from tls
-#                             (default: "core tls", plus upgrade-from when
+#   DASH_E2E_PHASES           space-separated subset of:
+#                             core upgrade-from kustomize tls
+#                             (default: "core kustomize tls", plus upgrade-from when
 #                             DASH_E2E_UPGRADE_FROM_REF is set)
 #   DASH_E2E_UPGRADE_FROM_REF git ref whose chart is installed first and then
 #                             upgraded to the working-tree chart
@@ -91,9 +94,9 @@ IMAGE_REPOSITORY="dash"
 IMAGE_TAG="e2e"
 SOURCE_IMAGE="${DASH_E2E_IMAGE:-${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}-e2e:${IMAGE_TAG}}"
 UPGRADE_FROM_REF="${DASH_E2E_UPGRADE_FROM_REF:-}"
-DEFAULT_PHASES="core tls"
+DEFAULT_PHASES="core kustomize tls"
 if [[ -n "${UPGRADE_FROM_REF}" ]]; then
-  DEFAULT_PHASES="core upgrade-from tls"
+  DEFAULT_PHASES="core upgrade-from kustomize tls"
 fi
 PHASES="${DASH_E2E_PHASES:-${DEFAULT_PHASES}}"
 TENANT="e2e-tenant"
@@ -714,6 +717,58 @@ phase_upgrade_from() {
   delete_namespace "${ns}"
 }
 
+# --- raw manifests (kustomize) ------------------------------------------------
+phase_kustomize() {
+  local ns="dash-system" overlay="${WORK_DIR}/kustomize-overlay" svc
+  step "kustomize: apply deploy/k8s with the e2e image"
+  rm -rf "${overlay}"
+  mkdir -p "${overlay}"
+  {
+    echo "apiVersion: kustomize.config.k8s.io/v1beta1"
+    echo "kind: Kustomization"
+    echo "resources:"
+    # kustomize only accepts a relative path to a base.
+    echo "  - $(realpath --relative-to="${overlay}" "${ROOT_DIR}/deploy/k8s")"
+    echo "images:"
+    for svc in ingestion retrieval control-plane; do
+      echo "  - name: ghcr.io/bhaweshbhaskar/dash-${svc}"
+      echo "    newName: ${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}-${svc}"
+      echo "    newTag: \"${IMAGE_TAG}\""
+    done
+  } > "${overlay}/kustomization.yaml"
+  kubectl apply -f "${ROOT_DIR}/deploy/k8s/00-namespace.yaml" >/dev/null
+  # The Secrets the manifests expect (deploy/k8s/11-secrets.yaml).
+  kubectl -n "${ns}" create secret generic dash-retrieval-secrets \
+    --from-literal=DASH_RETRIEVAL_API_KEY="${DASH_RETRIEVAL_API_KEY}" \
+    --from-literal=DASH_RETRIEVAL_JWT_HS256_SECRET="${DASH_RETRIEVAL_JWT_HS256_SECRET}" \
+    --from-literal=DASH_RETRIEVAL_REPLICATION_TOKEN="${DASH_RETRIEVAL_REPLICATION_TOKEN}" >/dev/null
+  kubectl -n "${ns}" create secret generic dash-ingestion-secrets \
+    --from-literal=DASH_INGEST_API_KEY="${DASH_INGEST_API_KEY}" \
+    --from-literal=DASH_INGEST_JWT_HS256_SECRET="${DASH_INGEST_JWT_HS256_SECRET}" \
+    --from-literal=DASH_INGEST_REPLICATION_TOKEN="${DASH_INGEST_REPLICATION_TOKEN}" >/dev/null
+  kubectl -n "${ns}" create secret generic dash-control-plane-secrets \
+    --from-literal=DASH_CONTROL_PLANE_TOKEN="${DASH_CONTROL_PLANE_TOKEN}" >/dev/null
+  kubectl apply -k "${overlay}" >/dev/null || fail "kubectl apply -k deploy/k8s failed"
+  local sts
+  for sts in dash-ingestion dash-retrieval dash-control-plane; do
+    kubectl -n "${ns}" rollout status "statefulset/${sts}" --timeout="${TIMEOUT}s" \
+      || fail "statefulset ${ns}/${sts} (raw manifests) not ready within ${TIMEOUT}s"
+  done
+  kubectl -n "${ns}" get pods,pvc -o wide
+
+  step "kustomize: ingest -> retrieve on every retrieval pod"
+  pf_start ing "${ns}" svc/dash-ingestion 80
+  pf_start ret0 "${ns}" pod/dash-retrieval-0 8080
+  pf_start ret1 "${ns}" pod/dash-retrieval-1 8080
+  wait_http_ok ing /v1/ready
+  ingest_claim ing k-claim-1 1
+  ingest_claim ing k-claim-2 2
+  wait_ids ret0 "$(csv k-claim-1 k-claim-2)"
+  wait_ids ret1 "$(csv k-claim-1 k-claim-2)"
+  pf_stop_all
+  delete_namespace "${ns}"
+}
+
 # --- TLS ----------------------------------------------------------------------
 generate_tls() {
   local ns="$1" rel="$2" dir="${WORK_DIR}/tls" san="" c
@@ -781,8 +836,8 @@ main() {
   local p
   for p in ${PHASES}; do
     case "${p}" in
-      core|upgrade-from|tls) ;;
-      *) fail "unknown phase '${p}' in DASH_E2E_PHASES (expected: core upgrade-from tls)" ;;
+      core|upgrade-from|kustomize|tls) ;;
+      *) fail "unknown phase '${p}' in DASH_E2E_PHASES (expected: core upgrade-from kustomize tls)" ;;
     esac
   done
   for tool in docker curl jq openssl tar sha256sum git; do
@@ -799,6 +854,7 @@ main() {
     case "${p}" in
       core) phase_core ;;
       upgrade-from) phase_upgrade_from ;;
+      kustomize) phase_kustomize ;;
       tls) phase_tls ;;
     esac
   done
