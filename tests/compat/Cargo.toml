@@ -13,6 +13,7 @@ store = { path = "../../pkg/store" }
 tempfile = "3"
 
 [dev-dependencies]
+auth = { path = "../../pkg/auth" }
 control-plane = { path = "../../services/control-plane" }
 dash-common = { path = "../../services/common" }
 indexer = { path = "../../services/indexer" }

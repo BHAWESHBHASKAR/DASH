@@ -704,6 +704,7 @@ dependencies = [
 name = "dash-compat"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "control-plane",
  "dash-common",
  "flate2",
