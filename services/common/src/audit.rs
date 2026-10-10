@@ -1388,16 +1388,28 @@ mod tests {
             fsync: false,
             fail_closed: false,
         };
+        // The bucket refills in real time (default 50/s, burst 500), so the
+        // bound depends on how long the loop took: a slow runner legitimately
+        // lets a few more records through.
+        let (rate, burst) = denial_limits();
+        let started = Instant::now();
         for i in 0..700u64 {
             append_record(&path, &input("t", 401, "denied"), i, &opts).expect("append");
         }
+        let refilled = started.elapsed().as_secs_f64() * rate;
         let lines = std::fs::read_to_string(&path)
             .expect("read")
             .lines()
             .count();
-        assert!(lines <= 520, "{lines} denial records written");
-        assert!(lines >= 400, "{lines}");
-        assert!(denials_dropped_total() - before >= 150);
+        let ceiling = (burst + refilled).ceil() as usize + 1;
+        assert!(
+            lines <= ceiling,
+            "{lines} denial records written, ceiling {ceiling}"
+        );
+        assert!(lines >= burst as usize, "{lines}");
+        let dropped = denials_dropped_total() - before;
+        assert!(dropped >= (700 - ceiling.min(700)) as u64, "{dropped} dropped");
+        assert!(dropped > 0, "nothing was throttled");
         assert!(render_prometheus_counters().contains("dash_audit_denials_dropped_total"));
         // Non-denial records are never throttled.
         let path2 = dir.path().join("ok.jsonl").to_string_lossy().to_string();
