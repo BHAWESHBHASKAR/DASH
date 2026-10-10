@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::StoreError;
+use crate::crypt::{self, Detected, KeyringRef, LineCodec};
 
 mod replication_export;
 mod replication_index;
@@ -280,6 +281,8 @@ struct ClosedGeneration {
     /// `from_records`).
     records: usize,
     path: PathBuf,
+    /// How the closed file's lines are stored.
+    codec: LineCodec,
     /// Index of the closed file, built on first use after a restart.
     index: ReplicationIndex,
 }
@@ -568,6 +571,10 @@ pub(crate) fn resolve_commit_groups<T>(
 
 pub struct FileWal {
     path: PathBuf,
+    /// Keyring captured when the WAL was opened (`None`: encryption off).
+    keyring: KeyringRef,
+    /// How the lines of the current WAL file are stored.
+    codec: LineCodec,
     wal_records: usize,
     sync_every_records: usize,
     append_buffer_max_records: usize,
@@ -651,6 +658,18 @@ impl FileWal {
         path: impl AsRef<Path>,
         policy: WalWritePolicy,
     ) -> Result<Self, StoreError> {
+        Self::open_with_keyring(path, policy, crypt::current_keyring())
+    }
+
+    /// [`FileWal::open_with_policy`] with an explicit keyring instead of the
+    /// one in effect (`encryption::current()`). With a keyring, new files
+    /// are encrypted and an existing plaintext WAL is rewritten encrypted
+    /// here; without one, an encrypted WAL fails to open (fail closed).
+    pub fn open_with_keyring(
+        path: impl AsRef<Path>,
+        policy: WalWritePolicy,
+        keyring: Option<std::sync::Arc<encryption::Keyring>>,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -662,13 +681,42 @@ impl FileWal {
         if !existed {
             sync_parent_dir(&path)?;
         }
-        let torn_tail_dropped = repair_torn_tail(&path)? + truncate_unterminated_group(&path)?;
+        let mut torn_header = 0usize;
+        let mut codec = match crypt::detect_line_file(&path, keyring.as_ref())? {
+            Detected::Plain => LineCodec::Plain,
+            Detected::Encrypted(codec) => codec,
+            Detected::TornHeader => {
+                // A crash while the file was being created: nothing but a
+                // partial header was written.
+                let saved = save_truncated_tail(&path, 0, &LineCodec::Plain)?;
+                eprintln!(
+                    "warning: discarding the incomplete encryption header of write-ahead log {} (saved to {})",
+                    path.display(),
+                    saved.display()
+                );
+                let file = OpenOptions::new().write(true).open(&path)?;
+                file.set_len(0)?;
+                file.sync_all()?;
+                torn_header = 1;
+                LineCodec::Plain
+            }
+        };
+        let torn_tail_dropped = torn_header
+            + repair_torn_tail(&path, &codec)?
+            + truncate_unterminated_group(&path, &codec)?;
+        if !codec.is_encrypted()
+            && let Some(keyring) = keyring.as_ref()
+        {
+            codec = encrypt_plain_line_file(&path, keyring)?;
+        }
         let wal_records = count_non_empty_lines(&path)?;
         let generation = load_or_create_generation(&generation_path_for(&path))?;
         let transitions = load_transitions(&transitions_path_for(&path));
-        let closed = load_closed_generation(&path, transitions.last());
+        let closed = load_closed_generation(&path, transitions.last(), keyring.as_ref())?;
         Ok(Self {
             path,
+            keyring,
+            codec,
             wal_records,
             sync_every_records: policy.sync_every_records.max(1),
             append_buffer_max_records: policy.append_buffer_max_records.max(1),
@@ -766,7 +814,7 @@ impl FileWal {
         if self.append_buffer.iter().any(|line| is_tombstone(line)) {
             return Ok(true);
         }
-        let scan = scan_wal(&self.path)?;
+        let scan = scan_wal(&self.path, &self.codec)?;
         Ok(scan.lines.iter().any(|(_, line)| is_tombstone(line)))
     }
 
@@ -803,6 +851,12 @@ impl FileWal {
     /// (`replication_group_too_large`).
     pub fn replication_group_too_large_total(&self) -> u64 {
         self.replication_group_too_large_total
+    }
+
+    /// KEK id of the data key of the current WAL file (`None`: the file is
+    /// not encrypted).
+    pub fn encryption_key_id(&self) -> Option<&str> {
+        self.codec.key_id()
     }
 
     /// Torn tail lines discarded since this handle was opened.
@@ -1085,12 +1139,14 @@ impl FileWal {
             return Ok(None);
         };
         if !closed.path.exists()
-            || !closed.index.refresh(&closed.path)?
+            || !closed.index.refresh(&closed.path, &closed.codec)?
             || closed.index.total() != closed.records
         {
             return Ok(None);
         }
-        let lines = closed.index.lines_from(&closed.path, from_offset)?;
+        let lines = closed
+            .index
+            .lines_from(&closed.path, &closed.codec, from_offset)?;
         match cut_frame(lines, from_offset, max_records, closed_records, cap)? {
             FrameCut::Lines { next_offset, lines } => Ok(Some(WalReplicationFrame {
                 generation,
@@ -1167,7 +1223,7 @@ impl FileWal {
         self.flush_pending_sync()?;
         // Only the new tail of the file is read here; the view itself is
         // read lazily below, from the frame's first line on.
-        if !self.replication_index.refresh(&self.path)? {
+        if !self.replication_index.refresh(&self.path, &self.codec)? {
             return self.replication_frame_full_scan(
                 from_generation,
                 from_offset,
@@ -1185,7 +1241,9 @@ impl FileWal {
         ) {
             return Ok(resync);
         }
-        let lines = self.replication_index.lines_from(&self.path, from_offset)?;
+        let lines = self
+            .replication_index
+            .lines_from(&self.path, &self.codec, from_offset)?;
         let cut = cut_frame(
             lines,
             from_offset,
@@ -1294,7 +1352,7 @@ impl FileWal {
 
     /// Length of the replication view of the flushed WAL.
     fn replication_view_len(&mut self) -> Result<usize, StoreError> {
-        if self.replication_index.refresh(&self.path)? {
+        if self.replication_index.refresh(&self.path, &self.codec)? {
             self.note_replication_skipped(self.replication_index.skipped());
             return Ok(self.replication_index.total());
         }
@@ -1314,14 +1372,30 @@ impl FileWal {
     ) -> Result<ExportFreeze, StoreError> {
         self.flush_pending_sync()?;
         let snapshot = match File::open(self.snapshot_path()) {
-            Ok(file) => Some(file),
+            Ok(mut file) => {
+                let what = self.snapshot_path().display().to_string();
+                let codec =
+                    match crypt::detect_open_line_file(&mut file, self.keyring.as_ref(), &what)? {
+                        Detected::Encrypted(codec) => codec,
+                        Detected::Plain => LineCodec::Plain,
+                        Detected::TornHeader => {
+                            return Err(StoreError::Parse(format!(
+                                "{what}: the encryption header is incomplete"
+                            )));
+                        }
+                    };
+                Some((file, codec))
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(err.into()),
         };
         let mut wal_records = 0usize;
-        if self.replication_index.refresh(&self.path)? {
+        if self.replication_index.refresh(&self.path, &self.codec)? {
             self.note_replication_skipped(self.replication_index.skipped());
-            for line in self.replication_index.lines_from(&self.path, 0)? {
+            for line in self
+                .replication_index
+                .lines_from(&self.path, &self.codec, 0)?
+            {
                 let line = line?;
                 wal_out.write_all(line.as_bytes())?;
                 wal_out.write_all(b"\n")?;
@@ -1413,17 +1487,22 @@ impl FileWal {
         tmp_path.push(".tmp");
         let tmp_path = PathBuf::from(tmp_path);
         {
+            let snapshot_codec = LineCodec::create(self.keyring.as_ref())?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&tmp_path)?;
             let mut out = std::io::BufWriter::new(&mut file);
-            out.write_all(SNAPSHOT_HEADER.as_bytes())?;
+            if let Some(header) = snapshot_codec.header_line() {
+                out.write_all(header.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+            out.write_all(snapshot_codec.encode(SNAPSHOT_HEADER).as_bytes())?;
             out.write_all(b"\n")?;
             export.for_each_line(|section, line| {
                 if section == ExportSection::Snapshot {
-                    out.write_all(line.as_bytes())?;
+                    out.write_all(snapshot_codec.encode(line).as_bytes())?;
                     out.write_all(b"\n")?;
                 }
                 Ok(())
@@ -1440,15 +1519,21 @@ impl FileWal {
         self.discard_closed_generation();
         self.replication_index.reset();
         {
+            let codec = LineCodec::create(self.keyring.as_ref())?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .open(&self.path)?;
+            self.codec = codec.clone();
             let mut out = std::io::BufWriter::new(&mut file);
+            if let Some(header) = codec.header_line() {
+                out.write_all(header.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
             export.for_each_line(|section, line| {
                 if section == ExportSection::Wal {
-                    out.write_all(line.as_bytes())?;
+                    out.write_all(codec.encode(line).as_bytes())?;
                     out.write_all(b"\n")?;
                 }
                 Ok(())
@@ -1545,10 +1630,7 @@ impl FileWal {
             return Ok(());
         }
         self.ensure_writable()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
         self.write_append_buffer(&mut file)
     }
 
@@ -1556,10 +1638,14 @@ impl FileWal {
     /// it (also on error, as before).
     fn write_append_buffer(&mut self, file: &mut File) -> Result<(), StoreError> {
         let bytes: usize = self.append_buffer.iter().map(|line| line.len() + 1).sum();
+        let bytes = if self.codec.is_encrypted() {
+            bytes * 4 / 3 + self.append_buffer.len() * 64
+        } else {
+            bytes
+        };
         let mut buf = String::with_capacity(bytes);
         for line in self.append_buffer.drain(..) {
-            buf.push_str(&line);
-            buf.push('\n');
+            self.codec.push_line(&mut buf, &line);
         }
         file.write_all(buf.as_bytes())?;
         crate::observe::observe_wal_bytes_written(buf.len());
@@ -1571,10 +1657,7 @@ impl FileWal {
             return Ok(());
         }
         self.ensure_writable()?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
         self.write_append_buffer(&mut file)?;
         if self.unsynced_records > 0 {
             if let Err(err) = sync_wal_data(&file) {
@@ -1603,7 +1686,7 @@ impl FileWal {
         policy: ReplayPolicy,
         collect_vectors_from: Option<usize>,
     ) -> Result<WalReplay, StoreError> {
-        let mut sink = QuarantineSink::load(self.quarantine_path())?;
+        let mut sink = QuarantineSink::load(self.quarantine_path(), self.keyring.clone())?;
         let mut parser = ReplayParser::new(policy);
         let mut items = Vec::new();
 
@@ -1619,7 +1702,7 @@ impl FileWal {
             }
             n
         };
-        let scan = scan_wal(&self.path)?;
+        let scan = scan_wal(&self.path, &self.codec)?;
         // Vector-index changes after line `from` (see
         // `WalReplay::vector_catch_up`); impossible when the WAL is shorter
         // than `from`.
@@ -1681,42 +1764,38 @@ impl FileWal {
         if !snapshot_path.exists() {
             return Ok(Vec::new());
         }
-        let file = OpenOptions::new().read(true).open(snapshot_path)?;
+        let codec = crypt::line_codec_for(&snapshot_path, self.keyring.as_ref())?;
+        let file = OpenOptions::new().read(true).open(&snapshot_path)?;
         let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let header = loop {
-            match lines.next() {
-                Some(line) => {
-                    let line = line?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    break line;
-                }
-                None => {
-                    return Err(StoreError::Parse("snapshot file is empty".to_string()));
-                }
-            }
-        };
-        if header != SNAPSHOT_HEADER {
-            return Err(StoreError::Parse(
-                "snapshot file has invalid header".to_string(),
-            ));
-        }
-
+        let mut header_seen = false;
         let mut out = Vec::new();
-        for line in lines {
-            let line = line?;
+        for (idx, raw) in reader.split(b'\n').enumerate() {
+            let raw = raw?;
+            let line = codec.decode(&raw).map_err(|reason| {
+                StoreError::Parse(format!("snapshot line {}: {reason}", idx + 1))
+            })?;
             if line.trim().is_empty() {
                 continue;
             }
+            if !header_seen {
+                if line != SNAPSHOT_HEADER {
+                    return Err(StoreError::Parse(
+                        "snapshot file has invalid header".to_string(),
+                    ));
+                }
+                header_seen = true;
+                continue;
+            }
             out.push(line);
+        }
+        if !header_seen {
+            return Err(StoreError::Parse("snapshot file is empty".to_string()));
         }
         Ok(out)
     }
 
     fn replay_wal_lines_raw(&self) -> Result<Vec<String>, StoreError> {
-        Ok(scan_wal(&self.path)?
+        Ok(scan_wal(&self.path, &self.codec)?
             .lines
             .into_iter()
             .map(|(_, line)| line)
@@ -1739,15 +1818,17 @@ impl FileWal {
         tmp_path.push(".tmp");
         let tmp_path = PathBuf::from(tmp_path);
 
+        let codec = LineCodec::create(self.keyring.as_ref())?;
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&tmp_path)?;
-        write_line(&mut file, SNAPSHOT_HEADER)?;
-        for line in lines {
-            write_line(&mut file, line)?;
-        }
+        crypt::write_line_file(
+            &mut file,
+            &codec,
+            std::iter::once(SNAPSHOT_HEADER).chain(lines.iter().map(String::as_str)),
+        )?;
         failpoint!("snapshot.tmp_written");
         sync_file(&file)?;
         failpoint!("snapshot.fsynced");
@@ -1759,15 +1840,15 @@ impl FileWal {
         Ok(())
     }
 
-    fn write_wal_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
+    fn write_wal_lines_raw(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        let codec = LineCodec::create(self.keyring.as_ref())?;
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        for line in lines {
-            write_line(&mut file, line)?;
-        }
+        self.codec = codec.clone();
+        crypt::write_line_file(&mut file, &codec, lines.iter().map(String::as_str))?;
         file.sync_all()?;
         sync_parent_dir(&self.path)?;
         Ok(())
@@ -1787,13 +1868,18 @@ impl FileWal {
         let previous = self.closed.take();
         let index = self.replication_index.take_for_renamed_file();
         let closed_path = closed_path_for(&self.path, closed_generation);
+        let new_codec = LineCodec::create(self.keyring.as_ref())?;
         rename_file(&self.path, &closed_path)?;
         failpoint!("wal.closed_renamed");
-        let file = OpenOptions::new()
+        let closed_codec = std::mem::replace(&mut self.codec, new_codec);
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
+        if let Some(header) = self.codec.header_line() {
+            write_line(&mut file, header)?;
+        }
         sync_file(&file)?;
         drop(file);
         sync_parent_dir(&self.path)?;
@@ -1807,6 +1893,7 @@ impl FileWal {
             generation: closed_generation,
             records: index.total(),
             path: closed_path,
+            codec: closed_codec,
             index,
         });
         self.wal_records = 0;
@@ -1887,7 +1974,8 @@ fn closed_path_for(wal_path: &Path, generation: u64) -> PathBuf {
 fn load_closed_generation(
     wal_path: &Path,
     newest: Option<&GenerationTransition>,
-) -> Option<ClosedGeneration> {
+    keyring: Option<&std::sync::Arc<encryption::Keyring>>,
+) -> Result<Option<ClosedGeneration>, StoreError> {
     let keep = newest.map(|t| closed_path_for(wal_path, t.from_generation));
     let keep_name = keep
         .as_ref()
@@ -1909,14 +1997,20 @@ fn load_closed_generation(
             }
         }
     }
-    let newest = newest?;
-    let path = keep?;
-    path.exists().then(|| ClosedGeneration {
+    let (Some(newest), Some(path)) = (newest, keep) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let codec = crypt::line_codec_for(&path, keyring)?;
+    Ok(Some(ClosedGeneration {
         generation: newest.from_generation,
         records: newest.from_records,
         path,
+        codec,
         index: ReplicationIndex::default(),
-    })
+    }))
 }
 
 fn transitions_path_for(wal_path: &Path) -> PathBuf {
@@ -1985,7 +2079,7 @@ fn count_non_empty_lines(path: &Path) -> Result<usize, StoreError> {
     let mut count = 0usize;
     for line in reader.lines() {
         let line = line?;
-        if !line.trim().is_empty() {
+        if !line.trim().is_empty() && !encryption::is_header_line(line.as_bytes()) {
             count += 1;
         }
     }
@@ -2113,7 +2207,7 @@ struct WalScan {
 /// final line is parsed here; interior lines are returned verbatim so
 /// that a corrupt interior line is reported (with its line number) by
 /// the caller rather than silently dropped.
-fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
+fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
     let mut bytes = Vec::new();
     OpenOptions::new()
         .read(true)
@@ -2122,26 +2216,25 @@ fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
 
     let raw = physical_lines(&bytes);
 
-    // Decode text; invalid UTF-8 is treated as an unparseable line.
-    let decode = |s: usize, e: usize| -> Option<String> {
-        let mut slice = &bytes[s..e];
-        if slice.last() == Some(&b'\r') {
-            slice = &slice[..slice.len() - 1];
-        }
-        std::str::from_utf8(slice).ok().map(str::to_string)
-    };
+    // Decode text (decrypting an encrypted file); a line that does not
+    // decode is treated as an unparseable line.
+    let decoded: Vec<Result<String, String>> = raw
+        .iter()
+        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+        .collect();
+    let decode = |idx: usize| -> Option<String> { decoded[idx].as_ref().ok().cloned() };
 
     // Index of the last non-blank physical line.
-    let last_content = raw
+    let last_content = decoded
         .iter()
-        .rposition(|&(s, e, _)| decode(s, e).is_none_or(|t| !t.trim().is_empty()));
+        .rposition(|text| text.as_ref().map_or(true, |t| !t.trim().is_empty()));
 
     let mut lines = Vec::new();
     let mut valid_len = bytes.len() as u64;
     let mut torn_tail = false;
     let mut missing_newline = false;
-    for (idx, &(s, e, terminated)) in raw.iter().enumerate() {
-        let text = decode(s, e);
+    for (idx, &(s, _, terminated)) in raw.iter().enumerate() {
+        let text = decode(idx);
         let is_last = Some(idx) == last_content;
         if is_last {
             let ok = text
@@ -2161,10 +2254,8 @@ fn scan_wal(path: &Path) -> Result<WalScan, StoreError> {
             Some(t) if t.trim().is_empty() => {}
             Some(t) => lines.push((idx + 1, t)),
             None => {
-                return Err(StoreError::Parse(format!(
-                    "wal line {}: invalid UTF-8",
-                    idx + 1
-                )));
+                let reason = decoded[idx].as_ref().err().cloned().unwrap_or_default();
+                return Err(StoreError::Parse(format!("wal line {}: {reason}", idx + 1)));
             }
         }
     }
@@ -2327,21 +2418,62 @@ pub(crate) struct WalReplay {
 /// again, so restarting never grows the file.
 pub(crate) struct QuarantineSink {
     path: PathBuf,
+    codec: LineCodec,
     seen: HashSet<String>,
     pending: Vec<String>,
 }
 
 impl QuarantineSink {
-    fn load(path: PathBuf) -> Result<Self, StoreError> {
+    /// Loads `<wal>.quarantine`. With a keyring, a plaintext quarantine file
+    /// is rewritten encrypted (it holds raw record lines).
+    fn load(path: PathBuf, keyring: KeyringRef) -> Result<Self, StoreError> {
         let mut seen = HashSet::new();
+        let mut codec = LineCodec::create(keyring.as_ref())?;
         if path.exists() {
+            let existing = crypt::line_codec_for(&path, keyring.as_ref())?;
             let bytes = std::fs::read(&path)?;
-            for line in String::from_utf8_lossy(&bytes).lines() {
-                seen.insert(line.to_string());
+            for (idx, raw) in bytes.split(|b| *b == b'\n').enumerate() {
+                let line = match &existing {
+                    LineCodec::Plain => String::from_utf8_lossy(raw)
+                        .trim_end_matches('\r')
+                        .to_string(),
+                    encrypted => encrypted.decode(raw).map_err(|reason| {
+                        StoreError::Parse(format!(
+                            "{} line {}: {reason}",
+                            path.display(),
+                            idx + 1
+                        ))
+                    })?,
+                };
+                if !line.is_empty() {
+                    seen.insert(line);
+                }
+            }
+            if existing.is_encrypted() || keyring.is_none() {
+                codec = existing;
+            } else if !seen.is_empty() {
+                let mut tmp = path.clone().into_os_string();
+                tmp.push(".encrypt.tmp");
+                let tmp = PathBuf::from(tmp);
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                let mut lines: Vec<&str> = seen.iter().map(String::as_str).collect();
+                lines.sort_unstable();
+                crypt::write_line_file(&mut file, &codec, lines)?;
+                sync_file(&file)?;
+                drop(file);
+                rename_file(&tmp, &path)?;
+                sync_parent_dir(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
             }
         }
         Ok(Self {
             path,
+            codec,
             seen,
             pending: Vec::new(),
         })
@@ -2351,6 +2483,7 @@ impl QuarantineSink {
     fn detached() -> Self {
         Self {
             path: PathBuf::new(),
+            codec: LineCodec::Plain,
             seen: HashSet::new(),
             pending: Vec::new(),
         }
@@ -2367,12 +2500,9 @@ impl QuarantineSink {
             return Ok(());
         }
         let existed = self.path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = crypt::open_line_file_for_append(&self.path, &self.codec)?;
         for line in &self.pending {
-            write_line(&mut file, line)?;
+            write_line(&mut file, &self.codec.encode(line))?;
         }
         file.sync_all()?;
         drop(file);
@@ -2489,16 +2619,50 @@ fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
     (kept, skipped)
 }
 
+/// Rewrites the plaintext WAL at `path` encrypted under a fresh DEK
+/// (temporary file, fsync, rename, directory fsync) and returns its codec.
+/// The record lines are unchanged, so replication offsets keep their meaning.
+/// Called on open once the torn tail is repaired.
+fn encrypt_plain_line_file(
+    path: &Path,
+    keyring: &std::sync::Arc<encryption::Keyring>,
+) -> Result<LineCodec, StoreError> {
+    let codec = LineCodec::create(Some(keyring))?;
+    let scan = scan_wal(path, &LineCodec::Plain)?;
+    if !scan.lines.is_empty() {
+        eprintln!(
+            "info: encrypting the existing plaintext write-ahead log {} ({} lines) under key {}",
+            path.display(),
+            scan.lines.len(),
+            keyring.active_key_id()
+        );
+    }
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".encrypt.tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    crypt::write_line_file(&mut file, &codec, scan.lines.iter().map(|(_, l)| l.as_str()))?;
+    sync_file(&file)?;
+    drop(file);
+    rename_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(codec)
+}
+
 /// Truncates a torn final WAL line (and terminates an otherwise valid
 /// unterminated one). Returns the number of dropped lines (0 or 1).
-fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
-    let scan = scan_wal(path)?;
+fn repair_torn_tail(path: &Path, codec: &LineCodec) -> Result<usize, StoreError> {
+    let scan = scan_wal(path, codec)?;
     if !scan.torn_tail && !scan.missing_newline {
         return Ok(0);
     }
     let file = OpenOptions::new().write(true).open(path)?;
     if scan.torn_tail {
-        let saved = save_truncated_tail(path, scan.valid_len)?;
+        let saved = save_truncated_tail(path, scan.valid_len, codec)?;
         eprintln!(
             "warning: discarding torn tail of write-ahead log {} (truncating to {} bytes; removed bytes saved to {})",
             path.display(),
@@ -2518,8 +2682,10 @@ fn repair_torn_tail(path: &Path) -> Result<usize, StoreError> {
 
 /// Copies the bytes of `path` from `from` to EOF into a fresh, fsynced
 /// `<path>.truncated-<unix-ms>` sidecar so a truncation never destroys data
-/// irrecoverably. Returns the sidecar path.
-fn save_truncated_tail(path: &Path, from: u64) -> Result<PathBuf, StoreError> {
+/// irrecoverably. Returns the sidecar path. For an encrypted file the
+/// sidecar starts with the file's encryption header line, so it can be
+/// decrypted on its own.
+fn save_truncated_tail(path: &Path, from: u64, codec: &LineCodec) -> Result<PathBuf, StoreError> {
     use std::io::{Seek, SeekFrom};
     let mut src = OpenOptions::new().read(true).open(path)?;
     src.seek(SeekFrom::Start(from))?;
@@ -2544,6 +2710,10 @@ fn save_truncated_tail(path: &Path, from: u64) -> Result<PathBuf, StoreError> {
             .open(&sidecar)
         {
             Ok(mut out) => {
+                if let Some(header) = codec.header_line() {
+                    out.write_all(header.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
                 out.write_all(&tail)?;
                 out.sync_all()?;
                 sync_parent_dir(&sidecar)?;
@@ -2565,8 +2735,8 @@ fn save_truncated_tail(path: &Path, from: u64) -> Result<PathBuf, StoreError> {
 /// only be a crash artifact, so every line in it must be intact). The
 /// removed bytes of a genuine torn group are first saved to a
 /// `<wal>.truncated-<ts>` sidecar.
-fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
-    let scan = scan_wal(path)?;
+fn truncate_unterminated_group(path: &Path, codec: &LineCodec) -> Result<usize, StoreError> {
+    let scan = scan_wal(path, codec)?;
     let mut open: Option<(usize, String)> = None;
     for (line_no, line) in &scan.lines {
         if !line.starts_with("B2\t") {
@@ -2614,7 +2784,7 @@ fn truncate_unterminated_group(path: &Path) -> Result<usize, StoreError> {
         offset += chunk.len();
     }
     let dropped = scan.lines.iter().filter(|(n, _)| *n >= begin_line).count();
-    let saved = save_truncated_tail(path, offset as u64)?;
+    let saved = save_truncated_tail(path, offset as u64, codec)?;
     eprintln!(
         "warning: discarding unterminated commit group in write-ahead log {} ({dropped} records; removed bytes saved to {})",
         path.display(),
@@ -3352,22 +3522,24 @@ struct Classified {
     torn_tail: Option<usize>,
 }
 
-fn classify_file(bytes: &[u8]) -> Classified {
+fn classify_file(bytes: &[u8], codec: &LineCodec) -> Classified {
     let phys = physical_lines(bytes);
-    let decode = |s: usize, e: usize| -> Option<&str> {
-        let mut slice = &bytes[s..e];
-        if slice.last() == Some(&b'\r') {
-            slice = &slice[..slice.len() - 1];
-        }
-        std::str::from_utf8(slice).ok()
-    };
+    let decoded: Vec<Result<String, String>> = phys
+        .iter()
+        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+        .collect();
+    let decode = |idx: usize| -> Option<&str> { decoded[idx].as_deref().ok() };
     let mut lines = Vec::new();
     let mut is_snapshot = false;
     let mut header_end = 0usize;
     let mut header_seen = false;
     for (idx, &(s, e, terminated)) in phys.iter().enumerate() {
-        let text = decode(s, e);
+        let text = decode(idx);
         if text.is_some_and(|t| t.trim().is_empty()) {
+            // The encryption header line belongs to the kept prefix.
+            if !header_seen && encryption::is_header_line(&bytes[s..e]) {
+                header_end = if terminated { e + 1 } else { e };
+            }
             continue;
         }
         if !header_seen {
@@ -3381,7 +3553,7 @@ fn classify_file(bytes: &[u8]) -> Classified {
         let verdict = match text {
             None => Err(WalInvalidLine {
                 line_no: idx + 1,
-                error: "invalid UTF-8".to_string(),
+                error: decoded[idx].as_ref().err().cloned().unwrap_or_default(),
                 checksum_failure: false,
                 raw: bytes[s..e].to_vec(),
             }),
@@ -3396,7 +3568,12 @@ fn classify_file(bytes: &[u8]) -> Classified {
                         line_no: idx + 1,
                         checksum_failure: error.contains("checksum"),
                         error,
-                        raw: bytes[s..e].to_vec(),
+                        // The decrypted text for an encrypted file.
+                        raw: if codec.is_encrypted() {
+                            t.as_bytes().to_vec()
+                        } else {
+                            bytes[s..e].to_vec()
+                        },
                     })
                 }
             },
@@ -3414,8 +3591,7 @@ fn classify_file(bytes: &[u8]) -> Classified {
         None
     } else {
         lines.last().and_then(|last| {
-            let ok =
-                decode(last.start, last.end).is_some_and(|t| is_valid_tail(t, last.terminated));
+            let ok = decode(last.line_no - 1).is_some_and(|t| is_valid_tail(t, last.terminated));
             (!ok).then_some(lines.len() - 1)
         })
     };
@@ -3427,6 +3603,25 @@ fn classify_file(bytes: &[u8]) -> Classified {
     }
 }
 
+/// The codec of a WAL or snapshot file from its bytes, using the keyring in
+/// effect (`encryption::current()`).
+fn codec_for_bytes(path: &Path, bytes: &[u8]) -> Result<LineCodec, StoreError> {
+    let first = bytes.split(|b| *b == b'\n').next().unwrap_or(&[]);
+    if !encryption::is_header_line(first) {
+        return Ok(LineCodec::Plain);
+    }
+    let keyring = crypt::current_keyring();
+    let text = std::str::from_utf8(first)
+        .map_err(|_| StoreError::Parse(format!("{}: invalid encryption header", path.display())))?;
+    let cipher = encryption::LineCipher::from_header_line(
+        keyring.as_deref(),
+        text,
+        &path.display().to_string(),
+    )
+    .map_err(crypt::enc_err)?;
+    Ok(LineCodec::Encrypted(std::sync::Arc::new(cipher)))
+}
+
 fn read_generation(path: &Path) -> Option<u64> {
     let raw = std::fs::read_to_string(generation_path_for(path)).ok()?;
     u64::from_str_radix(raw.trim(), 16).ok().filter(|v| *v != 0)
@@ -3436,7 +3631,8 @@ fn read_generation(path: &Path) -> Option<u64> {
 pub fn inspect_wal_file(path: impl AsRef<Path>) -> Result<WalInspection, StoreError> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
-    let classified = classify_file(&bytes);
+    let codec = codec_for_bytes(path, &bytes)?;
+    let classified = classify_file(&bytes, &codec);
     let mut out = WalInspection {
         is_snapshot: classified.is_snapshot,
         generation: if classified.is_snapshot {
@@ -3504,13 +3700,14 @@ pub fn repair_wal_file(
 ) -> Result<WalRepairReport, StoreError> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
-    let classified = classify_file(&bytes);
+    let codec = codec_for_bytes(path, &bytes)?;
+    let classified = classify_file(&bytes, &codec);
     let mut report = WalRepairReport {
         dry_run: options.dry_run,
         ..WalRepairReport::default()
     };
     let mut out: Vec<u8> = bytes[..classified.header_end].to_vec();
-    if classified.is_snapshot && !out.is_empty() && !out.ends_with(b"\n") {
+    if !out.is_empty() && !out.ends_with(b"\n") {
         out.push(b'\n');
     }
     let mut quarantined: Vec<Vec<u8>> = Vec::new();
@@ -3578,17 +3775,12 @@ pub fn repair_wal_file(
     sync_parent_dir(&backup)?;
 
     if let Some(qpath) = &report.quarantine_path {
-        let existed = qpath.exists();
-        let mut file = OpenOptions::new().create(true).append(true).open(qpath)?;
+        // Same storage as replay's quarantine (encrypted with a keyring).
+        let mut sink = QuarantineSink::load(qpath.clone(), crypt::current_keyring())?;
         for raw in &quarantined {
-            file.write_all(raw)?;
-            file.write_all(b"\n")?;
+            sink.pending.push(String::from_utf8_lossy(raw).into_owned());
         }
-        file.sync_all()?;
-        drop(file);
-        if !existed {
-            sync_parent_dir(qpath)?;
-        }
+        sink.flush()?;
     }
 
     let mut tmp = path.to_path_buf().into_os_string();

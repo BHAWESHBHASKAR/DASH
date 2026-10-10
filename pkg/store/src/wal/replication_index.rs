@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{
     QuarantineSink, ReplayParser, ReplayPolicy, is_legacy_kind, is_valid_tail, record_kind,
 };
+use crate::crypt::LineCodec;
 use crate::StoreError;
 
 /// One anchor (byte offset of a replication line) every this many lines.
@@ -175,7 +176,7 @@ impl ReplicationIndex {
     /// which also produces the exact error for a corrupt line. An open
     /// [`super::FileWal`] never leaves either state behind (opening repairs
     /// the tail and every append is newline-terminated).
-    pub(super) fn refresh(&mut self, path: &Path) -> Result<bool, StoreError> {
+    pub(super) fn refresh(&mut self, path: &Path, codec: &LineCodec) -> Result<bool, StoreError> {
         let len = std::fs::metadata(path)?.len();
         if len < self.indexed_bytes {
             // Truncated behind the index's back: start over.
@@ -200,7 +201,7 @@ impl ReplicationIndex {
             pos += n as u64;
             let terminated = buf.last() == Some(&b'\n');
             let body = if terminated { &buf[..n - 1] } else { &buf[..] };
-            let text = decode_line(body);
+            let text = codec.decode(body).ok();
             let blank = text.as_deref().is_some_and(|t| t.trim().is_empty());
             if blank {
                 if !terminated {
@@ -264,11 +265,13 @@ impl ReplicationIndex {
     pub(super) fn lines_from<'a>(
         &'a self,
         path: &Path,
+        codec: &LineCodec,
         from: usize,
     ) -> Result<ViewLines<'a>, StoreError> {
         if from >= self.kept {
             return Ok(ViewLines {
                 index: self,
+                codec: codec.clone(),
                 reader: None,
                 pos: self.indexed_bytes,
                 buf: Vec::new(),
@@ -279,6 +282,7 @@ impl ReplicationIndex {
         reader.seek(SeekFrom::Start(anchor))?;
         let mut lines = ViewLines {
             index: self,
+            codec: codec.clone(),
             reader: Some(reader),
             pos: anchor,
             buf: Vec::new(),
@@ -295,6 +299,7 @@ impl ReplicationIndex {
 /// Iterator over replication lines; see [`ReplicationIndex::lines_from`].
 pub(super) struct ViewLines<'a> {
     index: &'a ReplicationIndex,
+    codec: LineCodec,
     reader: Option<BufReader<File>>,
     pos: u64,
     buf: Vec<u8>,
@@ -315,11 +320,9 @@ impl ViewLines<'_> {
             let start = self.pos;
             self.pos += n as u64;
             let body = self.buf.strip_suffix(b"\n").unwrap_or(&self.buf);
-            let Some(text) = decode_line(body) else {
-                return Err(StoreError::Parse(format!(
-                    "wal bytes at offset {start}: invalid UTF-8"
-                )));
-            };
+            let text = self.codec.decode(body).map_err(|reason| {
+                StoreError::Parse(format!("wal bytes at offset {start}: {reason}"))
+            })?;
             if text.trim().is_empty() || self.index.dropped.contains(&start) {
                 continue;
             }
@@ -337,12 +340,6 @@ impl Iterator for ViewLines<'_> {
     }
 }
 
-/// Text of one physical line (without its newline); a trailing `\r` is
-/// dropped. `None` for invalid UTF-8.
-pub(super) fn decode_line(body: &[u8]) -> Option<String> {
-    let body = body.strip_suffix(b"\r").unwrap_or(body);
-    std::str::from_utf8(body).ok().map(str::to_string)
-}
 
 #[cfg(test)]
 mod tests {
