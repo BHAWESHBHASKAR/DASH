@@ -214,10 +214,10 @@ fn temporal_event_time_filter_excludes_older_claims() {
 #[test]
 fn temporal_validity_window_inclusive() {
     let mut store = InMemoryStore::new();
-    let mut in_window = make_claim("in-window", "t1", "during 2024", 0.9);
+    let mut in_window = make_claim("in-window", "t1", "claim during 2024", 0.9);
     in_window.valid_from = Some(100);
     in_window.valid_to = Some(200);
-    let mut outside = make_claim("outside", "t1", "way before", 0.9);
+    let mut outside = make_claim("outside", "t1", "claim way before", 0.9);
     outside.valid_from = Some(0);
     outside.valid_to = Some(50);
 
@@ -676,6 +676,60 @@ fn empty_query_returns_all_tenant_claims() {
         3,
         "empty query should fall back to all tenant claims"
     );
+}
+
+/// A text-only query returns only claims that share a term with it: claims
+/// with no query term are never used to fill `top_k`, whatever their
+/// confidence, and a query no claim matches returns nothing. The explicit
+/// candidate path (segment base plus WAL delta) applies the same rule.
+#[test]
+fn text_query_never_returns_claims_without_a_query_term() {
+    let mut store = InMemoryStore::new();
+    store
+        .ingest_bundle(
+            make_claim("match", "t1", "Helios acquired Nova", 0.2),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    for i in 0..4 {
+        store
+            .ingest_bundle(
+                make_claim(&format!("other{i}"), "t1", "unrelated weather report", 1.0),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+    }
+    let request = |query: &str| RetrievalRequest {
+        tenant_id: "t1".into(),
+        query: query.into(),
+        top_k: 5,
+        stance_mode: StanceMode::Balanced,
+    };
+    let all: std::collections::HashSet<String> = store.claim_ids_for_tenant("t1");
+    for query in ["helios", "zebra"] {
+        let index = store.retrieve(&request(query));
+        let explicit = store
+            .retrieve_with_time_range_query_vector_and_explicit_candidate_claim_ids(
+                &request(query),
+                None,
+                None,
+                None,
+                &all,
+                None,
+            );
+        let ids = |rows: &[schema::RetrievalResult]| -> Vec<String> {
+            rows.iter().map(|r| r.claim_id.clone()).collect()
+        };
+        let expected: Vec<String> = if query == "helios" {
+            vec!["match".to_string()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(ids(&index), expected, "index path, query {query}");
+        assert_eq!(ids(&explicit), expected, "explicit path, query {query}");
+    }
 }
 
 #[test]
