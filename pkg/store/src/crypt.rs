@@ -504,8 +504,8 @@ pub fn check_encryption_state(
     Ok(encrypted)
 }
 
-/// Reads the keyring from `DASH_ENCRYPTION_KEY_FILE` /
-/// `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, installs it for the process and
+/// Reads the keyring from the environment (`DASH_ENCRYPTION_PROVIDER`, the
+/// key files or the key manager settings), installs it for the process and
 /// checks the existing files with [`check_encryption_state`]. Services call
 /// this at startup before opening any data file and exit on `Err`.
 pub fn init_encryption_from_env(paths: &EncryptionStatePaths) -> Result<KeyringRef, String> {

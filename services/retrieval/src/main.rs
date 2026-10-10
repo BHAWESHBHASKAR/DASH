@@ -294,7 +294,7 @@ fn parse_vector_index_persistence(wal_path: &str) -> Option<Arc<VectorIndexPersi
     )))
 }
 
-/// Installs the encryption keyring from `DASH_ENCRYPTION_KEY_FILE` (ADR
+/// Installs the encryption keyring (`DASH_ENCRYPTION_PROVIDER`, ADR
 /// 0005) and checks the data already on disk before anything is opened:
 /// encrypted files without a usable key stop the service (fail closed).
 fn init_encryption(service: &str, paths: store::EncryptionStatePaths) {
@@ -306,7 +306,7 @@ fn init_encryption(service: &str, paths: store::EncryptionStatePaths) {
             keyring.key_ids().len()
         ),
         Ok(None) => tracing::info!(
-            "{service} encryption at rest: off (set DASH_ENCRYPTION_KEY_FILE to enable it)"
+            "{service} encryption at rest: off (set DASH_ENCRYPTION_KEY_FILE, or DASH_ENCRYPTION_PROVIDER=vault or aws-kms, to enable it)"
         ),
         Err(reason) => {
             tracing::error!("{service} startup refused: encryption at rest: {reason}");
