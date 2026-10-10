@@ -360,6 +360,45 @@ impl Stack {
         }
     }
 
+    /// [`Stack::retrieval_replication`] that returns `None` instead of
+    /// panicking when retrieval does not answer.
+    pub fn try_retrieval_replication(&self) -> Option<Value> {
+        let mut c = self.rc();
+        c.timeout = Duration::from_secs(5);
+        let r = c.request("GET", "/ready", &[], None).ok()?;
+        serde_json::from_str::<Value>(&r.body)
+            .ok()
+            .map(|v| v["replication"].clone())
+    }
+
+    /// [`Stack::leader_position`] that returns `None` instead of panicking
+    /// when the leader does not answer.
+    pub fn try_leader_position(&self) -> Option<(u64, usize)> {
+        let mut c = self.ic();
+        c.timeout = Duration::from_secs(5);
+        let r = c
+            .request(
+                "GET",
+                "/internal/replication/wal?from_offset=0&max_records=1",
+                &[("x-replication-token", self.replication_token.as_str())],
+                None,
+            )
+            .ok()?;
+        if r.status != 200 {
+            return None;
+        }
+        let kv = |name: &str| -> Option<String> {
+            r.body
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                .map(str::to_string)
+        };
+        Some((
+            kv("generation")?.parse().ok()?,
+            kv("total_records")?.parse().ok()?,
+        ))
+    }
+
     /// `(generation, total_records)` as reported by the leader's WAL frame.
     pub fn leader_position(&self) -> (u64, usize) {
         let r = self.ic().get(

@@ -13,6 +13,9 @@
 //! servers' resident memory (`VmRSS` in `/proc/<pid>/status`);
 //! `--max-rss-growth-mib` turns unbounded growth into a failure, and
 //! `--id-space` keeps the data set bounded so memory should plateau.
+//! Every interval (and at the end) it also samples the retrieval follower's
+//! replication lag in WAL records, and after the load stops it measures how
+//! long the follower takes to catch up (`--catch-up-timeout-secs`).
 //!
 //! Exit status: 0 when the error rate and RSS growth stay within the given
 //! limits, 1 otherwise, 2 for usage errors. See
@@ -54,6 +57,9 @@ const USAGE: &str = "usage: loadgen [options]
   --max-rss-growth-mib N   fail when any server's RSS grows more than N MiB
                            between the first and last sample
   --json-out PATH          write the report as JSON
+  --catch-up-timeout-secs N after the run, wait up to N s for the retrieval
+                           follower to reach the leader's WAL position and
+                           report the time it took (default 120; 0: skip)
  spawned servers (default):
   --server-workers N       HTTP workers per service (default 4)
   --checkpoint-every N     DASH_CHECKPOINT_MAX_WAL_RECORDS for ingestion
@@ -83,6 +89,7 @@ struct Config {
     max_error_rate: f64,
     max_rss_growth_mib: Option<f64>,
     json_out: Option<PathBuf>,
+    catch_up_timeout: Duration,
     server_workers: usize,
     checkpoint_every: Option<usize>,
     ingest_url: Option<String>,
@@ -110,6 +117,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         max_error_rate: 0.0,
         max_rss_growth_mib: None,
         json_out: None,
+        catch_up_timeout: Duration::from_secs(120),
         server_workers: 4,
         checkpoint_every: None,
         ingest_url: None,
@@ -152,6 +160,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--max-error-rate" => cfg.max_error_rate = num(flag, value()?)?,
             "--max-rss-growth-mib" => cfg.max_rss_growth_mib = Some(num(flag, value()?)?),
             "--json-out" => cfg.json_out = Some(PathBuf::from(value()?)),
+            "--catch-up-timeout-secs" => cfg.catch_up_timeout = secs(value()?)?,
             "--server-workers" => cfg.server_workers = num::<usize>(flag, value()?)?.max(1),
             "--checkpoint-every" => cfg.checkpoint_every = Some(num(flag, value()?)?),
             "--ingest-url" => cfg.ingest_url = Some(value()?),
@@ -557,6 +566,77 @@ fn rss_summary(samples: &[RssSample]) -> BTreeMap<String, (u64, u64, u64)> {
     out
 }
 
+/// Replication lag of the retrieval follower in WAL records. With spawned
+/// servers it is measured against the leader's live WAL position (the
+/// follower's own `lag_records` only knows the total it saw on its last
+/// poll); a follower in another generation (resync in progress) lags by the
+/// leader's whole WAL. Against external servers it is the follower's
+/// reported `lag_records`. `None` when it cannot be read.
+fn follower_lag(target: &Target) -> Option<u64> {
+    match &target.stack {
+        Some(stack) => {
+            let (generation, total) = stack.try_leader_position()?;
+            let rep = stack.try_retrieval_replication()?;
+            if rep["generation"].as_u64() != Some(generation) {
+                return Some(total as u64);
+            }
+            Some((total as u64).saturating_sub(rep["offset"].as_u64()?))
+        }
+        None => {
+            let mut client = Client::new(target.retrieve);
+            client.timeout = Duration::from_secs(5);
+            let r = client.request("GET", "/ready", &[], None).ok()?;
+            r.json()["replication"]["lag_records"].as_u64()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LagStats {
+    samples: Vec<(f64, u64)>,
+}
+
+impl LagStats {
+    fn record(&mut self, t_secs: f64, lag: Option<u64>) {
+        if let Some(lag) = lag {
+            self.samples.push((t_secs, lag));
+        }
+    }
+
+    fn max(&self) -> Option<u64> {
+        self.samples.iter().map(|(_, lag)| *lag).max()
+    }
+
+    fn mean(&self) -> Option<f64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        Some(
+            self.samples.iter().map(|(_, lag)| *lag as f64).sum::<f64>()
+                / self.samples.len() as f64,
+        )
+    }
+
+    fn last(&self) -> Option<u64> {
+        self.samples.last().map(|(_, lag)| *lag)
+    }
+}
+
+/// Time until the follower's lag reaches zero, polled every 50 ms, or
+/// `None` when it does not within `timeout`.
+fn wait_follower_caught_up(target: &Target, timeout: Duration) -> Option<Duration> {
+    let started = Instant::now();
+    loop {
+        if follower_lag(target) == Some(0) {
+            return Some(started.elapsed());
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match parse_args(&args) {
@@ -655,6 +735,7 @@ fn main() -> ExitCode {
     let t_run = Instant::now();
     let end = t_run + cfg.duration;
     let mut last_report = Instant::now();
+    let mut lag = LagStats::default();
     while Instant::now() < end {
         let step = cfg
             .report_every
@@ -667,6 +748,8 @@ fn main() -> ExitCode {
             let window = last_report.elapsed().as_secs_f64();
             last_report = Instant::now();
             sample_rss(&target.pids, t_start, &mut rss);
+            let lag_now = follower_lag(&target);
+            lag.record(t_run.elapsed().as_secs_f64(), lag_now);
             let mut line = format!("[{:>7.1}s]", t_run.elapsed().as_secs_f64());
             for op in [Op::Ingest, Op::Retrieve] {
                 let mut s = shared.ops[op as usize].lock().unwrap();
@@ -687,16 +770,23 @@ fn main() -> ExitCode {
                     line.push_str(&format!(" {name}_rss={:.1}MiB", kib as f64 / 1024.0));
                 }
             }
+            if let Some(records) = lag_now {
+                line.push_str(&format!(" follower_lag={records}"));
+            }
             println!("{line}");
         }
     }
     shared.recording.store(false, Ordering::Relaxed);
     let measured = t_run.elapsed().as_secs_f64();
+    lag.record(measured, follower_lag(&target));
     shared.stop.store(true, Ordering::Relaxed);
     for h in handles {
         let _ = h.join();
     }
     sample_rss(&target.pids, t_start, &mut rss);
+    let lag_at_stop = follower_lag(&target);
+    let catch_up = (!cfg.catch_up_timeout.is_zero())
+        .then(|| wait_follower_caught_up(&target, cfg.catch_up_timeout));
 
     let ingest = shared.ops[0].lock().unwrap();
     let retrieve = shared.ops[1].lock().unwrap();
@@ -716,6 +806,12 @@ fn main() -> ExitCode {
         failures.push(format!(
             "error rate {error_rate:.6} above the limit {}",
             cfg.max_error_rate
+        ));
+    }
+    if let Some(None) = catch_up {
+        failures.push(format!(
+            "retrieval follower did not catch up within {:?} after the load stopped",
+            cfg.catch_up_timeout
         ));
     }
     if let Some(limit) = cfg.max_rss_growth_mib {
@@ -768,6 +864,26 @@ fn main() -> ExitCode {
             (*last as f64 - *first as f64) / 1024.0
         );
     }
+    let fmt_opt = |v: Option<u64>| v.map_or_else(|| "n/a".to_string(), |v| v.to_string());
+    println!(
+        "follower lag (WAL records): max {}, mean {}, at end of run {}, after workers stopped {}",
+        fmt_opt(lag.max()),
+        lag.mean()
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.0}")),
+        fmt_opt(lag.last()),
+        fmt_opt(lag_at_stop),
+    );
+    match catch_up {
+        Some(Some(d)) => println!(
+            "follower caught up {:.2}s after the load stopped",
+            d.as_secs_f64()
+        ),
+        Some(None) => println!(
+            "follower did not catch up within {:?}",
+            cfg.catch_up_timeout
+        ),
+        None => {}
+    }
     let report = json!({
         "ok": failures.is_empty(),
         "failures": failures,
@@ -797,6 +913,14 @@ fn main() -> ExitCode {
         "rss": rss_by_server.iter().map(|(name, (first, last, peak))| {
             (name.clone(), json!({"first_kib": first, "last_kib": last, "peak_kib": peak}))
         }).collect::<serde_json::Map<String, Value>>(),
+        "follower_lag_records": {
+            "max": lag.max(),
+            "mean": lag.mean(),
+            "end_of_run": lag.last(),
+            "after_stop": lag_at_stop,
+            "samples": lag.samples.iter().map(|(t, l)| json!({"t_secs": t, "records": l})).collect::<Vec<_>>(),
+        },
+        "follower_catch_up_secs": catch_up.flatten().map(|d| d.as_secs_f64()),
         "rss_samples": rss.iter().map(|s| json!({"t_secs": s.t_secs, "server": s.name, "kib": s.kib})).collect::<Vec<_>>(),
     });
     if let Some(path) = &cfg.json_out
@@ -885,6 +1009,21 @@ mod tests {
         let j = op_json(&s, 2.0);
         assert_eq!(j["throughput_rps"], 2.0);
         assert!((j["latency_ms"]["max"].as_f64().unwrap() - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn lag_stats_summarise_samples() {
+        let mut lag = LagStats::default();
+        assert_eq!(lag.max(), None);
+        lag.record(1.0, Some(10));
+        lag.record(2.0, None);
+        lag.record(3.0, Some(30));
+        lag.record(4.0, Some(5));
+        assert_eq!(lag.max(), Some(30));
+        assert_eq!(lag.last(), Some(5));
+        assert_eq!(lag.mean(), Some(15.0));
+        let cfg = parse_args(&args(&["--catch-up-timeout-secs", "0"])).unwrap();
+        assert!(cfg.catch_up_timeout.is_zero());
     }
 
     #[test]
