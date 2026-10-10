@@ -1451,3 +1451,123 @@ fn deletes_replicate_in_order_through_restart_resync_and_a_saved_vector_index() 
         },
     );
 }
+
+// ---------------------------------------------------------------------
+// Checkpoints without resync, chunked resync
+// ---------------------------------------------------------------------
+
+/// The leader checkpoints every few records while the follower keeps up:
+/// the follower finishes each closed generation from the leader's retained
+/// file and switches to the new one, so it never resyncs, and holds exactly
+/// the leader's data (live and after a restart from its own WAL).
+#[test]
+fn leader_checkpoints_are_crossed_without_a_resync() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(
+        &dir.path().join("leader.wal"),
+        None,
+        CheckpointPolicy {
+            max_wal_records: Some(20),
+            max_wal_bytes: None,
+        },
+    );
+    let follower_wal = dir.path().join("follower.wal");
+    let node = start_durable(test_config(&leader.addr), &follower_wal);
+    wait_until("initial sync", Duration::from_secs(10), || {
+        node.status().synced_once
+    });
+    let mut expected = Vec::new();
+    let mut next = 0;
+    let rounds = 4;
+    for round in 0..rounds {
+        // The follower is held while the leader takes writes up to exactly
+        // one checkpoint, so it is inside the closed generation when it
+        // resumes (deterministically, whatever the machine's speed).
+        node.handle().pause();
+        let (generation_before, _) = leader.frame();
+        loop {
+            let id = format!("k{next:03}");
+            next += 1;
+            leader.ingest(&id, None);
+            expected.push(id);
+            if leader.frame().0 != generation_before {
+                break;
+            }
+        }
+        node.handle().resume();
+        let (generation, total) = leader.frame();
+        wait_until("follower caught up", Duration::from_secs(20), || {
+            let status = node.status();
+            status.generation == Some(generation) && status.offset == total
+        });
+        let status = node.status();
+        assert_eq!(status.resyncs_total, 0, "round {round}: {status:?}");
+        assert_eq!(
+            status.generation_switches_total,
+            round + 1,
+            "round {round}: {status:?}"
+        );
+    }
+    expected.sort();
+    assert_eq!(node.claim_ids(), expected);
+    let status = node.status();
+    assert_eq!(status.resyncs_total, 0, "{status:?}");
+    assert_eq!(status.generation_switches_total, rounds, "{status:?}");
+    for id in &expected {
+        assert_eq!(supports_for(&node.store, id), 1, "evidence for {id}");
+    }
+    let mut node = node;
+    node.stop();
+    // The follower's own WAL replays to the same data, and it resumes
+    // without a resync.
+    let wal = FileWal::open(&follower_wal).expect("open follower wal");
+    let replayed = InMemoryStore::load_from_wal(&wal).expect("replay");
+    assert_eq!(replayed.claims_len(), expected.len());
+    drop(wal);
+    let node = start_durable(test_config(&leader.addr), &follower_wal);
+    leader.ingest("after-restart", None);
+    wait_until("resumed", Duration::from_secs(10), || {
+        node.claim_ids().len() == expected.len() + 1
+    });
+    assert_eq!(node.status().resyncs_total, 0);
+}
+
+/// A fresh follower of a leader whose data set is larger than one chunk
+/// downloads the export in chunks (bounded responses) and reaches the
+/// leader's state with one resync.
+#[test]
+fn fresh_follower_resyncs_through_a_chunked_export() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Leader::start(
+        &dir.path().join("leader.wal"),
+        None,
+        CheckpointPolicy {
+            max_wal_records: Some(25),
+            max_wal_bytes: None,
+        },
+    );
+    let mut expected = Vec::new();
+    for i in 0..30 {
+        let id = format!("x{i:02}");
+        leader.ingest(&id, None);
+        expected.push(id);
+    }
+    expected.sort();
+    let mut config = test_config(&leader.addr);
+    config.export_chunk_bytes = 1024;
+    // Chunks are bounded by the response limit as well.
+    config.max_response_bytes = 64 * 1024;
+    let node = start_volatile(config, InMemoryStore::new());
+    wait_until("resynced", Duration::from_secs(20), || {
+        node.claim_ids() == expected
+    });
+    let status = node.status();
+    assert_eq!(status.resyncs_total, 1, "{status:?}");
+    assert!(
+        status.export_bytes_total > 4 * 1024,
+        "the export took several chunks: {status:?}"
+    );
+    for id in &expected {
+        assert_eq!(supports_for(&node.store, id), 1, "evidence for {id}");
+    }
+}

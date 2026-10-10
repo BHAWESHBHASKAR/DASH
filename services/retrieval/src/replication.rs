@@ -866,6 +866,10 @@ impl Follower {
             }
             let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
             guard.set_wal_position(Some(wal.position()));
+            drop(guard);
+            // Nothing follows this node, so the closed generation it just
+            // produced is not needed.
+            wal.discard_closed_generation();
         }
         self.state = FollowerState {
             generation: Some(generation),
@@ -1740,6 +1744,109 @@ mod tests {
             .expect("poisoned legacy lines must not wedge the follower");
         assert_eq!(store.read().expect("read").claims_len(), 1);
         assert_eq!(status.skipped_total.load(Ordering::Relaxed), 3);
+    }
+
+    /// A crash in the middle of a resync's swap (after the cursor was
+    /// removed, or after the local WAL was replaced) restarts into a resync
+    /// that applies the already verified download again: no network, no
+    /// loss, no duplicate, and the cursor matches the WAL afterwards.
+    #[test]
+    fn a_crash_during_the_resync_swap_recovers_from_the_downloaded_export() {
+        use schema::claim_builder;
+        for point in [
+            "retrieval.resync.cursor_cleared",
+            "retrieval.resync.wal_replaced",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // A leader (store level) with a snapshot and a WAL tail.
+            let leader_path = dir.path().join("leader.wal");
+            let mut leader_wal = FileWal::open(&leader_path).expect("leader wal");
+            let mut leader = InMemoryStore::new();
+            for i in 0..12 {
+                let claim = claim_builder(&format!("l{i}"), "tenant-r", "leader claim", 0.9);
+                leader
+                    .ingest_bundle_persistent(&mut leader_wal, claim, vec![], vec![])
+                    .expect("leader write");
+                if i == 8 {
+                    leader
+                        .checkpoint_and_compact(&mut leader_wal)
+                        .expect("checkpoint");
+                }
+            }
+            let exports = store::ReplicationExportStore::for_wal(&leader_path);
+            let leader_wal = Mutex::new(leader_wal);
+
+            // A follower with stale data of its own and no cursor.
+            let follower_path = dir.path().join("follower.wal");
+            {
+                let mut wal = FileWal::open(&follower_path).expect("follower wal");
+                let mut stale = InMemoryStore::new();
+                let claim = claim_builder("stale", "tenant-r", "stale claim", 0.9);
+                stale
+                    .ingest_bundle_persistent(&mut wal, claim, vec![], vec![])
+                    .expect("stale write");
+            }
+            let paths = store::DownloadPaths::for_wal(&follower_path);
+            let mut source = store::LocalExportSource {
+                store: &exports,
+                wal: &leader_wal,
+            };
+            let store::DownloadOutcome::Complete(download) =
+                store::download_export(&mut source, &paths, 256).expect("download")
+            else {
+                panic!("complete");
+            };
+
+            let start = || {
+                let wal = FileWal::open(&follower_path).expect("follower wal");
+                let store = Arc::new(RwLock::new(
+                    InMemoryStore::load_from_wal(&wal).expect("load follower"),
+                ));
+                // Unreachable leader: everything must come from the download.
+                let config = ReplicationFollowerConfig::new("http://127.0.0.1:9");
+                let status = Arc::new(FollowerStatus::new(&config));
+                let follower = Follower::new(Arc::clone(&store), config, Some(wal), status);
+                (follower, store)
+            };
+            let (mut follower, _) = start();
+            assert!(follower.force_resync, "populated WAL without a cursor");
+            arm_crash_point(point);
+            let err = follower.poll_once().expect_err("crash point");
+            assert!(err.contains("crash point"), "{point}: {err}");
+            assert!(
+                read_state(follower.state_path.as_deref().expect("state path")).is_none(),
+                "{point}: the cursor is gone before the files change"
+            );
+            drop(follower);
+
+            let (mut follower, store) = start();
+            assert!(follower.force_resync, "{point}: restart resyncs");
+            follower.poll_once().expect("resync from the download");
+            let mut ids: Vec<String> = store
+                .read()
+                .unwrap()
+                .claims_for_tenant("tenant-r")
+                .into_iter()
+                .map(|c| c.claim_id)
+                .collect();
+            ids.sort();
+            let mut want: Vec<String> = (0..12).map(|i| format!("l{i}")).collect();
+            want.sort();
+            assert_eq!(ids, want, "{point}");
+            let saved = read_state(follower.state_path.as_deref().unwrap()).expect("cursor");
+            assert_eq!(saved.generation, Some(download.manifest.generation));
+            assert_eq!(saved.offset, download.manifest.wal_records);
+            assert_eq!(
+                follower.wal.as_ref().unwrap().wal_record_count().unwrap(),
+                saved.offset,
+                "{point}: cursor matches the local WAL"
+            );
+            assert!(!paths.part.exists(), "{point}: download removed");
+            drop(follower);
+            let replayed =
+                InMemoryStore::load_from_wal(&FileWal::open(&follower_path).unwrap()).unwrap();
+            assert_eq!(replayed.claims_len(), 12, "{point}: replay, no duplicates");
+        }
     }
 
     #[test]
