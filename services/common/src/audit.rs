@@ -164,24 +164,13 @@ pub struct Actor {
     pub id: Option<String>,
 }
 
-/// HMAC-SHA256 (RFC 2104) built on SHA-256.
+/// HMAC-SHA256 (RFC 2104), via the RustCrypto `hmac` crate.
 pub(crate) fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    const BLOCK: usize = 64;
-    let mut block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Sha256::new();
-    inner.update(block.map(|b| b ^ 0x36));
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(block.map(|b| b ^ 0x5c));
-    outer.update(inner);
-    outer.finalize().into()
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
 }
 
 /// Lower-case hex of `bytes`.

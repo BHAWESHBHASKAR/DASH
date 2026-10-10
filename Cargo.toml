@@ -48,6 +48,7 @@ uuid = { version = "1.10", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 usearch = { version = "2", default-features = false }
 
