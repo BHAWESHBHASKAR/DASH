@@ -10,7 +10,9 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
-use dash_compat::{Era, FIXTURES, Fixture, ingest_requests, old_readers, record_kinds, repo_root};
+use dash_compat::{
+    Era, FIXTURES, Fixture, ingest_requests, old_readers, record_kinds, upgrade_guide_mentions,
+};
 use serde_json::Value;
 use store::{FileWal, InMemoryStore, inspect_wal_file};
 use support::load_strict;
@@ -345,9 +347,8 @@ fn a_0_2_build_cannot_read_what_the_current_code_writes() {
         unreadable > 0,
         "a checkpointed snapshot is unreadable by 0.2"
     );
-    let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
     assert!(
-        guide.contains("restore the backup taken before the upgrade"),
+        upgrade_guide_mentions("restore the backup taken before the upgrade"),
         "the upgrade guide documents the 0.2 rollback procedure"
     );
 }
@@ -394,10 +395,8 @@ fn after_a_checkpoint_no_tombstone_is_left_for_an_older_reader() {
             "{}",
             fixture.label
         );
-        let guide =
-            fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
         assert!(
-            guide.contains("checkpoint before the downgrade"),
+            upgrade_guide_mentions("run a checkpoint before the downgrade"),
             "guide documents it"
         );
     }

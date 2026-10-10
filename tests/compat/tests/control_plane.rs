@@ -9,7 +9,7 @@ use std::fs;
 
 use control_plane::ControlPlanePlacementState;
 use control_plane::leader::LeaderLease;
-use dash_compat::{Era, FIXTURES, copy_tree, old_readers, repo_root};
+use dash_compat::{Era, FIXTURES, copy_tree, old_readers, upgrade_guide_mentions};
 
 #[test]
 fn the_current_control_plane_takes_over_an_old_lease_with_a_higher_fencing_token() {
@@ -64,10 +64,11 @@ fn the_current_control_plane_takes_over_an_old_lease_with_a_higher_fencing_token
             fixture.label
         );
     }
-    let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md")).expect("guide");
     assert!(
-        guide.contains("leader.lease.epoch"),
-        "the guide names the lease files to remove"
+        upgrade_guide_mentions(
+            "delete `leader.lease`, `leader.lease.epoch` and `leader.lease.lock`"
+        ),
+        "the guide names the lease files to remove on rollback"
     );
 }
 

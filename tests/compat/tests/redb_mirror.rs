@@ -224,11 +224,8 @@ fn a_0_2_build_cannot_decode_rows_the_current_code_wrote() {
             );
         }
     }
-    let guide =
-        std::fs::read_to_string(dash_compat::repo_root().join("docs/operations/upgrades.md"))
-            .expect("guide");
     assert!(
-        guide.contains("delete the redb file"),
+        dash_compat::upgrade_guide_mentions("delete the redb file"),
         "the guide documents the redb downgrade rule"
     );
 }

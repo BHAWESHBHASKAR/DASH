@@ -262,6 +262,21 @@ pub fn record_kinds(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Whether the operator upgrade guide (`docs/operations/upgrades.md`) states
+/// `phrase` (case and line breaks ignored). Downgrade rules that cannot be
+/// executed against an old binary are asserted to be documented there.
+pub fn upgrade_guide_mentions(phrase: &str) -> bool {
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let guide = fs::read_to_string(repo_root().join("docs/operations/upgrades.md"))
+        .expect("docs/operations/upgrades.md exists");
+    normalize(&guide).contains(&normalize(phrase))
+}
+
 /// Oracles that reproduce what OLDER releases accept, copied from their
 /// source, so downgrade constraints are checked by executing the old rules
 /// rather than only stated in prose.
