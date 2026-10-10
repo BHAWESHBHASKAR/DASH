@@ -6,6 +6,67 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (automatic failover of the ingestion leader, P3 step 1, ADR 0006)
+
+- **Leader failover, off by default.** With `DASH_CONTROL_PLANE_INGEST_FAILOVER=1`
+  on the control plane and `DASH_INGEST_FAILOVER_CONTROL_PLANE_URL`,
+  `DASH_NODE_ID` and `DASH_INGEST_FAILOVER_ADVERTISE_URL` on every ingestion
+  node, the control plane names the ingestion leader and its term (a fencing
+  token persisted before use), the leader writes only while its lease is valid
+  (`DASH_CONTROL_PLANE_INGEST_LEASE_MS`, measured on its monotonic clock from
+  before the heartbeat), and when the lease lapses the most up-to-date synced
+  follower of the current term and WAL lineage is promoted after
+  `DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS` and a fresh report from every
+  live member. Placements led by the old node move to the new one (epoch + 1).
+  New endpoints: `POST /v1/control-plane/ingest/heartbeat`,
+  `GET /v1/control-plane/ingest`, `POST /v1/control-plane/ingest/step-down`
+  (planned handover), `GET /v1/ready/leader` on ingestion. See
+  `docs/operations/failover.md`.
+- **Fencing.** A promoted follower names its WAL after the old leader's
+  generation and checkpoints, so other followers continue without a resync or,
+  if they hold records the new leader never received, resync. Followers send
+  their term with every poll and refuse frames from an older term; a leader
+  that sees a newer term stops writing. Writes are checked against the lease
+  at the HTTP entry and again under the runtime lock before the WAL append. A
+  deposed leader copies its WAL to `<wal>.deposed-t<term>-<unix ms>` and
+  resyncs.
+- **Non-leader answers** to writes are `503` with `Retry-After: 1`,
+  `X-Dash-Leader: false`, `X-Dash-Leader-Node`, `X-Dash-Leader-Url` and
+  `X-Dash-Term` (backwards compatible: clients already retry 503).
+- **Synchronous replication** (`DASH_INGEST_MIN_SYNC_REPLICAS`, default 0):
+  a write is answered once N ingestion followers durably applied it, so with
+  N = 1 an acknowledged write survives the loss of any single node.
+  `DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS` and
+  `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT` (`fail`: 503
+  `sync_replication_timeout`; `degrade`: 200 with
+  `commit_status: sync_degraded`). Followers long-poll a caught-up leader
+  (`wait_ms`), and followers' WAL polls and commit acks get a reserved worker
+  lane so they never queue behind waiting writes.
+- **Metrics and alerts:** `dash_control_plane_ingest_*`,
+  `dash_ingest_failover_*`, `dash_ingest_sync_replication_*`; alerts
+  `DashIngestNoLeader`, `DashIngestFailoverBlocked`,
+  `DashIngestFailoverHappened`, `DashIngestSyncReplicationTimeouts` with
+  runbooks (25 alerts in total).
+- **Helm:** `failover.enabled` runs `failover.replicas` ingestion pods with
+  leader-only readiness (`/v1/ready/leader`, so the ingestion Service and the
+  retrieval followers follow the leader), a headless peers Service, an
+  ingestion PodDisruptionBudget, peer NetworkPolicy and
+  `updateStrategy: OnDelete`.
+- **Tests:** deterministic control-plane tests with an explicit clock,
+  ingestion tests of the write gate, demotion, fencing checkpoint, term checks
+  and synchronous writes, the e2e scenario `s14_leader_failover` (SIGKILL of
+  the leader under synchronous load; SIGSTOP and resume of the leader) and
+  `crash-test --failover` (25 randomized leader kills with checkpoints: 0 of
+  413 acknowledged requests lost, failover p50 2.68 s with a 2 s lease).
+
+### Fixed
+
+- The replication client's per-read timeout had no effect: the HTTP client
+  applies the overall request deadline (60 s) instead when both are set. A
+  zero deadline now leaves only the per-read timeout, which failover
+  followers use for WAL polls and acks so a dead or paused leader is given up
+  on within seconds.
+
 ### Added (encryption at rest, SEC-16, ADR 0005)
 
 - **Encryption at rest, off by default.** Setting `DASH_ENCRYPTION_KEY_FILE`

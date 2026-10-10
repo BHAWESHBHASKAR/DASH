@@ -60,7 +60,7 @@ against the same followers).
 | Replication mode | An acknowledged write survives | Measured |
 |---|---|---|
 | Asynchronous (`DASH_INGEST_MIN_SYNC_REPLICAS=0`, default) | the loss of any follower; the loss of the leader **only if a follower had applied it** (or the leader comes back before a promotion). Unreplicated writes are lost from the cluster (a copy stays in `<wal>.deposed-*`). | `crash-test --failover --env DASH_INGEST_MIN_SYNC_REPLICAS=0`: 4 of 337 acknowledged writes lost over 3 leader kills |
-| Synchronous, `DASH_INGEST_MIN_SYNC_REPLICAS=1` (one follower or more) | the loss of **any single node**. Two nodes lost together (the leader and the only follower that confirmed) can lose it. Use `N=2` with three followers for two losses. | `crash-test --failover`: 0 lost over 20 kills; e2e `s14_leader_failover.rs` |
+| Synchronous, `DASH_INGEST_MIN_SYNC_REPLICAS=1` (one follower or more) | the loss of **any single node**. Two nodes lost together (the leader and the only follower that confirmed) can lose it. Use `N=2` with three followers for two losses. | `crash-test --failover --checkpoint-every 30`: 0 of 413 acknowledged requests lost over 25 leader kills; e2e `s14_leader_failover.rs` |
 
 In both modes:
 
