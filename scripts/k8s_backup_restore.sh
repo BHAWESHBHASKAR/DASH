@@ -212,6 +212,22 @@ do_backup() {
   local wal_files=("$(basename "${WAL_PATH}")")
   if hexec test -f "${WAL_PATH}.snapshot"; then
     wal_files+=("$(basename "${WAL_PATH}").snapshot")
+    # A pending checkpoint marker (the pod stopped while a snapshot was
+    # written) also needs the base snapshot and the closed WAL files it
+    # lists; backup_state_bundle.sh puts them into the bundle.
+    local marker
+    marker="$(hexec head -c 65536 "${WAL_PATH}.snapshot" | head -n 64 || true)"
+    if [[ "$(printf '%s\n' "${marker}" | head -n 1)" == $'SNAP_PENDING\t1' ]]; then
+      if printf '%s\n' "${marker}" | grep -qx $'base\t1'; then
+        wal_files+=("$(basename "${WAL_PATH}").snapshot.base")
+      fi
+      local key value
+      while IFS=$'\t' read -r key value; do
+        if [[ "${key}" == "replay" ]] && hexec test -f "${WAL_PATH}.closed.${value}"; then
+          wal_files+=("$(basename "${WAL_PATH}").closed.${value}")
+        fi
+      done <<< "${marker}"
+    fi
   fi
   hexec tar -C "${WAL_DIR}" -cf - "${wal_files[@]}" | tar -C "${stage}/wal" -xf -
   if [[ -n "${SEGMENT_DIR}" ]] && hexec test -d "${SEGMENT_DIR}"; then

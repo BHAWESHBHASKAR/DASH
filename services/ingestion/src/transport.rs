@@ -178,6 +178,42 @@ pub struct IngestionRuntime {
     /// `DASH_INGEST_MIN_SYNC_REPLICAS` and its timeout behaviour.
     sync_replication: failover::SyncReplicationConfig,
     sync_metrics: Arc<sync_replication::SyncReplicationMetrics>,
+    /// The thread writing the snapshot of the checkpoint in flight (see
+    /// `checkpoint_after_commit`). Joined before the next checkpoint starts
+    /// and when the runtime is dropped.
+    checkpoint_worker: Option<std::thread::JoinHandle<()>>,
+    /// Test hook: the checkpoint thread calls it before writing the
+    /// snapshot (a test holds it there to make the write slow on demand).
+    checkpoint_gate: Option<CheckpointGate>,
+    /// A checkpoint whose snapshot write failed, kept (with its frozen
+    /// state) to be written again instead of rotating once more, and when
+    /// it failed. While it is held the WAL refuses new checkpoints, so a
+    /// disk that keeps failing makes the WAL grow (and its writes fail) as
+    /// before, instead of piling up closed generations.
+    failed_checkpoint: FailedCheckpoint,
+    /// Least time between two attempts to write a failed checkpoint's
+    /// snapshot ([`CHECKPOINT_RETRY_INTERVAL`]; tests lower it).
+    checkpoint_retry_interval: Duration,
+}
+
+/// See `IngestionRuntime::failed_checkpoint`.
+type FailedCheckpoint = Arc<Mutex<Option<(store::CheckpointJob, Instant)>>>;
+
+/// Least time between two attempts to write a failed checkpoint's snapshot.
+const CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// See `IngestionRuntime::set_checkpoint_gate_for_tests`.
+pub type CheckpointGate = Arc<dyn Fn() + Send + Sync>;
+
+impl Drop for IngestionRuntime {
+    /// Waits for a checkpoint whose snapshot is still being written, so a
+    /// clean shutdown (or a test that reopens the WAL) never races it. The
+    /// worker only takes the WAL lock, never the runtime lock.
+    fn drop(&mut self) {
+        if let Some(worker) = self.checkpoint_worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -302,6 +338,10 @@ impl IngestionRuntime {
             replica_progress: Arc::new(failover::ReplicaProgress::default()),
             sync_replication: failover::SyncReplicationConfig::default(),
             sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
+            checkpoint_worker: None,
+            checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
         }
     }
 
@@ -326,7 +366,7 @@ impl IngestionRuntime {
                 }
             }
         });
-        Self {
+        let mut runtime = Self {
             store,
             wal: Some(wal),
             group_commit,
@@ -390,7 +430,14 @@ impl IngestionRuntime {
             replica_progress: Arc::new(failover::ReplicaProgress::default()),
             sync_replication: failover::SyncReplicationConfig::default(),
             sync_metrics: Arc::new(sync_replication::SyncReplicationMetrics::default()),
-        }
+            checkpoint_worker: None,
+            checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
+        };
+        runtime.warm_replication_index();
+        runtime.resume_pending_checkpoint();
+        runtime
     }
 
     pub fn claims_len(&self) -> usize {
@@ -787,18 +834,52 @@ impl IngestionRuntime {
     /// Checkpoint after a committed write. A failure never invalidates the
     /// commit: the write is durable in the WAL, so the caller is told the
     /// checkpoint was deferred and a later write retries it (DATA-10).
+    ///
+    /// Only the rotation and a copy-on-write copy of the state happen here,
+    /// under the runtime and WAL locks (milliseconds); the snapshot is
+    /// written and published by a background thread while writes continue
+    /// in the new WAL (see `store::CheckpointJob`). The returned stats
+    /// describe the checkpoint that started. While one is still being
+    /// written no other starts.
     fn checkpoint_after_commit(
         &mut self,
         label: &str,
     ) -> (Option<store::WalCheckpointStats>, bool) {
-        let Some(wal) = self.wal.as_ref() else {
+        let Some(shared) = self.wal.as_ref() else {
             return (None, false);
         };
-        let mut wal = lock_wal(wal);
+        let mut wal = lock_wal(shared);
+        if wal.checkpoint_in_flight() {
+            // A failed snapshot write is retried (same frozen state, no new
+            // rotation) once the WAL is past the threshold again.
+            let retry = if matches!(
+                should_checkpoint_now(&self.checkpoint_policy, &wal),
+                Ok(true)
+            ) {
+                self.take_failed_checkpoint_due()
+            } else {
+                None
+            };
+            drop(wal);
+            if let Some(job) = retry {
+                eprintln!("ingestion {label}: retrying the failed checkpoint snapshot write");
+                self.spawn_checkpoint_writer(job, label);
+            }
+            return (None, false);
+        }
         match should_checkpoint_now(&self.checkpoint_policy, &wal) {
             Ok(false) => (None, false),
-            Ok(true) => match self.store.checkpoint_and_compact(&mut wal) {
-                Ok(stats) => {
+            Ok(true) => match self.store.begin_checkpoint(&mut wal) {
+                Ok(job) => {
+                    drop(wal);
+                    let stats = job.stats().clone();
+                    tracing::info!(
+                        "ingestion checkpoint started after {label}: pause_ms={:.3}, snapshot_records={}, closed_wal_records={}",
+                        job.pause().as_secs_f64() * 1000.0,
+                        stats.snapshot_records,
+                        stats.truncated_wal_records
+                    );
+                    self.spawn_checkpoint_writer(job, label);
                     // The checkpoint started a new WAL generation, which the
                     // saved vector index no longer matches: save it again.
                     if let Some(persistence) = self.vector_index_persistence.as_ref() {
@@ -816,6 +897,181 @@ impl IngestionRuntime {
                 (None, true)
             }
         }
+    }
+
+    /// Writes and publishes the snapshot of `job` on a background thread
+    /// (on this thread if none can be started).
+    fn spawn_checkpoint_writer(&mut self, job: store::CheckpointJob, label: &str) {
+        if let Some(previous) = self.checkpoint_worker.take() {
+            // It finished: the WAL refuses a checkpoint while one is in
+            // flight. Joining only reaps the thread.
+            let _ = previous.join();
+        }
+        let Some(wal) = self.wal.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let label = label.to_string();
+        let gate = self.checkpoint_gate.clone();
+        let failed = Arc::clone(&self.failed_checkpoint);
+        let run = move |job: store::CheckpointJob, wal: &SharedWal| {
+            if let Some(gate) = gate.as_ref() {
+                gate();
+            }
+            let started = std::time::Instant::now();
+            let written = job.write_catching_panics();
+            let write_secs = started.elapsed().as_secs_f64();
+            if let Err(err) = written {
+                // Kept for a retry; the files keep the pending state
+                // (replayed correctly at startup) meanwhile.
+                eprintln!("ingestion {label} background checkpoint failed: {err:?}");
+                *failed.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((job, std::time::Instant::now()));
+                return;
+            }
+            let mut guard = lock_wal(wal);
+            let result = job.finish(&mut guard);
+            drop(guard);
+            // Retired files (the old snapshot, closed WAL files) are
+            // deleted here, without the WAL lock.
+            let result = result.map(|done| {
+                tracing::info!(
+                    "ingestion checkpoint published: snapshot_records={}, write_secs={write_secs:.3}",
+                    done.stats.snapshot_records
+                );
+            });
+            if let Err(err) = result {
+                // The WAL keeps the pending state (base snapshot plus closed
+                // WAL files, replayed at startup); the next checkpoint
+                // supersedes it.
+                eprintln!("ingestion {label} background checkpoint failed: {err:?}");
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<store::CheckpointJob>();
+        let worker_wal = Arc::clone(&wal);
+        let worker_run = run.clone();
+        let spawned = std::thread::Builder::new()
+            .name("dash-ingest-checkpoint".to_string())
+            .spawn(move || {
+                if let Ok(job) = rx.recv() {
+                    worker_run(job, &worker_wal);
+                }
+            });
+        match spawned {
+            Ok(handle) => match tx.send(job) {
+                Ok(()) => self.checkpoint_worker = Some(handle),
+                Err(std::sync::mpsc::SendError(job)) => run(job, &wal),
+            },
+            Err(err) => {
+                eprintln!(
+                    "ingestion could not start the checkpoint thread ({err}); writing the snapshot inline"
+                );
+                run(job, &wal);
+            }
+        }
+    }
+
+    /// Indexes the WAL read at startup once, before serving. Appends keep
+    /// the replication index current from then on, so neither a follower's
+    /// first poll nor a checkpoint (which needs the closed generation's view
+    /// length) reads the whole WAL under the lock.
+    fn warm_replication_index(&mut self) {
+        if let Some(wal) = self.wal.as_ref()
+            && let Err(err) = lock_wal(wal).replication_position()
+        {
+            eprintln!("ingestion could not index the WAL for replication at startup: {err:?}");
+        }
+    }
+
+    /// A checkpoint whose snapshot was never published (a crash, or a failed
+    /// write before the last shutdown) left the pending state behind:
+    /// replay reads the base snapshot and the closed WAL files. Start a new
+    /// checkpoint right away, which supersedes them, instead of keeping them
+    /// until the WAL reaches the threshold again. Only when the store was
+    /// loaded from this WAL (its position matches), so the snapshot is the
+    /// WAL's state.
+    fn resume_pending_checkpoint(&mut self) {
+        let Some(shared) = self.wal.as_ref() else {
+            return;
+        };
+        let mut wal = lock_wal(shared);
+        if !wal.checkpoint_pending()
+            || wal.checkpoint_in_flight()
+            || self.store.wal_position() != Some(wal.position())
+        {
+            return;
+        }
+        match self.store.begin_checkpoint(&mut wal) {
+            Ok(job) => {
+                drop(wal);
+                tracing::info!(
+                    "ingestion found an unpublished checkpoint; checkpoint started: snapshot_records={}",
+                    job.stats().snapshot_records
+                );
+                self.spawn_checkpoint_writer(job, "startup");
+            }
+            Err(err) => {
+                eprintln!("ingestion could not supersede the unpublished checkpoint: {err:?}");
+            }
+        }
+    }
+
+    /// The failed checkpoint held for a retry, if its retry is due.
+    fn take_failed_checkpoint_due(&self) -> Option<store::CheckpointJob> {
+        let mut held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match held.as_ref() {
+            Some((_, failed_at)) if failed_at.elapsed() >= self.checkpoint_retry_interval => {
+                held.take().map(|(job, _)| job)
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits for a running checkpoint thread and gives up a failed
+    /// checkpoint held for a retry (its pending files stay; the next
+    /// checkpoint or a resync supersedes them). Followers call it before
+    /// they compact or replace their WAL.
+    pub(crate) fn settle_checkpoint(&mut self) {
+        self.wait_for_checkpoint();
+        let held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let (Some((job, _)), Some(wal)) = (held, self.wal.as_ref()) {
+            job.abort(&mut lock_wal(wal));
+        }
+    }
+
+    /// Waits until the checkpoint whose snapshot is being written (if any)
+    /// is published or has failed.
+    pub fn wait_for_checkpoint(&mut self) {
+        if let Some(worker) = self.checkpoint_worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    /// Takes the handle of the checkpoint thread, so a caller can wait for it
+    /// without holding the runtime lock.
+    pub(crate) fn take_checkpoint_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.checkpoint_worker.take()
+    }
+
+    /// Test hook: retry a failed checkpoint snapshot write after `interval`
+    /// instead of [`CHECKPOINT_RETRY_INTERVAL`].
+    #[doc(hidden)]
+    pub fn set_checkpoint_retry_interval_for_tests(&mut self, interval: Duration) {
+        self.checkpoint_retry_interval = interval;
+    }
+
+    /// Test hook: `gate` runs on the checkpoint thread before it writes the
+    /// snapshot. A test blocks in it to hold a checkpoint "in the middle of
+    /// a slow snapshot write" deterministically.
+    #[doc(hidden)]
+    pub fn set_checkpoint_gate_for_tests(&mut self, gate: Option<CheckpointGate>) {
+        self.checkpoint_gate = gate;
     }
 
     fn ingest_input_internal(
@@ -1102,7 +1358,11 @@ impl IngestionRuntime {
         mut self,
         persistence: Arc<VectorIndexPersistence>,
     ) -> Self {
-        if self.wal.is_some() {
+        if let Some(wal) = self.wal.as_ref() {
+            // A checkpoint started at construction changed the generation.
+            if lock_wal(wal).checkpoint_in_flight() {
+                persistence.request_save();
+            }
             self.vector_index_persistence = Some(persistence);
         }
         self

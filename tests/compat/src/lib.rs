@@ -292,6 +292,18 @@ pub mod old_readers {
     pub const V0_3_PRE_DELETE_WAL_KINDS: &[&str] =
         &["C", "E", "G", "V", "B", "C2", "E2", "G2", "V2", "B2"];
 
+    /// The snapshot header every release before background checkpoints
+    /// requires as the first non-blank line of `<wal>.snapshot`
+    /// (`pkg/store/src/wal.rs::replay_snapshot_lines_raw` at `main` ae86667
+    /// and in the 0.3 line up to background checkpoints: anything else is
+    /// `snapshot file has invalid header` and fails the start).
+    pub const SNAPSHOT_HEADER: &str = "SNAP\t1";
+
+    /// Whether such a release accepts `text` as a snapshot file.
+    pub fn accepts_snapshot(text: &str) -> bool {
+        text.lines().find(|line| !line.trim().is_empty()) == Some(SNAPSHOT_HEADER)
+    }
+
     /// The 0.2 lease reader (`services/control-plane/src/leader.rs::read_lease`
     /// at `main` ae86667): exactly `node_id,epoch,expires_at_ms`.
     pub fn v0_2_reads_lease(text: &str) -> Result<(String, u64, u64), String> {

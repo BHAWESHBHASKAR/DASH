@@ -192,9 +192,11 @@ fn checkpoint_failure_after_commit_is_reported_as_deferred_not_an_error() {
         max_wal_bytes: None,
     };
     let mut runtime = persistent_runtime(dir.path(), policy);
-    // The snapshot is written to `<wal>.snapshot.tmp`; a directory there
-    // makes the checkpoint fail after the write has been committed.
-    std::fs::create_dir(dir.path().join("wal.log.snapshot.tmp")).unwrap();
+    // The rotation writes the pending marker through
+    // `<wal>.snapshot.pending.tmp`; a directory there makes the checkpoint
+    // fail (synchronously) after the write has been committed.
+    let blocker = dir.path().join("wal.log.snapshot.pending.tmp");
+    std::fs::create_dir(&blocker).unwrap();
 
     let response = runtime
         .ingest(item("s1", "Committed despite checkpoint failure"))
@@ -204,11 +206,99 @@ fn checkpoint_failure_after_commit_is_reported_as_deferred_not_an_error() {
     assert!(runtime.store.claim_by_id("s1").is_some());
     drop(runtime);
 
-    // The write is durable: a restart replays it from the WAL.
+    // The write is durable: a restart (once the path is usable again)
+    // replays it from the WAL.
+    std::fs::remove_dir(&blocker).unwrap();
     let wal = FileWal::open(dir.path().join("wal.log")).unwrap();
     let replayed = InMemoryStore::load_from_wal(&wal).unwrap();
     assert!(replayed.claim_by_id("s1").is_some());
     assert!(replayed.edges_for_claim("s1").is_empty());
+}
+
+#[test]
+fn a_failed_background_snapshot_write_keeps_every_write_and_the_next_checkpoint_publishes() {
+    let _guard = env_lock().lock().expect("env lock");
+    let dir = tempfile::tempdir().unwrap();
+    let policy = CheckpointPolicy {
+        max_wal_records: Some(1),
+        max_wal_bytes: None,
+    };
+    let mut runtime = persistent_runtime(dir.path(), policy);
+    runtime.set_checkpoint_retry_interval_for_tests(std::time::Duration::ZERO);
+    // The snapshot is written to `<wal>.snapshot.tmp` by the background
+    // thread; a directory there makes that write fail after the response.
+    let tmp = dir.path().join("wal.log.snapshot.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+
+    let response = runtime
+        .ingest(item("s1", "Committed before a failing snapshot write"))
+        .expect("a committed write must not turn into an error");
+    assert!(response.checkpoint_triggered, "the rotation succeeded");
+    assert!(!response.checkpoint_deferred);
+    runtime.wait_for_checkpoint();
+    {
+        let wal = lock_wal(runtime.wal.as_ref().unwrap());
+        // Held for a retry: no new rotation while the write keeps failing.
+        assert!(wal.checkpoint_in_flight());
+        assert!(
+            wal.checkpoint_pending(),
+            "the failed write leaves the pending state"
+        );
+    }
+    let generation = lock_wal(runtime.wal.as_ref().unwrap()).generation();
+    let response = runtime
+        .ingest(item(
+            "s1b",
+            "Committed while the snapshot cannot be written",
+        ))
+        .unwrap();
+    assert!(!response.checkpoint_triggered, "no second rotation");
+    runtime.wait_for_checkpoint();
+    assert_eq!(
+        lock_wal(runtime.wal.as_ref().unwrap()).generation(),
+        generation,
+        "the retry writes the same checkpoint again"
+    );
+    let pending_copy = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() && entry.file_name() != "store.redb" {
+            std::fs::copy(entry.path(), pending_copy.path().join(entry.file_name())).unwrap();
+        }
+    }
+    let restarted_wal = FileWal::open(pending_copy.path().join("wal.log")).unwrap();
+    let replayed = InMemoryStore::load_from_wal(&restarted_wal).unwrap();
+    assert!(replayed.claim_by_id("s1").is_some(), "a restart replays it");
+    // A restart supersedes the unpublished checkpoint right away.
+    let mut restarted =
+        IngestionRuntime::persistent(replayed, restarted_wal, CheckpointPolicy::default());
+    restarted.wait_for_checkpoint();
+    {
+        let wal = lock_wal(restarted.wal.as_ref().unwrap());
+        assert!(!wal.checkpoint_pending(), "published at startup");
+    }
+    drop(restarted);
+    let after_restart =
+        InMemoryStore::load_from_wal(&FileWal::open(pending_copy.path().join("wal.log")).unwrap())
+            .unwrap();
+    assert!(after_restart.claim_by_id("s1").is_some());
+
+    std::fs::remove_dir(&tmp).unwrap();
+    runtime
+        .ingest(item("s2", "Committed after the disk recovered"))
+        .unwrap();
+    // That write retried the held checkpoint, which now publishes.
+    runtime.wait_for_checkpoint();
+    {
+        let wal = lock_wal(runtime.wal.as_ref().unwrap());
+        assert!(!wal.checkpoint_pending(), "the next checkpoint published");
+    }
+    drop(runtime);
+    let replayed =
+        InMemoryStore::load_from_wal(&FileWal::open(dir.path().join("wal.log")).unwrap()).unwrap();
+    assert!(replayed.claim_by_id("s1").is_some());
+    assert!(replayed.claim_by_id("s1b").is_some());
+    assert!(replayed.claim_by_id("s2").is_some());
 }
 
 #[test]

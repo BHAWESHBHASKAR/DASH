@@ -662,6 +662,9 @@ impl IngestionRuntime {
             if self.replication_follower.force_resync {
                 return Err("the follower state needs a full resync".to_string());
             }
+            // A background checkpoint still writing its snapshot would make
+            // the fencing checkpoint fail (one at a time): let it finish.
+            self.settle_checkpoint();
             if let Some(wal) = self.wal.clone() {
                 let mut wal = lock_wal(&wal);
                 let records = wal
@@ -731,6 +734,11 @@ impl IngestionRuntime {
             .is_some_and(|records| records > 0);
         if !(was_leader || own_history) {
             return;
+        }
+        if populated {
+            // The resync replaces the WAL; no checkpoint may still be
+            // writing into it.
+            self.settle_checkpoint();
         }
         if populated && let Some(wal) = self.wal.as_ref() {
             let mut wal = lock_wal(wal);

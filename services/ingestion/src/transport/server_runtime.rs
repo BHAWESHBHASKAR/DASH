@@ -220,6 +220,16 @@ pub(super) fn serve_http_with_workers(
         }
         result
     });
+    // A checkpoint whose snapshot is still being written finishes first, so
+    // the files are left in their steady state (a crash instead would also
+    // recover, from the pending state).
+    let checkpoint_worker = runtime
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take_checkpoint_worker());
+    if let Some(worker) = checkpoint_worker {
+        let _ = worker.join();
+    }
     // Every worker and background thread has exited: save the final state
     // so the next start loads it instead of rebuilding.
     if let Some(persistence) = vector_index_persistence {

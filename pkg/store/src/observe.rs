@@ -23,6 +23,8 @@ static WAL_GROUP_COMMIT_BATCH_ENTRIES: LazyLock<Histogram> =
     LazyLock::new(|| Histogram::new(BATCH_SIZE_BUCKETS));
 static CHECKPOINT_SECONDS: LazyLock<Histogram> =
     LazyLock::new(|| Histogram::new(SLOW_OPERATION_SECONDS_BUCKETS));
+static CHECKPOINT_PAUSE_SECONDS: LazyLock<Histogram> =
+    LazyLock::new(|| Histogram::new(FSYNC_SECONDS_BUCKETS));
 static VECTOR_INDEX_SAVE_SECONDS: LazyLock<Histogram> =
     LazyLock::new(|| Histogram::new(SLOW_OPERATION_SECONDS_BUCKETS));
 static VECTOR_INDEX_LOAD_SECONDS: LazyLock<Histogram> =
@@ -33,6 +35,7 @@ static WAL_FSYNC_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CHECKPOINTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CHECKPOINT_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CHECKPOINT_LAST_SUCCESS_UNIX: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINTS_IN_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static VECTOR_INDEX_SAVE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// One WAL append unit (write plus the `fsync` the write policy asked for).
@@ -67,6 +70,27 @@ pub(crate) fn observe_checkpoint(elapsed: Duration, ok: bool) {
     } else {
         CHECKPOINT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// The part of a checkpoint that runs under the WAL lock: rotation and the
+/// copy-on-write copy of the state (start) or publication (finish).
+pub(crate) fn observe_checkpoint_pause(elapsed: Duration) {
+    CHECKPOINT_PAUSE_SECONDS.observe_duration(elapsed);
+}
+
+pub(crate) fn observe_checkpoint_started() {
+    CHECKPOINTS_IN_PROGRESS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn observe_checkpoint_ended() {
+    let _ = CHECKPOINTS_IN_PROGRESS.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
+}
+
+/// Checkpoints whose snapshot is being written right now.
+pub fn checkpoints_in_progress() -> u64 {
+    CHECKPOINTS_IN_PROGRESS.load(Ordering::Relaxed)
 }
 
 pub(crate) fn observe_vector_index_save(elapsed: Duration, ok: bool) {
@@ -130,7 +154,17 @@ pub fn render_into(w: &mut MetricsWriter) {
     CHECKPOINT_SECONDS.render(
         w,
         "dash_wal_checkpoint_duration_seconds",
-        "Duration of WAL checkpoints (snapshot write plus WAL compaction), successful or not.",
+        "Duration of WAL checkpoints from rotation to the published snapshot, successful or not.",
+    );
+    CHECKPOINT_PAUSE_SECONDS.render(
+        w,
+        "dash_wal_checkpoint_pause_seconds",
+        "Time a checkpoint holds the WAL lock: rotation plus state copy, and publication (one observation each).",
+    );
+    w.gauge(
+        "dash_wal_checkpoint_in_progress",
+        "Checkpoints whose snapshot is being written (writes continue meanwhile).",
+        checkpoints_in_progress() as f64,
     );
     w.counter(
         "dash_wal_checkpoints_total",

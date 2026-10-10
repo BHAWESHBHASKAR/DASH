@@ -679,6 +679,9 @@ struct Follower {
     state: FollowerState,
     force_resync: bool,
     status: Arc<FollowerStatus>,
+    /// The snapshot write of the local checkpoint a generation switch
+    /// started; published by the next poll after it is done.
+    local_checkpoint: Option<store::BackgroundWrite>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -751,6 +754,30 @@ impl Follower {
             state,
             force_resync,
             status,
+            local_checkpoint: None,
+        }
+    }
+
+    /// Publishes the snapshot of the local checkpoint a generation switch
+    /// started, once it is written (`wait`: wait for it). A failed write
+    /// leaves the pending state, which the local replay reads, until the
+    /// next switch or resync supersedes it.
+    fn finish_local_checkpoint(&mut self, wait: bool) {
+        let Some(write) = self.local_checkpoint.take() else {
+            return;
+        };
+        if !wait && !write.is_finished() {
+            self.local_checkpoint = Some(write);
+            return;
+        }
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        match write.finish(wal) {
+            Ok(done) => drop(done),
+            Err(err) => {
+                eprintln!("retrieval replication follower: local checkpoint failed: {err:?}");
+            }
         }
     }
 
@@ -782,6 +809,7 @@ impl Follower {
             gate.polling.store(false, Ordering::SeqCst);
             sleep_interruptible(delay, stop);
         }
+        self.finish_local_checkpoint(true);
     }
 
     fn on_failure(&self, err: String) -> Duration {
@@ -792,6 +820,7 @@ impl Follower {
     }
 
     fn poll_once(&mut self) -> Result<PollOutcome, String> {
+        self.finish_local_checkpoint(false);
         if self.force_resync {
             return self.resync();
         }
@@ -880,24 +909,37 @@ impl Follower {
     /// local generation) so the saved offset keeps matching the local WAL,
     /// and continue at offset 0 of `generation`.
     fn switch_generation(&mut self, generation: u64) -> Result<(), String> {
+        // The previous switch's snapshot may still be being written.
+        self.finish_local_checkpoint(true);
         if let Some(wal) = self.wal.as_mut() {
-            let compacted = {
+            // Only the rotation and a copy-on-write copy of the state happen
+            // here; the snapshot is written on another thread and published
+            // by a later poll. A crash before that replays the base snapshot
+            // and the closed WAL, and the local WAL (empty, then the new
+            // generation's records) still matches the cursor.
+            let begun = {
                 let guard = self.store.read().unwrap_or_else(|p| p.into_inner());
-                guard.checkpoint_and_compact(wal)
+                guard.begin_checkpoint(wal)
             };
-            if let Err(err) = compacted {
-                // The local WAL may be half compacted: rebuild from the leader.
-                self.force_resync = true;
-                return Err(format!(
-                    "local WAL checkpoint for a generation switch failed: {err:?}"
-                ));
-            }
+            let job = match begun {
+                Ok(job) => job,
+                Err(err) => {
+                    // The local WAL may be half compacted: rebuild from the
+                    // leader.
+                    self.force_resync = true;
+                    return Err(format!(
+                        "local WAL checkpoint for a generation switch failed: {err:?}"
+                    ));
+                }
+            };
             let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
             guard.set_wal_position(Some(wal.position()));
             drop(guard);
             // Nothing follows this node, so the closed generation it just
-            // produced is not needed.
+            // produced is not needed (its file goes once the snapshot is
+            // published; replay needs it until then).
             wal.discard_closed_generation();
+            self.local_checkpoint = Some(job.write_in_background("dash-retrieval-checkpoint"));
         }
         self.state = FollowerState {
             generation: Some(generation),
@@ -1066,6 +1108,9 @@ impl Follower {
             .skipped_total
             .fetch_add(skipped, Ordering::Relaxed);
         fresh.clear_wal_events();
+        // A local checkpoint still writing its snapshot finishes first (the
+        // WAL refuses to be replaced while one is in flight).
+        self.finish_local_checkpoint(true);
         if let Some(wal) = self.wal.as_mut() {
             if let Some(path) = self.state_path.as_deref() {
                 remove_state(path)
@@ -1139,6 +1184,9 @@ impl Follower {
             .skipped_total
             .fetch_add(skipped, Ordering::Relaxed);
         fresh.clear_wal_events();
+        // A local checkpoint still writing its snapshot finishes first (the
+        // WAL refuses to be replaced while one is in flight).
+        self.finish_local_checkpoint(true);
         if let Some(wal) = self.wal.as_mut() {
             wal.replace_with_replication_export(&export.export)
                 .map_err(|err| format!("failed to replace local WAL with export: {err:?}"))?;

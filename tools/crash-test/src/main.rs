@@ -254,17 +254,44 @@ fn writer(
     out
 }
 
-/// `wal-inspect verify` on the WAL and, when present, the snapshot (with
-/// the service's encryption settings). With `--encryption` both must also
-/// be encrypted files.
+/// `wal-inspect verify` on the WAL and, when present, the snapshot (or the
+/// pending checkpoint marker), the base snapshot and the closed WAL files
+/// (with the service's encryption settings). With `--encryption` they must
+/// also be encrypted files.
 fn verify_files(cfg: &Config, state: &Path) -> Result<(), String> {
-    for name in ["ingest.wal", "ingest.wal.snapshot"] {
-        let path = state.join(name);
+    let mut names: Vec<String> = [
+        "ingest.wal",
+        "ingest.wal.snapshot",
+        "ingest.wal.snapshot.base",
+    ]
+    .iter()
+    .map(|n| n.to_string())
+    .collect();
+    if let Ok(entries) = std::fs::read_dir(state) {
+        let mut closed: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ingest.wal.closed."))
+            .collect();
+        closed.sort();
+        names.extend(closed);
+    }
+    for name in names {
+        let path = state.join(&name);
         if !path.exists() {
             continue;
         }
+        // After recovery the service is running: a background checkpoint
+        // may retire a file (the base snapshot, a closed WAL) or rotate the
+        // WAL between the listing and its check. A file that is gone once
+        // its check failed was retired, not damaged.
+        let retired = |path: &Path| !path.exists();
         if cfg.encryption {
-            let bytes = std::fs::read(&path).map_err(|e| format!("read {name}: {e}"))?;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) if retired(&path) => continue,
+                Err(e) => return Err(format!("read {name}: {e}")),
+            };
             if !bytes.is_empty() && !bytes.starts_with(b"~DASHENC1 ") {
                 return Err(format!("{name} is not encrypted"));
             }
@@ -282,7 +309,7 @@ fn verify_files(cfg: &Config, state: &Path) -> Result<(), String> {
             )
             .output()
             .map_err(|e| format!("run wal-inspect: {e}"))?;
-        if !out.status.success() {
+        if !out.status.success() && !retired(&path) {
             return Err(format!(
                 "wal-inspect verify {name} failed:\n{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -428,12 +455,14 @@ fn check_oracle(
             return Err(format!("edge {claim} -> {to} lost"));
         }
     }
-    // Once per section: a checkpoint interrupted between the snapshot
-    // rename and the WAL truncation legitimately leaves a record in both.
+    // Exactly once: a checkpoint never leaves a record in both the snapshot
+    // and the WAL (the WAL is rotated before the snapshot is written, and
+    // a pending checkpoint replays the closed WAL instead of the WAL), and
+    // nothing here writes the same evidence twice.
     if let Some((e, [snap, wal])) = leader
         .evidence_lines_by_section
         .iter()
-        .find(|(_, [snap, wal])| *snap > 1 || *wal > 1)
+        .find(|(_, [snap, wal])| snap + wal > 1)
     {
         return Err(format!(
             "evidence {e} is written more than once (snapshot {snap}, WAL {wal})"

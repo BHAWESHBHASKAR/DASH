@@ -336,6 +336,56 @@ fn a_promoted_follower_fences_its_lineage() {
 }
 
 #[test]
+fn promotion_waits_for_a_background_checkpoint_still_writing() {
+    let _env = env_lock().lock().unwrap();
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let leader = Arc::new(Mutex::new(persistent(dir_a.path())));
+    for id in ["c1", "c2"] {
+        assert_eq!(handle_request(&leader, &ingest_request(id)).status, 200);
+    }
+    let frame = leader
+        .lock()
+        .unwrap()
+        .replication_delta_for_followers(None, 0, 1_000, true)
+        .unwrap();
+    let follower = member(persistent(dir_b.path()), "b", None);
+    let mut b = follower.lock().unwrap();
+    b.failover.role = NodeRole::Follower;
+    b.apply_replication_delta_frame(&replication::ReplicationDeltaFrame {
+        generation: frame.generation,
+        needs_resync: false,
+        switch_from: None,
+        from_offset: 0,
+        next_offset: frame.next_offset,
+        total_records: frame.total_records,
+        wal_lines: frame.wal_lines.clone(),
+        term: None,
+    })
+    .unwrap();
+    b.replication_follower.synced_once = true;
+    // The leader's checkpoint is crossed; the local snapshot write is slow.
+    b.set_checkpoint_gate_for_tests(Some(Arc::new(|| {
+        std::thread::sleep(Duration::from_millis(300));
+    })));
+    let next_generation = frame.generation.wrapping_add(1).max(1);
+    b.switch_replication_generation(next_generation).unwrap();
+    assert!(
+        b.checkpoint_worker.is_some(),
+        "snapshot still being written"
+    );
+
+    b.apply_heartbeat_reply(&leader_reply(2), Instant::now());
+    assert_eq!(b.failover.role, NodeRole::Leader, "promotion succeeded");
+    assert!(!b.failover.promotion_refused);
+    let wal = lock_wal(b.wal.as_ref().unwrap());
+    assert!(!wal.checkpoint_in_flight());
+    let transition = *wal.generation_transitions().last().unwrap();
+    assert_eq!(transition.from_generation, next_generation);
+    assert_eq!(transition.from_records, 0);
+}
+
+#[test]
 fn promotion_is_refused_when_the_wal_does_not_match_the_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = member(persistent(dir.path()), "b", None);

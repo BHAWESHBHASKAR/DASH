@@ -29,12 +29,16 @@ use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 use crate::StoreError;
 use crate::crypt::{self, Detected, KeyringRef, LineCodec};
 
+mod checkpoint;
 mod failover;
 mod replication_export;
 mod replication_index;
 #[cfg(test)]
 mod replication_tests;
 
+pub use checkpoint::{CHECKPOINT_IN_PROGRESS, CheckpointTicket, RetiredFiles};
+
+use checkpoint::{PendingCheckpoint, recover_pending_checkpoint};
 pub(crate) use replication_export::ExportFreeze;
 pub use replication_export::{
     ChunkFetch, ChunkRead, DownloadOutcome, DownloadPaths, DownloadedExport,
@@ -611,6 +615,16 @@ pub struct FileWal {
     /// the first replay uses them instead of reading (and decrypting) the
     /// file again, when the file has not changed since.
     open_scan: std::sync::Mutex<Option<OpenScan>>,
+    /// A checkpoint whose snapshot is not published yet: `<wal>.snapshot`
+    /// is a pending marker and replay reads the base snapshot and closed
+    /// WAL files it lists (see `checkpoint`).
+    pending: Option<PendingCheckpoint>,
+    /// Generation started by the checkpoint whose snapshot is being written
+    /// (between `begin_checkpoint` and `finish_checkpoint`).
+    checkpoint_in_flight: Option<u64>,
+    /// Files the last rotation renamed out of the way, handed to the next
+    /// checkpoint ticket for deletion outside the lock.
+    retired_on_rotation: Vec<PathBuf>,
 }
 
 /// The WAL's `(physical line number, line)` pairs read at open, with the
@@ -729,7 +743,13 @@ impl FileWal {
         let opened_len = std::fs::metadata(&path)?.len();
         let generation = load_or_create_generation(&generation_path_for(&path))?;
         let transitions = load_transitions(&transitions_path_for(&path));
-        let closed = load_closed_generation(&path, transitions.last(), keyring.as_ref())?;
+        let pending = recover_pending_checkpoint(&path, keyring.as_ref())?;
+        let closed = load_closed_generation(
+            &path,
+            transitions.last(),
+            pending.as_ref().map_or(&[][..], |p| p.replay.as_slice()),
+            keyring.as_ref(),
+        )?;
         Ok(Self {
             path,
             keyring,
@@ -752,6 +772,9 @@ impl FileWal {
             closed,
             poisoned: None,
             open_scan: std::sync::Mutex::new(Some((opened_len, scan.lines))),
+            pending,
+            checkpoint_in_flight: None,
+            retired_on_rotation: Vec::new(),
         })
     }
 
@@ -830,6 +853,16 @@ impl FileWal {
     pub fn contains_tombstones(&self) -> Result<bool, StoreError> {
         let is_tombstone = |line: &str| line.starts_with("T2\t");
         if self.append_buffer.iter().any(|line| is_tombstone(line)) {
+            return Ok(true);
+        }
+        // Everything replayed before the WAL counts too: the closed WAL files
+        // of a pending checkpoint, and a snapshot taken from an export built
+        // while one was pending (its snapshot section holds those files).
+        if self
+            .replay_prefix_lines_raw()?
+            .iter()
+            .any(|line| is_tombstone(line))
+        {
             return Ok(true);
         }
         let scan = scan_wal(&self.path, &self.codec)?;
@@ -925,9 +958,7 @@ impl FileWal {
     }
 
     pub fn snapshot_path(&self) -> PathBuf {
-        let mut path = self.path.clone().into_os_string();
-        path.push(".snapshot");
-        PathBuf::from(path)
+        checkpoint::snapshot_path_for(&self.path)
     }
 
     pub fn append_claim(&mut self, claim: &Claim) -> Result<(), StoreError> {
@@ -1000,7 +1031,7 @@ impl FileWal {
     }
 
     pub fn replay_boundary(&self) -> Result<WalReplayBoundary, StoreError> {
-        let snapshot_record_count = self.replay_snapshot_lines_raw()?.len();
+        let snapshot_record_count = self.replay_prefix_lines_raw()?.len();
         let mut wal_delta_record_count = self.replay_wal_lines_raw()?.len();
         wal_delta_record_count = wal_delta_record_count.saturating_add(self.append_buffer.len());
         Ok(WalReplayBoundary {
@@ -1190,7 +1221,9 @@ impl FileWal {
     /// Deletes the retained closed generation (a follower that serves no
     /// one of its own does not need it).
     pub fn discard_closed_generation(&mut self) {
-        if let Some(closed) = self.closed.take() {
+        if let Some(closed) = self.closed.take()
+            && !self.is_pending_replay_generation(closed.generation)
+        {
             let _ = std::fs::remove_file(&closed.path);
         }
     }
@@ -1390,24 +1423,21 @@ impl FileWal {
         wal_out: &mut dyn Write,
     ) -> Result<ExportFreeze, StoreError> {
         self.flush_pending_sync()?;
-        let snapshot = match File::open(self.snapshot_path()) {
-            Ok(mut file) => {
-                let what = self.snapshot_path().display().to_string();
-                let codec =
-                    match crypt::detect_open_line_file(&mut file, self.keyring.as_ref(), &what)? {
-                        Detected::Encrypted(codec) => codec,
-                        Detected::Plain => LineCodec::Plain,
-                        Detected::TornHeader => {
-                            return Err(StoreError::Parse(format!(
-                                "{what}: the encryption header is incomplete"
-                            )));
-                        }
-                    };
-                Some((file, codec))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.into()),
+        // While a checkpoint is pending, the state before the WAL is the
+        // base snapshot plus the closed WAL files it lists; the open handles
+        // keep reading them even if the checkpoint publishes and deletes
+        // them meanwhile.
+        let snapshot = match self.replay_base_path() {
+            Some(path) => open_line_file_with_codec(&path, self.keyring.as_ref())?,
+            None => None,
         };
+        let mut closed = Vec::new();
+        for path in self.pending_replay_paths() {
+            let opened = open_line_file_with_codec(&path, self.keyring.as_ref())?;
+            closed.push(
+                opened.ok_or_else(|| StoreError::Io(format!("{} is missing", path.display())))?,
+            );
+        }
         let mut wal_records = 0usize;
         if self.replication_index.refresh(&self.path, &self.codec)? {
             self.note_replication_skipped(self.replication_index.skipped());
@@ -1441,19 +1471,36 @@ impl FileWal {
             generation: self.generation,
             wal_records,
             snapshot,
+            closed,
         })
     }
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
         self.flush_pending_sync()?;
         let (snapshot_lines, skipped_snapshot) =
-            filter_replication_lines(self.replay_snapshot_lines_raw()?);
+            filter_replication_lines(self.replay_prefix_lines_raw()?);
         let (wal_lines, skipped_wal) = filter_replication_lines(self.replay_wal_lines_raw()?);
         self.note_replication_skipped(skipped_snapshot + skipped_wal);
         Ok(WalReplicationExport {
             snapshot_lines,
             wal_lines,
         })
+    }
+
+    fn ensure_no_checkpoint_in_flight(&self) -> Result<(), StoreError> {
+        if self.checkpoint_in_flight.is_some() {
+            return Err(StoreError::Conflict(CHECKPOINT_IN_PROGRESS.to_string()));
+        }
+        Ok(())
+    }
+
+    /// A resync replaced `<wal>.snapshot` (and with it a pending marker): the
+    /// files of the pending checkpoint are no longer replayed.
+    fn retire_pending_after_snapshot_replaced(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            let generation = self.generation;
+            self.retire_pending_files(&pending, generation).delete();
+        }
     }
 
     fn note_replication_skipped(&mut self, skipped: usize) {
@@ -1471,12 +1518,14 @@ impl FileWal {
         export: &WalReplicationExport,
     ) -> Result<(), StoreError> {
         self.ensure_writable()?;
+        self.ensure_no_checkpoint_in_flight()?;
         self.flush_pending_sync()?;
         for line in export.snapshot_lines.iter().chain(&export.wal_lines) {
             check_replicated_line(line)?;
         }
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
+        self.retire_pending_after_snapshot_replaced();
         self.bump_generation()?;
         self.discard_closed_generation();
         self.replication_index.reset();
@@ -1498,6 +1547,7 @@ impl FileWal {
         export: &ReplicationExportFile,
     ) -> Result<(), StoreError> {
         self.ensure_writable()?;
+        self.ensure_no_checkpoint_in_flight()?;
         self.flush_pending_sync()?;
         export.for_each_line(|_, line| check_replicated_line(line))?;
         self.forget_open_scan();
@@ -1533,6 +1583,7 @@ impl FileWal {
         }
         rename_file(&tmp_path, &snapshot_path)?;
         sync_parent_dir(&snapshot_path)?;
+        self.retire_pending_after_snapshot_replaced();
         failpoint!("export_apply.snapshot_replaced");
 
         self.bump_generation()?;
@@ -1657,6 +1708,9 @@ impl FileWal {
     /// Writes the whole append buffer with a single `write_all` and empties
     /// it (also on error, as before).
     fn write_append_buffer(&mut self, file: &mut File) -> Result<(), StoreError> {
+        if self.append_buffer.is_empty() {
+            return Ok(());
+        }
         self.forget_open_scan();
         let bytes: usize = self.append_buffer.iter().map(|line| line.len() + 1).sum();
         let bytes = if self.codec.is_encrypted() {
@@ -1668,8 +1722,13 @@ impl FileWal {
         for line in self.append_buffer.drain(..) {
             self.codec.push_line(&mut buf, &line);
         }
+        let start = file.metadata()?.len();
         file.write_all(buf.as_bytes())?;
         crate::observe::observe_wal_bytes_written(buf.len());
+        // Keep the replication index current from memory (see
+        // `ReplicationIndex::observe_append`).
+        self.replication_index
+            .observe_append(start, buf.as_bytes(), &self.codec);
         Ok(())
     }
 
@@ -1723,6 +1782,23 @@ impl FileWal {
             }
             n
         };
+        // A pending checkpoint's closed WAL files come between the base
+        // snapshot and the WAL; they are WAL records (commit groups,
+        // tombstones) and replay as such.
+        let mut wal_items = Vec::new();
+        for path in self.pending_replay_paths() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let codec = crypt::line_codec_for(&path, self.keyring.as_ref())?;
+            for (line_no, line) in scan_wal(&path, &codec)?.lines {
+                let origin = format!("{name} line {line_no}");
+                if let Some(item) = parser.parse(line, origin, &mut sink)? {
+                    wal_items.push(item);
+                }
+            }
+        }
         let scan = self.scan_for_replay()?;
         // Vector-index changes after line `from` (see
         // `WalReplay::vector_catch_up`); impossible when the WAL is shorter
@@ -1731,7 +1807,6 @@ impl FileWal {
             .filter(|from| *from <= scan.lines.len())
             .map(|_| VectorCatchUp::default());
         let collect_from = collect_vectors_from.unwrap_or(usize::MAX);
-        let mut wal_items = Vec::new();
         for (index, (line_no, line)) in scan.lines.into_iter().enumerate() {
             let origin = format!("wal line {line_no}");
             if let Some(item) = parser.parse(line, origin, &mut sink)? {
@@ -1806,8 +1881,12 @@ impl FileWal {
         scan_wal(&self.path, &self.codec)
     }
 
+    /// Lines of the snapshot replay starts from (the base snapshot while a
+    /// checkpoint is pending).
     fn replay_snapshot_lines_raw(&self) -> Result<Vec<String>, StoreError> {
-        let snapshot_path = self.snapshot_path();
+        let Some(snapshot_path) = self.replay_base_path() else {
+            return Ok(Vec::new());
+        };
         if !snapshot_path.exists() {
             return Ok(Vec::new());
         }
@@ -1841,16 +1920,36 @@ impl FileWal {
         Ok(out)
     }
 
+    /// Lines of the closed WAL files a pending checkpoint replays between
+    /// the base snapshot and the WAL (empty when none is pending).
+    fn replay_closed_lines_raw(&self) -> Result<Vec<String>, StoreError> {
+        let mut out = Vec::new();
+        for path in self.pending_replay_paths() {
+            let codec = crypt::line_codec_for(&path, self.keyring.as_ref())?;
+            out.extend(
+                scan_wal(&path, &codec)?
+                    .lines
+                    .into_iter()
+                    .map(|(_, line)| line),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Everything replay applies before the WAL: the snapshot lines, then
+    /// the lines of the closed WAL files of a pending checkpoint.
+    fn replay_prefix_lines_raw(&self) -> Result<Vec<String>, StoreError> {
+        let mut lines = self.replay_snapshot_lines_raw()?;
+        lines.extend(self.replay_closed_lines_raw()?);
+        Ok(lines)
+    }
+
     fn replay_wal_lines_raw(&self) -> Result<Vec<String>, StoreError> {
         Ok(scan_wal(&self.path, &self.codec)?
             .lines
             .into_iter()
             .map(|(_, line)| line)
             .collect())
-    }
-
-    fn write_snapshot_records(&self, records: &[PersistedRecord]) -> Result<(), StoreError> {
-        self.write_snapshot_lines_raw(&records.iter().map(record_to_line).collect::<Vec<String>>())
     }
 
     fn write_snapshot_lines_raw(&self, lines: &[String]) -> Result<(), StoreError> {
@@ -1935,8 +2034,21 @@ impl FileWal {
         failpoint!("wal.truncated");
         if let Some(previous) = previous
             && previous.path != closed_path
+            && !self.is_pending_replay_generation(previous.generation)
         {
-            let _ = std::fs::remove_file(&previous.path);
+            // Renamed now, deleted by the snapshot writer after the lock is
+            // released (see `CheckpointTicket::retired_on_rotation`).
+            let retired = checkpoint::retired_path_for(
+                &self.path,
+                &format!("closed-{:016x}", previous.generation),
+                self.generation,
+            );
+            match rename_file(&previous.path, &retired) {
+                Ok(()) => self.retired_on_rotation.push(retired),
+                Err(_) => {
+                    let _ = std::fs::remove_file(&previous.path);
+                }
+            }
         }
         self.closed = Some(ClosedGeneration {
             generation: closed_generation,
@@ -1951,44 +2063,30 @@ impl FileWal {
         Ok(())
     }
 
+    /// A whole checkpoint on the calling thread: rotation, snapshot of
+    /// `snapshot_records`, publication (see `checkpoint`).
+    #[cfg(test)]
     pub(crate) fn compact_with_snapshot(
         &mut self,
         snapshot_records: &[PersistedRecord],
     ) -> Result<WalCheckpointStats, StoreError> {
-        self.ensure_writable()?;
-        let truncated_wal_records = self.wal_records;
-        self.flush_pending_sync()?;
-        // The view length the snapshot corresponds to. If it cannot be read
-        // no transition is recorded and followers resync, as before.
-        let closed = match self.replication_view_len() {
-            Ok(len) => Some((self.generation, len)),
+        let ticket = self.begin_checkpoint()?;
+        let written = ticket.write_snapshot(snapshot_records.iter().map(record_to_line));
+        let snapshot_records = match written {
+            Ok(count) => count,
             Err(err) => {
-                eprintln!("warning: checkpoint could not measure the replication view: {err:?}");
-                None
+                self.abort_checkpoint(&ticket);
+                return Err(err);
             }
         };
-        self.write_snapshot_records(snapshot_records)?;
-        self.truncate_wal()?;
-        // Recorded only after the truncation is durable: a crash before this
-        // point leaves no transition, so followers resync instead of
-        // switching into a WAL that may still hold the old lines.
-        match closed {
-            Some((from_generation, from_records)) => {
-                failpoint!("wal.before_transition_recorded");
-                if let Some(retained) = self.closed.as_mut() {
-                    retained.records = from_records;
-                }
-                self.record_transition(GenerationTransition {
-                    from_generation,
-                    from_records,
-                    to_generation: self.generation,
-                });
-            }
-            None => self.discard_closed_generation(),
+        if let Err(err) = ticket.publish() {
+            self.abort_checkpoint(&ticket);
+            return Err(err);
         }
+        self.finish_checkpoint(&ticket)?.delete();
         Ok(WalCheckpointStats {
-            snapshot_records: snapshot_records.len(),
-            truncated_wal_records,
+            snapshot_records,
+            truncated_wal_records: ticket.truncated_wal_records,
         })
     }
 }
@@ -2011,6 +2109,30 @@ impl FileWal {
     }
 }
 
+/// Opens the line file `path` with the codec its first line declares
+/// (`None`: no such file). The handle is at offset 0.
+fn open_line_file_with_codec(
+    path: &Path,
+    keyring: Option<&std::sync::Arc<encryption::Keyring>>,
+) -> Result<Option<(File, LineCodec)>, StoreError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let what = path.display().to_string();
+    let codec = match crypt::detect_open_line_file(&mut file, keyring, &what)? {
+        Detected::Encrypted(codec) => codec,
+        Detected::Plain => LineCodec::Plain,
+        Detected::TornHeader => {
+            return Err(StoreError::Parse(format!(
+                "{what}: the encryption header is incomplete"
+            )));
+        }
+    };
+    Ok(Some((file, codec)))
+}
+
 fn closed_path_for(wal_path: &Path, generation: u64) -> PathBuf {
     let mut path = wal_path.to_path_buf().into_os_string();
     path.push(format!(".closed.{generation:016x}"));
@@ -2019,12 +2141,22 @@ fn closed_path_for(wal_path: &Path, generation: u64) -> PathBuf {
 
 /// The closed generation file that matches the newest transition. Closed
 /// files of other generations (left by a crash, or by a checkpoint whose
-/// transition could not be recorded) are deleted.
+/// transition could not be recorded) are deleted, except those a pending
+/// checkpoint still replays (`replay`).
 fn load_closed_generation(
     wal_path: &Path,
     newest: Option<&GenerationTransition>,
+    replay: &[u64],
     keyring: Option<&std::sync::Arc<encryption::Keyring>>,
 ) -> Result<Option<ClosedGeneration>, StoreError> {
+    let replay_names: Vec<String> = replay
+        .iter()
+        .filter_map(|g| {
+            closed_path_for(wal_path, *g)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .collect();
     let keep = newest.map(|t| closed_path_for(wal_path, t.from_generation));
     let keep_name = keep
         .as_ref()
@@ -2040,7 +2172,10 @@ fn load_closed_generation(
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with(&prefix) && Some(&file_name) != keep_name.as_ref() {
+                if file_name.starts_with(&prefix)
+                    && Some(&file_name) != keep_name.as_ref()
+                    && !replay_names.contains(&file_name)
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -3566,6 +3701,42 @@ pub struct WalInspection {
     pub missing_final_newline: bool,
     /// Invalid lines that are not the torn tail (in file order).
     pub invalid_lines: Vec<WalInvalidLine>,
+    /// The file is the pending marker a checkpoint keeps at
+    /// `<wal>.snapshot` while its snapshot is written (see
+    /// `docs/operations/wal-durability.md`): no records, only what replay
+    /// reads instead.
+    pub pending_checkpoint: Option<PendingCheckpointInfo>,
+}
+
+/// Content of a pending checkpoint marker.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PendingCheckpointInfo {
+    /// Replay starts from `<wal>.snapshot.base`.
+    pub base: bool,
+    /// Closed generations whose `<wal>.closed.<generation>` files replay
+    /// applies after the base, oldest first.
+    pub replay: Vec<u64>,
+}
+
+/// The marker's content when `bytes` (stored with `codec`) is a pending
+/// checkpoint marker.
+fn pending_marker(
+    bytes: &[u8],
+    codec: &LineCodec,
+) -> Option<Result<PendingCheckpointInfo, StoreError>> {
+    let mut text = String::new();
+    for raw in bytes.split(|b| *b == b'\n') {
+        text.push_str(&codec.decode(raw).ok()?);
+        text.push('\n');
+    }
+    let first = text.lines().find(|line| !line.trim().is_empty())?;
+    if first != checkpoint::PENDING_HEADER {
+        return None;
+    }
+    Some(
+        checkpoint::parse_pending_marker(&text)
+            .map(|(base, replay)| PendingCheckpointInfo { base, replay }),
+    )
 }
 
 impl WalInspection {
@@ -3708,6 +3879,25 @@ pub fn inspect_wal_file(path: impl AsRef<Path>) -> Result<WalInspection, StoreEr
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
     let codec = codec_for_bytes(path, &bytes)?;
+    if let Some(marker) = pending_marker(&bytes, &codec) {
+        return Ok(match marker {
+            Ok(info) => WalInspection {
+                is_snapshot: true,
+                pending_checkpoint: Some(info),
+                ..WalInspection::default()
+            },
+            Err(err) => WalInspection {
+                is_snapshot: true,
+                invalid_lines: vec![WalInvalidLine {
+                    line_no: 1,
+                    error: format!("{err:?}"),
+                    checksum_failure: false,
+                    raw: bytes.iter().take(256).copied().collect(),
+                }],
+                ..WalInspection::default()
+            },
+        });
+    }
     let classified = classify_file(&bytes, &codec);
     let mut out = WalInspection {
         is_snapshot: classified.is_snapshot,
@@ -3777,6 +3967,12 @@ pub fn repair_wal_file(
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
     let codec = codec_for_bytes(path, &bytes)?;
+    if pending_marker(&bytes, &codec).is_some() {
+        return Err(StoreError::Parse(format!(
+            "{} is a pending checkpoint marker, not a snapshot; it holds no records to repair (the service completes or rolls back the checkpoint at startup)",
+            path.display()
+        )));
+    }
     let classified = classify_file(&bytes, &codec);
     let mut report = WalRepairReport {
         dry_run: options.dry_run,

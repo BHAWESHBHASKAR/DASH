@@ -8,10 +8,11 @@ flips to 1.
 
 ## Checkpoints: switching generations instead of resyncing
 
-A checkpoint writes the leader's state to `<wal>.snapshot`, starts a new,
-empty WAL and a new WAL generation. Offsets of the old generation mean
-nothing in the new one, so before this release every checkpoint sent every
-follower through a full resync. Now:
+A checkpoint starts a new, empty WAL and a new WAL generation and writes the
+leader's state at that moment to `<wal>.snapshot` (in the background, see
+[WAL durability](wal-durability.md#checkpoints)). Offsets of the old
+generation mean nothing in the new one, so before generation switches every
+checkpoint sent every follower through a full resync. Now:
 
 * The leader records each checkpoint as a transition `(closed generation,
   replication view length at the checkpoint, new generation)` in
@@ -19,7 +20,7 @@ follower through a full resync. Now:
   WAL file as `<wal>.closed.<generation>` until the next checkpoint.
 * A follower inside the closed generation (offset below its end) keeps
   receiving frames of that generation, read from the closed file. A
-  checkpoint runs right after the write that triggered it, under the same
+  checkpoint starts right after the write that triggered it, under the same
   lock, so a live follower is practically always a few records behind when
   it happens: this is the common case.
 * A follower at the exact end of the closed generation receives a frame
@@ -37,7 +38,7 @@ follower through a full resync. Now:
   file, and followers that do not send `gen_switch=1` (earlier builds).
 
 **Why the switch is safe.** The snapshot a checkpoint writes is the leader's
-in-memory state at that moment, and that state is exactly the result of
+in-memory state at the rotation, and that state is exactly the result of
 applying the replication view of the closed generation, in order, on top of
 the generation's starting snapshot (the WAL is the source of truth: a write
 is validated before it is appended and applied after; replay and followers
@@ -52,9 +53,16 @@ of the old view and at the start of the new one) and none is applied twice
 checks the follower's position against the recorded transition and the
 follower checks the leader's `switch_from` against its own cursor; both
 must match exactly. The transition is recorded only after the new WAL is
-durable (snapshot fsynced and renamed, generation file written, old WAL
-renamed to the closed file, new WAL fsynced): a crash anywhere before that
-leaves no transition, and the follower resyncs. A crash during the
+durable (pending marker written, generation file written, old WAL renamed
+to the closed file, new WAL fsynced): a crash anywhere before that leaves no
+transition, and the follower resyncs. It is recorded before the snapshot is
+written, because the switch does not depend on the snapshot: until the
+snapshot is published, the leader's state at the end of the closed
+generation is durable as the base snapshot plus the closed WAL, which its
+replay reads (a leader that crashes before publishing restarts with the
+same state and the same generation, and followers that already switched
+continue). The follower's own compaction is the same three-step checkpoint,
+run in one go. A crash during the
 follower's own compaction leaves a local WAL whose length no longer matches
 the saved offset, which the follower detects at startup and answers with a
 resync. Tests: `pkg/store/src/wal/replication_tests.rs` (exact end, behind,
@@ -77,7 +85,13 @@ in chunks:
    writes `<wal>.exports/<id>.export` from the frozen inputs without the
    lock, streaming. The answer is a manifest: export id, generation, record
    counts, size and SHA-256. A leader whose generation and WAL are unchanged
-   hands out the export it already has.
+   hands out the export it already has. While a checkpoint's snapshot is
+   being written, the frozen snapshot is the base snapshot followed by the
+   closed WAL files the pending marker lists (all opened under the lock, so
+   a publication that deletes them meanwhile does not affect the export);
+   the follower stores them as its snapshot. Its WAL then counts as holding
+   tombstones if they do, which makes a redb cold start rebuild the mirror
+   (see `FileWal::contains_tombstones`).
 2. `GET /internal/replication/export/chunk?export_id=&offset=&max_bytes=`
    returns up to `max_bytes` of the file, cut back to the last complete
    line, read straight from the file (no lock, no copy of the export in
@@ -183,15 +197,71 @@ off; `DASH_CHECKPOINT_MAX_WAL_RECORDS` adds a record threshold, off by
 default). Earlier releases had no default because each checkpoint forced
 every follower through a full resync whose export had to fit in one
 response. Neither holds any more: followers that keep up cross a checkpoint
-with a generation switch, and a resync is chunked. What a checkpoint still
-costs is writing the snapshot (proportional to the data set, under the
-ingestion lock, so writes wait for it) and, on followers, the same local
-compaction. 256 MiB bounds the WAL on disk (plus one closed generation of the
-same size), the replay time at restart, and the replication index, while a
-data set well below that size is rewritten at most about once per 256 MiB of
-writes. Deployments with a data set much larger than 256 MiB should raise
-the threshold (a checkpoint rewrites the whole data set) or accept the
-write pauses; the deployment templates in `deploy/` set 50 MiB.
+with a generation switch, and a resync is chunked. 256 MiB bounds the WAL on
+disk (plus one closed generation of the same size), the replay time at
+restart, and the replication index, while a data set well below that size
+is rewritten at most about once per 256 MiB of writes; the deployment
+templates in `deploy/` set 50 MiB.
+
+### Checkpoint cost
+
+A checkpoint rewrites the whole data set into the snapshot, so its I/O and
+CPU grow with the data set, but writes no longer wait for it: under the
+ingestion lock it only rotates the WAL and copies the state copy-on-write
+(see [WAL durability](wal-durability.md#checkpoints)); the snapshot is
+written by a background thread while writes continue in the new WAL, and
+published with a rename under the WAL lock. What remains:
+
+* **Pause.** A few milliseconds per checkpoint (small fsyncs and renames,
+  plus one pass over the evidence and edge lists to count the records; 6.6
+  to 8.0 ms in the measurement below), reported by
+  `dash_wal_checkpoint_pause_seconds`. It does not read the WAL:
+  the replication view length is kept current by every append.
+* **Background work.** One thread encodes and writes the snapshot; on a
+  machine with few cores it competes with request handling for CPU and with
+  WAL fsyncs for the disk, so expect some latency increase while
+  `dash_wal_checkpoint_in_progress` is 1 (see the measurements below).
+* **Disk.** Until publication: the old snapshot, the new one being written,
+  the closed WAL and the new WAL. Retired files are deleted after the WAL
+  lock is released (unlinking a 1 GiB file took about half a second).
+* **Memory.** A store shard written to during the snapshot write exists
+  twice until the write finishes (at most a second copy of the claim,
+  evidence, edge, vector and batch maps).
+* **Followers.** A follower's generation switch still runs the checkpoint
+  in one go on its replication thread, as before: on a retrieval follower
+  under the store's read lock (queries keep being served, the next frames
+  wait), on an ingestion follower under its runtime lock (its requests wait
+  for the snapshot write).
+
+**Measured** (release build, shared 4 vCPU VM, ext4 virtual disk; one
+ingestion service, WAL only (`DASH_INGEST_PERSISTENCE_DISABLE=1`), 32 HTTP
+workers). 200,000 claims (384-dimensional vector, two evidence rows each)
+preloaded with `tools/loadgen --preload`, the service restarted with
+`DASH_CHECKPOINT_MAX_WAL_BYTES=64 MiB` (the restart replays the 1 GiB WAL,
+so the first write checkpoints), then `loadgen` sends single ingests
+(`--concurrency 16 --batch-size 1`, new ids) for 150 s. The snapshot is
+about 1.1 GiB (800,000 to 957,000 records); before is the parent commit,
+after is this change:
+
+| | before | after |
+| --- | ---: | ---: |
+| checkpoints during the run | 2 | 4 |
+| writes blocked per checkpoint | 22.8 s and 27.0 s (whole snapshot write) | 6.6 to 8.0 ms (rotation) |
+| snapshot write | (under the lock) | 20.0 to 25.7 s, in the background |
+| ingests completed | 26,125 (174/s) | 40,819 (272/s) |
+| p50 / p95 / p99 latency | 55.5 / 88.8 / 137.2 ms | 54.1 / 87.7 / 131.1 ms |
+| max latency | 27,033.6 ms | 571.9 ms |
+| worst one-second p99 | 27,033.6 ms | 571.4 ms |
+
+The remaining tail while a snapshot is written is CPU and disk contention
+on this 4 vCPU machine (the writer thread encodes about 1 GiB of text; the
+one-second p50 rose to 70 to 240 ms in those seconds), not a lock: no ingest
+waited on the checkpoint for longer than the rotation. Single runs on a
+shared VM; treat differences under about 15% as noise.
+
+Deployments with a data set much larger than the threshold still rewrite
+the whole data set once per threshold of writes; raise the threshold to
+trade WAL size and replay time for less checkpoint I/O.
 
 ## Commit group size
 

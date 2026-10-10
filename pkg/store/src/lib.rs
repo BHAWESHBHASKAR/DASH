@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use cow_map::CowMap;
 use graph::summarize_incoming_edges;
 use ranking::{RankSignals, hybrid_relevance, lexical_relevance, prior_score, ranked_score};
 use schema::{
@@ -12,10 +13,13 @@ use schema::{
 
 #[macro_use]
 mod failpoint;
+mod checkpoint;
+mod cow_map;
 mod crypt;
 mod delete;
 mod disk;
 mod value_codec;
+pub use checkpoint::{BackgroundWrite, CheckpointJob, FinishedCheckpoint, StoreSnapshot};
 pub use delete::{DeleteOutcome, DeleteStats, PreparedDelete};
 pub use disk::{DiskBackedStore, DiskStatus};
 
@@ -59,9 +63,10 @@ pub(crate) use wal::{
     record_to_line,
 };
 pub use wal::{
-    CheckpointPolicy, FileWal, ReplayPolicy, WAL_POISONED_PREFIX, WAL_REPLAY_STRICT_ENV,
-    WalCheckpointStats, WalEvent, WalInspection, WalInvalidLine, WalPosition, WalRepairOptions,
-    WalRepairReport, WalReplayBoundary, WalReplayStats, WalReplicationDelta, WalReplicationExport,
+    CHECKPOINT_IN_PROGRESS, CheckpointPolicy, CheckpointTicket, FileWal, PendingCheckpointInfo,
+    ReplayPolicy, RetiredFiles, WAL_POISONED_PREFIX, WAL_REPLAY_STRICT_ENV, WalCheckpointStats,
+    WalEvent, WalInspection, WalInvalidLine, WalPosition, WalRepairOptions, WalRepairReport,
+    WalReplayBoundary, WalReplayStats, WalReplicationDelta, WalReplicationExport,
     WalReplicationFrame, WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
 pub use wal::{
@@ -298,12 +303,12 @@ struct IncomingEdge {
 /// `commit_staged`.
 #[derive(Default)]
 pub struct InMemoryStore {
-    claims: HashMap<String, Claim>,
-    evidence_by_claim: HashMap<String, Vec<Evidence>>,
-    edges_by_claim: HashMap<String, Vec<ClaimEdge>>,
+    claims: CowMap<Claim>,
+    evidence_by_claim: CowMap<Vec<Evidence>>,
+    edges_by_claim: CowMap<Vec<ClaimEdge>>,
     /// Reverse index: target claim id -> edges pointing at it.
     edges_in: HashMap<String, Vec<IncomingEdge>>,
-    claim_vectors: HashMap<String, Vec<f32>>,
+    claim_vectors: CowMap<Vec<f32>>,
     /// Per-tenant vector index (flat below the threshold, HNSW above).
     /// Holds no full-precision copy: rerank reads `claim_vectors`.
     vector_indexes: HashMap<String, TenantVectorIndex>,
@@ -317,7 +322,7 @@ pub struct InMemoryStore {
     entity_index: HashMap<String, HashMap<String, HashSet<String>>>,
     embedding_index: HashMap<String, HashMap<String, HashSet<String>>>,
     temporal_index: HashMap<String, BTreeMap<i64, HashSet<String>>>,
-    batch_commits: HashMap<String, BatchCommitMetadata>,
+    batch_commits: CowMap<BatchCommitMetadata>,
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
     wal: WalEventRing,
@@ -1145,17 +1150,6 @@ impl InMemoryStore {
         self.validate_claim_vector(claim_id, &vector)?;
         wal.append_claim_vector(claim_id, &vector)?;
         self.apply_claim_vector(claim_id, vector)
-    }
-
-    pub fn checkpoint_and_compact(
-        &self,
-        wal: &mut FileWal,
-    ) -> Result<WalCheckpointStats, StoreError> {
-        let started = std::time::Instant::now();
-        let records = self.snapshot_records();
-        let result = wal.compact_with_snapshot(&records);
-        observe::observe_checkpoint(started.elapsed(), result.is_ok());
-        result
     }
 
     pub fn observe_batch_commit(
@@ -2194,62 +2188,9 @@ impl InMemoryStore {
         score_query_candidate_vectors_cpu(query_vector, &candidate_vectors)
     }
 
+    #[cfg(test)]
     fn snapshot_records(&self) -> Vec<PersistedRecord> {
-        let mut claim_ids: Vec<String> = self.claims.keys().cloned().collect();
-        claim_ids.sort_unstable();
-
-        let mut records = Vec::new();
-        for claim_id in &claim_ids {
-            if let Some(claim) = self.claims.get(claim_id) {
-                records.push(PersistedRecord::Claim(claim.clone()));
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(values) = self.claim_vectors.get(claim_id) {
-                records.push(PersistedRecord::ClaimVector(ClaimVectorRecord {
-                    claim_id: claim_id.clone(),
-                    values: values.clone(),
-                }));
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(evidence) = self.evidence_by_claim.get(claim_id) {
-                let mut evidence = evidence.clone();
-                evidence.sort_by(|a, b| a.evidence_id.cmp(&b.evidence_id));
-                for evd in evidence {
-                    records.push(PersistedRecord::Evidence(evd));
-                }
-            }
-        }
-
-        for claim_id in &claim_ids {
-            if let Some(edges) = self.edges_by_claim.get(claim_id) {
-                let mut edges = edges.clone();
-                edges.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
-                for edge in edges {
-                    records.push(PersistedRecord::Edge(edge));
-                }
-            }
-        }
-
-        let mut commit_ids: Vec<&String> = self.batch_commits.keys().collect();
-        commit_ids.sort_unstable();
-        for commit_id in commit_ids {
-            let metadata = self
-                .batch_commits
-                .get(commit_id)
-                .expect("batch commit should exist");
-            records.push(PersistedRecord::BatchCommit(BatchCommitRecord {
-                commit_id: metadata.commit_id.clone(),
-                batch_size: metadata.batch_size,
-                ts_unix_ms: metadata.ts_unix_ms,
-                claim_ids: metadata.claim_ids.clone(),
-            }));
-        }
-
-        records
+        self.snapshot_state().records().collect()
     }
 
     fn validate_bundle(
@@ -2451,8 +2392,7 @@ impl InMemoryStore {
         }
         let entry = self
             .evidence_by_claim
-            .entry(claim_id.to_string())
-            .or_default();
+            .get_or_default_mut(claim_id.to_string());
         for evd in evidence {
             upsert_evidence(entry, evd.clone());
         }
@@ -2464,8 +2404,7 @@ impl InMemoryStore {
         let evidence_id = evidence.evidence_id.clone();
         upsert_evidence(
             self.evidence_by_claim
-                .entry(evidence.claim_id.clone())
-                .or_default(),
+                .get_or_default_mut(evidence.claim_id.clone()),
             evidence,
         );
         self.wal.push(WalEvent::EvidenceUpsert(evidence_id));
@@ -2516,8 +2455,7 @@ impl InMemoryStore {
     fn upsert_edge_in_memory(&mut self, edge: ClaimEdge) {
         let list = self
             .edges_by_claim
-            .entry(edge.from_claim_id.clone())
-            .or_default();
+            .get_or_default_mut(edge.from_claim_id.clone());
         let existing = list
             .iter()
             .position(|e| e.to_claim_id == edge.to_claim_id && e.relation == edge.relation);
@@ -2707,7 +2645,7 @@ impl InMemoryStore {
     pub(crate) fn rebuild_vector_indexes(&mut self) {
         self.defer_vector_index = false;
         let mut by_tenant: HashMap<&str, Vec<(&str, &[f32])>> = HashMap::new();
-        for (claim_id, vector) in &self.claim_vectors {
+        for (claim_id, vector) in self.claim_vectors.iter() {
             if let Some(claim) = self.claims.get(claim_id) {
                 by_tenant
                     .entry(claim.tenant_id.as_str())

@@ -187,6 +187,32 @@ impl ReplicationIndex {
         }
         let mut reader = BufReader::new(File::open(path)?);
         reader.seek(SeekFrom::Start(self.indexed_bytes))?;
+        self.index_from(&mut reader, codec, true)
+    }
+
+    /// Indexes `bytes`, which were just appended to the file at offset
+    /// `start`, without reading the file. The WAL calls it after every
+    /// append, so the index stays current even when no follower polls and a
+    /// checkpoint (which needs the view length) never has to read the whole
+    /// WAL under the lock. Does nothing unless the index ends exactly at
+    /// `start`; [`Self::refresh`] then catches up from the file.
+    pub(super) fn observe_append(&mut self, start: u64, bytes: &[u8], codec: &LineCodec) {
+        if start != self.indexed_bytes {
+            return;
+        }
+        // `Ok(false)` leaves the rest to `refresh` (and its full-scan
+        // fallback), exactly as a refresh that read these bytes would.
+        let _ = self.index_from(&mut std::io::Cursor::new(bytes), codec, false);
+    }
+
+    /// The indexing loop of [`Self::refresh`], over the bytes that follow
+    /// `indexed_bytes` (read from the file, or just written).
+    fn index_from(
+        &mut self,
+        reader: &mut impl BufRead,
+        codec: &LineCodec,
+        count_reads: bool,
+    ) -> Result<bool, StoreError> {
         let mut pos = self.indexed_bytes;
         let mut pending: Option<PendingLine> = None;
         let mut buf = Vec::new();
@@ -196,7 +222,9 @@ impl ReplicationIndex {
             if n == 0 {
                 break;
             }
-            self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            if count_reads {
+                self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            }
             let start = pos;
             pos += n as u64;
             let terminated = buf.last() == Some(&b'\n');
@@ -390,6 +418,47 @@ mod tests {
             format!("{scanned:?}"),
             "frame from={from} max={max} generation={generation:?}"
         );
+    }
+
+    /// Appends feed the index from memory: with no follower polling, the
+    /// view length a checkpoint needs is known without reading the WAL (the
+    /// checkpoint would otherwise read the whole log under the lock).
+    #[test]
+    fn appends_keep_the_index_current_without_reading_the_file() {
+        let dir = TempDir::new().unwrap();
+        let mut wal = FileWal::open(dir.path().join("leader.wal")).unwrap();
+        for round in 0..50u64 {
+            for claim in 0..10 {
+                append_update(&mut wal, &format!("claim-{claim}"), round);
+            }
+        }
+        let (_, view) = wal.replication_position().unwrap();
+        assert_eq!(view, 50 * 10 * 4);
+        assert_eq!(
+            wal.replication_read_bytes_total(),
+            0,
+            "the view length came from the index fed by the appends"
+        );
+        // Frames served from it equal a full scan.
+        let generation = wal.generation();
+        let frame = wal
+            .replication_frame_from(Some(generation), 0, 10_000)
+            .unwrap();
+        assert_eq!(frame.wal_lines, wal.replay_wal_lines_raw().unwrap());
+        // With relaxed fsync (an append buffer) the index follows the
+        // flushed bytes only, and catches up from the file otherwise.
+        let mut relaxed =
+            FileWal::open_with_sync_every_records(dir.path().join("relaxed.wal"), 7).unwrap();
+        for round in 0..9u64 {
+            append_update(&mut relaxed, "claim-r", round);
+        }
+        let (_, view) = relaxed.replication_position().unwrap();
+        assert_eq!(view, 9 * 4);
+        let generation = relaxed.generation();
+        let frame = relaxed
+            .replication_frame_from(Some(generation), 0, 10_000)
+            .unwrap();
+        assert_eq!(frame.wal_lines, relaxed.replay_wal_lines_raw().unwrap());
     }
 
     #[test]
