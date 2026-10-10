@@ -117,6 +117,23 @@ switches the retrieval source to `https://ingestion:8081`, withdraws
 Use certificates from your own PKI (same file names) outside development. See
 `docs/operations/tls.md`.
 
+### Encryption at rest
+
+`docker-compose.encryption.yml` mounts `deploy/container/encryption`
+read-only at `/etc/dash/encryption` and sets `DASH_ENCRYPTION_KEY_FILE` for
+ingestion, retrieval and the segment maintenance daemon:
+
+```bash
+mkdir -p deploy/container/encryption
+openssl rand -hex 32 > deploy/container/encryption/active.key
+sudo chown 10001 deploy/container/encryption/active.key && chmod 0400 deploy/container/encryption/active.key
+docker compose -f deploy/container/docker-compose.yml \
+               -f deploy/container/docker-compose.encryption.yml up -d
+```
+
+The directory is git-ignored. Keep a copy of the key elsewhere: the volumes
+and their backups hold ciphertext only. See `docs/operations/encryption.md`.
+
 ## Environment variables
 
 All variables are read by the Rust binaries (or by the container scripts in

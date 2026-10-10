@@ -228,3 +228,86 @@ fn usage_errors_exit_with_code_two() {
     assert_eq!(code(&run(&["verify"])), 2);
     assert_eq!(code(&run(&["verify", "/nonexistent/dash.wal"])), 2);
 }
+
+fn key_file(dir: &Path, name: &str, byte: u8) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let hex: String = std::iter::repeat_n(format!("{byte:02x}"), 32).collect();
+    std::fs::write(&path, hex).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    path
+}
+
+fn run_with_keys(args: &[&str], active: Option<&Path>, previous: Option<&Path>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wal-inspect"));
+    cmd.args(args)
+        .env_remove("DASH_ENCRYPTION_KEY_FILE")
+        .env_remove("DASH_ENCRYPTION_PREVIOUS_KEY_FILES");
+    if let Some(active) = active {
+        cmd.env("DASH_ENCRYPTION_KEY_FILE", active);
+    }
+    if let Some(previous) = previous {
+        cmd.env("DASH_ENCRYPTION_PREVIOUS_KEY_FILES", previous);
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn encrypted_files_are_verified_listed_and_rewrapped_with_the_configured_keys() {
+    use std::sync::Arc;
+    use store::encryption::{Keyring, local_key_id, with_keyring};
+    let dir = TempDir::new().unwrap();
+    let keys = TempDir::new().unwrap();
+    let old_key = key_file(keys.path(), "old.key", 0x11);
+    let new_key = key_file(keys.path(), "new.key", 0x22);
+    let wal = dir.path().join("dash.wal");
+    with_keyring(
+        Some(Arc::new(Keyring::local([0x11; 32], &[]).unwrap())),
+        || write_encrypted(&wal),
+    );
+    let wal_arg = wal.to_str().unwrap();
+
+    let out = run_with_keys(&["verify", wal_arg], Some(&old_key), None);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("ok: 3 valid records"), "{}", text(&out));
+
+    let out = run_with_keys(&["verify", wal_arg], None, None);
+    assert_eq!(code(&out), 2);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("no encryption key is configured"), "{err}");
+
+    let dir_arg = dir.path().to_str().unwrap();
+    let out = run_with_keys(&["keys", dir_arg], None, None);
+    assert_eq!(code(&out), 0);
+    let listed = text(&out);
+    assert!(listed.contains(&local_key_id(&[0x11; 32])), "{listed}");
+    assert!(listed.contains("encrypted lines"), "{listed}");
+
+    // Rewrap needs the old key to unwrap; afterwards the new key alone works.
+    let out = run_with_keys(&["rewrap", dir_arg], Some(&new_key), None);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    let out = run_with_keys(&["rewrap", dir_arg], Some(&new_key), Some(&old_key));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("rewrapped"), "{}", text(&out));
+    let out = run_with_keys(&["verify", wal_arg], Some(&new_key), None);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let out = run_with_keys(&["keys", dir_arg], None, None);
+    assert!(text(&out).contains(&local_key_id(&[0x22; 32])));
+}
+
+fn write_encrypted(path: &Path) {
+    let mut wal = FileWal::open(path).unwrap();
+    for i in 0..3 {
+        wal.append_claim(&claim_builder(
+            &format!("c{i}"),
+            "tenant-a",
+            "secret text",
+            0.9,
+        ))
+        .unwrap();
+    }
+    wal.flush_pending_sync().unwrap();
+}

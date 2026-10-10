@@ -48,12 +48,19 @@ cp "$REPO_ROOT"/deploy/observability/prometheus/*.rules.yml "$EVIDENCE_DIR/monit
 cp "$REPO_ROOT"/deploy/observability/prometheus/tests/*.yml "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
 cp -r "$REPO_ROOT/docs/operations/runbooks" "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
 
-# 6. Encryption provider name (non-sensitive)
-echo "[soc2] encryption provider config"
+# 6. Encryption at rest configuration (non-sensitive: whether a key file is
+#    configured and the key ids found on disk, never key material)
+echo "[soc2] encryption at rest config"
 {
-    echo "DASH_ENCRYPTION_PROVIDER=${DASH_ENCRYPTION_PROVIDER:-unset}"
-    echo "EME_ENCRYPTION_PROVIDER=${EME_ENCRYPTION_PROVIDER:-unset}"
-} > "$EVIDENCE_DIR/encryption-provider.txt"
+    if [[ -n "${DASH_ENCRYPTION_KEY_FILE:-}" ]]; then
+        echo "encryption_at_rest=on"
+    else
+        echo "encryption_at_rest=off"
+    fi
+    if [[ -n "${DASH_ENCRYPTION_PREVIOUS_KEY_FILES:-}" ]]; then
+        echo "previous_key_files_configured=yes"
+    fi
+} > "$EVIDENCE_DIR/encryption-at-rest.txt"
 
 # 7. Dependency audit (if cargo-audit installed)
 echo "[soc2] dependency audit"

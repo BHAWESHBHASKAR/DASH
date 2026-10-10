@@ -81,6 +81,8 @@ sdks/typescript/.tsbuild/
 
 # Development TLS material from scripts/generate-dev-tls.sh
 /deploy/container/tls/
+# Encryption keys for the Compose encryption overlay (never commit keys)
+/deploy/container/encryption/
 
 # Upgrade-compatibility fixtures are committed state directories, WALs included.
 !tests/compat/fixtures/**

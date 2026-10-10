@@ -12,6 +12,7 @@ use schema::{
 
 #[macro_use]
 mod failpoint;
+mod crypt;
 mod delete;
 mod disk;
 mod value_codec;
@@ -27,6 +28,10 @@ pub mod text_index;
 pub mod vector_index;
 mod vector_persist;
 mod wal;
+pub use crypt::{EncryptionStatePaths, check_encryption_state, init_encryption_from_env};
+/// The encryption crate, re-exported so services and tools use the same
+/// version as the store.
+pub use encryption;
 pub use metrics::{StoreIndexStats, StoreLoadStats, VectorBackendRuntime};
 pub(crate) use metrics::{VECTOR_BACKEND_ENV, VectorBackendPreference};
 use text_index::{QueryTerms, TenantTextIndex, analyze_query};

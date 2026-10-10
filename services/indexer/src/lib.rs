@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions, create_dir_all, read_dir, remove_file, rename},
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -280,8 +280,8 @@ pub fn write_tenant_marker(tenant_dir: &Path, tenant_id: &str) -> Result<(), Seg
             .create_new(true)
             .write(true)
             .open(&tmp_path)?;
-        writeln!(file, "{TENANT_MARKER_HEADER}")?;
-        writeln!(file, "{}", escape_field(tenant_id))?;
+        let body = format!("{TENANT_MARKER_HEADER}\n{}\n", escape_field(tenant_id));
+        write_body(&mut file, &body)?;
         file.sync_all()?;
     }
     rename(tmp_path, path)?;
@@ -292,10 +292,10 @@ pub fn write_tenant_marker(tenant_dir: &Path, tenant_id: &str) -> Result<(), Seg
 /// The tenant recorded by [`write_tenant_marker`], or `None` for directories
 /// written before markers existed.
 pub fn read_tenant_marker(tenant_dir: &Path) -> Result<Option<String>, SegmentStoreError> {
-    let raw = match std::fs::read_to_string(tenant_dir.join(TENANT_MARKER_FILE_NAME)) {
+    let raw = match read_body(&tenant_dir.join(TENANT_MARKER_FILE_NAME)) {
         Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+        Err(SegmentStoreError::MissingFile(_)) => return Ok(None),
+        Err(err) => return Err(err),
     };
     let mut lines = raw.lines();
     if lines.next() != Some(TENANT_MARKER_HEADER) {
@@ -748,12 +748,20 @@ pub fn publish_claims_to_dir(
     claims: &[Claim],
     options: &SegmentPublishOptions,
 ) -> Result<SegmentPublishResult, SegmentStoreError> {
-    let config_key = format!(
+    // The storage format is part of the key: turning encryption at rest on,
+    // or rotating its key, republishes the tenant's files sealed under the
+    // active key (ADR 0005) even when its claims did not change.
+    // (Plaintext keeps the key it always had.)
+    let mut config_key = format!(
         "{}|{}|{}",
         options.max_segment_size,
         options.scheduler.max_segments_per_tier,
         options.scheduler.max_compaction_input_segments
     );
+    if let Some(keyring) = store::encryption::current() {
+        config_key.push_str("|sealed:");
+        config_key.push_str(keyring.active_key_id());
+    }
     let fingerprint = claim_set_fingerprint(claims, &config_key);
     if read_fingerprint(tenant_dir) == Some(fingerprint)
         && let Ok(Some(manifest)) = load_manifest(tenant_dir)
@@ -826,19 +834,17 @@ pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, Segment
     if !manifest_path.exists() {
         return Ok(None);
     }
-    let file = match File::open(manifest_path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
+    let raw = match read_body(&manifest_path) {
+        Ok(raw) => raw,
+        Err(SegmentStoreError::MissingFile(_)) => return Ok(None),
+        Err(err) => return Err(err),
     };
-    let mut reader = BufReader::new(file);
-    let mut header = String::new();
-    let header_bytes = reader.read_line(&mut header)?;
-    if header_bytes == 0 {
+    let mut lines = raw.split_inclusive('\n');
+    let Some(header) = lines.next() else {
         return Err(SegmentStoreError::Parse(
             "segment manifest is empty".to_string(),
         ));
-    }
+    };
     if header.trim_end() != MANIFEST_HEADER {
         return Err(SegmentStoreError::Parse(
             "segment manifest header is invalid".to_string(),
@@ -846,8 +852,8 @@ pub fn load_manifest(root_dir: &Path) -> Result<Option<SegmentManifest>, Segment
     }
 
     let mut entries = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    for line in lines {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
@@ -932,18 +938,18 @@ fn write_manifest_atomic(
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        writeln!(file, "{MANIFEST_HEADER}")?;
+        let mut body = format!("{MANIFEST_HEADER}\n");
         for entry in &manifest.entries {
-            writeln!(
-                file,
-                "{}\t{}\t{}\t{}\t{}",
+            body.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
                 escape_field(&entry.segment_id),
                 format_tier(&entry.tier),
                 escape_field(&entry.file_name),
                 entry.claim_count,
                 entry.checksum
-            )?;
+            ));
         }
+        write_body(&mut file, &body)?;
         file.sync_all()?;
     }
     rename(tmp_path, manifest_path)?;
@@ -963,17 +969,18 @@ fn write_segment_file_atomic(
             .truncate(true)
             .write(true)
             .open(&tmp_path)?;
-        writeln!(
-            file,
-            "{SEGMENT_HEADER}\t{}\t{}\t{}\t{}",
+        let mut body = format!(
+            "{SEGMENT_HEADER}\t{}\t{}\t{}\t{}\n",
             escape_field(&segment.segment_id),
             format_tier(&segment.tier),
             segment.claim_ids.len(),
             checksum
-        )?;
+        );
         for claim_id in &segment.claim_ids {
-            writeln!(file, "{}", escape_field(claim_id))?;
+            body.push_str(&escape_field(claim_id));
+            body.push('\n');
         }
+        write_body(&mut file, &body)?;
         file.sync_all()?;
     }
     rename(tmp_path, path)?;
@@ -981,22 +988,14 @@ fn write_segment_file_atomic(
 }
 
 fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SegmentStoreError::MissingFile(path.display().to_string()));
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let mut reader = BufReader::new(file);
-    let mut header = String::new();
-    let header_bytes = reader.read_line(&mut header)?;
-    if header_bytes == 0 {
+    let raw = read_body(path)?;
+    let mut lines = raw.split_inclusive('\n');
+    let Some(header) = lines.next() else {
         return Err(SegmentStoreError::Parse(format!(
             "segment file '{}' is empty",
             path.display()
         )));
-    }
+    };
     let header = header.trim_end();
     let parts: Vec<&str> = header.split('\t').collect();
     if parts.len() != 6 || parts[0] != "DASHSEG" || parts[1] != "1" {
@@ -1016,12 +1015,12 @@ fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
         .map_err(|_| SegmentStoreError::Parse("segment checksum is invalid".to_string()))?;
 
     let mut claim_ids = Vec::with_capacity(claim_count);
-    for line in reader.lines() {
-        let line = line?;
+    for line in lines {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
-        claim_ids.push(unescape_field(&line)?);
+        claim_ids.push(unescape_field(line)?);
     }
     if claim_ids.len() != claim_count {
         return Err(SegmentStoreError::Integrity(format!(
@@ -1044,6 +1043,47 @@ fn read_segment_file(path: &Path) -> Result<Segment, SegmentStoreError> {
         tier,
         claim_ids,
     })
+}
+
+/// Writes the text `body` of a segment, manifest or tenant marker file:
+/// sealed (format B, ADR 0005) when a keyring is in effect, plain
+/// otherwise.
+fn write_body(file: &mut File, body: &str) -> Result<(), SegmentStoreError> {
+    match store::encryption::current() {
+        Some(keyring) => {
+            let sealed = store::encryption::seal_bytes(&keyring, body.as_bytes())
+                .map_err(|e| SegmentStoreError::Io(e.to_string()))?;
+            file.write_all(&sealed)?;
+        }
+        None => file.write_all(body.as_bytes())?,
+    }
+    Ok(())
+}
+
+/// Reads the text of a file written by [`write_body`], decrypting a sealed
+/// file (which fails closed without the key). A missing file is
+/// [`SegmentStoreError::MissingFile`].
+fn read_body(path: &Path) -> Result<String, SegmentStoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SegmentStoreError::MissingFile(path.display().to_string()));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let bytes = if bytes.starts_with(store::encryption::SEAL_MAGIC) {
+        let keyring = store::encryption::current();
+        store::encryption::open_sealed_bytes(
+            keyring.as_deref(),
+            &bytes,
+            &path.display().to_string(),
+        )
+        .map_err(|e| SegmentStoreError::Integrity(e.to_string()))?
+    } else {
+        bytes
+    };
+    String::from_utf8(bytes)
+        .map_err(|_| SegmentStoreError::Parse(format!("'{}' is not UTF-8", path.display())))
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -1983,5 +2023,72 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn segment_files_are_sealed_with_a_keyring_and_fail_closed_without_it() {
+        use std::sync::Arc;
+        use store::encryption::{self, Keyring};
+        let root = temp_dir("segment-encrypted");
+        let keyring = Arc::new(Keyring::local([0x33; 32], &[]).unwrap());
+        let marker = "claim-secret-marker";
+        let segments = vec![Segment {
+            segment_id: "hot-0".into(),
+            tier: Tier::Hot,
+            claim_ids: vec![marker.into(), "claim-2".into()],
+        }];
+        encryption::with_keyring(Some(keyring.clone()), || {
+            write_tenant_marker(&root, "tenant-secret").unwrap();
+            let manifest = persist_segments_atomic(&root, &segments).unwrap();
+            let loaded = load_manifest(&root).unwrap().unwrap();
+            assert_eq!(loaded, manifest);
+            assert_eq!(
+                load_segments_from_manifest(&root, &loaded).unwrap(),
+                segments
+            );
+            assert_eq!(
+                read_tenant_marker(&root).unwrap().as_deref(),
+                Some("tenant-secret")
+            );
+        });
+        for entry in fs::read_dir(&root).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains(marker), "{}", path.display());
+            assert!(!text.contains("tenant-secret"), "{}", path.display());
+            if !path.to_string_lossy().ends_with(FINGERPRINT_FILE_NAME) {
+                assert!(
+                    bytes.starts_with(encryption::SEAL_MAGIC),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+        // Damage is an integrity error, not garbage.
+        let manifest = encryption::with_keyring(Some(keyring.clone()), || {
+            load_manifest(&root).unwrap().unwrap()
+        });
+        let segment_path = root.join(&manifest.entries[0].file_name);
+        let mut bytes = fs::read(&segment_path).unwrap();
+        let at = bytes.len() - 5;
+        bytes[at] ^= 1;
+        fs::write(&segment_path, &bytes).unwrap();
+        encryption::with_keyring(Some(keyring), || {
+            let err = load_segments_from_manifest(&root, &manifest).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("authentication failed"),
+                "{err:?}"
+            );
+        });
+        // No key configured: fail closed with the key id named.
+        encryption::with_keyring(None, || {
+            let err = load_manifest(&root).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("DASH_ENCRYPTION_KEY_FILE"),
+                "{err:?}"
+            );
+        });
+        let _ = fs::remove_dir_all(&root);
     }
 }

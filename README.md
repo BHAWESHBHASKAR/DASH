@@ -116,11 +116,12 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - Observability: `/metrics` on all three services is valid Prometheus exposition (checked by a strict parser in the tests) with per-route request counters by status code, latency histograms (`dash_http_server_request_duration_seconds`), an in-flight gauge, WAL append/fsync, group-commit, checkpoint and vector index histograms, embedding call latency, errors and breaker state, follower lag in records and seconds, process metrics and `dash_build_info`; labels are bounded (no tenant or claim ids). Every request carries an `X-Request-Id` (a valid client id is kept, otherwise one is generated) that is echoed in the response, added to JSON error bodies, stored in audit records and attached to log events; `DASH_LOG_FORMAT=json` gives JSON logs. `deploy/observability/` ships 21 alerts, each with a runbook in [`docs/operations/runbooks/`](docs/operations/runbooks/) and unit-tested with `promtool test rules` in CI, SLO recording rules ([`docs/operations/slos.md`](docs/operations/slos.md)) and three Grafana dashboards; the Helm chart can install them (ServiceMonitor, PrometheusRule, dashboard ConfigMap). No OpenTelemetry trace export yet.
 - Ranking: support and contradiction contributions saturate (support bonus capped at 0.4, contradiction penalty at 0.5), and an edge `from supports to` credits the target claim.
 - Kubernetes: the Helm chart and the raw manifests install on a kind cluster and pass an end-to-end test (`scripts/kind_e2e.sh`, CI workflow `kind-e2e.yml`): authenticated ingest, retrieve from every retrieval replica, delete, ingestion and retrieval pod kills (including a lost follower PVC), cold backup and restore of the ingestion volume (`scripts/k8s_backup_restore.sh`), `helm upgrade` with changed values and from an older chart, and native TLS with a self-signed CA, under Pod Security "restricted" with NetworkPolicy enforced. One ingestion pod (no writer failover) and manual retrieval scaling ([`docs/operations/kubernetes.md`](docs/operations/kubernetes.md)).
+- Encryption at rest, off by default: with `DASH_ENCRYPTION_KEY_FILE` set, the WAL, snapshot, closed generations, replication exports and part files, persisted vector index, segment files and redb values are encrypted with AES-256-GCM under per-file data keys wrapped by your key; torn-tail recovery and damaged-record errors work as before, plaintext data from earlier releases is read and migrated, a node finding encrypted files without its key refuses to start, and keys rotate without re-encrypting data (`wal-inspect rewrap`). A plaintext canary test drives the real services and scans every file. Audit logs, identifiers (redb keys, directory names) and replication on the wire stay plaintext (use TLS). Local key files only; no KMS provider and no per-tenant keys ([`docs/operations/encryption.md`](docs/operations/encryption.md), [ADR 0005](docs/adr/0005-encryption-at-rest.md)).
 - Benchmark and drill scripts. Numbers in `docs/benchmarks/` are drill output, not a published performance claim.
 
 **Planned (do not rely on):**
 - Keyed (HMAC) audit chain and external anchoring; the current chain is unkeyed.
-- Encryption at rest / CMEK. `pkg/encryption` is a standalone AES-256-GCM library with an env-key provider; no storage code calls it, so nothing on disk is encrypted by DASH.
+- Cloud KMS key providers (AWS KMS, GCP KMS, Azure Key Vault, Vault Transit) and per-tenant data keys with crypto-shredding; encryption at rest uses local key files today.
 - An external penetration test and published SOC 2 evidence. TLS on by default in the shipped deployment artifacts (today it is one setting away; see above).
 - GPU vector backend. `pkg/store/src/gpu.rs` is a placeholder that never returns a GPU engine; scoring runs on CPU.
 - Consensus replication (Raft), automatic failover, sharded cluster mode.
@@ -139,7 +140,7 @@ DASH is a Rust workspace (edition 2024).
 | `pkg/graph` | Claim graph expansion and support/contradiction path reasoning |
 | `pkg/auth` | HS256 JWT, OIDC/JWKS, roles, SHA-256 helper |
 | `pkg/embeddings` | `EmbeddingProvider` trait; hash, Ollama, OpenAI providers; circuit breaker |
-| `pkg/encryption` | AES-256-GCM envelope library with env-key provider (not wired into storage) |
+| `pkg/encryption` | Envelope encryption for files at rest: KEK providers (local key files), per-file data keys, encrypted line and sealed chunk formats |
 | `services/ingestion` | Write API (`/v1/ingest*`), WAL owner, replication source |
 | `services/retrieval` | Read API (`/v1/retrieve`, `/v1/embeddings`), WAL/replication follower |
 | `services/control-plane` | Placement state, file-lease leader election, failover promotion |
@@ -175,7 +176,7 @@ Counts are static (computed 2026-10-10: the Rust figure with `cargo test --works
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1424 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1471 |
 | Python SDK | 77 |
 | Go SDK | 98 |
 | TypeScript SDK | 77 |

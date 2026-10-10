@@ -20,7 +20,8 @@
 //! ```
 //!
 //! Defaults: N=50000, DIM=384, TAIL=1000, RUNS=2. Prints one line per
-//! measurement and a final `COLD_START_JSON:` line.
+//! measurement and a final `COLD_START_JSON:` line. Set
+//! `DASH_ENCRYPTION_KEY_FILE` to measure with encryption at rest.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -115,7 +116,14 @@ fn main() {
     let tail = arg(3, 1_000);
     let runs = arg(4, 2).max(1);
     let threads = std::thread::available_parallelism().map_or(1, |p| p.get());
-    println!("cold_start: n={n} dim={dim} tail={tail} runs={runs} threads={threads}");
+    // With DASH_ENCRYPTION_KEY_FILE set, every file (WAL, vector index) is
+    // encrypted at rest, as in a service with that setting.
+    let keyring = store::encryption::keyring_from_env().expect("encryption settings");
+    let encryption = keyring.is_some();
+    store::encryption::install(keyring);
+    println!(
+        "cold_start: n={n} dim={dim} tail={tail} runs={runs} threads={threads} encryption={encryption}"
+    );
 
     let dir = tempfile::TempDir::new().expect("temp dir");
     let wal_path = dir.path().join("bench.wal");

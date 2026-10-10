@@ -14,7 +14,7 @@
 //! * Add a row here when you add an environment read; the coverage test fails
 //!   otherwise.
 
-use crate::model::{ALL_SERVICES, Alias, DATA, Entry, Honors, INGEST, Kind, Scope};
+use crate::model::{ALL_SERVICES, Alias, DATA, Entry, Honors, INGEST, Kind, Scope, TOOLS};
 use Scope::{Common, ControlPlane, Ingestion, Retrieval, Tools};
 
 // ---- topics (docs sub-headings) -------------------------------------------
@@ -34,7 +34,7 @@ pub const T_EMBEDDING: &str = "Embedding providers";
 pub const T_EXTRACTION: &str = "Extraction and parsing";
 pub const T_SERVER: &str = "HTTP server";
 pub const T_LEASE: &str = "State and leader lease";
-pub const T_ENCRYPTION: &str = "Encryption (library only)";
+pub const T_ENCRYPTION: &str = "Encryption at rest";
 pub const T_CONTAINER: &str = "Container and compose variables";
 pub const T_BENCH: &str = "Benchmarks";
 pub const T_LOAD: &str = "Load test";
@@ -926,30 +926,27 @@ pub static REGISTRY: &[Entry] = &[
         "10000",
         "Time before one probe call is admitted.",
     ),
-    // ---- encryption (library only)
+    // ---- encryption at rest (ADR 0005)
     Entry::new(
-        "DASH_ENCRYPTION_PROVIDER",
+        "DASH_ENCRYPTION_KEY_FILE",
         Common,
         T_ENCRYPTION,
-        Kind::Enum {
-            values: &["none", "env"],
-        },
-        "none",
-        "Read by `pkg/encryption::provider_from_env`. **No service calls it**, so setting it has no effect on stored data. Encryption at rest is planned (P4).",
-    )
-    .readers(0)
-    .blank_ok()
-    .eme(),
-    Entry::new(
-        "DASH_ENCRYPTION_MASTER_KEY",
-        Common,
-        T_ENCRYPTION,
-        Kind::Secret,
+        Kind::Path,
         "",
-        "64 hex characters or base64 of 32 bytes, for provider `env`. Not used by any service yet.",
+        "Path of the active key-encryption key: 64 hex characters (`openssl rand -hex 32`) or 32 raw bytes. **Setting it turns encryption at rest on**: new WAL, snapshot, export, vector index, segment files and redb values are encrypted under per-file data keys wrapped by this key. The file must not be accessible to other users or writable by the group (mode `0600`/`0400`; group read is tolerated for Kubernetes `fsGroup`). Unset: encryption off, and a service refuses to start if it finds encrypted files.",
     )
-    .readers(0)
-    .eme(),
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_PREVIOUS_KEY_FILES",
+        Common,
+        T_ENCRYPTION,
+        Kind::CSV,
+        "",
+        "Comma-separated paths of retired key files that still decrypt (key rotation). Files written under them stay readable; new files use `DASH_ENCRYPTION_KEY_FILE`. Requires `DASH_ENCRYPTION_KEY_FILE`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
     // ---- container / compose (not read by Rust)
     Entry::new(
         "DASH_BIN",

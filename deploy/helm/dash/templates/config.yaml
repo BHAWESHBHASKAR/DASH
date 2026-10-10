@@ -90,6 +90,19 @@ data:
   DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | int64 | quote }}
   DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: {{ printf "%s/state/retrieval-replication.offset" $p | quote }}
 
+  {{- if .Values.encryption.enabled }}
+  # ----- encryption at rest (docs/operations/encryption.md) -----
+  {{- $enc := .Values.encryption }}
+  DASH_ENCRYPTION_KEY_FILE: {{ printf "%s/%s" $enc.mountPath $enc.keyName | quote }}
+  {{- if $enc.previousKeyNames }}
+  {{- $prev := list }}
+  {{- range $enc.previousKeyNames }}
+  {{- $prev = append $prev (printf "%s/%s" $enc.mountPath .) }}
+  {{- end }}
+  DASH_ENCRYPTION_PREVIOUS_KEY_FILES: {{ join "," $prev | quote }}
+  {{- end }}
+  {{- end }}
+
   # ----- control plane -----
   DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" $p | quote }}
   DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" $p | quote }}

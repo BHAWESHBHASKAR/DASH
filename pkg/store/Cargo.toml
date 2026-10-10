@@ -30,6 +30,7 @@ hex = { workspace = true }
 dash-observe = { path = "../observe", default-features = false }
 unicode-segmentation = "1.12"
 rust-stemmers = "1.2"
+encryption = { path = "../encryption" }
 
 [dev-dependencies]
 tempfile = "3"

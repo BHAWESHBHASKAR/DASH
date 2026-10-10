@@ -32,6 +32,13 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let config = config_from_inputs(args, |key| env::var(key).ok())?;
+    // Manifests are sealed when encryption at rest is on (ADR 0005); the
+    // same key settings as the services apply.
+    store::init_encryption_from_env(&store::EncryptionStatePaths {
+        segment_dirs: vec![config.root_dir.clone()],
+        ..store::EncryptionStatePaths::default()
+    })
+    .map_err(|reason| format!("encryption at rest: {reason}"))?;
 
     if config.once {
         let started_at = unix_timestamp_seconds();

@@ -50,6 +50,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -865,11 +866,12 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "hex",
+ "hmac",
  "rand 0.8.7",
- "serde",
- "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -2379,6 +2381,7 @@ dependencies = [
  "chrono",
  "dash-observe",
  "embeddings",
+ "encryption",
  "graph",
  "hex",
  "rand 0.8.7",

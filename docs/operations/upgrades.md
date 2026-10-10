@@ -169,6 +169,16 @@ placement state is read unchanged.
 
 ## Rollback
 
+### After enabling encryption at rest
+
+A release without encryption at rest cannot read encrypted files (it refuses
+the encrypted redb values and stops on the encrypted WAL header), and there
+is no tool that decrypts a data directory back to plaintext. Before turning
+encryption on, take a plaintext backup if a rollback must stay possible; a
+rollback is then a restore of that backup (writes made since are lost), or a
+rebuild of the node from a plaintext replica. See
+[encryption.md](encryption.md).
+
 ### 0.3.0 to 0.2.x
 
 0.2 cannot read the WAL or snapshot after 0.3 has written to them, so a

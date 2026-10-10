@@ -103,6 +103,24 @@ certificate. Probes switch to `HTTPS`, Services to `appProtocol: https`, and
 the ingress gets `backend-protocol: HTTPS`. Renewed files are picked up
 without a restart. See `docs/operations/tls.md`.
 
+## Encryption at rest
+
+Off by default. Put a 32-byte key (64 hex characters) in a Secret and enable
+it; ingestion and retrieval mount the Secret read-only (mode `0400`) and
+`DASH_ENCRYPTION_KEY_FILE` points at it:
+
+```bash
+openssl rand -hex 32 > dash.key
+kubectl -n dash-system create secret generic dash-encryption-key --from-file=active.key=dash.key
+helm upgrade --install dash ./deploy/helm/dash -n dash-system \
+  --set encryption.enabled=true --set encryption.secretName=dash-encryption-key ...
+```
+
+`encryption.keyName` (default `active.key`) names the active key inside the
+Secret; `encryption.previousKeyNames` lists retired keys that must still
+decrypt during a rotation. Store a copy of every key outside the cluster:
+PVC snapshots hold ciphertext only. See `docs/operations/encryption.md`.
+
 ## Persistence layout (per pod, mounted at `config.persistencePath`)
 
 ```

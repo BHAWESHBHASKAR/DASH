@@ -502,7 +502,10 @@ fn an_interrupted_download_resumes_from_the_part_file() {
     source.fail_on_chunk = Some(4);
     let err = download_export(&mut source, &paths, 256).unwrap_err();
     assert!(err.contains("connection reset"), "{err}");
-    let partial = fs::metadata(&paths.part).unwrap().len();
+    // Plaintext bytes held (the file length unless it is encrypted).
+    let partial = encryption::read_all(&paths.part, crate::crypt::current_keyring().as_deref())
+        .unwrap()
+        .len() as u64;
     assert!(partial > 0, "three chunks were kept");
     assert_eq!(source.begins.len(), 1);
 
@@ -1120,4 +1123,208 @@ fn in_place_apply_writes_redb_once_and_rejects_unreadable_frames_untouched() {
     )
     .unwrap();
     assert_eq!(state(&reloaded), state(&leader.store));
+}
+
+// ---------------------------------------------------------------------
+// The same protocol with encryption at rest (ADR 0005): every file the
+// leader and the follower write is encrypted, frames and chunks stay
+// plaintext, and the follower ends up with the leader's state.
+// ---------------------------------------------------------------------
+
+mod encrypted {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn keyring() -> Arc<encryption::Keyring> {
+        Arc::new(encryption::Keyring::local([0x5a; 32], &[]).unwrap())
+    }
+
+    fn run(test: fn()) {
+        encryption::with_keyring(Some(keyring()), test);
+    }
+
+    /// No file under `dir` holds `needle` in plaintext, and every data file
+    /// is encrypted.
+    fn assert_no_plaintext(dir: &Path, needle: &str) {
+        let mut stack = vec![dir.to_path_buf()];
+        let mut checked = 0usize;
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for entry in fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "{} holds plaintext",
+                path.display()
+            );
+            let metadata_only = name.ends_with(".gen")
+                || name.ends_with(".transitions")
+                || name.ends_with(".manifest");
+            if !metadata_only && !bytes.is_empty() {
+                let format = encryption::detect_format(&bytes).unwrap();
+                assert!(format.is_encrypted(), "{} is not encrypted", path.display());
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no data files under {}", dir.display());
+    }
+
+    #[test]
+    fn export_and_resync_round_trip_with_every_file_encrypted() {
+        run(|| {
+            let dir = TempDir::new().unwrap();
+            let mut leader = Leader::open(dir.path());
+            leader.write_n(30);
+            leader.checkpoint();
+            leader.write_n(10);
+            let mut follower = Follower::open(&dir.path().join("f"));
+            follower.sync(&leader);
+            follower.assert_matches(&leader, "encrypted resync");
+            assert_eq!(follower.resyncs, 1);
+            // A frame on the wire is plaintext.
+            let (generation, _) = leader.position();
+            let frame = leader
+                .wal()
+                .replication_frame_from(Some(generation), 0, 3)
+                .unwrap();
+            assert!(frame.wal_lines.iter().all(|l| !l.starts_with("~E1")));
+            assert!(!frame.wal_lines.is_empty());
+            // Exports retained on the leader are sealed.
+            assert!(!leader.exports.manifests().is_empty());
+            assert_no_plaintext(dir.path(), "replicated claim");
+        });
+    }
+
+    #[test]
+    fn chunked_export_reproduces_the_leader_state() {
+        run(chunked_export_reproduces_the_single_response_export_and_the_leader_state);
+    }
+
+    #[test]
+    fn chunk_requests_outside_the_export_are_refused_when_sealed() {
+        run(chunk_requests_outside_the_export_are_refused);
+    }
+
+    #[test]
+    fn interrupted_download_resumes() {
+        run(an_interrupted_download_resumes_from_the_part_file);
+    }
+
+    #[test]
+    fn checksum_mismatch_discards_the_download() {
+        run(a_checksum_mismatch_discards_the_download_and_asks_for_another_export);
+    }
+
+    #[test]
+    fn pruned_export_starts_a_new_one() {
+        run(an_export_pruned_mid_download_starts_a_new_one);
+    }
+
+    #[test]
+    fn checkpoint_during_download() {
+        run(a_checkpoint_during_the_download_does_not_change_the_export);
+    }
+
+    #[test]
+    fn checkpoint_between_freeze_and_build() {
+        run(a_checkpoint_between_freeze_and_build_does_not_change_the_export);
+    }
+
+    #[test]
+    fn crash_in_the_middle_of_the_swap() {
+        run(a_crash_in_the_middle_of_the_swap_is_repaired_by_applying_the_export_again);
+    }
+
+    #[test]
+    fn follower_switches_at_the_end_of_the_closed_generation() {
+        run(a_follower_at_the_end_of_the_closed_generation_switches_without_a_resync);
+    }
+
+    #[test]
+    fn followers_inside_the_closed_generation_catch_up() {
+        run(followers_inside_the_closed_generation_catch_up_from_its_file_then_switch);
+    }
+
+    #[test]
+    fn transitions_survive_a_restart() {
+        run(transitions_survive_a_restart_and_a_damaged_file_only_costs_a_resync);
+    }
+
+    #[test]
+    fn crash_during_the_followers_local_checkpoint() {
+        run(a_crash_during_the_followers_local_checkpoint_falls_back_to_a_resync);
+    }
+
+    #[test]
+    fn torn_encrypted_part_file_line_is_cut_and_the_download_resumes() {
+        run(|| {
+            let dir = TempDir::new().unwrap();
+            let mut leader = Leader::open(dir.path());
+            leader.write_n(20);
+            let follower_dir = dir.path().join("f");
+            let follower = Follower::open(&follower_dir);
+            let paths = follower.paths();
+            // Fetch part of the export, then tear the last line in half.
+            let mut source = leader.source();
+            let manifest = source.begin(None).unwrap().unwrap();
+            fs::write(&paths.manifest, manifest.render()).unwrap();
+            let ChunkFetch::Chunk(chunk) = source.chunk(&manifest.export_id, 0, 400).unwrap()
+            else {
+                panic!("chunk");
+            };
+            let codec = LineCodec::create(crate::crypt::current_keyring().as_ref()).unwrap();
+            let mut text = String::new();
+            text.push_str(codec.header_line().unwrap());
+            text.push('\n');
+            for line in chunk.data.lines() {
+                codec.push_line(&mut text, line);
+            }
+            let torn = &text[..text.len() - 20];
+            fs::write(&paths.part, torn).unwrap();
+            let DownloadOutcome::Complete(download) =
+                download_export(&mut leader.source(), &paths, 300).unwrap()
+            else {
+                panic!("complete");
+            };
+            assert!(download.resumed);
+            let (_, sha) = hash_file(&paths.part).unwrap();
+            assert_eq!(sha, download.manifest.sha256);
+            assert_no_plaintext(&follower_dir, "replicated claim");
+        });
+    }
+
+    #[test]
+    fn a_node_without_the_key_cannot_open_encrypted_files() {
+        let dir = TempDir::new().unwrap();
+        let paths = encryption::with_keyring(Some(keyring()), || {
+            let mut leader = Leader::open(dir.path());
+            leader.write_n(5);
+            let follower = Follower::open(&dir.path().join("f"));
+            let paths = follower.paths();
+            let DownloadOutcome::Complete(_) =
+                download_export(&mut leader.source(), &paths, 300).unwrap()
+            else {
+                panic!("complete");
+            };
+            paths
+        });
+        encryption::with_keyring(None, || {
+            let err = ReplicationExportFile::open(&paths.part).unwrap_err();
+            assert!(
+                format!("{err:?}").contains("DASH_ENCRYPTION_KEY_FILE"),
+                "{err:?}"
+            );
+            let err = FileWal::open(dir.path().join("leader.wal")).err().unwrap();
+            assert!(
+                format!("{err:?}").contains("no encryption key is configured"),
+                "{err:?}"
+            );
+        });
+    }
 }

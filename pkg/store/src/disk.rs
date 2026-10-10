@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use redb::{Database, ReadableTable, TableDefinition, TableError};
+use redb::{Database, ReadableTable, TableDefinition, TableError, TableHandle};
 use schema::{Claim, ClaimEdge, Evidence};
 
 use crate::{BatchCommitMetadata, InMemoryStore, StoreIndexStats, value_codec};
@@ -111,8 +111,149 @@ fn dedupe_edges(edges: &[ClaimEdge]) -> Vec<ClaimEdge> {
     out
 }
 
-fn read_bytes<V: serde::de::DeserializeOwned>(bytes: Vec<u8>, ctx: &str) -> Result<V, String> {
-    value_codec::decode(&bytes).map_err(|e| map_codec_err(ctx, e))
+const TABLE_CRYPTO: TableDefinition<&str, &str> = TableDefinition::new("dash_crypto");
+const CRYPTO_DEK_KEY: &str = "dek";
+/// Value-codec style marker of an encrypted value: `DASH` + `e1` + `\0\xff`.
+/// Releases without encryption refuse it (unknown `DASH....\xff` version).
+const ENCRYPTED_VALUE_HEADER: [u8; 8] = *b"DASHe1\x00\xff";
+
+/// Seals redb values (ADR 0005, section 3.4): the database's DEK is kept
+/// wrapped in table `dash_crypto`; every value is sealed with AAD
+/// `table \0 key`, so a value cannot be moved to another row.
+pub(crate) struct ValueCrypt {
+    cipher: Option<encryption::RecordCipher>,
+    key_id: Option<String>,
+    what: String,
+}
+
+impl ValueCrypt {
+    fn open(
+        db: &Database,
+        keyring: Option<&encryption::Keyring>,
+        what: &str,
+    ) -> Result<Self, String> {
+        let stored: Option<String> = {
+            let txn = db.begin_read().map_err(|e| err("begin_read", e))?;
+            match txn.open_table(TABLE_CRYPTO) {
+                Ok(table) => table
+                    .get(CRYPTO_DEK_KEY)
+                    .map_err(|e| err("read data key", e))?
+                    .map(|v| v.value().to_string()),
+                Err(TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(err("open dash_crypto", e)),
+            }
+        };
+        let store_header = |header: &encryption::FileHeader| -> Result<(), String> {
+            let txn = db.begin_write().map_err(|e| err("begin_write", e))?;
+            {
+                let mut table = txn
+                    .open_table(TABLE_CRYPTO)
+                    .map_err(|e| err("open dash_crypto", e))?;
+                table
+                    .insert(
+                        CRYPTO_DEK_KEY,
+                        encryption::render_header_line(header).as_str(),
+                    )
+                    .map_err(|e| err("write data key", e))?;
+            }
+            txn.commit().map_err(|e| err("commit data key", e))
+        };
+        let key = match (stored, keyring) {
+            (None, None) => {
+                return Ok(Self {
+                    cipher: None,
+                    key_id: None,
+                    what: what.to_string(),
+                });
+            }
+            (None, Some(keyring)) => {
+                let key = keyring.new_file_key().map_err(|e| e.to_string())?;
+                store_header(key.header())?;
+                key
+            }
+            (Some(line), keyring) => {
+                let header =
+                    encryption::parse_header_line(&line).map_err(|e| format!("{what}: {e}"))?;
+                let mut key =
+                    encryption::open_file_key(keyring, &header, what).map_err(|e| e.to_string())?;
+                if let Some(keyring) = keyring
+                    && header.key_id != keyring.active_key_id()
+                {
+                    // Key rotation: rewrap the data key with the active KEK.
+                    let rewrapped = keyring.rewrap(&header, what).map_err(|e| e.to_string())?;
+                    store_header(&rewrapped)?;
+                    key = keyring
+                        .open_file_key(&rewrapped, what)
+                        .map_err(|e| e.to_string())?;
+                }
+                key
+            }
+        };
+        Ok(Self {
+            key_id: Some(key.key_id().to_string()),
+            cipher: Some(encryption::RecordCipher::new(&key, encryption::REDB_LABEL)),
+            what: what.to_string(),
+        })
+    }
+
+    fn aad(table: &str, key: &str) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(table.len() + 1 + key.len());
+        aad.extend_from_slice(table.as_bytes());
+        aad.push(0);
+        aad.extend_from_slice(key.as_bytes());
+        aad
+    }
+
+    /// The stored bytes of `value` in row `key` of `table`.
+    fn encode<T: serde::Serialize + ?Sized, K: AsRef<str> + ?Sized>(
+        &self,
+        table: &str,
+        key: &K,
+        value: &T,
+        ctx: &str,
+    ) -> Result<Vec<u8>, String> {
+        let plain = value_codec::encode(value).map_err(|e| map_codec_err(ctx, e))?;
+        let Some(cipher) = &self.cipher else {
+            return Ok(plain);
+        };
+        let sealed = cipher
+            .seal(&plain, &Self::aad(table, key.as_ref()))
+            .map_err(|e| format!("{ctx}: {e}"))?;
+        let mut out = Vec::with_capacity(ENCRYPTED_VALUE_HEADER.len() + sealed.len());
+        out.extend_from_slice(&ENCRYPTED_VALUE_HEADER);
+        out.extend_from_slice(&sealed);
+        Ok(out)
+    }
+
+    /// Decodes a stored value (sealed or, from before encryption was
+    /// enabled, plaintext).
+    fn decode<T: serde::de::DeserializeOwned, K: AsRef<str> + ?Sized>(
+        &self,
+        table: &str,
+        key: &K,
+        bytes: &[u8],
+        ctx: &str,
+    ) -> Result<T, String> {
+        let Some(sealed) = bytes.strip_prefix(&ENCRYPTED_VALUE_HEADER[..]) else {
+            return value_codec::decode(bytes).map_err(|e| map_codec_err(ctx, e));
+        };
+        let Some(cipher) = &self.cipher else {
+            return Err(format!(
+                "{}: {ctx}: the value is encrypted but the database has no data key",
+                self.what
+            ));
+        };
+        let plain = cipher
+            .open(sealed, &Self::aad(table, key.as_ref()))
+            .map_err(|_| {
+                format!(
+                    "{}: {ctx}: row '{}' of {table}: authentication failed (wrong key, or the value was modified or damaged)",
+                    self.what,
+                    key.as_ref()
+                )
+            })?;
+        value_codec::decode(&plain).map_err(|e| map_codec_err(ctx, e))
+    }
 }
 
 /// `redb`-backed persistence for the in-memory store.
@@ -124,13 +265,59 @@ fn read_bytes<V: serde::de::DeserializeOwned>(bytes: Vec<u8>, ctx: &str) -> Resu
 /// touching the in-memory state.
 pub struct DiskBackedStore {
     db: Database,
+    values: ValueCrypt,
 }
 
 impl DiskBackedStore {
-    /// Open (or create) a `redb` database at `path`.
+    /// Open (or create) a `redb` database at `path`, with the keyring in
+    /// effect (`encryption::current()`).
     pub fn new(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::new_with_keyring(path, crate::crypt::current_keyring())
+    }
+
+    /// [`DiskBackedStore::new`] with an explicit keyring. With a keyring the
+    /// values are sealed (keys stay plaintext); existing plaintext values
+    /// stay readable and are sealed when rewritten. A database whose data
+    /// key exists cannot be opened without a keyring (fail closed).
+    pub fn new_with_keyring(
+        path: impl AsRef<Path>,
+        keyring: Option<std::sync::Arc<encryption::Keyring>>,
+    ) -> Result<Self, String> {
         let db = Database::create(path.as_ref()).map_err(|e| err("create", e))?;
-        Ok(Self { db })
+        let what = format!("redb mirror {}", path.as_ref().display());
+        let values = ValueCrypt::open(&db, keyring.as_deref(), &what)?;
+        Ok(Self { db, values })
+    }
+
+    /// KEK id recorded in the redb file at `path` (`None`: not encrypted),
+    /// read without unwrapping anything and without creating a data key.
+    pub fn stored_encryption_key_id(path: impl AsRef<Path>) -> Result<Option<String>, String> {
+        let db = Database::open(path.as_ref()).map_err(|e| err("open", e))?;
+        let txn = db.begin_read().map_err(|e| err("begin_read", e))?;
+        let line = match txn.open_table(TABLE_CRYPTO) {
+            Ok(table) => table
+                .get(CRYPTO_DEK_KEY)
+                .map_err(|e| err("read data key", e))?
+                .map(|v| v.value().to_string()),
+            Err(TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(err("open dash_crypto", e)),
+        };
+        match line {
+            None => Ok(None),
+            Some(line) => encryption::parse_header_line(&line)
+                .map(|h| Some(h.key_id))
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// `true` when values written by this handle are encrypted.
+    pub fn encrypts_values(&self) -> bool {
+        self.values.cipher.is_some()
+    }
+
+    /// KEK id that wraps this database's data key, if it has one.
+    pub fn encryption_key_id(&self) -> Option<String> {
+        self.values.key_id.clone()
     }
 
     /// Report the runtime disk status. Constructed stores are always
@@ -178,7 +365,12 @@ impl DiskBackedStore {
     /// `claim_id`) and record its tenant membership in the SAME write
     /// transaction, so the claim row and the tenant set cannot diverge.
     pub fn put_claim(&self, claim: &Claim) -> Result<(), String> {
-        let bytes = value_codec::encode(claim).map_err(|e| map_codec_err("serialize claim", e))?;
+        let bytes = self.values.encode(
+            TABLE_CLAIMS.name(),
+            &claim.claim_id,
+            claim,
+            "serialize claim",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -209,7 +401,9 @@ impl DiskBackedStore {
         match table.get(id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let claim: Claim = read_bytes(value, "deserialize claim")?;
+                let claim: Claim =
+                    self.values
+                        .decode(TABLE_CLAIMS.name(), id, &value, "deserialize claim")?;
                 Ok(Some(claim))
             }
             Ok(None) => Ok(None),
@@ -222,8 +416,12 @@ impl DiskBackedStore {
     /// Duplicate `evidence_id`s inside the blob are collapsed (last wins).
     pub fn put_evidence_blob(&self, claim_id: &str, evidence: &[Evidence]) -> Result<(), String> {
         let evidence = dedupe_evidence(evidence);
-        let bytes =
-            value_codec::encode(&evidence).map_err(|e| map_codec_err("serialize evidence", e))?;
+        let bytes = self.values.encode(
+            TABLE_EVIDENCE.name(),
+            claim_id,
+            &evidence,
+            "serialize evidence",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -250,13 +448,22 @@ impl DiskBackedStore {
                 .get(evidence.claim_id.as_str())
                 .map_err(|e| err("read evidence", e))?
             {
-                Some(v) => read_bytes(v.value().to_vec(), "deserialize evidence")?,
+                Some(v) => self.values.decode(
+                    TABLE_EVIDENCE.name(),
+                    &evidence.claim_id,
+                    v.value(),
+                    "deserialize evidence",
+                )?,
                 None => Vec::new(),
             };
             current.push(evidence.clone());
             let current = dedupe_evidence(&current);
-            let bytes = value_codec::encode(&current)
-                .map_err(|e| map_codec_err("serialize evidence", e))?;
+            let bytes = self.values.encode(
+                TABLE_EVIDENCE.name(),
+                &evidence.claim_id,
+                &current,
+                "serialize evidence",
+            )?;
             table
                 .insert(evidence.claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -277,13 +484,22 @@ impl DiskBackedStore {
                 .get(edge.from_claim_id.as_str())
                 .map_err(|e| err("read edges", e))?
             {
-                Some(v) => read_bytes(v.value().to_vec(), "deserialize edges")?,
+                Some(v) => self.values.decode(
+                    TABLE_EDGES.name(),
+                    &edge.from_claim_id,
+                    v.value(),
+                    "deserialize edges",
+                )?,
                 None => Vec::new(),
             };
             current.push(edge.clone());
             let current = dedupe_edges(&current);
-            let bytes =
-                value_codec::encode(&current).map_err(|e| map_codec_err("serialize edges", e))?;
+            let bytes = self.values.encode(
+                TABLE_EDGES.name(),
+                &edge.from_claim_id,
+                &current,
+                "serialize edges",
+            )?;
             table
                 .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;
@@ -304,7 +520,12 @@ impl DiskBackedStore {
         match table.get(claim_id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let evidence: Vec<Evidence> = read_bytes(value, "deserialize evidence")?;
+                let evidence: Vec<Evidence> = self.values.decode(
+                    TABLE_EVIDENCE.name(),
+                    claim_id,
+                    &value,
+                    "deserialize evidence",
+                )?;
                 Ok(Some(evidence))
             }
             Ok(None) => Ok(None),
@@ -318,7 +539,9 @@ impl DiskBackedStore {
     /// collapsed (last wins).
     pub fn put_edge_blob(&self, from: &str, edges: &[ClaimEdge]) -> Result<(), String> {
         let edges = dedupe_edges(edges);
-        let bytes = value_codec::encode(&edges).map_err(|e| map_codec_err("serialize edges", e))?;
+        let bytes = self
+            .values
+            .encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -344,7 +567,9 @@ impl DiskBackedStore {
         match table.get(from) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let edges: Vec<ClaimEdge> = read_bytes(value, "deserialize edges")?;
+                let edges: Vec<ClaimEdge> =
+                    self.values
+                        .decode(TABLE_EDGES.name(), from, &value, "deserialize edges")?;
                 Ok(Some(edges))
             }
             Ok(None) => Ok(None),
@@ -355,8 +580,12 @@ impl DiskBackedStore {
     /// Persist an embedding vector for a claim. Replaces any prior
     /// vector for the same `claim_id` atomically.
     pub fn put_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), String> {
-        let bytes =
-            value_codec::encode(vector).map_err(|e| map_codec_err("serialize vector", e))?;
+        let bytes = self.values.encode(
+            TABLE_CLAIM_VECTORS.name(),
+            claim_id,
+            vector,
+            "serialize vector",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -382,7 +611,12 @@ impl DiskBackedStore {
         match table.get(claim_id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let vector: Vec<f32> = read_bytes(value, "deserialize vector")?;
+                let vector: Vec<f32> = self.values.decode(
+                    TABLE_CLAIM_VECTORS.name(),
+                    claim_id,
+                    &value,
+                    "deserialize vector",
+                )?;
                 Ok(Some(vector))
             }
             Ok(None) => Ok(None),
@@ -393,8 +627,12 @@ impl DiskBackedStore {
     /// Persist batch-commit metadata. Replaces any prior entry with
     /// the same `commit_id` atomically.
     pub fn put_batch_commit(&self, commit: &BatchCommitMetadata) -> Result<(), String> {
-        let bytes =
-            value_codec::encode(commit).map_err(|e| map_codec_err("serialize batch_commit", e))?;
+        let bytes = self.values.encode(
+            TABLE_BATCH_COMMITS.name(),
+            &commit.commit_id,
+            commit,
+            "serialize batch_commit",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -419,7 +657,12 @@ impl DiskBackedStore {
         match table.get(id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let commit: BatchCommitMetadata = read_bytes(value, "deserialize batch_commit")?;
+                let commit: BatchCommitMetadata = self.values.decode(
+                    TABLE_BATCH_COMMITS.name(),
+                    id,
+                    &value,
+                    "deserialize batch_commit",
+                )?;
                 Ok(Some(commit))
             }
             Ok(None) => Ok(None),
@@ -522,7 +765,9 @@ impl DiskBackedStore {
 
     /// Persist the index stats singleton.
     pub fn set_stats(&self, stats: &StoreIndexStats) -> Result<(), String> {
-        let bytes = value_codec::encode(stats).map_err(|e| map_codec_err("serialize stats", e))?;
+        let bytes = self
+            .values
+            .encode(TABLE_STATS.name(), STATS_KEY, stats, "serialize stats")?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -548,7 +793,12 @@ impl DiskBackedStore {
         match table.get(STATS_KEY) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let stats: StoreIndexStats = read_bytes(value, "deserialize stats")?;
+                let stats: StoreIndexStats = self.values.decode(
+                    TABLE_STATS.name(),
+                    STATS_KEY,
+                    &value,
+                    "deserialize stats",
+                )?;
                 Ok(stats)
             }
             Ok(None) => Ok(StoreIndexStats::default()),
@@ -580,9 +830,11 @@ impl DiskBackedStore {
             let iter = table.iter().map_err(|e| err("iter claims", e))?;
             for entry in iter {
                 let entry = entry.map_err(|e| err("scan claims", e))?;
+                let key = entry.0.value().to_string();
                 let value = entry.1.value().to_vec();
-                let claim: Claim = value_codec::decode(&value)
-                    .map_err(|e| map_codec_err("deserialize claim", e))?;
+                let claim: Claim =
+                    self.values
+                        .decode(TABLE_CLAIMS.name(), &key, &value, "deserialize claim")?;
                 dest.apply_claim_for_load(claim)
                     .map_err(|e| format!("apply_claim_for_load: {e:?}"))?;
                 claims_loaded += 1;
@@ -600,8 +852,12 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan evidence", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let evidence: Vec<Evidence> = value_codec::decode(&value)
-                        .map_err(|e| map_codec_err("deserialize evidence", e))?;
+                    let evidence: Vec<Evidence> = self.values.decode(
+                        TABLE_EVIDENCE.name(),
+                        &key,
+                        &value,
+                        "deserialize evidence",
+                    )?;
                     let evidence = dedupe_evidence(&evidence);
                     dest.apply_evidence_blob_for_load(&key, &evidence)
                         .map_err(|e| format!("apply_evidence_blob_for_load: {e:?}"))?;
@@ -618,8 +874,12 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan edges", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let edges: Vec<ClaimEdge> = value_codec::decode(&value)
-                        .map_err(|e| map_codec_err("deserialize edges", e))?;
+                    let edges: Vec<ClaimEdge> = self.values.decode(
+                        TABLE_EDGES.name(),
+                        &key,
+                        &value,
+                        "deserialize edges",
+                    )?;
                     let edges = dedupe_edges(&edges);
                     dest.apply_edge_blob_for_load(&key, &edges)
                         .map_err(|e| format!("apply_edge_blob_for_load: {e:?}"))?;
@@ -638,8 +898,12 @@ impl DiskBackedStore {
                         let entry = entry.map_err(|e| err("scan claim_vectors", e))?;
                         let key = entry.0.value().to_string();
                         let value = entry.1.value().to_vec();
-                        let vector: Vec<f32> = value_codec::decode(&value)
-                            .map_err(|e| map_codec_err("deserialize vector", e))?;
+                        let vector: Vec<f32> = self.values.decode(
+                            TABLE_CLAIM_VECTORS.name(),
+                            &key,
+                            &value,
+                            "deserialize vector",
+                        )?;
                         dest.apply_claim_vector_blob_for_load(&key, vector)
                             .map_err(|e| format!("apply_claim_vector_blob_for_load: {e:?}"))?;
                     }
@@ -658,9 +922,14 @@ impl DiskBackedStore {
                 let iter = table.iter().map_err(|e| err("iter batch_commits", e))?;
                 for entry in iter {
                     let entry = entry.map_err(|e| err("scan batch_commits", e))?;
+                    let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let commit: BatchCommitMetadata = value_codec::decode(&value)
-                        .map_err(|e| map_codec_err("deserialize batch_commit", e))?;
+                    let commit: BatchCommitMetadata = self.values.decode(
+                        TABLE_BATCH_COMMITS.name(),
+                        &key,
+                        &value,
+                        "deserialize batch_commit",
+                    )?;
                     dest.apply_batch_commit_for_load(&commit)
                         .map_err(|e| format!("apply_batch_commit_for_load: {e:?}"))?;
                 }
@@ -711,8 +980,12 @@ impl DiskBackedStore {
         for op in ops {
             match op {
                 StagedDiskOp::Claim(claim) => {
-                    let bytes = value_codec::encode(claim)
-                        .map_err(|e| map_codec_err("serialize claim", e))?;
+                    let bytes = self.values.encode(
+                        TABLE_CLAIMS.name(),
+                        &claim.claim_id,
+                        claim,
+                        "serialize claim",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_CLAIMS)
                         .map_err(|e| err("open claims", e))?;
@@ -734,12 +1007,21 @@ impl DiskBackedStore {
                         .get(evidence.claim_id.as_str())
                         .map_err(|e| err("read evidence", e))?
                     {
-                        Some(v) => read_bytes(v.value().to_vec(), "deserialize evidence")?,
+                        Some(v) => self.values.decode(
+                            TABLE_EVIDENCE.name(),
+                            &evidence.claim_id,
+                            v.value(),
+                            "deserialize evidence",
+                        )?,
                         None => Vec::new(),
                     };
                     crate::upsert_evidence(&mut current, evidence.clone());
-                    let bytes = value_codec::encode(&dedupe_evidence(&current))
-                        .map_err(|e| map_codec_err("serialize evidence", e))?;
+                    let bytes = self.values.encode(
+                        TABLE_EVIDENCE.name(),
+                        &evidence.claim_id,
+                        &dedupe_evidence(&current),
+                        "serialize evidence",
+                    )?;
                     table
                         .insert(evidence.claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write evidence", e))?;
@@ -752,12 +1034,21 @@ impl DiskBackedStore {
                         .get(edge.from_claim_id.as_str())
                         .map_err(|e| err("read edges", e))?
                     {
-                        Some(v) => read_bytes(v.value().to_vec(), "deserialize edges")?,
+                        Some(v) => self.values.decode(
+                            TABLE_EDGES.name(),
+                            &edge.from_claim_id,
+                            v.value(),
+                            "deserialize edges",
+                        )?,
                         None => Vec::new(),
                     };
                     crate::upsert_edge(&mut current, edge.clone());
-                    let bytes = value_codec::encode(&dedupe_edges(&current))
-                        .map_err(|e| map_codec_err("serialize edges", e))?;
+                    let bytes = self.values.encode(
+                        TABLE_EDGES.name(),
+                        &edge.from_claim_id,
+                        &dedupe_edges(&current),
+                        "serialize edges",
+                    )?;
                     table
                         .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write edges", e))?;
@@ -768,8 +1059,12 @@ impl DiskBackedStore {
                     vector,
                     new_dim,
                 } => {
-                    let bytes = value_codec::encode(vector)
-                        .map_err(|e| map_codec_err("serialize vector", e))?;
+                    let bytes = self.values.encode(
+                        TABLE_CLAIM_VECTORS.name(),
+                        claim_id,
+                        vector,
+                        "serialize vector",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_CLAIM_VECTORS)
                         .map_err(|e| err("open claim_vectors", e))?;
@@ -785,8 +1080,12 @@ impl DiskBackedStore {
                     }
                 }
                 StagedDiskOp::BatchCommit(commit) => {
-                    let bytes = value_codec::encode(commit)
-                        .map_err(|e| map_codec_err("serialize batch_commit", e))?;
+                    let bytes = self.values.encode(
+                        TABLE_BATCH_COMMITS.name(),
+                        &commit.commit_id,
+                        commit,
+                        "serialize batch_commit",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_BATCH_COMMITS)
                         .map_err(|e| err("open batch_commits", e))?;
@@ -794,7 +1093,7 @@ impl DiskBackedStore {
                         .insert(commit.commit_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write batch_commit", e))?;
                 }
-                StagedDiskOp::Delete(deletion) => apply_deletion_in(&txn, deletion)?,
+                StagedDiskOp::Delete(deletion) => apply_deletion_in(&txn, deletion, &self.values)?,
             }
         }
         txn.commit().map_err(|e| err("commit batch", e))?;
@@ -840,8 +1139,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIMS)
                 .map_err(|e| err("open claims", e))?;
             for claim in store.claims_iter() {
-                let bytes =
-                    value_codec::encode(claim).map_err(|e| map_codec_err("serialize claim", e))?;
+                let bytes = self.values.encode(
+                    TABLE_CLAIMS.name(),
+                    &claim.claim_id,
+                    claim,
+                    "serialize claim",
+                )?;
                 claims_table
                     .insert(claim.claim_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write claim", e))?;
@@ -852,8 +1155,12 @@ impl DiskBackedStore {
                 .map_err(|e| err("open evidence", e))?;
             for (claim_id, evidence) in store.evidence_iter() {
                 let evidence = dedupe_evidence(evidence);
-                let bytes = value_codec::encode(&evidence)
-                    .map_err(|e| map_codec_err("serialize evidence", e))?;
+                let bytes = self.values.encode(
+                    TABLE_EVIDENCE.name(),
+                    claim_id,
+                    &evidence,
+                    "serialize evidence",
+                )?;
                 evidence_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write evidence", e))?;
@@ -865,7 +1172,8 @@ impl DiskBackedStore {
             for (from, edges) in store.edges_iter() {
                 let edges = dedupe_edges(edges);
                 let bytes =
-                    value_codec::encode(&edges).map_err(|e| map_codec_err("serialize edges", e))?;
+                    self.values
+                        .encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
                 edges_table
                     .insert(from, bytes.as_slice())
                     .map_err(|e| err("write edges", e))?;
@@ -875,8 +1183,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIM_VECTORS)
                 .map_err(|e| err("open claim_vectors", e))?;
             for (claim_id, vector) in store.claim_vectors_iter() {
-                let bytes = value_codec::encode(vector)
-                    .map_err(|e| map_codec_err("serialize vector", e))?;
+                let bytes = self.values.encode(
+                    TABLE_CLAIM_VECTORS.name(),
+                    claim_id,
+                    vector,
+                    "serialize vector",
+                )?;
                 vectors_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write claim_vector", e))?;
@@ -886,8 +1198,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_BATCH_COMMITS)
                 .map_err(|e| err("open batch_commits", e))?;
             for commit in store.batch_commits_iter() {
-                let bytes = value_codec::encode(commit)
-                    .map_err(|e| map_codec_err("serialize batch_commit", e))?;
+                let bytes = self.values.encode(
+                    TABLE_BATCH_COMMITS.name(),
+                    &commit.commit_id,
+                    commit,
+                    "serialize batch_commit",
+                )?;
                 batch_commits_table
                     .insert(commit.commit_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write batch_commit", e))?;
@@ -939,6 +1255,7 @@ impl DiskBackedStore {
 fn apply_deletion_in(
     txn: &redb::WriteTransaction,
     deletion: &crate::delete::DiskDeletion,
+    values: &ValueCrypt,
 ) -> Result<(), String> {
     let mut evidence_table = txn
         .open_table(TABLE_EVIDENCE)
@@ -949,8 +1266,12 @@ fn apply_deletion_in(
                 .remove(claim_id.as_str())
                 .map_err(|e| err("remove evidence", e))?;
         } else {
-            let bytes = value_codec::encode(&dedupe_evidence(evidence))
-                .map_err(|e| map_codec_err("serialize evidence", e))?;
+            let bytes = values.encode(
+                TABLE_EVIDENCE.name(),
+                claim_id,
+                &dedupe_evidence(evidence),
+                "serialize evidence",
+            )?;
             evidence_table
                 .insert(claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -965,8 +1286,12 @@ fn apply_deletion_in(
                 .remove(from.as_str())
                 .map_err(|e| err("remove edges", e))?;
         } else {
-            let bytes = value_codec::encode(&dedupe_edges(edges))
-                .map_err(|e| map_codec_err("serialize edges", e))?;
+            let bytes = values.encode(
+                TABLE_EDGES.name(),
+                from,
+                &dedupe_edges(edges),
+                "serialize edges",
+            )?;
             edges_table
                 .insert(from.as_str(), bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;

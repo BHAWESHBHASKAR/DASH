@@ -47,5 +47,13 @@ AmbientCapabilities=
 UMask=0077
 LimitNOFILE=65536
 
+# Encryption at rest (docs/operations/encryption.md). Keep the key file
+# under /etc/dash/encryption (directory 0700, file 0400, owner root) and let
+# systemd hand it to the service: LoadCredential copies it to
+# /run/credentials/dash-segment-maintenance.service/dash-kek, readable by this service only (mode
+# 0400), and the env file points DASH_ENCRYPTION_KEY_FILE there. Needs
+# systemd 247 or later.
+#LoadCredential=dash-kek:/etc/dash/encryption/active.key
+
 [Install]
 WantedBy=multi-user.target

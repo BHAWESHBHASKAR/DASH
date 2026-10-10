@@ -176,6 +176,19 @@ jobs:
             echo "helm template with tls.enabled succeeded without tls.secretName" >&2
             exit 1
           fi
+          # Encryption at rest: the key Secret is mounted and the key file
+          # settings are rendered (docs/operations/encryption.md).
+          helm lint deploy/helm/dash --strict "${args[@]}" \
+            --set encryption.enabled=true --set encryption.secretName=dash-encryption-key
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set encryption.enabled=true --set encryption.secretName=dash-encryption-key \
+            --set 'encryption.previousKeyNames={old.key}' > helm-encryption.yaml
+          grep -q 'DASH_ENCRYPTION_KEY_FILE: "/etc/dash/encryption/active.key"' helm-encryption.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set encryption.enabled=true >/dev/null 2>&1; then
+            echo "helm template with encryption.enabled succeeded without encryption.secretName" >&2
+            exit 1
+          fi
           # Monitoring: ServiceMonitors, PrometheusRule, Grafana dashboards and
           # the scrape NetworkPolicy (deploy/observability/).
           monitoring=(
@@ -219,7 +232,8 @@ jobs:
             exit 1
           fi
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
-            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml helm-kind.yaml
+            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml helm-kind.yaml \
+            helm-encryption.yaml
 
       - name: Kustomize build and kubeconform
         run: |
@@ -259,6 +273,8 @@ jobs:
           docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.dev.yml config -q
           docker compose -f deploy/container/docker-compose.yml -f deploy/container/docker-compose.tls.yml \
             --profile control-plane config -q
+          docker compose -f deploy/container/docker-compose.yml \
+            -f deploy/container/docker-compose.encryption.yml config -q
 
       - name: Compose must refuse to start without secrets
         run: |

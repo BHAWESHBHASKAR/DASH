@@ -184,6 +184,9 @@ pub struct VectorIndexSnapshot {
     position: WalPosition,
     tuning: AnnTuningConfig,
     tenants: Vec<(String, TenantVectorIndex)>,
+    /// Keyring in effect when the snapshot was taken; the file is sealed
+    /// with it (format B, ADR 0005).
+    keyring: crate::crypt::KeyringRef,
 }
 
 impl VectorIndexSnapshot {
@@ -196,6 +199,7 @@ impl VectorIndexSnapshot {
             position,
             tuning,
             tenants,
+            keyring: crate::crypt::current_keyring(),
         }
     }
 
@@ -260,11 +264,15 @@ impl VectorIndexSnapshot {
         header.extend_from_slice(&digest);
 
         let bytes = header.len() as u64 + sections.iter().map(|s| s.len() as u64).sum::<u64>();
+        let keyring = self.keyring.as_deref();
         write_atomically(path, |file| {
-            file.write_all(&header)?;
+            let mut out = crate::crypt::SealSink::new(std::io::BufWriter::new(file), keyring)
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            out.write_all(&header)?;
             for section in &sections {
-                file.write_all(section)?;
+                out.write_all(section)?;
             }
+            out.finish()?.flush()?;
             Ok(())
         })?;
         Ok(VectorIndexSaveStats {
@@ -373,7 +381,8 @@ fn parse_header(header: &[u8], manifest_len: usize) -> Result<Manifest, String> 
 /// The WAL position recorded in the file header at `path`, if the header is
 /// intact. Reads only the header.
 pub(crate) fn peek_saved_position(path: &Path) -> Option<WalPosition> {
-    let mut file = File::open(path).ok()?;
+    let keyring = crate::crypt::current_keyring();
+    let mut file = crate::crypt::open_plain(path, keyring.as_deref()).ok()?;
     let mut prefix = [0u8; PREFIX_LEN];
     file.read_exact(&mut prefix).ok()?;
     let manifest_len = check_prefix(&prefix).ok()?;
@@ -390,9 +399,14 @@ struct LoadedFile {
 
 /// Reads and fully verifies the file. `Ok(None)` when it does not exist.
 fn read_index_file(path: &Path, tuning: &AnnTuningConfig) -> Result<Option<LoadedFile>, String> {
-    let bytes = match std::fs::read(path) {
+    if !path.exists() {
+        return Ok(None);
+    }
+    // A sealed file is decrypted (and authenticated) as a whole first.
+    let keyring = crate::crypt::current_keyring();
+    let bytes = match encryption::read_all(path, keyring.as_deref()) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) if !path.exists() => return Ok(None),
         Err(e) => return Err(format!("read failed: {e}")),
     };
     let manifest_len = check_prefix(&bytes)?;

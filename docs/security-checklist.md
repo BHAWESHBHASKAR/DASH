@@ -53,12 +53,14 @@ regression.
       the documented RPS without dropping legitimate traffic. Worst-case
       per-tenant RPS is recorded in the runbook.
       Evidence: <paste bench summary>
-- [ ] **redb encryption-at-rest decision recorded** — currently **no** in-app
-      encryption; see `docs/adr/ADR-006-redb-encryption.md`. This decision
-      has been re-confirmed for this release, and the operator-facing
-      runbook still requires an encrypted block device underneath the
-      `dash.redb` file.
-      Evidence: <link to re-confirmation comment>
+- [ ] **Encryption at rest decision recorded** — DASH can encrypt its data
+      files (`DASH_ENCRYPTION_KEY_FILE`, off by default; see
+      `docs/adr/0005-encryption-at-rest.md` and
+      `docs/operations/encryption.md`). For this release either encryption
+      is enabled with the key stored outside the data volumes and backups
+      (and `wal-inspect keys` shows no plaintext data file), or the decision
+      to rely on an encrypted block device instead is recorded.
+      Evidence: <link to the decision and the `wal-inspect keys` output>
 - [ ] **Dependency licenses reviewed** — `cargo deny check licenses` is
       green and the resulting license list has been diffed against the
       previous release. Any new license appears in `THIRD_PARTY_LICENSES.md`.

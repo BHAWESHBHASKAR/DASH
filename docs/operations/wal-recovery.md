@@ -7,6 +7,13 @@ with `wal-inspect`.
 When a write is acknowledged, how group commit batches fsyncs and what a
 failed fsync does are described in [WAL durability](wal-durability.md).
 
+With encryption at rest ([encryption.md](encryption.md)) every rule on this
+page holds unchanged: each record is one encrypted line, a torn final line is
+cut off, a line that fails authentication is treated like a line that fails
+its checksum, and the quarantine file and truncation sidecars are encrypted
+too. Run `wal-inspect` with the same `DASH_ENCRYPTION_KEY_FILE` (and
+`DASH_ENCRYPTION_PREVIOUS_KEY_FILES`) as the service.
+
 Files involved, for a WAL at `<wal>` (for example the path in
 `DASH_INGEST_WAL_PATH` or `DASH_RETRIEVAL_WAL_PATH`):
 

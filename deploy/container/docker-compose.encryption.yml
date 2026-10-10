@@ -1,0 +1,39 @@
+# Encryption at rest overlay for the Compose stack
+# (docs/operations/encryption.md, ADR 0005).
+#
+#   mkdir -p deploy/container/encryption
+#   openssl rand -hex 32 > deploy/container/encryption/active.key
+#   sudo chown 10001 deploy/container/encryption/active.key   # the image's UID
+#   chmod 0400 deploy/container/encryption/active.key
+#   docker compose -f deploy/container/docker-compose.yml \
+#                  -f deploy/container/docker-compose.encryption.yml up -d
+#
+# deploy/container/encryption is mounted read-only at /etc/dash/encryption.
+# The services refuse to start if the key file is readable by other users or
+# writable by its group. Keep a copy of the key outside this host: the
+# volumes (and every backup of them) hold ciphertext that is useless without
+# it. For a key rotation put the new key next to the old one, point
+# DASH_ENCRYPTION_KEY_FILE at it and list the old file in
+# DASH_ENCRYPTION_PREVIOUS_KEY_FILES (see the operations guide).
+
+x-encryption-volume: &encryption-volume ./encryption:/etc/dash/encryption:ro
+
+services:
+  ingestion:
+    volumes:
+      - *encryption-volume
+    environment:
+      DASH_ENCRYPTION_KEY_FILE: /etc/dash/encryption/active.key
+
+  retrieval:
+    volumes:
+      - *encryption-volume
+    environment:
+      DASH_ENCRYPTION_KEY_FILE: /etc/dash/encryption/active.key
+
+  # Reads the sealed segment manifests it prunes against.
+  segment-maintenance:
+    volumes:
+      - *encryption-volume
+    environment:
+      DASH_ENCRYPTION_KEY_FILE: /etc/dash/encryption/active.key

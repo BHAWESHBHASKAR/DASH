@@ -41,9 +41,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::replication_index::{ReplicationFilter, decode_line};
+use super::replication_index::ReplicationFilter;
 use super::{FileWal, SNAPSHOT_HEADER, sync_file, sync_parent_dir};
 use crate::StoreError;
+use crate::crypt::{self, CapturedKeyring, Detected, LineCodec, PlainFile, SealSink};
 
 /// Chunk size a follower asks for unless configured otherwise.
 pub const EXPORT_CHUNK_DEFAULT_BYTES: usize = 4 * 1024 * 1024;
@@ -273,6 +274,9 @@ pub struct ReplicationExportStore {
     bytes_served_total: AtomicU64,
     retained: usize,
     idle_ttl: Duration,
+    /// Keyring captured at construction: export files and the WAL staging
+    /// file are sealed with it (the wire format stays plaintext).
+    keyring: CapturedKeyring,
 }
 
 impl ReplicationExportStore {
@@ -296,6 +300,7 @@ impl ReplicationExportStore {
             bytes_served_total: AtomicU64::new(0),
             retained: EXPORTS_RETAINED,
             idle_ttl: EXPORT_IDLE_TTL,
+            keyring: CapturedKeyring::current(),
         };
         store.remove_temporaries();
         store
@@ -377,7 +382,7 @@ impl ReplicationExportStore {
         }
         let text = fs::read_to_string(self.manifest_path(id)).ok()?;
         let manifest = ReplicationExportManifest::parse(&text).ok()?;
-        let len = fs::metadata(self.export_path(id)).ok()?.len();
+        let len = PlainFile::plain_len(&self.export_path(id)).ok()?;
         (manifest.export_id == id && len == manifest.total_bytes).then_some(manifest)
     }
 
@@ -425,16 +430,19 @@ impl ReplicationExportStore {
                 self.reused_total.fetch_add(1, Ordering::Relaxed);
                 return Ok(latest);
             }
-            let mut out = BufWriter::new(File::create(&wal_tmp)?);
-            let frozen = wal.freeze_for_export(&mut out);
-            let frozen = frozen.and_then(|frozen| {
-                out.flush()?;
-                Ok(frozen)
-            });
+            let mut out =
+                SealSink::new(BufWriter::new(File::create(&wal_tmp)?), self.keyring.get())?;
+            let frozen = match wal.freeze_for_export(&mut out) {
+                Ok(frozen) => out
+                    .finish()
+                    .and_then(|mut inner| inner.flush())
+                    .map(|()| frozen)
+                    .map_err(StoreError::from),
+                Err(err) => Err(err),
+            };
             match frozen {
                 Ok(frozen) => frozen,
                 Err(err) => {
-                    drop(out);
                     let _ = fs::remove_file(&wal_tmp);
                     return Err(err);
                 }
@@ -464,54 +472,44 @@ impl ReplicationExportStore {
     fn build_export(
         &self,
         id: &str,
-        frozen: ExportFreeze,
+        mut frozen: ExportFreeze,
         wal_tmp: &Path,
     ) -> Result<ReplicationExportManifest, StoreError> {
         let tmp = self.export_tmp_path(id);
-        let mut file = OpenOptions::new()
+        // Count the snapshot lines first: the header carries the counts and
+        // a sealed file cannot be patched in place.
+        let snapshot_records = match frozen.snapshot.as_mut() {
+            Some((file, codec)) => for_each_snapshot_line(file, codec, |_| Ok(()))?,
+            None => 0,
+        };
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        let mut out = BufWriter::new(&mut file);
-        write_export_header(&mut out, frozen.generation, 0, 0)?;
+        let mut out = HashWriter::new(SealSink::new(BufWriter::new(file), self.keyring.get())?);
+        write_export_header(
+            &mut out,
+            frozen.generation,
+            snapshot_records,
+            frozen.wal_records,
+        )?;
         out.write_all(b"SNAPSHOT\n")?;
-        let mut snapshot_records = 0usize;
-        if let Some(snapshot) = frozen.snapshot {
-            let mut filter = ReplicationFilter::new();
-            let mut seen_header = false;
-            for line in BufReader::new(snapshot).split(b'\n') {
-                let line = line?;
-                let Some(text) = decode_line(&line) else {
-                    return Err(StoreError::Parse(
-                        "snapshot file holds invalid UTF-8".to_string(),
-                    ));
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                if !seen_header {
-                    if text != SNAPSHOT_HEADER {
-                        return Err(StoreError::Parse(
-                            "snapshot file has invalid header".to_string(),
-                        ));
-                    }
-                    seen_header = true;
-                    continue;
-                }
-                if filter.keep(&text) {
-                    out.write_all(text.as_bytes())?;
-                    out.write_all(b"\n")?;
-                    snapshot_records += 1;
-                }
-            }
-            if !seen_header {
-                return Err(StoreError::Parse("snapshot file is empty".to_string()));
+        if let Some((file, codec)) = frozen.snapshot.as_mut() {
+            let written = for_each_snapshot_line(file, codec, |text| {
+                out.write_all(text.as_bytes())?;
+                out.write_all(b"\n")?;
+                Ok(())
+            })?;
+            if written != snapshot_records {
+                return Err(StoreError::Io(format!(
+                    "snapshot changed while it was exported ({written} lines, counted {snapshot_records})"
+                )));
             }
         }
         out.write_all(b"WAL\n")?;
         let mut wal_records = 0usize;
-        for line in BufReader::new(File::open(wal_tmp)?).split(b'\n') {
+        for line in crypt::open_plain(wal_tmp, self.keyring.get())?.split(b'\n') {
             let line = line?;
             out.write_all(&line)?;
             out.write_all(b"\n")?;
@@ -523,14 +521,15 @@ impl ReplicationExportStore {
                 frozen.wal_records
             )));
         }
-        out.flush()?;
-        drop(out);
-        file.seek(SeekFrom::Start(0))?;
-        write_export_header(&mut file, frozen.generation, snapshot_records, wal_records)?;
+        let (sink, total_bytes, sha256) = out.finish();
+        let mut buffered = sink.finish()?;
+        buffered.flush()?;
+        let file = buffered
+            .into_inner()
+            .map_err(|e| StoreError::from(e.into_error()))?;
         failpoint!("export.tmp_written");
         sync_file(&file)?;
         drop(file);
-        let (total_bytes, sha256) = hash_file(&tmp)?;
         fs::rename(&tmp, self.export_path(id))?;
         let manifest = ReplicationExportManifest {
             export_id: id.to_string(),
@@ -613,39 +612,59 @@ impl ReplicationExportStore {
                 "offset {offset} is past the end of the export ({total} bytes)"
             )));
         }
-        let mut file = match File::open(self.export_path(id)) {
+        let path = self.export_path(id);
+        let mut file = match PlainFile::open(&path, self.keyring.get()) {
             Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ChunkRead::NotFound);
-            }
-            Err(err) => return Err(err.into()),
+            Err(_) if !path.exists() => return Ok(ChunkRead::NotFound),
+            Err(err) => return Err(err),
         };
+        if file.len() != total {
+            return Ok(ChunkRead::NotFound);
+        }
         if offset > 0 {
-            file.seek(SeekFrom::Start(offset - 1))?;
             let mut prev = [0u8; 1];
-            file.read_exact(&mut prev)?;
-            if prev[0] != b'\n' {
+            if file.read_at(offset - 1, &mut prev)? != 1 || prev[0] != b'\n' {
                 return Ok(ChunkRead::BadOffset(format!(
                     "offset {offset} is not at a line boundary"
                 )));
             }
-        } else {
-            file.seek(SeekFrom::Start(0))?;
         }
         let max_bytes = max_bytes.clamp(1, EXPORT_CHUNK_MAX_BYTES);
         let want = (total - offset).min(max_bytes as u64) as usize;
         let mut buf = vec![0u8; want];
-        file.read_exact(&mut buf)?;
+        if file.read_at(offset, &mut buf)? != want {
+            return Err(StoreError::Io(
+                "replication export file is shorter than its manifest".to_string(),
+            ));
+        }
         let at_end = offset + want as u64 == total;
         if !at_end {
             match buf.iter().rposition(|b| *b == b'\n') {
                 Some(pos) => buf.truncate(pos + 1),
                 None => {
                     // One line longer than the chunk: extend to its end.
-                    let mut reader = BufReader::new(file.take(EXPORT_LINE_MAX_BYTES as u64));
                     let mut rest = Vec::new();
-                    reader.read_until(b'\n', &mut rest)?;
-                    if rest.last() != Some(&b'\n') && offset + (want + rest.len()) as u64 != total {
+                    let mut pos = offset + want as u64;
+                    let mut piece = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = file.read_at(pos, &mut piece)?;
+                        if n == 0 {
+                            break;
+                        }
+                        if let Some(i) = piece[..n].iter().position(|b| *b == b'\n') {
+                            rest.extend_from_slice(&piece[..=i]);
+                            break;
+                        }
+                        rest.extend_from_slice(&piece[..n]);
+                        pos += n as u64;
+                        if rest.len() > EXPORT_LINE_MAX_BYTES {
+                            break;
+                        }
+                    }
+                    if rest.len() > EXPORT_LINE_MAX_BYTES
+                        || (rest.last() != Some(&b'\n')
+                            && offset + (want + rest.len()) as u64 != total)
+                    {
                         return Err(StoreError::Io(format!(
                             "replication export line at offset {offset} exceeds {EXPORT_LINE_MAX_BYTES} bytes"
                         )));
@@ -672,8 +691,88 @@ impl ReplicationExportStore {
 pub(crate) struct ExportFreeze {
     pub(crate) generation: u64,
     pub(crate) wal_records: usize,
-    /// Open handle on the snapshot at the freeze (`None`: no snapshot).
-    pub(crate) snapshot: Option<File>,
+    /// Open handle on the snapshot at the freeze, with the codec of its
+    /// lines (`None`: no snapshot).
+    pub(crate) snapshot: Option<(File, LineCodec)>,
+}
+
+/// Calls `f` with every snapshot record line that belongs to the
+/// replication view (the header and blank lines are skipped) and returns
+/// how many there were. Reads `file` from the start.
+fn for_each_snapshot_line(
+    file: &mut File,
+    codec: &LineCodec,
+    mut f: impl FnMut(&str) -> std::io::Result<()>,
+) -> Result<usize, StoreError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut filter = ReplicationFilter::new();
+    let mut seen_header = false;
+    let mut count = 0usize;
+    for (idx, line) in BufReader::new(&mut *file).split(b'\n').enumerate() {
+        let line = line?;
+        let text = codec.decode(&line).map_err(|reason| {
+            if codec.is_encrypted() {
+                StoreError::Parse(format!("snapshot line {}: {reason}", idx + 1))
+            } else {
+                StoreError::Parse("snapshot file holds invalid UTF-8".to_string())
+            }
+        })?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        if !seen_header {
+            if text != SNAPSHOT_HEADER {
+                return Err(StoreError::Parse(
+                    "snapshot file has invalid header".to_string(),
+                ));
+            }
+            seen_header = true;
+            continue;
+        }
+        if filter.keep(&text) {
+            f(&text)?;
+            count += 1;
+        }
+    }
+    if !seen_header {
+        return Err(StoreError::Parse("snapshot file is empty".to_string()));
+    }
+    Ok(count)
+}
+
+/// Passes writes through and keeps the length and SHA-256 of what passed.
+struct HashWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+    len: u64,
+}
+
+impl<W: Write> HashWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    /// The inner writer, the byte count and the lowercase hex SHA-256.
+    fn finish(self) -> (W, u64, String) {
+        (self.inner, self.len, hex::encode(self.hasher.finalize()))
+    }
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn write_export_header(
@@ -692,9 +791,10 @@ fn write_export_header(
     )
 }
 
-/// `(length, lowercase hex SHA-256)` of a file, read in 1 MiB blocks.
+/// `(length, lowercase hex SHA-256)` of a file's plaintext, read in 1 MiB
+/// blocks (an encrypted file is decrypted with the keyring in effect).
 pub fn hash_file(path: &Path) -> Result<(u64, String), StoreError> {
-    let mut file = File::open(path)?;
+    let mut file = crypt::open_plain(path, crypt::current_keyring().as_deref())?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     let mut total = 0u64;
@@ -748,6 +848,7 @@ pub enum ExportSection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationExportFile {
     path: PathBuf,
+    keyring: CapturedKeyring,
     pub generation: u64,
     pub snapshot_records: usize,
     pub wal_records: usize,
@@ -759,7 +860,8 @@ impl ReplicationExportFile {
     /// are applied).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref().to_path_buf();
-        let mut reader = BufReader::new(File::open(&path)?);
+        let keyring = CapturedKeyring::current();
+        let mut reader = crypt::open_plain(&path, keyring.get())?;
         if read_header(&mut reader, "status")? != "ok" {
             return Err(StoreError::Parse(
                 "replication export status is not ok".to_string(),
@@ -785,6 +887,7 @@ impl ReplicationExportFile {
         }
         Ok(Self {
             path,
+            keyring,
             generation,
             snapshot_records,
             wal_records,
@@ -800,7 +903,7 @@ impl ReplicationExportFile {
         &self,
         mut f: impl FnMut(ExportSection, &str) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        let reader = BufReader::new(File::open(&self.path)?);
+        let reader = crypt::open_plain(&self.path, self.keyring.get())?;
         let mut lines = reader.split(b'\n');
         // status, generation, snapshot_records, wal_records, SNAPSHOT
         for _ in 0..5 {
@@ -971,6 +1074,7 @@ pub fn download_export(
     {
         fs::create_dir_all(parent).map_err(|e| io("create directory", e))?;
     }
+    let keyring = crypt::current_keyring();
     let mut avoid: Option<String> = None;
     let mut fetched = 0u64;
     let mut resumed = false;
@@ -994,11 +1098,16 @@ pub fn download_export(
                 manifest
             }
         };
-        let mut part = OpenOptions::new()
-            .append(true)
-            .open(&paths.part)
-            .map_err(|e| io("open part file", e))?;
-        let mut have = part.metadata().map_err(|e| io("stat part file", e))?.len();
+        let (codec, mut have) = match part_state(&paths.part, keyring.as_ref()) {
+            Ok(state) => state,
+            Err(reason) => {
+                eprintln!("discarding the partial replication export download: {reason}");
+                paths.remove();
+                continue;
+            }
+        };
+        let mut part = crypt::open_line_file_for_append(&paths.part, &codec)
+            .map_err(|e| format!("replication export download: open part file: {e:?}"))?;
         let mut lost = false;
         while have < manifest.total_bytes {
             match source.chunk(&manifest.export_id, have, chunk_bytes)? {
@@ -1016,7 +1125,14 @@ pub fn download_export(
                             "replication export chunk does not continue the download".to_string()
                         );
                     }
-                    part.write_all(chunk.data.as_bytes())
+                    let mut stored = String::with_capacity(chunk.data.len() + 64);
+                    for piece in chunk.data.split_inclusive('\n') {
+                        match piece.strip_suffix('\n') {
+                            Some(line) => codec.push_line(&mut stored, line),
+                            None => stored.push_str(&codec.encode(piece)),
+                        }
+                    }
+                    part.write_all(stored.as_bytes())
                         .map_err(|e| io("write part file", e))?;
                     sync_file(&part).map_err(|e| io("fsync part file", e))?;
                     have = chunk.next_offset();
@@ -1067,6 +1183,70 @@ pub fn download_export(
         }));
     }
     Err("replication export download failed verification repeatedly".to_string())
+}
+
+/// The codec of a (possibly partial) download part file and the plaintext
+/// bytes it holds. A torn final encrypted line (a crash mid-append) is cut
+/// off; anything else that does not decode is reported, and the caller
+/// starts the download over.
+fn part_state(
+    path: &Path,
+    keyring: Option<&std::sync::Arc<encryption::Keyring>>,
+) -> Result<(LineCodec, u64), String> {
+    let fail = |e: StoreError| format!("{}: {e:?}", path.display());
+    let len = fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if len == 0 {
+        return Ok((LineCodec::create(keyring).map_err(fail)?, 0));
+    }
+    let codec = match crypt::detect_line_file(path, keyring).map_err(fail)? {
+        Detected::Plain if keyring.is_some() => {
+            return Err("a plaintext part file while encryption is on".to_string());
+        }
+        Detected::Plain => return Ok((LineCodec::Plain, len)),
+        Detected::TornHeader => {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|e| e.to_string())?;
+            file.set_len(0).map_err(|e| e.to_string())?;
+            return Ok((LineCodec::create(keyring).map_err(fail)?, 0));
+        }
+        Detected::Encrypted(codec) => {
+            crypt::terminate_lone_header(path).map_err(fail)?;
+            codec
+        }
+    };
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let mut have = 0u64;
+    let mut offset = 0usize;
+    let mut chunks = bytes.split_inclusive(|b| *b == b'\n').peekable();
+    while let Some(raw) = chunks.next() {
+        let terminated = raw.last() == Some(&b'\n');
+        let body = if terminated {
+            &raw[..raw.len() - 1]
+        } else {
+            raw
+        };
+        match codec.decode(body) {
+            Ok(text) => {
+                if !encryption::is_header_line(body) {
+                    have += text.len() as u64 + u64::from(terminated);
+                }
+            }
+            Err(_) if chunks.peek().is_none() => {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|e| e.to_string())?;
+                file.set_len(offset as u64).map_err(|e| e.to_string())?;
+                file.sync_all().map_err(|e| e.to_string())?;
+                break;
+            }
+            Err(reason) => return Err(format!("{}: {reason}", path.display())),
+        }
+        offset += raw.len();
+    }
+    Ok((codec, have))
 }
 
 /// [`ExportSource`] over the leader's HTTP endpoints. `fetch` performs one

@@ -19,6 +19,6 @@ See the table in `SECURITY.md`. DASH is pre-1.0; the current development tree is
 
 The current threat model, including the attack surface that earlier text omitted (control plane, replication endpoints, embeddings proxy), is in [`docs/threat-model.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/threat-model.md). Each mitigation there is marked as implemented, partial, planned or not implemented, with a link to code or a test. A control is only described as present if it can be found in the repository.
 
-Out of scope for the DASH code, as before: compromise of the operator's host, compromise of the identity provider, TLS termination (DASH speaks plain HTTP and expects a proxy), and encryption of volumes (DASH does not encrypt data at rest).
+Out of scope for the DASH code, as before: compromise of the operator's host, compromise of the identity provider, TLS termination (DASH speaks plain HTTP and expects a proxy), and encryption of volumes (DASH can encrypt its data files when `DASH_ENCRYPTION_KEY_FILE` is set; it is off by default, and file names, sizes and audit logs stay plaintext).
 
 For the controls in more detail see [Security](../concepts/security.md) and [Security and audit](../operations/security-audit.md).

@@ -53,6 +53,23 @@ fn main() {
     )
     .unwrap_or_else(|| "./data/dash-retrieval.redb".to_string());
 
+    {
+        let wal_path = env_with_fallback("DASH_RETRIEVAL_WAL_PATH", "EME_RETRIEVAL_WAL_PATH");
+        init_encryption(
+            "retrieval",
+            store::EncryptionStatePaths {
+                vector_index: wal_path
+                    .as_deref()
+                    .and_then(parse_vector_index_persistence)
+                    .map(|p| p.path().to_path_buf()),
+                redb: (!disk_disabled && wal_path.is_some())
+                    .then(|| std::path::PathBuf::from(&disk_path)),
+                wal: wal_path.map(std::path::PathBuf::from),
+                segment_dirs: segment_dir.iter().map(std::path::PathBuf::from).collect(),
+            },
+        );
+    }
+
     let mut follower_wal: Option<FileWal> = None;
     let mut vector_index_persistence: Option<Arc<VectorIndexPersistence>> = None;
     let store = if let Some(wal_path) =
@@ -275,6 +292,27 @@ fn parse_vector_index_persistence(wal_path: &str) -> Option<Arc<VectorIndexPersi
         path,
         (interval_ms > 0).then(|| Duration::from_millis(interval_ms)),
     )))
+}
+
+/// Installs the encryption keyring from `DASH_ENCRYPTION_KEY_FILE` (ADR
+/// 0005) and checks the data already on disk before anything is opened:
+/// encrypted files without a usable key stop the service (fail closed).
+fn init_encryption(service: &str, paths: store::EncryptionStatePaths) {
+    match store::init_encryption_from_env(&paths) {
+        Ok(Some(keyring)) => tracing::info!(
+            "{service} encryption at rest: on (provider {}, active key id {}, {} key id(s) configured)",
+            keyring.provider_name(),
+            keyring.active_key_id(),
+            keyring.key_ids().len()
+        ),
+        Ok(None) => tracing::info!(
+            "{service} encryption at rest: off (set DASH_ENCRYPTION_KEY_FILE to enable it)"
+        ),
+        Err(reason) => {
+            tracing::error!("{service} startup refused: encryption at rest: {reason}");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
