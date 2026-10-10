@@ -89,11 +89,17 @@ When the leader's lease has lapsed (`now > t_seen + L + G`), the control plane p
 
 **Positions and lineage.** A follower's position is `(generation, offset)` in the leader's WAL
 lineage; the leader's is its own `(generation, view length)`. Generations are random ids that change
-at every checkpoint, so they are ordered by the control plane's lineage list: generations reported
-by the current-term leader (with the transition `prev_generation:prev_records` it reports from its
-last checkpoint) and by followers that crossed a checkpoint (`switch_from`). Each lineage entry may
-carry an end (`records` at which it was closed); an offset beyond the end is a divergent history and
-not eligible. A member in a generation the lineage does not know is not eligible.
+at every checkpoint, so they are ordered by the control plane's lineage list (persisted with the
+term). The current-term leader reports its recent checkpoint chain (`from:records:to`, the newest
+eight), which is authoritative: several checkpoints between two heartbeats are all learned. A
+follower that crossed a checkpoint reports it (`switch_from`) together with the term of the leader
+that served the crossing; it extends the lineage only when that term is the current one, the source
+generation is the newest known one and the record count fits. This covers a leader that dies right
+after a checkpoint it never reported, and refuses the case where a follower crossed a checkpoint of
+a deposed leader that the new leader never saw (a divergent history). Each lineage entry may carry an
+end (`records` at which it was closed; at a promotion the new leader's position, a lower bound until
+its fencing checkpoint is known); an offset beyond the end is a divergent history and not eligible.
+A member in a generation the lineage does not know is not eligible.
 
 ### 3.4 Promotion
 
@@ -200,6 +206,11 @@ plus the follower's fsync, not a poll interval.
   stable URL (leader Service or a health-checked load balancer).
 * **Membership is implicit** (whoever heartbeats); there is no joint consensus for adding or
   removing nodes, and node identity (`DASH_NODE_ID`) must be unique.
+* **The control-plane record must survive.** If the failover record is lost while the leader is
+  gone too, the control plane falls back to the bootstrap election, which compares positions across
+  WAL generations and can choose a node that is behind.
+* **Synchronous writes hold an HTTP worker** while they wait for confirmations (the server is
+  thread-per-request), so write concurrency is bounded by the worker count.
 * **A failover resyncs followers that were ahead** of the promoted node and rewrites the promoted
   node's snapshot once (the fencing checkpoint).
 * The fencing token is not yet checked by storage below the WAL (there is no shared storage; each
