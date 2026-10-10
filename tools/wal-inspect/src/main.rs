@@ -143,6 +143,23 @@ fn preview(raw: &[u8]) -> String {
 }
 
 fn print_inspection(path: &Path, info: &WalInspection) {
+    if let Some(pending) = &info.pending_checkpoint {
+        println!("file: {} (pending checkpoint marker)", path.display());
+        println!(
+            "replay: {}then {} closed WAL file(s), then the WAL",
+            if pending.base {
+                "<wal>.snapshot.base, "
+            } else {
+                ""
+            },
+            pending.replay.len()
+        );
+        for generation in &pending.replay {
+            println!("  <wal>.closed.{generation:016x}");
+        }
+        println!("invalid lines: 0");
+        return;
+    }
     println!(
         "file: {} ({})",
         path.display(),

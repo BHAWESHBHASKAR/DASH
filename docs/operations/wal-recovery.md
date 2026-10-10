@@ -20,7 +20,11 @@ Files involved, for a WAL at `<wal>` (for example the path in
 | File | Purpose |
 | --- | --- |
 | `<wal>` | append-only log |
-| `<wal>.snapshot` | checkpoint written by compaction, replayed before the WAL |
+| `<wal>.snapshot` | checkpoint written by compaction, replayed before the WAL; while a checkpoint's snapshot is being written, a small *pending marker* instead (see below) |
+| `<wal>.snapshot.base` | the previous snapshot (a hard link), replayed instead of `<wal>.snapshot` while a checkpoint is pending |
+| `<wal>.closed.<generation>` | the WAL of the generation the last checkpoint closed (served to followers); while a checkpoint is pending, replayed between the base snapshot and the WAL |
+| `<wal>.snapshot.tmp`, `<wal>.snapshot.pending.tmp` | a snapshot or marker being written; a leftover one is ignored and overwritten |
+| `<wal>.retired-*` | a base snapshot or closed WAL a finished checkpoint no longer needs, waiting to be deleted outside the WAL lock; leftovers are deleted at startup |
 | `<wal>.gen` | WAL lineage id used by replication |
 | `<wal>.quarantine` | records replay could not apply (created on demand) |
 | `<wal>.bak` | copy taken by `wal-inspect repair` before it changes a file |
@@ -84,7 +88,18 @@ without validation (wrong dimension, non-finite values, unknown claim).
 
 ## Replay policy
 
-Replay reads the snapshot first, then the WAL.
+Replay reads the snapshot first, then the WAL. While a checkpoint is pending
+(`<wal>.snapshot` starts with `SNAP_PENDING\t1`), it reads
+`<wal>.snapshot.base` (when the marker says `base\t1`), then every
+`<wal>.closed.<generation>` the marker lists (as WAL records, origin
+`<file> line N`), then the WAL. Opening the WAL first brings an interrupted
+checkpoint into one of these states (see
+[WAL durability](wal-durability.md#checkpoints)); a marker that names a
+missing base snapshot or a missing closed file other than its newest entry
+fails the start with an error naming the file. `wal-inspect inspect
+<wal>.snapshot` describes a marker; `wal-inspect repair` refuses it (it holds
+no records). Do not delete or move these files by hand while the marker is
+in place.
 
 Torn tail. If the final WAL line is incomplete or fails its checksum it is
 treated as an interrupted write: `FileWal::open` truncates it, prints a

@@ -25,9 +25,12 @@ use std::sync::Arc;
 /// below a millisecond.
 pub(crate) const SHARDS: usize = 4096;
 
+/// One shard: shared with clones until written.
+type Shard<V> = Option<Arc<HashMap<String, V>>>;
+
 pub(crate) struct CowMap<V> {
     /// `None` for a shard that never held an entry (no allocation).
-    shards: Box<[Option<Arc<HashMap<String, V>>>]>,
+    shards: Box<[Shard<V>]>,
     len: usize,
     hasher: RandomState,
 }
@@ -222,6 +225,9 @@ mod tests {
             })
             .count();
         let populated = frozen.shards.iter().flatten().count();
-        assert!(shared + 4 >= populated, "shared={shared} populated={populated}");
+        assert!(
+            shared + 4 >= populated,
+            "shared={shared} populated={populated}"
+        );
     }
 }

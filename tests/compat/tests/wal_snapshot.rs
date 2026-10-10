@@ -401,3 +401,53 @@ fn after_a_checkpoint_no_tombstone_is_left_for_an_older_reader() {
         );
     }
 }
+
+/// Background checkpoints: while a checkpoint's snapshot is being written
+/// (or after a crash in that window) `<wal>.snapshot` is a pending marker,
+/// which a release from before background checkpoints refuses ("snapshot
+/// file has invalid header") instead of starting without the records the
+/// marker points to. The current code replays the same data from it, and
+/// once the checkpoint is published every file is one the older release
+/// reads again.
+#[test]
+fn a_pending_checkpoint_is_refused_by_older_readers_and_a_published_one_is_not() {
+    for fixture in FIXTURES {
+        let state = fixture.scratch_state();
+        let claims;
+        {
+            let (store, _, mut wal) = load_strict(&state);
+            claims = store.claims_len();
+            // Rotation only: the snapshot is not written (a crash right
+            // after the rotation leaves exactly these files).
+            let job = store.begin_checkpoint(&mut wal).expect("rotation");
+            drop(job);
+        }
+        let marker = fs::read_to_string(state.snapshot()).expect("marker");
+        assert!(
+            !old_readers::accepts_snapshot(&marker),
+            "{}: an older reader must refuse the pending marker",
+            fixture.label
+        );
+        let inspection = inspect_wal_file(state.snapshot()).expect("inspect");
+        assert!(inspection.pending_checkpoint.is_some(), "{}", fixture.label);
+        {
+            let (store, _, mut wal) = load_strict(&state);
+            assert!(wal.checkpoint_pending(), "{}", fixture.label);
+            assert_eq!(store.claims_len(), claims, "{}", fixture.label);
+            store.checkpoint_and_compact(&mut wal).expect("checkpoint");
+            assert!(!wal.checkpoint_pending(), "{}", fixture.label);
+        }
+        let snapshot = fs::read_to_string(state.snapshot()).expect("snapshot");
+        assert!(
+            old_readers::accepts_snapshot(&snapshot),
+            "{}: a published snapshot keeps the header older readers accept",
+            fixture.label
+        );
+        let (store, _, _) = load_strict(&state);
+        assert_eq!(store.claims_len(), claims, "{}", fixture.label);
+    }
+    assert!(
+        upgrade_guide_mentions("pending checkpoint marker"),
+        "the upgrade guide documents the pending marker"
+    );
+}

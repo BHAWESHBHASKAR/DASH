@@ -242,12 +242,30 @@ fn writer(
     out
 }
 
-/// `wal-inspect verify` on the WAL and, when present, the snapshot (with
-/// the service's encryption settings). With `--encryption` both must also
-/// be encrypted files.
+/// `wal-inspect verify` on the WAL and, when present, the snapshot (or the
+/// pending checkpoint marker), the base snapshot and the closed WAL files
+/// (with the service's encryption settings). With `--encryption` they must
+/// also be encrypted files.
 fn verify_files(cfg: &Config, state: &Path) -> Result<(), String> {
-    for name in ["ingest.wal", "ingest.wal.snapshot"] {
-        let path = state.join(name);
+    let mut names: Vec<String> = [
+        "ingest.wal",
+        "ingest.wal.snapshot",
+        "ingest.wal.snapshot.base",
+    ]
+    .iter()
+    .map(|n| n.to_string())
+    .collect();
+    if let Ok(entries) = std::fs::read_dir(state) {
+        let mut closed: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ingest.wal.closed."))
+            .collect();
+        closed.sort();
+        names.extend(closed);
+    }
+    for name in names {
+        let path = state.join(&name);
         if !path.exists() {
             continue;
         }
@@ -416,12 +434,14 @@ fn check_oracle(
             return Err(format!("edge {claim} -> {to} lost"));
         }
     }
-    // Once per section: a checkpoint interrupted between the snapshot
-    // rename and the WAL truncation legitimately leaves a record in both.
+    // Exactly once: a checkpoint never leaves a record in both the snapshot
+    // and the WAL (the WAL is rotated before the snapshot is written, and
+    // a pending checkpoint replays the closed WAL instead of the WAL), and
+    // nothing here writes the same evidence twice.
     if let Some((e, [snap, wal])) = leader
         .evidence_lines_by_section
         .iter()
-        .find(|(_, [snap, wal])| *snap > 1 || *wal > 1)
+        .find(|(_, [snap, wal])| snap + wal > 1)
     {
         return Err(format!(
             "evidence {e} is written more than once (snapshot {snap}, WAL {wal})"

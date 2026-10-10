@@ -6,6 +6,55 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (background checkpoints)
+
+- **A checkpoint no longer blocks writes while it writes the snapshot.**
+  Under the ingestion lock it now only rotates the WAL (the current snapshot
+  is kept as a hard link `<wal>.snapshot.base`, a small pending marker
+  replaces `<wal>.snapshot`, the WAL becomes `<wal>.closed.<generation>`, a
+  new WAL starts) and copies the store state copy-on-write; a background
+  thread writes the snapshot and publishes it with one rename; under the WAL
+  lock it only ends the pending state, and the files it no longer needs are
+  deleted after the lock is released. Writes continue in the new WAL meanwhile. With a 1.1 GiB snapshot
+  (200,000 claims with 384-dimensional vectors, release build, 4 vCPU) the
+  longest ingest during a 150 s run with checkpoints went from 27.0 s to
+  0.57 s, the time writes are blocked per checkpoint from 23 to 27 s to
+  6.6 to 8.0 ms, and throughput from 174 to 272 ingests/s
+  (`docs/operations/replication-limits.md`, "Checkpoint cost").
+  The store keeps the maps a snapshot is written from (claims, evidence,
+  edges, vectors, batch metadata) in 4096 copy-on-write shards, so the copy
+  costs microseconds and a write during the snapshot copies one shard.
+- **Crash consistency.** While the marker is in place, replay reads the base
+  snapshot, the closed WAL files the marker lists and the WAL; after the
+  rename, the new snapshot and the WAL. A crash at any step recovers every
+  acknowledged write exactly once (failpoint tests for every step in
+  `pkg/store/src/failpoint.rs`). A failed snapshot write leaves the marker;
+  the next checkpoint supersedes it, and a service that starts on one
+  starts a checkpoint right away. `docs/operations/wal-durability.md`
+  ("Checkpoints") has the full argument.
+- **Replication.** The generation transition is recorded at the rotation, so
+  followers switch to the new generation while the snapshot is still being
+  written (they never depend on it); a chunked export frozen during the
+  write carries the base snapshot plus the closed WAL as its snapshot
+  section. Follower generation switches use the same three steps (the
+  retrieval follower publishes its local snapshot on a later poll). The
+  replication index is now fed by every WAL append, so a checkpoint never
+  reads the WAL under the lock to measure the closed generation.
+- **On-disk format.** The published snapshot is unchanged. The pending
+  marker (`SNAP_PENDING\t1`) is new: a build from before this change refuses
+  to start on it instead of starting without its records; stop the service
+  cleanly before a rollback (see `docs/operations/upgrades.md`).
+  `wal-inspect` describes the marker and refuses to repair it; backup
+  bundles carry the base snapshot and closed WAL files of a pending
+  checkpoint (`data/wal/pending/`) and restore puts them back.
+- **Metrics.** `dash_wal_checkpoint_pause_seconds` (time a checkpoint holds
+  the WAL lock) and `dash_wal_checkpoint_in_progress`;
+  `dash_wal_checkpoint_duration_seconds` now runs from the rotation to the
+  published snapshot. The ingestion log reports each checkpoint's pause and
+  snapshot write time.
+- **`crash-test`** now requires every evidence row exactly once across the
+  snapshot and WAL sections (a record in both was tolerated before) and
+  verifies the base snapshot and closed WAL files with `wal-inspect`.
 ### Added (encryption at rest, SEC-16, ADR 0005)
 
 - **Encryption at rest, off by default.** Setting `DASH_ENCRYPTION_KEY_FILE`

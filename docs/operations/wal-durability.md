@@ -1,8 +1,9 @@
 # WAL durability and group commit
 
 This page describes when the ingestion service acknowledges a write, how
-concurrent single ingests share fsyncs (group commit), and what happens when
-the disk reports an error. Damaged files and the `wal-inspect` tool are
+concurrent single ingests share fsyncs (group commit), how checkpoints write
+their snapshot without blocking writes, and what happens when the disk
+reports an error. Damaged files and the `wal-inspect` tool are
 covered in [WAL recovery](wal-recovery.md); every setting named here is in
 the [configuration reference](../../docs-site/docs/reference/configuration.md)
 (section "Persistence and WAL").
@@ -70,8 +71,9 @@ ingest; before this release it was one fsync per record).
   tenant's dimension). Every validation therefore sees the effect of every
   earlier WAL record it could depend on, and the state after any set of
   concurrent requests equals a serial replay of the WAL.
-* A checkpoint runs only when no ingest is between commit and apply, so a
-  snapshot never misses a durable record.
+* A checkpoint starts only when no ingest is between commit and apply, so
+  its snapshot never misses a durable record; it then writes the snapshot
+  in the background while ingests continue (see [Checkpoints](#checkpoints)).
 
 ### Backpressure
 
@@ -107,6 +109,102 @@ A write error that is not an fsync error (for example the file cannot be
 opened) fails every request of the batch with `500`, truncates the file back
 to where the batch started and leaves the WAL usable.
 
+## Checkpoints
+
+A checkpoint replaces the WAL by a snapshot of the state, so the WAL (and
+the replay at the next start) stays bounded. The ingestion service runs one
+after a write once the WAL reaches `DASH_CHECKPOINT_MAX_WAL_BYTES` (default
+256 MiB) or `DASH_CHECKPOINT_MAX_WAL_RECORDS`. Writing the snapshot takes
+time proportional to the data set (seconds for a few GiB); it no longer
+blocks writes. A checkpoint runs in three steps:
+
+1. **Rotate, under the runtime and WAL locks.** Only when no ingest is
+   between commit and apply (so the state equals the WAL). The current
+   snapshot is kept as `<wal>.snapshot.base` (a hard link, no copy), a small
+   *pending marker* replaces `<wal>.snapshot`, the WAL is renamed to
+   `<wal>.closed.<generation>`, a new, empty WAL starts under a new
+   generation, and the generation transition is recorded. The store state
+   is copied copy-on-write at the same moment: the maps a snapshot is
+   written from are split into 4096 shards behind shared pointers, so the
+   copy shares everything and a later write copies only the shard it
+   touches. The response of the write that triggered the checkpoint reports
+   `checkpoint_triggered: true` with the record counts as soon as this step
+   is done.
+2. **Write and publish, without any lock.** A background thread writes the
+   copy to `<wal>.snapshot.tmp` (flushing to disk every 64 MiB, so the final
+   fsync is short and WAL fsyncs never queue behind one large burst), fsyncs
+   it, renames it over the marker (the commit point) and fsyncs the
+   directory. Writes continue meanwhile and go to the new WAL.
+3. **Finish, under the WAL lock.** The pending state ends in memory, and the
+   base snapshot and the closed WAL files only replay needed are renamed to
+   `<wal>.retired-*` (the newest closed file stays for followers, as
+   before); they are deleted after the lock is released, because unlinking
+   a file of a few GiB takes long enough to stall writes. Until this step
+   readers of the pending state (an export frozen meanwhile) still find
+   every file. Leftover `<wal>.retired-*` files are deleted at the next
+   start.
+
+What the pause is made of: an fsync of the WAL tail, a few small file
+writes with their fsyncs (marker, generation file, new WAL, transitions
+file), a hard link and a few renames (the previous closed WAL is renamed
+out of the way and deleted by the writer thread), the shard-pointer copy
+(microseconds) and one pass over the evidence and edge lists to count the
+snapshot's records. The replication view length the transition needs is
+kept current by every WAL append (the WAL read at startup is indexed once
+before the service serves), so a checkpoint never reads the WAL under the
+lock. In the measurement in
+[replication limits](replication-limits.md#checkpoint-cost) the rotation
+took 6.6 to 8.0 ms with about 200,000 to 250,000 claims (a 1.1 GiB
+snapshot written in 20 to 26 s), against write stalls of 23 to 27 s before. The pause is
+reported as `dash_wal_checkpoint_pause_seconds` (one observation for the
+rotation, one for the publication) and logged
+(`ingestion checkpoint started after ...: pause_ms=...`).
+
+**Recovery.** `<wal>.snapshot` is always either a snapshot (`SNAP\t1`) or
+the marker (`SNAP_PENDING\t1`, see [upgrades](upgrades.md#format-versions)
+for the layout). With a snapshot, replay reads it and then the WAL. With
+the marker, replay reads the base snapshot (if the marker names one), then
+every closed WAL file the marker lists, in order, then the WAL. Both
+describe the complete state at every moment:
+
+* The base snapshot and the closed WAL were durable before the marker was
+  written, and the new WAL holds only records written after the rotation,
+  so the marker's files never miss and never repeat a record.
+* Publishing is one rename: before it the marker is in place (old snapshot
+  plus every WAL record), after it the new snapshot (state at the rotation)
+  plus the new WAL. A record is never in both the snapshot and the WAL that
+  is replayed after it.
+* A crash inside the rotation before the WAL was renamed leaves a marker
+  that names a closed file that does not exist yet: opening the WAL drops
+  that entry (its records are still in the WAL) and, if nothing is left,
+  puts the base snapshot back. A crash before the marker leaves only a
+  stray base link, which opening deletes.
+
+Every step has a failpoint test that copies the directory at that moment
+and reopens it (`pkg/store/src/failpoint.rs`).
+
+**Failures.** If the snapshot write or the publication fails (disk full,
+I/O error), the files stay in the pending state, which replay reads
+correctly, and the error is logged
+(`ingestion ... background checkpoint failed`, `dash_wal_checkpoint_failures_total`).
+The next checkpoint (the WAL reaches the threshold again) adds its own
+closed generation to the marker's list, and its snapshot supersedes all of
+them. A service that starts on a pending marker (after a crash, or a failure
+before a restart) starts a checkpoint right away. While a snapshot is being
+written no second checkpoint starts (`dash_wal_checkpoint_in_progress` is
+1); a shutdown with SIGTERM waits for it.
+
+**Cost.** Disk: until publication, the old snapshot (base), the new snapshot
+being written, the closed WAL and the new WAL. Memory: a shard touched by a
+write while the snapshot is written exists twice until the write finishes;
+in the worst case (every shard touched) that is a second copy of the claim,
+evidence, edge, vector and batch maps. The snapshot file format is
+unchanged.
+
+The replication side (followers cross the checkpoint as soon as the rotation
+is done; exports during the write) is described in
+[replication limits](replication-limits.md#checkpoints-switching-generations-instead-of-resyncing).
+
 ## Metrics
 
 | Metric | Meaning |
@@ -123,6 +221,10 @@ to where the batch started and leaves the WAL usable.
 | `dash_ingest_wal_group_commit_conflict_waits_total` | requests that waited for a conflicting in-flight ingest |
 | `dash_ingest_wal_group_commit_max_wait_us` | configured linger |
 | `dash_ingest_wal_poisoned` | 1 after an fsync failure, until restart |
+| `dash_wal_checkpoint_pause_seconds` | time a checkpoint holds the WAL lock (rotation and publication, one observation each) |
+| `dash_wal_checkpoint_duration_seconds` | rotation to published snapshot, successful or not |
+| `dash_wal_checkpoint_in_progress` | 1 while a checkpoint's snapshot is being written |
+| `dash_wal_checkpoints_total`, `dash_wal_checkpoint_failures_total` | published checkpoints and failed ones |
 
 ## Throughput
 

@@ -96,7 +96,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 **Stable (behavior covered by tests, unlikely to change shape):**
 - Claim, Evidence and Edge schema and validation (`pkg/schema`).
 - Retrieval semantics: `balanced` and `support_only` stance modes, contradiction demotion, temporal `time_range` filtering, optional graph payload.
-- WAL write, replay, checkpoint and snapshot compaction in a single process (`pkg/store`): checksummed records, torn-tail truncation, one commit group per single ingest, quarantine of unreadable legacy records (`tools/wal-inspect` to inspect and repair).
+- WAL write, replay, checkpoint and snapshot compaction in a single process (`pkg/store`): checksummed records, torn-tail truncation, one commit group per single ingest, quarantine of unreadable legacy records (`tools/wal-inspect` to inspect and repair). A checkpoint writes its snapshot in the background: writes pause only for the WAL rotation (milliseconds), and a crash at any step recovers every acknowledged write exactly once ([`docs/operations/wal-durability.md`](docs/operations/wal-durability.md#checkpoints)).
 - Authentication and authorization (`services/common`, `pkg/auth`): deny by default, HS256 JWT validation (kid rotation, `iss`/`aud`, tenant claims, `exp` required, lifetime cap, `jti` denylist), scoped API keys, key revocation lists, a role hierarchy (`admin`, `ingest`, `retrieve`, `read_only`), per-tenant token-bucket rate limiting (429) and SIGHUP reload. Details: [`docs/operations/auth.md`](docs/operations/auth.md).
 
 **Beta (works, with known gaps listed in the register or below):**

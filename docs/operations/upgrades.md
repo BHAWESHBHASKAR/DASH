@@ -43,7 +43,9 @@ rollback without restoring a backup would face.
 | Replication frames (`/internal/replication/wal`, `/export`) | no `generation=` line | `generation=<lineage>` as the second line; to a follower that sends `gen_switch=1`, also `switch_from=none` or `switch_from=<generation>:<offset>` after `needs_resync=` (see [Within 0.3.0](#within-030-chunked-export-and-generation-switches)) | Refused: both followers apply nothing and report `replication_leader_too_old` | Refused: the 0.2 follower expects `needs_resync=` on the second line and fails every poll |
 | Chunked export (`/internal/replication/export/begin`, `/chunk`) | not served (404) | manifest (`export_id`, `generation`, `snapshot_records`, `wal_records`, `total_bytes`, `sha256`) and chunks (`DATA` + whole lines) | n/a: followers fall back to the single-response export on 404 (and then refuse the 0.2 frame) | n/a |
 | Generation transitions `<wal>.gen.transitions` | not written | one `<from:16 hex> <records> <to:16 hex>` line per checkpoint, newest 16 | n/a | Ignored |
-| Closed generation `<wal>.closed.<16 hex>` | not written | the WAL file of the generation the last checkpoint closed (same records as the WAL), replaced at the next checkpoint | n/a | Ignored (delete it after a rollback) |
+| Closed generation `<wal>.closed.<16 hex>` | not written | the WAL file of the generation the last checkpoint closed (same records as the WAL), replaced at the next checkpoint; while a checkpoint is pending also replayed (see the next rows) | n/a | Ignored (delete it after a rollback) |
+| Pending checkpoint marker (at `<wal>.snapshot`) | not written | while a checkpoint's snapshot is written in the background, `<wal>.snapshot` is a small marker: `SNAP_PENDING\t1`, `base\t0` or `base\t1`, one `replay\t<16 hex>` line per closed generation to replay; the published snapshot replaces it (`SNAP\t1` as before) | n/a | No: a build from before background checkpoints stops with `snapshot file has invalid header` (see [Within 0.3.0](#within-030-chunked-export-and-generation-switches)) |
+| Base snapshot `<wal>.snapshot.base` | not written | a hard link to the previous snapshot, kept only while a checkpoint is pending | n/a | Ignored |
 | Exports `<wal>.exports/` | not written | `<id>.export` (single-response export layout, zero-padded counts) and `<id>.manifest`, newest 2, deleted after 15 idle minutes | n/a | Ignored (delete it after a rollback) |
 | Follower download `<wal>.resync.part`, `<wal>.resync.manifest` | not written | a partial or complete export download and its manifest, deleted after the swap | n/a | Ignored |
 | Follower cursor (`<wal>.replication`, `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) | bare offset (retrieval only) | `generation=…` and `offset=…` | A bare offset is read as a cursor without a generation, which the leader answers with a resync (the parser is unit-tested in `services/retrieval`, not in `tests/compat`) | n/a |
@@ -151,6 +153,22 @@ features available during the window:
   frame formats are unchanged, so it starts normally; it ignores
   `<wal>.gen.transitions`, `<wal>.closed.*` and `<wal>.exports/` (delete them
   to reclaim the space). Current followers fall back as above.
+* **Background checkpoints.** A checkpoint now writes its snapshot on a
+  background thread (see [WAL durability](wal-durability.md#checkpoints)).
+  The published snapshot, the WAL and the replication protocol are
+  unchanged, so an earlier 0.3 build reads them, with one exception: while
+  a snapshot is being written, and after a crash in that window,
+  `<wal>.snapshot` holds a **pending checkpoint marker** instead of a
+  snapshot, and an earlier build refuses to start on it (`snapshot file has
+  invalid header`) rather than start without the records it points to.
+  Before rolling back to an earlier build, stop the service with SIGTERM (it
+  waits for a running checkpoint) and check that
+  `wal-inspect inspect <wal>.snapshot` does not report a pending checkpoint
+  marker. If it does (the process was killed), start the current build once:
+  it supersedes the unpublished checkpoint at startup (log line
+  `ingestion checkpoint published`), then stop it again. Delete
+  `<wal>.snapshot.base` if one is left. Backups taken with
+  `scripts/backup_state_bundle.sh` carry the marker's files and restore them.
 * **Checkpoint default.** A leader upgraded without
   `DASH_CHECKPOINT_MAX_WAL_BYTES` in its environment now checkpoints once
   its WAL reaches 256 MiB (it never checkpointed on its own before). Set the

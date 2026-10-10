@@ -12,10 +12,9 @@ pub struct LeaderState {
     pub evidence: BTreeMap<String, String>,
     /// evidence_id -> number of E records carrying it (duplicates show here).
     pub evidence_lines: BTreeMap<String, usize>,
-    /// The same count per section: `[snapshot, wal]`. A record may appear
-    /// once in each after a crash between writing a checkpoint snapshot and
-    /// truncating the WAL (replay is idempotent); twice within one section
-    /// is a duplicated write.
+    /// The same count per section: `[snapshot, wal]`. While a checkpoint
+    /// is pending, the snapshot section is the base snapshot followed by
+    /// the closed WAL files it replays.
     pub evidence_lines_by_section: BTreeMap<String, [usize; 2]>,
     /// (from, to, relation)
     pub edges: BTreeSet<(String, String, String)>,

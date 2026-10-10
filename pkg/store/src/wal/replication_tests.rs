@@ -1328,3 +1328,213 @@ mod encrypted {
         });
     }
 }
+
+// ---------------------------------------------------------------------
+// Background checkpoints: the snapshot is written while writes continue
+// ---------------------------------------------------------------------
+
+impl Leader {
+    /// Rotation and state copy, as the ingestion service does it under its
+    /// locks; the snapshot is written later by the caller.
+    fn begin_background(&self) -> crate::CheckpointJob {
+        let mut wal = self.wal.lock().unwrap();
+        self.store.begin_checkpoint(&mut wal).unwrap()
+    }
+
+    /// The background part: write without any lock, publish under the WAL
+    /// lock.
+    fn finish_background(&self, job: crate::CheckpointJob) {
+        job.write().unwrap();
+        job.finish(&mut self.wal.lock().unwrap()).unwrap();
+    }
+}
+
+fn copy_files(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+#[test]
+fn followers_cross_a_background_checkpoint_while_its_snapshot_is_written() {
+    let dir = TempDir::new().unwrap();
+    let mut leader = Leader::open(dir.path());
+    leader.write_n(10);
+    leader.checkpoint();
+    leader.write_n(4);
+    let mut behind = Follower::open(&dir.path().join("behind"));
+    behind.sync(&leader);
+    leader.write_n(4);
+    let mut at_end = Follower::open(&dir.path().join("at-end"));
+    at_end.sync(&leader);
+    assert!(behind.offset < leader.position().1);
+    let (closed_generation, closed_len) = leader.position();
+
+    let job = leader.begin_background();
+    assert!(leader.wal().checkpoint_pending());
+    let new_generation = leader.position().0;
+    let newest = leader.wal().generation_transitions().last().copied();
+    assert_eq!(
+        newest,
+        Some(GenerationTransition {
+            from_generation: closed_generation,
+            from_records: closed_len,
+            to_generation: new_generation,
+        }),
+        "the transition is recorded at the rotation, before the snapshot is written"
+    );
+    // Writes continue in the new WAL while the snapshot is not written.
+    leader.write_n(6);
+    leader.delete("c3");
+    at_end.sync(&leader);
+    behind.sync(&leader);
+    // One resync each: the initial download (the leader had a snapshot).
+    assert_eq!((at_end.resyncs, at_end.switches), (1, 1));
+    assert_eq!((behind.resyncs, behind.switches), (1, 1));
+    at_end.assert_matches(&leader, "switched during the snapshot write");
+    behind.assert_matches(&leader, "caught up from the closed file, then switched");
+
+    // The leader crashes before publishing: it recovers the same state from
+    // the base snapshot, the closed WAL and the new WAL, under the same
+    // generation, and the followers continue without a resync.
+    let crashed_dir = dir.path().join("leader-crashed");
+    copy_files(dir.path(), &crashed_dir);
+    {
+        let crashed = FileWal::open(crashed_dir.join("leader.wal")).unwrap();
+        assert!(crashed.checkpoint_pending());
+        assert_eq!(crashed.generation(), new_generation);
+        let recovered = InMemoryStore::load_from_wal(&crashed).unwrap();
+        assert_eq!(
+            state(&recovered),
+            state(&leader.store),
+            "crash before publish"
+        );
+    }
+
+    leader.finish_background(job);
+    assert!(!leader.wal().checkpoint_pending());
+    leader.write_n(3);
+    at_end.sync(&leader);
+    behind.sync(&leader);
+    assert_eq!((at_end.resyncs, at_end.switches), (1, 1));
+    assert_eq!((behind.resyncs, behind.switches), (1, 1));
+    at_end.assert_matches(&leader, "after the publication");
+    behind.assert_matches(&leader, "after the publication");
+    let reopened = FileWal::open(dir.path().join("leader.wal")).unwrap();
+    assert_eq!(
+        state(&InMemoryStore::load_from_wal(&reopened).unwrap()),
+        state(&leader.store),
+        "leader replay after the publication"
+    );
+}
+
+#[test]
+fn a_chunked_export_during_a_background_checkpoint_carries_the_pending_state() {
+    let dir = TempDir::new().unwrap();
+    let mut leader = Leader::open(dir.path());
+    leader.write_n(20);
+    leader.checkpoint();
+    leader.write_n(5);
+    leader.delete("c4");
+    let job = leader.begin_background();
+    leader.write_n(3);
+    assert!(leader.wal().checkpoint_pending());
+
+    // A fresh follower resyncs while the snapshot is being written: the
+    // export's snapshot section is the base snapshot plus the closed WAL
+    // (tombstone included), its WAL section the new WAL.
+    let mut fresh = Follower::open(&dir.path().join("fresh"));
+    fresh.sync(&leader);
+    assert_eq!((fresh.resyncs, fresh.switches), (1, 0));
+    fresh.assert_matches(&leader, "export of the pending state");
+    assert!(
+        fresh.wal.contains_tombstones().unwrap(),
+        "a tombstone in the imported snapshot makes the redb cold start rebuild"
+    );
+
+    // An export frozen during the pending state and built after the
+    // publication deleted the base snapshot and the closed WAL: the open
+    // handles still read them.
+    leader.write_n(1);
+    let expected = leader.wal().replication_export().unwrap();
+    let position = leader.position();
+    let mut job = Some(job);
+    let manifest = leader
+        .exports
+        .begin_with_hook(&leader.wal, None, &mut || {
+            leader.finish_background(job.take().unwrap());
+            assert!(!leader.wal().base_snapshot_path().exists());
+        })
+        .unwrap();
+    assert!(job.is_none(), "published between freeze and build");
+    assert_eq!((manifest.generation, manifest.wal_records), position);
+    let file = ReplicationExportFile::open(
+        leader
+            .exports
+            .dir()
+            .join(format!("{}.export", manifest.export_id)),
+    )
+    .unwrap();
+    let mut snapshot = Vec::new();
+    let mut wal_lines = Vec::new();
+    file.for_each_line(|section, line| {
+        match section {
+            ExportSection::Snapshot => snapshot.push(line.to_string()),
+            ExportSection::Wal => wal_lines.push(line.to_string()),
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(snapshot, expected.snapshot_lines);
+    assert_eq!(wal_lines, expected.wal_lines);
+    let mut late = Follower::open(&dir.path().join("late"));
+    let paths = late.paths();
+    let DownloadOutcome::Complete(download) =
+        download_export(&mut leader.source(), &paths, 256).unwrap()
+    else {
+        panic!("complete");
+    };
+    assert_eq!(download.manifest, manifest, "the leader reuses that export");
+    late.apply(&download);
+    paths.remove();
+    late.sync(&leader);
+    assert_eq!((late.resyncs, late.switches), (1, 0));
+    late.assert_matches(&leader, "export frozen before the publication");
+
+    // A download running while a background checkpoint starts and publishes
+    // completes with the export it began with.
+    leader.write_n(2);
+    let frozen_state = state(&leader.store);
+    let frozen_position = leader.position();
+    let mut during = Follower::open(&dir.path().join("during"));
+    let paths = during.paths();
+    let mut source = FaultySource::new(&leader);
+    let started = Cell::new(false);
+    source.on_chunk = Some(Box::new(|call| {
+        if call == 2 && !started.replace(true) {
+            let job = leader.begin_background();
+            leader.finish_background(job);
+        }
+    }));
+    let DownloadOutcome::Complete(download) = download_export(&mut source, &paths, 256).unwrap()
+    else {
+        panic!("complete");
+    };
+    drop(source);
+    assert!(started.get());
+    assert_eq!(
+        (download.manifest.generation, download.manifest.wal_records),
+        frozen_position
+    );
+    during.apply(&download);
+    paths.remove();
+    assert_eq!(state(&during.store), frozen_state);
+    // The checkpoint was at the frozen position: crossed with a switch.
+    during.sync(&leader);
+    assert_eq!((during.resyncs, during.switches), (1, 1));
+    during.assert_matches(&leader, "download across a background checkpoint");
+}

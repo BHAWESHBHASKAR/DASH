@@ -855,14 +855,22 @@ impl IngestionRuntime {
     /// The leader closed our generation with a checkpoint exactly at our
     /// position, so this node's state is the leader's new snapshot. Compact
     /// the local WAL the same way (so the saved offset keeps matching the
-    /// local WAL) and continue at offset 0 of `generation`. A failed local
-    /// checkpoint flags a full resync.
+    /// local WAL) and continue at offset 0 of `generation`. Like a leader's
+    /// checkpoint, only the rotation happens here; the snapshot is written in
+    /// the background (a crash before it is published replays the base
+    /// snapshot and the closed WAL, and the local WAL still matches the
+    /// cursor). A failed local checkpoint flags a full resync.
     fn switch_replication_generation(&mut self, generation: u64) -> Result<(), StoreError> {
-        if let Some(wal) = self.wal.as_ref() {
-            let compacted = self.store.checkpoint_and_compact(&mut lock_wal(wal));
-            if let Err(err) = compacted {
-                self.replication_follower.force_resync = true;
-                return Err(err);
+        if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
+            // The previous switch's snapshot may still be being written.
+            self.wait_for_checkpoint();
+            let begun = self.store.begin_checkpoint(&mut lock_wal(&wal));
+            match begun {
+                Ok(job) => self.spawn_checkpoint_writer(job, "replication switch"),
+                Err(err) => {
+                    self.replication_follower.force_resync = true;
+                    return Err(err);
+                }
             }
             if let Some(persistence) = self.vector_index_persistence.as_ref() {
                 persistence.request_save();
@@ -903,9 +911,11 @@ impl IngestionRuntime {
             .replication_follower
             .skipped_records_total
             .saturating_add(skipped);
-        if let Some(wal) = self.wal.as_ref() {
+        if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
+            // A local checkpoint still writing its snapshot finishes first.
+            self.wait_for_checkpoint();
             self.clear_replication_state()?;
-            lock_wal(wal).replace_with_replication_export(&export)?;
+            lock_wal(&wal).replace_with_replication_export(&export)?;
         }
         self.finish_replication_resync(
             fresh,
@@ -938,11 +948,13 @@ impl IngestionRuntime {
             .replication_follower
             .skipped_records_total
             .saturating_add(skipped);
-        if let Some(wal) = self.wal.as_ref() {
+        if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
+            // A local checkpoint still writing its snapshot finishes first.
+            self.wait_for_checkpoint();
             self.clear_replication_state()?;
             #[cfg(test)]
             crash_point::hit("ingest.resync.cursor_cleared")?;
-            lock_wal(wal).replace_with_replication_export_file(&download.file)?;
+            lock_wal(&wal).replace_with_replication_export_file(&download.file)?;
             #[cfg(test)]
             crash_point::hit("ingest.resync.wal_replaced")?;
         }

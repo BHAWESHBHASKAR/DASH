@@ -473,3 +473,113 @@ fn group_commit_settings_are_read_and_clamped() {
     let defaults = super::super::group_commit::resolve_group_commit_config().unwrap();
     assert_eq!(defaults, store::GroupCommitConfig::default());
 }
+
+/// A checkpoint's snapshot is written on a background thread: single
+/// ingests keep committing through the group-commit pipeline while it is
+/// held, and only the short rotation happens on the request path.
+#[test]
+fn ingests_proceed_while_a_checkpoint_snapshot_is_being_written() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _limits = NoRateLimit::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = InMemoryStore::new().attach_disk(dir.path().join("store.redb"));
+    let wal = FileWal::open(dir.path().join("wal.log")).expect("wal should open");
+    let policy = CheckpointPolicy {
+        max_wal_records: Some(150),
+        max_wal_bytes: None,
+    };
+    let mut runtime = IngestionRuntime::persistent(store, wal, policy);
+    assert!(runtime.group_commit_active());
+    // The snapshot writer stops at this gate until the test opens it.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let release_rx = Mutex::new(release_rx);
+    runtime.set_checkpoint_gate_for_tests(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx.lock().unwrap().recv();
+    })));
+    let runtime = Arc::new(Mutex::new(runtime));
+
+    let mut acknowledged = Vec::new();
+    let mut triggered = false;
+    for i in 0..400 {
+        let id = format!("pre-{i}");
+        let response = handle_request(
+            &runtime,
+            &post(
+                "/v1/ingest",
+                ingest_body(&id, "ckpt", &format!("Claim text {id}"), ""),
+            ),
+        );
+        assert_eq!(response.status, 200, "{}", response.body);
+        acknowledged.push(id);
+        if response.body.contains("\"checkpoint_triggered\":true") {
+            triggered = true;
+            break;
+        }
+    }
+    assert!(triggered, "the policy started a checkpoint");
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the checkpoint thread reached the snapshot write");
+
+    let threads = 8;
+    let per_thread = 25;
+    let results: Vec<(String, std::time::Duration)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let runtime = &runtime;
+                scope.spawn(move || {
+                    let mut out = Vec::new();
+                    for i in 0..per_thread {
+                        let id = format!("during-t{t}-c{i}");
+                        let started = std::time::Instant::now();
+                        let response = handle_request(
+                            runtime,
+                            &post(
+                                "/v1/ingest",
+                                ingest_body(&id, "ckpt", &format!("Claim text {id}"), ""),
+                            ),
+                        );
+                        assert_eq!(response.status, 200, "{}", response.body);
+                        out.push((id, started.elapsed()));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    {
+        // Every one of them committed while the snapshot was not written.
+        let guard = runtime.lock().unwrap();
+        let wal = lock_wal(guard.wal.as_ref().unwrap());
+        assert!(wal.checkpoint_in_flight());
+        assert!(wal.checkpoint_pending());
+    }
+    let slowest = results.iter().map(|(_, d)| *d).max().unwrap();
+    assert!(
+        slowest < std::time::Duration::from_secs(5),
+        "an ingest took {slowest:?} during the checkpoint"
+    );
+    acknowledged.extend(results.into_iter().map(|(id, _)| id));
+
+    drop(release_tx);
+    runtime.lock().unwrap().wait_for_checkpoint();
+    {
+        let guard = runtime.lock().unwrap();
+        let wal = lock_wal(guard.wal.as_ref().unwrap());
+        assert!(!wal.checkpoint_in_flight());
+        assert!(!wal.checkpoint_pending(), "the snapshot was published");
+    }
+    drop(runtime);
+    let reloaded = reload(dir.path());
+    for id in &acknowledged {
+        assert!(reloaded.claim_by_id(id).is_some(), "acknowledged {id} lost");
+    }
+    assert_eq!(reloaded.claims_len(), acknowledged.len());
+}

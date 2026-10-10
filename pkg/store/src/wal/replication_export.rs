@@ -478,10 +478,7 @@ impl ReplicationExportStore {
         let tmp = self.export_tmp_path(id);
         // Count the snapshot lines first: the header carries the counts and
         // a sealed file cannot be patched in place.
-        let snapshot_records = match frozen.snapshot.as_mut() {
-            Some((file, codec)) => for_each_snapshot_line(file, codec, |_| Ok(()))?,
-            None => 0,
-        };
+        let snapshot_records = for_each_prefix_line(&mut frozen, |_| Ok(()))?;
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -495,17 +492,15 @@ impl ReplicationExportStore {
             frozen.wal_records,
         )?;
         out.write_all(b"SNAPSHOT\n")?;
-        if let Some((file, codec)) = frozen.snapshot.as_mut() {
-            let written = for_each_snapshot_line(file, codec, |text| {
-                out.write_all(text.as_bytes())?;
-                out.write_all(b"\n")?;
-                Ok(())
-            })?;
-            if written != snapshot_records {
-                return Err(StoreError::Io(format!(
-                    "snapshot changed while it was exported ({written} lines, counted {snapshot_records})"
-                )));
-            }
+        let written = for_each_prefix_line(&mut frozen, |text| {
+            out.write_all(text.as_bytes())?;
+            out.write_all(b"\n")?;
+            Ok(())
+        })?;
+        if written != snapshot_records {
+            return Err(StoreError::Io(format!(
+                "snapshot changed while it was exported ({written} lines, counted {snapshot_records})"
+            )));
         }
         out.write_all(b"WAL\n")?;
         let mut wal_records = 0usize;
@@ -694,18 +689,53 @@ pub(crate) struct ExportFreeze {
     /// Open handle on the snapshot at the freeze, with the codec of its
     /// lines (`None`: no snapshot).
     pub(crate) snapshot: Option<(File, LineCodec)>,
+    /// Open handles on the closed WAL files a pending checkpoint replays
+    /// after the snapshot, oldest first, with their codecs (empty when none
+    /// is pending). Their lines go into the export's snapshot section: they
+    /// are the state the WAL section starts from.
+    pub(crate) closed: Vec<(File, LineCodec)>,
 }
 
-/// Calls `f` with every snapshot record line that belongs to the
-/// replication view (the header and blank lines are skipped) and returns
-/// how many there were. Reads `file` from the start.
+/// Calls `f` with every line of the export's snapshot section: the snapshot
+/// records, then the lines of the closed WAL files of a pending checkpoint,
+/// all that belong to the replication view (headers and blank lines are
+/// skipped). Returns how many there were. Reads every file from the start.
+fn for_each_prefix_line(
+    frozen: &mut ExportFreeze,
+    mut f: impl FnMut(&str) -> std::io::Result<()>,
+) -> Result<usize, StoreError> {
+    let mut filter = ReplicationFilter::new();
+    let mut count = 0usize;
+    if let Some((file, codec)) = frozen.snapshot.as_mut() {
+        count += for_each_snapshot_line(file, codec, &mut filter, &mut f)?;
+    }
+    for (file, codec) in frozen.closed.iter_mut() {
+        file.seek(SeekFrom::Start(0))?;
+        for (idx, line) in BufReader::new(&mut *file).split(b'\n').enumerate() {
+            let line = line?;
+            let text = codec.decode(&line).map_err(|reason| {
+                StoreError::Parse(format!("closed WAL line {}: {reason}", idx + 1))
+            })?;
+            if text.trim().is_empty() {
+                continue;
+            }
+            if filter.keep(&text) {
+                f(&text)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// The snapshot part of [`for_each_prefix_line`].
 fn for_each_snapshot_line(
     file: &mut File,
     codec: &LineCodec,
-    mut f: impl FnMut(&str) -> std::io::Result<()>,
+    filter: &mut ReplicationFilter,
+    f: &mut impl FnMut(&str) -> std::io::Result<()>,
 ) -> Result<usize, StoreError> {
     file.seek(SeekFrom::Start(0))?;
-    let mut filter = ReplicationFilter::new();
     let mut seen_header = false;
     let mut count = 0usize;
     for (idx, line) in BufReader::new(&mut *file).split(b'\n').enumerate() {
