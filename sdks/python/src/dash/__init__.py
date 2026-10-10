@@ -22,6 +22,7 @@ from .client import Client, EmbeddingsNamespace
 from .errors import DashAPIError, DashConnectionError, DashError
 from .types import (
     Citation,
+    DeleteResponse,
     EmbeddingData,
     EmbeddingRequest,
     EmbeddingResponse,
@@ -48,6 +49,7 @@ __all__ = [
     "DashError",
     # Types
     "Citation",
+    "DeleteResponse",
     "EmbeddingData",
     "EmbeddingRequest",
     "EmbeddingResponse",

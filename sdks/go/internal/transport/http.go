@@ -66,6 +66,18 @@ func New(cfg Config) *Transport {
 // If the request fails before a response is received, err is a
 // wrapped network error and status is 0.
 func (t *Transport) Post(ctx context.Context, path string, body any) (status int, raw []byte, err error) {
+	return t.Do(ctx, http.MethodPost, path, body)
+}
+
+// Delete issues a DELETE without a body (the delete routes take their
+// arguments from the path and query) and returns the raw response.
+func (t *Transport) Delete(ctx context.Context, path string) (status int, raw []byte, err error) {
+	return t.Do(ctx, http.MethodDelete, path, nil)
+}
+
+// Do issues a request with an optional JSON body. A nil body sends no
+// body and no Content-Type.
+func (t *Transport) Do(ctx context.Context, method, path string, body any) (status int, raw []byte, err error) {
 	url := t.cfg.BaseURL + path
 
 	var payload []byte
@@ -76,11 +88,17 @@ func (t *Transport) Post(ctx context.Context, path string, body any) (status int
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	var reader io.Reader
+	if payload != nil {
+		reader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return 0, nil, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if payload != nil || method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json")
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", DefaultUserAgent)

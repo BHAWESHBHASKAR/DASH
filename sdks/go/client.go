@@ -24,12 +24,16 @@ const DefaultTimeout = 30 * time.Second
 // connections.
 type Client struct {
 	baseURL      string
+	ingestionURL string
 	apiKey       string
 	timeout      time.Duration
 	httpClient   *http.Client
 	extraHeaders map[string]string
 
 	t *transport.Transport
+	// ingest talks to the ingestion service (deletes); nil when no
+	// ingestion URL is known.
+	ingest *transport.Transport
 
 	embeddings *EmbeddingsService
 	retrieve   *RetrieveService
@@ -44,6 +48,14 @@ type Option func(*Client)
 // "Authorization: Bearer <key>".
 func WithAPIKey(key string) Option {
 	return func(c *Client) { c.apiKey = key }
+}
+
+// WithIngestionBaseURL sets the root URL of the ingestion service, used
+// by the delete methods. Without it the URL is derived only for the
+// conventional local layout: a base URL on port 8080 maps to the same
+// host on port 8081.
+func WithIngestionBaseURL(u string) Option {
+	return func(c *Client) { c.ingestionURL = strings.TrimRight(u, "/") }
 }
 
 // WithHTTPClient replaces the underlying *http.Client. Use this to
@@ -95,6 +107,18 @@ func New(baseURL string, opts ...Option) *Client {
 		Client:       c.httpClient,
 		ExtraHeaders: c.extraHeaders,
 	})
+	if c.ingestionURL == "" {
+		c.ingestionURL = deriveIngestionURL(c.baseURL)
+	}
+	if c.ingestionURL != "" {
+		c.ingest = transport.New(transport.Config{
+			BaseURL:      c.ingestionURL,
+			APIKey:       c.apiKey,
+			Timeout:      c.timeout,
+			Client:       c.httpClient,
+			ExtraHeaders: c.extraHeaders,
+		})
+	}
 	c.embeddings = &EmbeddingsService{client: c}
 	c.retrieve = &RetrieveService{client: c}
 	return c
@@ -103,6 +127,10 @@ func New(baseURL string, opts ...Option) *Client {
 // BaseURL returns the (slash-trimmed) base URL the client was
 // constructed with.
 func (c *Client) BaseURL() string { return c.baseURL }
+
+// IngestionBaseURL returns the ingestion service URL used by the delete
+// methods, or "" when none is configured or derivable.
+func (c *Client) IngestionBaseURL() string { return c.ingestionURL }
 
 // Close releases the underlying http.Client. The standard
 // *http.Client has no Close, so this is currently a no-op kept for

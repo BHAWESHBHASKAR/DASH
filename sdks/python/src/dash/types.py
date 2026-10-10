@@ -390,8 +390,54 @@ class RetrieveResponse:
         )
 
 
+# ---------------------------------------------------------------------------
+# Deletes (ingestion service)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DeleteResponse:
+    """Response body of ``DELETE /v1/claims/{id}``, ``DELETE
+    /v1/evidence/{id}`` and ``DELETE /v1/tenants/{id}``.
+
+    Deletes are idempotent: ``deleted`` is ``False`` (with HTTP 200) when the
+    target did not exist, including a claim that belongs to another tenant.
+    """
+
+    deleted: bool
+    scope: str
+    tenant_id: str
+    claim_id: Optional[str] = None
+    evidence_id: Optional[str] = None
+    claims_deleted: int = 0
+    evidence_deleted: int = 0
+    edges_deleted: int = 0
+    vectors_deleted: int = 0
+    claims_total: int = 0
+    checkpoint_triggered: bool = False
+    checkpoint_deferred: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DeleteResponse":
+        return cls(
+            deleted=bool(data["deleted"]),
+            scope=str(data["scope"]),
+            tenant_id=str(data["tenant_id"]),
+            claim_id=data.get("claim_id"),
+            evidence_id=data.get("evidence_id"),
+            claims_deleted=int(data.get("claims_deleted", 0)),
+            evidence_deleted=int(data.get("evidence_deleted", 0)),
+            edges_deleted=int(data.get("edges_deleted", 0)),
+            vectors_deleted=int(data.get("vectors_deleted", 0)),
+            claims_total=int(data.get("claims_total", 0)),
+            checkpoint_triggered=bool(data.get("checkpoint_triggered", False)),
+            checkpoint_deferred=bool(data.get("checkpoint_deferred", False)),
+        )
+
+
 __all__ = [
     "Citation",
+    "DeleteResponse",
     "EmbeddingData",
     "EmbeddingRequest",
     "EmbeddingResponse",
