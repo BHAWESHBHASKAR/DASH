@@ -1,0 +1,7 @@
+status=ok
+generation=10500200212108922406
+needs_resync=1
+from_offset=0
+next_offset=31
+total_records=31
+records=0

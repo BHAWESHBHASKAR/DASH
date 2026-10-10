@@ -1,0 +1,3 @@
+tenant-a,0,3,node-a,leader,healthy
+tenant-a,0,3,node-b,follower,healthy
+tenant_b,0,1,node-b,leader,healthy

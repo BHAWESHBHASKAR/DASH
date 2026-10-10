@@ -1,0 +1,6 @@
+label: v0.3-hardening-f619475
+ref: origin/hardening/p0-production-readiness
+commit: 8c4415cbf6df1a4a234fa9d078c360e79abe531b
+generated: 2026-10-10
+generator: scripts/compat/generate_fixtures.sh
+dataset: tests/compat/dataset (ingest.jsonl, retrieve.jsonl, placements.csv)

@@ -41,7 +41,7 @@ INGEST_KEY = "compat-ingest-key-0123456789abcdef0123"
 RETRIEVE_KEY = "compat-retrieve-key-0123456789abcdef01"
 REPLICATION_TOKEN = "compat-replication-token-0123456789ab"
 CONTROL_TOKEN = "compat-control-token-0123456789abcdef"
-CHECKPOINT_MAX_WAL_RECORDS = "60"
+CHECKPOINT_MAX_WAL_RECORDS = "50"
 
 
 def free_port():
@@ -151,6 +151,8 @@ def run_ingestion(bin_dir, dataset, out, work, logs):
         "DASH_INGEST_AUDIT_LOG_PATH": os.path.join(state, "audit-ingestion.jsonl"),
         "DASH_CHECKPOINT_MAX_WAL_RECORDS": CHECKPOINT_MAX_WAL_RECORDS,
         "DASH_INGEST_API_KEY": INGEST_KEY,
+        # Releases with roles: the tenant delete needs admin.
+        "DASH_INGEST_API_KEY_DEFAULT_ROLES": "admin",
         "DASH_INGEST_REPLICATION_TOKEN": REPLICATION_TOKEN,
         "DASH_INGEST_HTTP_WORKERS": "2",
     })
@@ -201,6 +203,25 @@ def copy_state(src, dst):
             shutil.copytree(path, os.path.join(dst, name))
         else:
             shutil.copy2(path, os.path.join(dst, name))
+
+
+def drop_unreferenced_segment_files(segments):
+    """Removes segment files no manifest references. Releases that prune
+    with a grace period leave the files of superseded manifests behind for a
+    while; they are garbage and only make the fixture bigger."""
+    if not os.path.isdir(segments):
+        return
+    for tenant in sorted(os.listdir(segments)):
+        tenant_dir = os.path.join(segments, tenant)
+        manifest = os.path.join(tenant_dir, "segments.manifest")
+        if not os.path.isfile(manifest):
+            continue
+        with open(manifest, encoding="utf-8") as handle:
+            rows = [line.rstrip("\n").split("\t") for line in handle][1:]
+        live = {row[2] for row in rows if len(row) >= 3}
+        for name in os.listdir(tenant_dir):
+            if name.endswith(".seg") and name not in live:
+                os.remove(os.path.join(tenant_dir, name))
 
 
 def run_retrieval(bin_dir, dataset, out, work, state, logs):
@@ -297,6 +318,7 @@ def main():
     try:
         state = run_ingestion(bin_dir, dataset, out, work, logs)
         copy_state(state, os.path.join(out, "state"))
+        drop_unreferenced_segment_files(os.path.join(out, "state", "segments"))
         run_retrieval(bin_dir, dataset, out, work, state, logs)
         run_control_plane(bin_dir, dataset, out, work, logs)
     except BaseException:
