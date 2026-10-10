@@ -165,6 +165,27 @@ local keys readable while migrating (then run `wal-inspect rewrap`).
 `networkPolicy.internalCIDRs` by default); AWS KMS uses public HTTPS, which
 `networkPolicy.externalEgressPorts` already allows.
 
+## Distributed tracing
+
+Off by default. Point the services at an OpenTelemetry collector's OTLP/HTTP
+port (4318; gRPC is not supported):
+
+```bash
+helm upgrade --install dash ./deploy/helm/dash -n dash-system \
+  --set observability.tracing.enabled=true \
+  --set observability.tracing.endpoint=http://otel-collector.observability.svc.cluster.local:4318 ...
+```
+
+Sampling defaults to `parentbased_traceidratio` with `0.1` (callers that send
+a sampled `traceparent` are always traced); `observability.tracing.backgroundSampleRatio`
+thins the traces of replication polls and heartbeats. Every pod gets
+`k8s.namespace.name` and `k8s.pod.name` resource attributes. Collector
+credentials go in a Secret key holding the `OTEL_EXPORTER_OTLP_HEADERS` value
+(`observability.tracing.headersSecret.name` / `.key`). With
+`networkPolicy.enabled`, egress to the collector port on
+`observability.tracing.networkPolicy.cidrs` (default: the internal CIDRs) is
+allowed. See `docs/operations/tracing.md`.
+
 ## Persistence layout (per pod, mounted at `config.persistencePath`)
 
 ```
@@ -212,6 +233,11 @@ container creates the data directories on a fresh PVC.
 | `metrics.serviceMonitor.enabled` | `false` | One Prometheus Operator ServiceMonitor per component |
 | `metrics.prometheusRule.enabled` | `false` | PrometheusRule with the DASH recording and alert rules |
 | `metrics.grafanaDashboards.enabled` | `false` | ConfigMap with the Grafana dashboards (sidecar label `grafana_dashboard: "1"`) |
+| `observability.tracing.enabled` | `false` | OpenTelemetry trace export (`DASH_OTEL_ENABLED`) |
+| `observability.tracing.endpoint` | `""` | Collector OTLP/HTTP base URL (`OTEL_EXPORTER_OTLP_ENDPOINT`), required when enabled |
+| `observability.tracing.sampler` / `.samplerArg` | `parentbased_traceidratio` / `0.1` | `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` |
+| `observability.tracing.backgroundSampleRatio` | `0.1` | `DASH_OTEL_BACKGROUND_SAMPLE_RATIO` |
+| `observability.tracing.headersSecret.name` / `.key` | `""` | Secret key with the `OTEL_EXPORTER_OTLP_HEADERS` value |
 
 For an in-cluster Ollama, set `config.embeddingProvider=ollama`,
 `config.ollamaEndpoint=http://<service>:11434` and

@@ -1657,9 +1657,14 @@ impl FileWal {
         if self.background_flush_only {
             return Ok(());
         }
+        let mut span = dash_observe::trace::span("wal.append");
+        span.set_attr("dash.wal.pending_records", self.unsynced_records);
         let started = Instant::now();
         let result = self.apply_write_policy_inner();
         crate::observe::observe_wal_append(started.elapsed());
+        if result.is_err() {
+            span.set_error("WAL append failed");
+        }
         result
     }
 
@@ -2295,9 +2300,13 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
 /// `File::sync_data` for WAL appends, with a test-only failpoint (`wal.sync`)
 /// so tests can inject an fsync failure.
 fn sync_wal_data(file: &File) -> std::io::Result<()> {
+    let mut span = dash_observe::trace::span("wal.fsync");
     let started = Instant::now();
     let result = sync_wal_data_inner(file);
     crate::observe::observe_wal_fsync(started.elapsed(), result.is_ok());
+    if result.is_err() {
+        span.set_error("WAL fsync failed");
+    }
     result
 }
 

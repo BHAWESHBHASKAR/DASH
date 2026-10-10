@@ -3202,6 +3202,10 @@ tenant-a,0,12,node-a,follower,healthy\n",
 
     #[test]
     fn debug_planner_endpoint_returns_stage_counts() {
+        // The request is audited to the process-wide audit path; hold the
+        // env lock so a test that points that path at its own file does not
+        // see this record.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let mut store = sample_store();
         store
             .upsert_claim_vector("c1", vec![0.8, 0.2, 0.1, 0.9])
@@ -3223,6 +3227,10 @@ tenant-a,0,12,node-a,follower,healthy\n",
 
     #[test]
     fn debug_planner_endpoint_rejects_invalid_query_shape() {
+        // The request is audited to the process-wide audit path; hold the
+        // env lock so a test that points that path at its own file does not
+        // see this record.
+        let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
         let store = sample_store();
         let request = HttpRequest {
             method: "GET".to_string(),

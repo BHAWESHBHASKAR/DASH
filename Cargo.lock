@@ -687,6 +687,7 @@ version = "0.1.0"
 dependencies = [
  "auth",
  "dash-http",
+ "dash-observe",
  "dash-tls-fixtures",
  "hmac",
  "rand 0.8.7",
@@ -760,6 +761,7 @@ dependencies = [
  "dash-http",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]
@@ -1542,6 +1544,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dash-http",
+ "dash-observe",
  "dash-tls-fixtures",
  "serde",
  "serde_json",

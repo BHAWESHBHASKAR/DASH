@@ -94,6 +94,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        {{- include "dash.tracingEnv" . | nindent 8 }}
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config

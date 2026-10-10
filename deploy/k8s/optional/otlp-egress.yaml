@@ -1,0 +1,31 @@
+# Optional: allow every DASH pod to reach an in-cluster OpenTelemetry
+# collector over OTLP/HTTP (port 4318). Apply only when tracing is enabled in
+# 10-config.yaml (DASH_OTEL_ENABLED / OTEL_EXPORTER_OTLP_ENDPOINT); see
+# docs/operations/tracing.md:
+#
+#   kubectl apply -f deploy/k8s/optional/otlp-egress.yaml
+#
+# Tighten the ipBlocks to your collector's Service/pod CIDR where possible.
+# Do not add this file to the base kustomization.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otlp-egress
+  namespace: dash-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: dash
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+    - ipBlock:
+        cidr: 172.16.0.0/12
+    - ipBlock:
+        cidr: 192.168.0.0/16
+    ports:
+    - port: 4318
+      protocol: TCP

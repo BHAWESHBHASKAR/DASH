@@ -219,6 +219,36 @@ Off by default. Read by the ingestion and retrieval services, the `segment-maint
 
 Audit logs, `<wal>.gen*` files, export manifests and redb keys (tenant, claim and evidence ids) are not encrypted. Rotation of a local key: make the new key active, list the old one in `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, restart, then run `wal-inspect rewrap <dir>` (or let checkpoints rewrite the files) before removing the old key. Keys rotated inside Vault or KMS need no change here. Migration from local keys to a key manager: set the provider, move the local key to `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, then `wal-inspect rewrap`.
 
+### Distributed tracing (OpenTelemetry)
+
+Off by default; read by all three services. Spans are exported over OTLP/HTTP (protobuf) by a batch thread with a blocking client; incoming W3C `traceparent`/`tracestate` headers are continued and propagated on replication pulls and acks and on control-plane calls. The `OTEL_*` names are the standard OpenTelemetry variables (they are not validated at startup and have no `EME_` alias). See `docs/operations/tracing.md`.
+
+| Variable | Default | Type | Description | Notes |
+|---|---|---|---|---|
+| `DASH_OTEL_ENABLED` | off; on when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set | bool | Turns OpenTelemetry trace export on (`1`) or off (`0`). Unset, tracing is on exactly when an OTLP endpoint variable is set. `OTEL_SDK_DISABLED=true` and `OTEL_TRACES_EXPORTER=none` turn it off in every case. Off costs one atomic load per instrumented point. See [Distributed tracing](../operations/tracing.md). | DASH only. Read by ingestion, retrieval, control-plane. |
+| `DASH_OTEL_BACKGROUND_SAMPLE_RATIO` | `1` | number 0..1 | Extra fraction applied to new traces started by background work (replication polls, failover heartbeats, checkpoints outside a request) on top of `OTEL_TRACES_SAMPLER`. Lower it to thin the traces of idle replication loops without lowering request sampling. | DASH only. Read by ingestion, retrieval, control-plane. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | URL | Base URL of the OTLP/HTTP collector (`http://collector:4318`); spans go to `<endpoint>/v1/traces`. Setting it enables tracing unless `DASH_OTEL_ENABLED=0`. |  |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://localhost:4318/v1/traces` when tracing is enabled without an endpoint | URL | Full URL spans are POSTed to (used as is, no path appended). Wins over `OTEL_EXPORTER_OTLP_ENDPOINT`. |  |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | secret | Extra request headers for the collector as `name=value` pairs separated by commas (values may be `%`-encoded), for example the collector's credentials. Never logged; a malformed entry is skipped with a warning that names only its position. `OTEL_EXPORTER_OTLP_TRACES_HEADERS` wins when set. |  |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | unset | secret | Traces-only form of `OTEL_EXPORTER_OTLP_HEADERS`. |  |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `http/protobuf` | Only `http/protobuf` is supported. Any other value (`grpc`, `http/json`) keeps tracing off and logs why. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins when set. |  |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` | `http/protobuf` | Traces-only form of `OTEL_EXPORTER_OTLP_PROTOCOL`. |  |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | milliseconds >= 1 | Timeout of one export request. `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` wins when set. |  |
+| `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | `10000` | milliseconds >= 1 | Traces-only form of `OTEL_EXPORTER_OTLP_TIMEOUT`. |  |
+| `OTEL_EXPORTER_OTLP_CERTIFICATE` | unset | path | PEM bundle of CA certificates trusted for an `https://` collector, in addition to the public web roots. `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE` wins when set. Client certificates are not supported; use a local collector for mutual TLS. |  |
+| `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE` | unset | path | Traces-only form of `OTEL_EXPORTER_OTLP_CERTIFICATE`. |  |
+| `OTEL_SERVICE_NAME` | `dash-ingestion`, `dash-retrieval` or `dash-control-plane` | string | The `service.name` resource attribute. Wins over `service.name` in `OTEL_RESOURCE_ATTRIBUTES`. |  |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | string | Extra resource attributes as `key=value` pairs separated by commas (for example `deployment.environment=prod,k8s.pod.name=...`). |  |
+| `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | `always_on` \| `always_off` \| `traceidratio` \| `parentbased_always_on` \| `parentbased_always_off` \| `parentbased_traceidratio` | Head sampler. `parentbased_*` samplers follow the caller's `traceparent` decision and apply the named sampler to new traces. An unsupported value falls back to the default with a warning. |  |
+| `OTEL_TRACES_SAMPLER_ARG` | `1` | number 0..1 | Sampling ratio for `traceidratio` and `parentbased_traceidratio`. The decision is derived from the trace id, so every service samples the same traces. |  |
+| `OTEL_TRACES_EXPORTER` | `otlp` | `otlp` \| `none` | `none` turns tracing off. |  |
+| `OTEL_SDK_DISABLED` | `false` | bool | `true` turns tracing off, whatever else is set. |  |
+| `OTEL_BSP_SCHEDULE_DELAY` | `5000` | milliseconds >= 1 | Longest time a finished span waits in the export queue before a batch is sent. |  |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | `2048` | integer >= 1 | Spans buffered for export. When the queue is full new spans are dropped (counted in `dash_trace_spans_dropped_total{reason="queue_full"}`); request threads never wait for the exporter. |  |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` | integer >= 1 | Spans per export request (capped at the queue size). |  |
+
+Not supported: OTLP over gRPC or `http/json`, client certificates towards the collector, the `jaeger_remote` and `xray` samplers. Exporter health is in `dash_trace_spans_exported_total`, `dash_trace_spans_dropped_total{reason}` and `dash_trace_export_failures_total` (rendered while tracing is on).
+
 ### Container and compose variables
 
 `DASH_BIN` (which binary the image entrypoint runs: `ingestion`, `retrieval`, `control-plane` or `segment-maintenance-daemon`; default `retrieval`), `DASH_HOME` (default `/opt/dash`) and `DASH_HEALTHCHECK_URL` are read by the shell scripts in `deploy/container/scripts/`, not by the Rust services. `DASH_PUBLISH_ADDR` (default `127.0.0.1`) is read by the compose file for published ports. The compose file may also set `DASH_INGEST_TRANSPORT_RUNTIME` and `DASH_RETRIEVAL_TRANSPORT_RUNTIME`; no code reads them. These are known to the validator so that they do not produce unknown-variable warnings.

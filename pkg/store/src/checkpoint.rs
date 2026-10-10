@@ -121,6 +121,11 @@ pub struct CheckpointJob {
     started: Instant,
     pause: Duration,
     ended: bool,
+    /// The `checkpoint` trace span: a child of the request that started the
+    /// checkpoint, or a background root. Its `checkpoint.begin`, `.write`
+    /// and `.finish` children may run on different threads; it ends with
+    /// the job.
+    trace: dash_observe::trace::DetachedSpan,
 }
 
 impl Drop for CheckpointJob {
@@ -198,6 +203,20 @@ impl CheckpointJob {
     /// Writes and fsyncs the snapshot file. Takes no lock: the store and the
     /// WAL keep serving writes meanwhile.
     pub fn write(&self) -> Result<(), StoreError> {
+        let _context = self.trace.enter();
+        let mut span = dash_observe::trace::span("checkpoint.write");
+        span.set_attr(
+            "dash.checkpoint.snapshot_records",
+            self.stats.snapshot_records,
+        );
+        let result = self.write_untraced();
+        if result.is_err() {
+            span.set_error("checkpoint snapshot write failed");
+        }
+        result
+    }
+
+    fn write_untraced(&self) -> Result<(), StoreError> {
         let records = self.snapshot.records();
         let written = self
             .ticket
@@ -217,7 +236,15 @@ impl CheckpointJob {
     /// (or [`RetiredFiles::delete`]) the returned files after releasing it.
     pub fn finish(mut self, wal: &mut FileWal) -> Result<FinishedCheckpoint, StoreError> {
         let started = Instant::now();
-        let result = wal.finish_checkpoint(&self.ticket);
+        let result = {
+            let _context = self.trace.enter();
+            let mut span = dash_observe::trace::span("checkpoint.finish");
+            let result = wal.finish_checkpoint(&self.ticket);
+            if result.is_err() {
+                span.set_error("checkpoint publication failed");
+            }
+            result
+        };
         observe::observe_checkpoint_pause(started.elapsed());
         self.end(result.is_ok());
         result.map(|retired| FinishedCheckpoint {
@@ -234,6 +261,9 @@ impl CheckpointJob {
     }
 
     fn end(&mut self, ok: bool) {
+        if !ok {
+            self.trace.set_error("checkpoint failed");
+        }
         self.ended = true;
         observe::observe_checkpoint_ended();
         observe::observe_checkpoint(self.started.elapsed(), ok);
@@ -300,14 +330,23 @@ impl InMemoryStore {
     /// locks and [`CheckpointJob::finish`] under the WAL lock.
     pub fn begin_checkpoint(&self, wal: &mut FileWal) -> Result<CheckpointJob, StoreError> {
         let started = Instant::now();
+        let mut trace = dash_observe::trace::detached_root_or_child("checkpoint");
+        let context = trace.enter();
+        let mut begin_span = dash_observe::trace::span("checkpoint.begin");
         let ticket = match wal.begin_checkpoint() {
             Ok(ticket) => ticket,
             Err(err) => {
+                begin_span.set_error("checkpoint rotation failed");
+                drop(begin_span);
+                drop(context);
+                trace.set_error("checkpoint failed");
                 observe::observe_checkpoint(started.elapsed(), false);
                 return Err(err);
             }
         };
         let snapshot = self.snapshot_state();
+        drop(begin_span);
+        drop(context);
         let stats = WalCheckpointStats {
             snapshot_records: snapshot.record_count(),
             truncated_wal_records: ticket.truncated_wal_records(),
@@ -315,6 +354,11 @@ impl InMemoryStore {
         let pause = started.elapsed();
         observe::observe_checkpoint_pause(pause);
         observe::observe_checkpoint_started();
+        trace.set_attr("dash.checkpoint.snapshot_records", stats.snapshot_records);
+        trace.set_attr(
+            "dash.checkpoint.truncated_wal_records",
+            stats.truncated_wal_records,
+        );
         Ok(CheckpointJob {
             ticket,
             snapshot,
@@ -322,6 +366,7 @@ impl InMemoryStore {
             started,
             pause,
             ended: false,
+            trace,
         })
     }
 

@@ -8,7 +8,7 @@
 use crate::model::{CONTROL, DATA, Entry, INGEST, RETRIEVAL, Scope};
 use crate::registry::{
     REGISTRY, T_ANN, T_AUDIT, T_AUTH, T_BENCH, T_CONTAINER, T_EMBEDDING, T_ENCRYPTION,
-    T_EXTRACTION, T_JWT, T_PLACEMENT, T_REPLICATION, T_RETRIEVAL, T_SEGMENTS, T_SERVER,
+    T_EXTRACTION, T_JWT, T_PLACEMENT, T_REPLICATION, T_RETRIEVAL, T_SEGMENTS, T_SERVER, T_TRACING,
     T_TRANSPORT,
 };
 
@@ -146,6 +146,10 @@ fn topic_prose(scope: Scope, topic: &str) -> (&'static str, &'static str) {
         (Scope::Common, t) if t == T_ENCRYPTION => (
             "Off by default. Read by the ingestion and retrieval services, the `segment-maintenance-daemon` and `wal-inspect`. Envelope encryption (AES-256-GCM): every file gets its own data key, wrapped by a key-encryption key held in a local key file (`DASH_ENCRYPTION_KEY_FILE`), a Vault / OpenBao Transit engine or AWS KMS (`DASH_ENCRYPTION_PROVIDER`). Replication frames and exports on the wire stay plaintext (protect them with TLS); each node encrypts what it stores with its own key. See `docs/operations/encryption.md` and ADR 0005.",
             "Audit logs, `<wal>.gen*` files, export manifests and redb keys (tenant, claim and evidence ids) are not encrypted. Rotation of a local key: make the new key active, list the old one in `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, restart, then run `wal-inspect rewrap <dir>` (or let checkpoints rewrite the files) before removing the old key. Keys rotated inside Vault or KMS need no change here. Migration from local keys to a key manager: set the provider, move the local key to `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, then `wal-inspect rewrap`.",
+        ),
+        (Scope::Common, t) if t == T_TRACING => (
+            "Off by default; read by all three services. Spans are exported over OTLP/HTTP (protobuf) by a batch thread with a blocking client; incoming W3C `traceparent`/`tracestate` headers are continued and propagated on replication pulls and acks and on control-plane calls. The `OTEL_*` names are the standard OpenTelemetry variables (they are not validated at startup and have no `EME_` alias). See `docs/operations/tracing.md`.",
+            "Not supported: OTLP over gRPC or `http/json`, client certificates towards the collector, the `jaeger_remote` and `xray` samplers. Exporter health is in `dash_trace_spans_exported_total`, `dash_trace_spans_dropped_total{reason}` and `dash_trace_export_failures_total` (rendered while tracing is on).",
         ),
         (Scope::Common, t) if t == T_CONTAINER => (
             "`DASH_BIN` (which binary the image entrypoint runs: `ingestion`, `retrieval`, `control-plane` or `segment-maintenance-daemon`; default `retrieval`), `DASH_HOME` (default `/opt/dash`) and `DASH_HEALTHCHECK_URL` are read by the shell scripts in `deploy/container/scripts/`, not by the Rust services. `DASH_PUBLISH_ADDR` (default `127.0.0.1`) is read by the compose file for published ports. The compose file may also set `DASH_INGEST_TRANSPORT_RUNTIME` and `DASH_RETRIEVAL_TRANSPORT_RUNTIME`; no code reads them. These are known to the validator so that they do not produce unknown-variable warnings.",

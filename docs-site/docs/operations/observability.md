@@ -1,6 +1,6 @@
 # Observability
 
-DASH exposes Prometheus metrics on `/metrics` of every service (ingestion, retrieval and the control plane), tags every request with a correlation id, writes logs through `tracing` (text, or JSON lines), and ships alert rules with a runbook per alert, SLO recording rules and Grafana dashboards. There is no distributed tracing export yet (see the end of this page).
+DASH exposes Prometheus metrics on `/metrics` of every service (ingestion, retrieval and the control plane), tags every request with a correlation id, writes logs through `tracing` (text, or JSON lines), can export OpenTelemetry traces over OTLP (off by default, see [Distributed tracing](tracing.md)), and ships alert rules with a runbook per alert, SLO recording rules and Grafana dashboards.
 
 ## `/metrics` endpoint
 
@@ -134,12 +134,8 @@ When a client reports a failure, search the logs and the audit log for the id.
 
 Services log through `tracing`. The default output is compact text; set `DASH_LOG_FORMAT=json` for JSON lines (the Helm chart sets `json` by default through `config.logFormat`). Verbosity follows `RUST_LOG` (default `info`); `DASH_LOG_LEVEL` does not exist.
 
-Request handling runs inside an `http_request` span with `service`, `route`, `method` and `request_id` fields, so JSON log lines carry them under `span`. One `dash_access` event is emitted per completed request with `status` and `duration_ms`: at `debug` level for non-5xx answers (enable with `RUST_LOG=info,dash_access=debug`) and always at `warn` for 5xx. Some startup and background diagnostics are still written with `eprintln!` outside `tracing` and carry no request id. The field names above are stable; other log text may change.
+Request handling runs inside an `http_request` span with `service`, `route`, `method` and `request_id` fields (plus `trace_id` when [distributed tracing](tracing.md) is on), so JSON log lines carry them under `span`. One `dash_access` event is emitted per completed request with `status` and `duration_ms`: at `debug` level for non-5xx answers (enable with `RUST_LOG=info,dash_access=debug`) and always at `warn` for 5xx. Some startup and background diagnostics are still written with `eprintln!` outside `tracing` and carry no request id. The field names above are stable; other log text may change.
 
-## OpenTelemetry tracing (not implemented)
+## Distributed tracing
 
-There is no OTLP export. The services run on a synchronous thread-per-request HTTP stack, and an OpenTelemetry exporter needs an async runtime and a batch processor that would be added to every binary; the request spans described above are the integration point. Planned shape (follow-up work):
-
-* an optional `otel` cargo feature and `DASH_OTEL_EXPORTER_OTLP_ENDPOINT` setting that installs a `tracing-opentelemetry` layer only when configured (no cost when off);
-* W3C `traceparent` propagation from the SDKs through ingestion and retrieval, and on replication pulls;
-* child spans for authentication, embedding calls, index search, WAL append and fsync.
+The services can export OpenTelemetry spans over OTLP/HTTP (protobuf) to a collector. It is off by default and turned on with `DASH_OTEL_ENABLED=1` or by setting `OTEL_EXPORTER_OTLP_ENDPOINT`. Incoming W3C `traceparent` headers are continued, every request gets a server span named after its route label, retrieval, WAL, checkpoint and replication stages get child spans, and replication pulls, acks and control-plane heartbeats carry `traceparent` so one trace spans services. With tracing on, the `http_request` log span also carries `trace_id`. See [Distributed tracing](tracing.md).

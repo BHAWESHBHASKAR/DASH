@@ -284,6 +284,36 @@ encryption:
   kmsMaxRetries: 3
 
 # -----------------------------------------------------------------------------
+# Distributed tracing: OpenTelemetry spans over OTLP/HTTP (protobuf) to a
+# collector. Off by default. See docs/operations/tracing.md.
+#
+# endpoint is the collector's OTLP/HTTP base URL (port 4318); spans go to
+# <endpoint>/v1/traces. Only http/protobuf is supported (not gRPC).
+# Collector credentials, if any, come from a Secret key holding the
+# OTEL_EXPORTER_OTLP_HEADERS value (name=value pairs, comma-separated).
+# -----------------------------------------------------------------------------
+observability:
+  tracing:
+    enabled: false
+    endpoint: ""                # e.g. http://otel-collector.observability.svc.cluster.local:4318
+    sampler: parentbased_traceidratio   # OTEL_TRACES_SAMPLER
+    samplerArg: "0.1"           # OTEL_TRACES_SAMPLER_ARG (ratio for *traceidratio)
+    # DASH_OTEL_BACKGROUND_SAMPLE_RATIO: extra ratio for traces started by
+    # replication polls, failover heartbeats and background checkpoints.
+    backgroundSampleRatio: "0.1"
+    # Extra OTEL_RESOURCE_ATTRIBUTES (key=value,...); k8s.namespace.name and
+    # k8s.pod.name are always added.
+    resourceAttributes: ""
+    headersSecret:
+      name: ""
+      key: ""
+    # Egress from every DASH pod to the collector when networkPolicy.enabled.
+    networkPolicy:
+      port: 4318
+      # Empty -> networkPolicy.internalCIDRs.
+      cidrs: []
+
+# -----------------------------------------------------------------------------
 # Persistent storage. Per-pod PVCs via StatefulSet volumeClaimTemplates.
 # -----------------------------------------------------------------------------
 persistence:

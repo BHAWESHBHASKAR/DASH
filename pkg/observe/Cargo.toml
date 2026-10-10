@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish.workspace = true
-description = "Prometheus histograms, exposition helpers and validation, process metrics and HTTP request instrumentation for DASH services"
+description = "Prometheus histograms, exposition helpers and validation, process metrics, HTTP request instrumentation and OpenTelemetry trace export for DASH services"
 
 [features]
 default = ["http"]
@@ -12,10 +12,15 @@ default = ["http"]
 # latency histograms, in-flight gauge, request-scoped tracing span). The
 # storage and embedding crates use the crate without it.
 http = ["dep:dash-http"]
+# OTLP/HTTP (protobuf) span exporter with a batch thread and a blocking
+# client. The services enable it; the tracing core (`trace`) is always
+# available and costs one atomic load per instrumented point while off.
+otlp = ["http", "dep:ureq"]
 
 [dependencies]
 dash-http = { path = "../http", optional = true }
 tracing = { workspace = true }
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

@@ -12,7 +12,14 @@
 //!   log event emitted while handling the request is correlated; and
 //! * emits one `dash_access` event when the request completes (`debug` for
 //!   non-5xx answers, `warn` for 5xx), enabled with for example
-//!   `RUST_LOG=info,dash_access=debug`.
+//!   `RUST_LOG=info,dash_access=debug`; and
+//! * when distributed tracing is on ([`crate::trace`]), opens an
+//!   OpenTelemetry server span named `<METHOD> <route>` that continues the
+//!   caller's W3C `traceparent` (or starts a trace), records the route label,
+//!   method, status code and request id, and adds the trace id to the
+//!   `http_request` log span so every log line of the request carries it.
+//!   Probe and scrape routes (`health`, `live`, `ready`, `metrics`) are not
+//!   traced.
 //!
 //! Labels are bounded: `route` comes from the service's [`RouteClassifier`]
 //! (a fixed set of names, unknown paths fold to `other`), `method` is folded
@@ -29,6 +36,7 @@ use dash_http::{Handler, Request, Response};
 
 use crate::exposition::{MetricKind, MetricsWriter};
 use crate::histogram::{LATENCY_SECONDS_BUCKETS, LocalHistogram};
+use crate::trace;
 
 /// Maps a request method and path to a bounded route label.
 pub type RouteClassifier = fn(method: &str, path: &str) -> &'static str;
@@ -221,6 +229,35 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// Routes answered for probes and scrapes; they are frequent and carry no
+/// request work, so they get no trace span.
+fn is_untraced_route(route: &str) -> bool {
+    matches!(route, "health" | "live" | "ready" | "metrics")
+}
+
+/// The server span of one request (a no-op while tracing is off).
+fn open_server_span(
+    service: &'static str,
+    route: &'static str,
+    method: &'static str,
+    request: &Request,
+    request_id: &str,
+) -> trace::Span {
+    if !trace::enabled() || is_untraced_route(route) {
+        return trace::Span::none();
+    }
+    let mut span = trace::server_span(
+        format!("{method} {route}"),
+        request.header(trace::TRACEPARENT_HEADER),
+        request.header(trace::TRACESTATE_HEADER),
+    );
+    span.set_attr("http.request.method", method);
+    span.set_attr("http.route", route);
+    span.set_attr("dash.component", service);
+    span.set_attr("dash.request_id", request_id.to_string());
+    span
+}
+
 /// Handle one request with instrumentation (see the module docs).
 pub fn handle_instrumented(
     metrics: &HttpMetrics,
@@ -239,8 +276,13 @@ pub fn handle_instrumented(
         request_id = %request_id,
         method = method,
         route = route,
+        trace_id = tracing::field::Empty,
     );
     let _entered = span.enter();
+    let mut server_span = open_server_span(metrics.service, route, method, &request, &request_id);
+    if let Some(ctx) = server_span.context() {
+        span.record("trace_id", tracing::field::display(ctx.trace_id.to_hex()));
+    }
     metrics.in_flight.fetch_add(1, Ordering::Relaxed);
     let mut guard = InFlight {
         metrics,
@@ -254,6 +296,14 @@ pub fn handle_instrumented(
     guard.done = true;
     metrics.observe(route, method, response.status, elapsed.as_secs_f64());
     drop(guard);
+    if server_span.is_recording() {
+        server_span.set_attr("http.response.status_code", response.status);
+        if response.status >= 500 {
+            server_span.set_attr("error.type", response.status.to_string());
+            server_span.set_error("server error");
+        }
+    }
+    drop(server_span);
     let duration_ms = elapsed.as_secs_f64() * 1000.0;
     if response.status >= 500 {
         tracing::warn!(
@@ -286,6 +336,8 @@ pub fn render_service_metrics(service: &str, version: &str) -> String {
     if let Some(metrics) = registered(service) {
         metrics.render(&mut w);
     }
+    #[cfg(feature = "otlp")]
+    crate::otlp::render_metrics(&mut w);
     crate::process::render(&mut w, service, version);
     w.finish()
 }
@@ -442,6 +494,85 @@ mod tests {
         );
         assert!(lines[1].contains("\"status\":503"), "{}", lines[1]);
         assert!(lines[1].contains("WARN"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn with_tracing_on_the_request_gets_a_server_span_and_logs_carry_the_trace_id() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = crate::trace::test_sink();
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let metrics = HttpMetrics::new("unit-otel", classify);
+        let mut req = request("POST", "/boom");
+        req.headers.insert(
+            "traceparent".to_string(),
+            "00-7af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+        );
+        let mut child_parent = None;
+        tracing::subscriber::with_default(subscriber, || {
+            handle_instrumented(&metrics, req, |_r| {
+                drop(crate::trace::span("unit.work"));
+                // Back in the server span once the child ended.
+                child_parent = crate::trace::current().map(|c| c.span_id);
+                tracing::info!("inside handler");
+                Response::json(503, "{}".into())
+            });
+        });
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("\"trace_id\":\"7af7651916cd43dd8448eb211c80319c\""),
+            "{logs}"
+        );
+        let trace_id = crate::trace::TraceId::from_hex("7af7651916cd43dd8448eb211c80319c").unwrap();
+        let spans = sink.spans_of(&trace_id);
+        let server = spans
+            .iter()
+            .find(|s| s.name == "POST boom")
+            .expect("server span");
+        assert_eq!(server.kind, crate::trace::SpanKind::Server);
+        assert_eq!(server.parent_span_id.unwrap().to_hex(), "b7ad6b7169203331");
+        let attr = |k: &str| {
+            server
+                .attributes
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(attr("http.route"), Some("boom".into()));
+        assert_eq!(attr("http.request.method"), Some("POST".into()));
+        assert_eq!(attr("http.response.status_code"), Some(503u16.into()));
+        assert_eq!(attr("dash.request_id"), Some("rid-xyz".to_string().into()));
+        assert_eq!(
+            server.status,
+            crate::trace::SpanStatus::Error("server error")
+        );
+        let child = spans
+            .iter()
+            .find(|s| s.name == "unit.work")
+            .expect("child span");
+        assert_eq!(child.parent_span_id, Some(server.span_id));
+        assert_eq!(child_parent, Some(server.span_id));
+        // Probe and scrape routes are never traced.
+        for route in ["health", "live", "ready", "metrics"] {
+            assert!(is_untraced_route(route));
+        }
+        assert!(!is_untraced_route("retrieve"));
     }
 
     #[test]

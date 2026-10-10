@@ -89,6 +89,7 @@ spec:
         env:
         - name: DASH_BIN
           value: "retrieval"
+        {{- include "dash.tracingEnv" . | nindent 8 }}
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config

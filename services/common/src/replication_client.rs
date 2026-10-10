@@ -17,6 +17,11 @@
 //!   `DASH_REPLICATION_ALLOW_INSECURE_HTTP=1` acknowledges the exposure
 //!   (the same rule the embeddings client applies to API keys).
 //!
+//! * With distributed tracing on, every request runs in a
+//!   `replication.http_request` client span and carries the W3C
+//!   `traceparent` (and `tracestate`) of that span, so the leader's server
+//!   span joins the follower's trace.
+//!
 //! The leader serves HTTPS itself when `DASH_INGEST_TLS_CERT_FILE` and
 //! `DASH_INGEST_TLS_KEY_FILE` are set; see `docs/operations/tls.md`.
 
@@ -304,6 +309,41 @@ pub fn request(
     max_body_bytes: usize,
     options: &ClientOptions,
 ) -> Result<SourceResponse, String> {
+    let mut span = dash_observe::trace::client_span("replication.http_request");
+    if span.is_recording() {
+        span.set_attr("http.request.method", traced_method(method));
+    }
+    let result = request_inner(method, url, token, max_body_bytes, options);
+    if span.is_recording() {
+        match &result {
+            Ok(response) => {
+                span.set_attr("http.response.status_code", response.status);
+                if response.status >= 500 {
+                    span.set_error("replication source answered with a server error");
+                }
+            }
+            Err(_) => span.set_error("replication request failed"),
+        }
+    }
+    result
+}
+
+/// The method as a static attribute value (the client only sends these).
+fn traced_method(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "POST" => "POST",
+        _ => "OTHER",
+    }
+}
+
+fn request_inner(
+    method: &str,
+    url: &str,
+    token: Option<&str>,
+    max_body_bytes: usize,
+    options: &ClientOptions,
+) -> Result<SourceResponse, String> {
     let parsed = parse_source_url(url)?;
     check_token_transport(&parsed, token.is_some(), options.allow_insecure_http)?;
 
@@ -327,6 +367,12 @@ pub fn request(
     let mut req = agent.request(method, parsed.as_str());
     if let Some(token) = token {
         req = req.set("x-replication-token", token);
+    }
+    if let Some((traceparent, tracestate)) = dash_observe::trace::outgoing_headers() {
+        req = req.set(dash_observe::trace::TRACEPARENT_HEADER, &traceparent);
+        if let Some(state) = tracestate.as_deref() {
+            req = req.set(dash_observe::trace::TRACESTATE_HEADER, state);
+        }
     }
     let result = if method == "GET" {
         req.call()

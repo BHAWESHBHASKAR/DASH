@@ -22,6 +22,17 @@ data:
   DASH_EMBEDDING_PROVIDER: "hash"
   # DASH_OLLAMA_ENDPOINT: "http://ollama.ollama.svc.cluster.local:11434"
 
+  # ----- distributed tracing (docs/operations/tracing.md; off by default) -----
+  # Uncomment to export OpenTelemetry spans over OTLP/HTTP (protobuf, port
+  # 4318) to an in-cluster collector, and allow the egress in
+  # 50-networkpolicy.yaml. Collector credentials belong in a Secret
+  # (OTEL_EXPORTER_OTLP_HEADERS), not here.
+  # DASH_OTEL_ENABLED: "1"
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability.svc.cluster.local:4318"
+  # OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  # OTEL_TRACES_SAMPLER_ARG: "0.1"
+  # DASH_OTEL_BACKGROUND_SAMPLE_RATIO: "0.1"
+
   # ----- persistence (all paths live on the per-pod PVC at /var/lib/dash) -----
   # redb persistence paths are FILE paths, not directories.
   DASH_INGEST_PERSISTENCE_PATH: "/var/lib/dash/state/ingestion.redb"
