@@ -21,10 +21,24 @@ use rand::{Rng, SeedableRng};
 use serde_json::{Value, json};
 
 const T: &str = "tenant-a";
-/// A word every claim text in this file contains, so a retrieve with it lists
-/// every claim through lexical matching (a query that matches nothing returns
-/// nothing).
-const ALL: &str = "claim";
+/// Every claim text carries one of these bucket words. Retrieval considers at
+/// most 5000 candidates per query, and a long run writes more claims than that,
+/// so the follower is listed bucket by bucket (a few hundred claims each).
+const BUCKETS: usize = 16;
+
+fn bucket_word(claim: &str) -> String {
+    let sum: usize = claim.bytes().map(usize::from).sum();
+    format!("bucket{}", sum % BUCKETS)
+}
+
+/// Every claim retrieval knows for `T`, through one lexical query per bucket.
+fn all_claims(s: &Stack) -> BTreeMap<String, Vec<String>> {
+    let mut all = BTreeMap::new();
+    for b in 0..BUCKETS {
+        all.extend(s.claim_evidence_map(T, &format!("bucket{b}"), 100_000));
+    }
+    all
+}
 
 #[derive(Debug, Clone)]
 struct Rec {
@@ -47,8 +61,9 @@ fn make_bundle(rng: &mut StdRng, claim: &str, edge_to: Option<&str>) -> (Value, 
         T,
         claim,
         &format!(
-            "crash test claim {claim} on turbine {}",
-            rng.gen_range(0..50)
+            "crash test claim {claim} on turbine {} {}",
+            rng.gen_range(0..50),
+            bucket_word(claim)
         ),
         n,
     );
@@ -279,7 +294,7 @@ fn run(cycles: usize, seed: u64) {
         // with no duplicated citations.
         if cycle % 5 == 4 || cycle + 1 == cycles || cycle < 5 {
             s.wait_caught_up(Duration::from_secs(60));
-            let api = s.claim_evidence_map(T, ALL, 100_000);
+            let api = all_claims(&s);
             assert_eq!(
                 api.len(),
                 expected.len(),
