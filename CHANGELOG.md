@@ -46,8 +46,9 @@ to [Semantic Versioning](https://semver.org/).
   1,008 (0.15 s); numbers in `docs/operations/testing-durability.md`. A
   record that parses but cannot be applied now sends the follower into a
   full resync instead of retrying the frame forever.
-- **Leader writes batch their redb mirror writes.** An atomic bundle, a
-  batch and a delete write their redb mutations in one transaction; with
+- **Leader writes batch their redb mirror writes.** An atomic bundle and a
+  batch write their redb mutations in one transaction (a delete already
+  did), and a claim row and its tenant membership share one; with
   the follower changes, leader ingest throughput in the same soak went from
   647.6/s to 1,293.8/s.
 - **Automatic checkpoints are on by default.** The ingestion service
