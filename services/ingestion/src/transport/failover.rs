@@ -770,6 +770,11 @@ impl IngestionRuntime {
                     self.failover.promotion_failures_total.saturating_add(1);
                 self.failover.promotion_refused = true;
                 self.failover.term = self.failover.term.max(reply.term);
+                // Whatever made the local state unusable, a resync from the
+                // next leader repairs it.
+                if self.replication_follower.generation.is_some() {
+                    self.replication_follower.force_resync = true;
+                }
                 eprintln!(
                     "ingestion failover: refusing promotion at term {}: {err}",
                     reply.term
@@ -794,6 +799,11 @@ impl IngestionRuntime {
                     reply.leader_url.as_deref().unwrap_or("?"),
                     reply.term
                 );
+            }
+            if reply.leader_node_id.is_some() {
+                // Another node leads now: this node's refusal is moot, and its
+                // `synced` report reflects its state again.
+                self.failover.promotion_refused = false;
             }
             self.failover.leader_node_id = reply.leader_node_id.clone();
             self.failover.leader_url = reply.leader_url.clone();
