@@ -17,6 +17,91 @@ use common::*;
 use dash_http::{ExpectPolicy, Response};
 
 // ---------------------------------------------------------------------------
+// Request ids
+// ---------------------------------------------------------------------------
+
+fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+    let head = response.split("\r\n\r\n").next()?;
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+#[test]
+fn a_valid_client_request_id_is_propagated_to_the_handler_and_the_response() {
+    let server = start(config());
+    let response = send_raw(
+        &server.addr,
+        b"GET /request-id HTTP/1.1\r\nX-Request-Id: client-abc.123\r\n\r\n",
+    );
+    assert_eq!(
+        response_header(&response, "x-request-id"),
+        Some("client-abc.123")
+    );
+    assert!(
+        response.ends_with("{\"seen\":\"client-abc.123\"}"),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_missing_or_malformed_request_id_is_replaced_by_a_generated_one() {
+    let server = start(config());
+    for request in [
+        "GET /request-id HTTP/1.1\r\n\r\n".to_string(),
+        "GET /request-id HTTP/1.1\r\nX-Request-Id: has spaces and \"quotes\"\r\n\r\n".to_string(),
+        format!(
+            "GET /request-id HTTP/1.1\r\nX-Request-Id: {}\r\n\r\n",
+            "a".repeat(129)
+        ),
+    ] {
+        let response = send_raw(&server.addr, request.as_bytes());
+        let id = response_header(&response, "x-request-id").expect("request id header");
+        assert_eq!(id.len(), 32, "{response}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{response}");
+        assert!(
+            response.ends_with(&format!("{{\"seen\":\"{id}\"}}")),
+            "{response}"
+        );
+    }
+}
+
+#[test]
+fn error_responses_carry_the_request_id_in_header_and_body() {
+    let server = start(config());
+    // Handler error.
+    let response = send_raw(
+        &server.addr,
+        b"GET /x?bad=%zz HTTP/1.1\r\nX-Request-Id: err-1\r\n\r\n",
+    );
+    assert!(status_line(&response).contains("400"), "{response}");
+    assert_eq!(response_header(&response, "x-request-id"), Some("err-1"));
+    assert!(
+        response.contains("{\"request_id\":\"err-1\",\"error\":"),
+        "{response}"
+    );
+    // Handler panic.
+    let response = send_raw(
+        &server.addr,
+        b"GET /panic HTTP/1.1\r\nX-Request-Id: err-2\r\n\r\n",
+    );
+    assert!(status_line(&response).contains("500"), "{response}");
+    assert!(response.contains("\"request_id\":\"err-2\""), "{response}");
+    // Read error (before any handler runs): a generated id.
+    let mut request = b"GET /x HTTP/1.1\r\nX-Big: ".to_vec();
+    request.extend(std::iter::repeat_n(b'a', 16 * 1024));
+    request.extend_from_slice(b"\r\n\r\n");
+    let response = send_raw(&server.addr, &request);
+    assert!(status_line(&response).contains("431"), "{response}");
+    let id = response_header(&response, "x-request-id").expect("request id header");
+    assert!(
+        response.contains(&format!("\"request_id\":\"{id}\"")),
+        "{response}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Header and body caps
 // ---------------------------------------------------------------------------
 

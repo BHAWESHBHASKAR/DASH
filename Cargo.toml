@@ -8,6 +8,7 @@ members = [
   "pkg/ranking",
   "pkg/graph",
   "pkg/http",
+  "pkg/observe",
   "pkg/store",
   "services/control-plane",
   "services/ingestion",

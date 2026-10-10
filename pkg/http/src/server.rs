@@ -8,6 +8,9 @@ use crate::config::ServerConfig;
 use crate::conn::{Conn, ConnFrontend, Lane, PENDING_POLL_INTERVAL, Rejected, linger_close};
 use crate::parse::read_request;
 use crate::request::Request;
+use crate::request_id::{
+    REQUEST_ID_HEADER, attach_request_id, generate_request_id, resolve_request_id,
+};
 use crate::response::{Response, render_response};
 
 /// Maps a request to its response. Called on worker threads; a panic is
@@ -155,7 +158,9 @@ fn handle_connection(
         Ok(None) => return Ok(()),
         Err(err) => {
             hooks.on_read_error(err.status);
-            let result = write_response(stream, &Response::error(err.status, &err.message));
+            let mut response = Response::error(err.status, &err.message);
+            attach_request_id(&mut response, &generate_request_id());
+            let result = write_response(stream, &response);
             stream.finish();
             linger_close(stream.socket(), cfg.linger_max_bytes, cfg.linger_max_time);
             return result;
@@ -163,14 +168,24 @@ fn handle_connection(
     };
     request.peer = Some(peer);
     request.tls = tls;
+    // The handler sees the resolved id as the `x-request-id` header, so a
+    // malformed client value never reaches logs or audit records.
+    let request_id = resolve_request_id(&request.headers);
+    request
+        .headers
+        .insert(REQUEST_ID_HEADER.to_string(), request_id.clone());
 
-    let response = match catch_unwind(AssertUnwindSafe(|| handler(request))) {
+    let mut response = match catch_unwind(AssertUnwindSafe(|| handler(request))) {
         Ok(response) => response,
         Err(_) => {
-            eprintln!("{} transport: request handler panicked", cfg.name);
+            eprintln!(
+                "{} transport: request handler panicked (request_id={request_id})",
+                cfg.name
+            );
             Response::error(500, "internal server error")
         }
     };
+    attach_request_id(&mut response, &request_id);
     write_response(stream, &response)?;
     stream.finish();
     Ok(())

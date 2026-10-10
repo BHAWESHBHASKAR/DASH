@@ -15,6 +15,7 @@ mod config;
 mod conn;
 mod parse;
 mod request;
+pub mod request_id;
 mod response;
 mod server;
 mod tls;

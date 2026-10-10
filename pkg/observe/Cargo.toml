@@ -1,0 +1,21 @@
+[package]
+name = "dash-observe"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+description = "Prometheus histograms, exposition helpers and validation, process metrics and HTTP request instrumentation for DASH services"
+
+[features]
+default = ["http"]
+# Request instrumentation for `dash-http` handlers (per-route counters,
+# latency histograms, in-flight gauge, request-scoped tracing span). The
+# storage and embedding crates use the crate without it.
+http = ["dep:dash-http"]
+
+[dependencies]
+dash-http = { path = "../http", optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

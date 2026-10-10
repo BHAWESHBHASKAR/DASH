@@ -58,6 +58,7 @@ impl ServerHooks for CountingHooks {
 ///
 /// * `/health` answers `{"status":"ok"}`;
 /// * `/panic` panics;
+/// * `/request-id` answers the `x-request-id` header the handler saw;
 /// * `/slow?ms=N` sleeps `N` milliseconds;
 /// * anything else echoes method, path, body length, peer and query (400 on
 ///   invalid percent-encoding).
@@ -65,6 +66,13 @@ pub fn echo(request: Request) -> Response {
     match request.path() {
         "/health" => Response::json(200, "{\"status\":\"ok\"}".to_string()),
         "/panic" => panic!("handler panic requested by the test"),
+        "/request-id" => Response::json(
+            200,
+            format!(
+                "{{\"seen\":\"{}\"}}",
+                json_escape(request.header("x-request-id").unwrap_or("<none>"))
+            ),
+        ),
         "/slow" => {
             let ms = request
                 .query()

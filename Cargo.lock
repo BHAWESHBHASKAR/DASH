@@ -752,6 +752,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dash-observe"
+version = "0.1.0"
+dependencies = [
+ "dash-http",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dash-tls-fixtures"
 version = "0.1.0"
 dependencies = [
