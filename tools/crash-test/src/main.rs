@@ -266,6 +266,46 @@ struct Totals {
     recovery_ms: Vec<u64>,
     state_dirs: usize,
     final_claims: usize,
+    /// Group-commit counters scraped from `/metrics` just before each kill.
+    group_commit: GroupCommitSeen,
+}
+
+/// What `/metrics` said about WAL group commit right before the kills.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct GroupCommitSeen {
+    /// Scrapes that answered (a scrape can lose the race with the kill).
+    scrapes: usize,
+    /// Scrapes that reported `dash_ingest_wal_group_commit_enabled 1`.
+    enabled: usize,
+    /// Sum over cycles of the batches and entries the committer wrote.
+    batches: u64,
+    entries: u64,
+    /// Largest batch (entries sharing one fsync) seen in any cycle.
+    max_batch_entries: u64,
+}
+
+impl GroupCommitSeen {
+    /// Fold one `/metrics` body into the totals.
+    fn observe(&mut self, metrics: &str) {
+        let gauge = |name: &str| -> Option<u64> {
+            metrics
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(' ')?;
+                    (key == name).then(|| value.trim().parse::<f64>().ok())?
+                })
+                .map(|v| v as u64)
+        };
+        self.scrapes += 1;
+        if gauge("dash_ingest_wal_group_commit_enabled") == Some(1) {
+            self.enabled += 1;
+        }
+        self.batches += gauge("dash_ingest_wal_group_commit_batches_total").unwrap_or(0);
+        self.entries += gauge("dash_ingest_wal_group_commit_entries_total").unwrap_or(0);
+        self.max_batch_entries = self
+            .max_batch_entries
+            .max(gauge("dash_ingest_wal_group_commit_max_batch_entries").unwrap_or(0));
+    }
 }
 
 /// Check the restarted leader against everything the clients saw.
@@ -415,6 +455,15 @@ fn cycle(
         .collect();
     let delay = rng.gen_range(0..=cfg.max_kill_delay_ms);
     thread::sleep(Duration::from_millis(delay));
+    // Record whether the writes went through group commit (the default) and
+    // how many shared an fsync; the counters reset with every restart.
+    let mut metrics_client = Client::new(s.ingest_addr());
+    metrics_client.timeout = Duration::from_secs(2);
+    if let Ok(r) = metrics_client.request("GET", "/metrics", &[("x-api-key", &s.ops_key)], None)
+        && r.status == 200
+    {
+        totals.group_commit.observe(&r.body);
+    }
     s.kill_ingest();
     stop.store(true, Ordering::Relaxed);
     let outcomes: Vec<Outcome> = handles
@@ -539,6 +588,13 @@ fn main() -> ExitCode {
         "unknown_requests": totals.unknown_requests,
         "unknown_applied": totals.unknown_applied,
         "final_claims": totals.final_claims,
+        "group_commit": {
+            "scrapes": totals.group_commit.scrapes,
+            "enabled_scrapes": totals.group_commit.enabled,
+            "batches": totals.group_commit.batches,
+            "entries": totals.group_commit.entries,
+            "max_batch_entries": totals.group_commit.max_batch_entries,
+        },
         "recovery_ms": {
             "p50": percentile(&rec, 0.50),
             "p95": percentile(&rec, 0.95),
@@ -560,6 +616,11 @@ fn main() -> ExitCode {
         summary["recovery_ms"]["p95"],
         summary["recovery_ms"]["max"],
         t0.elapsed().as_secs_f64()
+    );
+    let gc = totals.group_commit;
+    println!(
+        "group commit before the kills: enabled in {}/{} scrapes, {} entries in {} batches, largest batch {}",
+        gc.enabled, gc.scrapes, gc.entries, gc.batches, gc.max_batch_entries
     );
     if let Some(path) = &cfg.json_out
         && let Err(e) = std::fs::write(path, format!("{summary:#}\n"))
@@ -629,6 +690,30 @@ mod tests {
         assert!(parse_args(&args(&["--cycles", "many"])).is_err());
         assert!(parse_args(&args(&["--cycles"])).is_err());
         assert!(parse_args(&args(&["--env", "novalue"])).is_err());
+    }
+
+    #[test]
+    fn group_commit_counters_are_read_from_metrics() {
+        let mut seen = GroupCommitSeen::default();
+        seen.observe(
+            "# TYPE dash_ingest_wal_group_commit_enabled gauge\n\
+dash_ingest_wal_group_commit_enabled 1\n\
+dash_ingest_wal_group_commit_batches_total 40\n\
+dash_ingest_wal_group_commit_entries_total 100\n\
+dash_ingest_wal_group_commit_max_batch_entries 4\n\
+dash_ingest_wal_group_commit_max_batch_entries_other 99\n",
+        );
+        seen.observe("dash_ingest_wal_group_commit_enabled 0\n");
+        assert_eq!(
+            seen,
+            GroupCommitSeen {
+                scrapes: 2,
+                enabled: 1,
+                batches: 40,
+                entries: 100,
+                max_batch_entries: 4,
+            }
+        );
     }
 
     #[test]
