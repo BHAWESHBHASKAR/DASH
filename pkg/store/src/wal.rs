@@ -28,6 +28,10 @@ use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::StoreError;
 
+mod replication_index;
+
+use replication_index::{ReplicationFilter, ReplicationIndex};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEvent {
     ClaimUpsert(String),
@@ -305,23 +309,49 @@ struct GroupTooLarge {
     cap: usize,
 }
 
-/// Moves `next` forward so a frame `[from, next)` does not end inside a
-/// commit group. A group that closes within `cap` records of its first line
-/// is shipped whole. A larger group that starts after `from` is left for the
-/// next frame (the frame ends just before it); one that starts at `from`
-/// can never be shipped, which is an error rather than a frame the follower
-/// would hold back forever. A group still open at the end of the log is a
-/// write in progress and is left as is.
-fn extend_to_group_end(
-    lines: &[String],
+/// A replication frame cut from the view, or why it cannot be cut.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameCut {
+    Lines {
+        next_offset: usize,
+        lines: Vec<String>,
+    },
+    GroupTooLarge(GroupTooLarge),
+}
+
+/// Cuts the frame starting at view line `from` (`lines` yields the view from
+/// `from` on; the view holds `total` lines). The frame covers up to
+/// `max_records` lines and does not end inside a commit group: a group that
+/// closes within `cap` records of its first line is shipped whole. A larger
+/// group that starts after `from` is left for the next frame (the frame ends
+/// just before it); one that starts at `from` can never be shipped, which is
+/// an error rather than a frame the follower would hold back forever. A
+/// group still open at the end of the log is a write in progress and is left
+/// as is.
+///
+/// Lines are consumed lazily: past the frame only while a group is open, and
+/// only the frame's own lines are kept in memory.
+fn cut_frame(
+    mut lines: impl Iterator<Item = Result<String, StoreError>>,
     from: usize,
-    next: usize,
+    max_records: usize,
+    total: usize,
     cap: usize,
-) -> Result<usize, GroupTooLarge> {
+) -> Result<FrameCut, StoreError> {
+    let next = from.saturating_add(max_records.max(1)).min(total);
+    let mut take = |idx: usize| -> Result<String, StoreError> {
+        lines.next().transpose()?.ok_or_else(|| {
+            StoreError::Io(format!(
+                "replication view ended at line {idx}, expected {total} lines"
+            ))
+        })
+    };
+    let mut frame = Vec::with_capacity(next.saturating_sub(from));
     let mut open: Option<(usize, String)> = None;
-    for (offset, line) in lines[from..next].iter().enumerate() {
-        match group_event(line) {
-            Some(GroupEvent::Begin(id)) => open = Some((from + offset, id)),
+    for idx in from..next {
+        let line = take(idx)?;
+        match group_event(&line) {
+            Some(GroupEvent::Begin(id)) => open = Some((idx, id)),
             Some(GroupEvent::End(id))
                 if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
             {
@@ -329,28 +359,53 @@ fn extend_to_group_end(
             }
             _ => {}
         }
+        frame.push(line);
     }
     let Some((start, id)) = open else {
-        return Ok(next);
+        return Ok(FrameCut::Lines {
+            next_offset: next,
+            lines: frame,
+        });
     };
-    let bound = lines.len().min(start.saturating_add(cap));
-    for (offset, line) in lines[next..bound].iter().enumerate() {
-        if let Some(GroupEvent::End(end)) = group_event(line)
-            && closes_group(&id, &end)
-        {
-            return Ok(next + offset + 1);
+    let closes = |line: &str| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end));
+    let bound = total.min(start.saturating_add(cap));
+    let mut idx = next;
+    while idx < bound {
+        let line = take(idx)?;
+        idx += 1;
+        let done = closes(&line);
+        frame.push(line);
+        if done {
+            return Ok(FrameCut::Lines {
+                next_offset: idx,
+                lines: frame,
+            });
         }
     }
-    let closes_beyond_cap = lines[bound..].iter().any(
-        |line| matches!(group_event(line), Some(GroupEvent::End(end)) if closes_group(&id, &end)),
-    );
+    frame.truncate(next - from);
+    let mut closes_beyond_cap = false;
+    while idx < total {
+        let line = take(idx)?;
+        idx += 1;
+        if closes(&line) {
+            closes_beyond_cap = true;
+            break;
+        }
+    }
     if !closes_beyond_cap {
-        return Ok(next);
+        return Ok(FrameCut::Lines {
+            next_offset: next,
+            lines: frame,
+        });
     }
     if start > from {
-        Ok(start)
+        frame.truncate(start - from);
+        Ok(FrameCut::Lines {
+            next_offset: start,
+            lines: frame,
+        })
     } else {
-        Err(GroupTooLarge { start, cap })
+        Ok(FrameCut::GroupTooLarge(GroupTooLarge { start, cap }))
     }
 }
 
@@ -447,6 +502,9 @@ pub struct FileWal {
     /// extended to cover.
     replication_group_cap: usize,
     replication_group_too_large_total: u64,
+    /// Incremental index of the replication view, so a replication frame
+    /// reads only the lines it ships instead of the whole file.
+    replication_index: ReplicationIndex,
     /// Set after an fsync failure. Once set, every write path fails closed:
     /// after a failed fsync the kernel may already have dropped the dirty
     /// pages, so retrying the fsync could report success for data that never
@@ -534,6 +592,7 @@ impl FileWal {
             replication_skipped: 0,
             replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
             replication_group_too_large_total: 0,
+            replication_index: ReplicationIndex::default(),
             poisoned: None,
         })
     }
@@ -799,6 +858,7 @@ impl FileWal {
             .truncate(false)
             .open(&self.path)?;
         file.set_len(point.file_len_bytes)?;
+        self.replication_index.reset();
         if let Err(err) = sync_wal_data(&file) {
             return Err(self.poison(&err));
         }
@@ -868,51 +928,121 @@ impl FileWal {
         check_generation: bool,
     ) -> Result<WalReplicationFrame, StoreError> {
         self.flush_pending_sync()?;
+        // Only the new tail of the file is read here; the view itself is
+        // read lazily below, from the frame's first line on.
+        if !self.replication_index.refresh(&self.path)? {
+            return self.replication_frame_full_scan(
+                from_generation,
+                from_offset,
+                max_records,
+                check_generation,
+            );
+        }
+        self.note_replication_skipped(self.replication_index.skipped());
+        let total_records = self.replication_index.total();
+        if let Some(resync) = self.resync_frame(
+            from_generation,
+            from_offset,
+            total_records,
+            check_generation,
+        ) {
+            return Ok(resync);
+        }
+        let lines = self.replication_index.lines_from(&self.path, from_offset)?;
+        let cut = cut_frame(
+            lines,
+            from_offset,
+            max_records,
+            total_records,
+            self.replication_group_cap,
+        )?;
+        self.finish_frame(from_offset, total_records, cut)
+    }
+
+    /// [`FileWal::replication_frame_inner`] built from a full scan of the
+    /// file. Used only when the incremental index cannot cover the file
+    /// (see [`ReplicationIndex::refresh`]).
+    fn replication_frame_full_scan(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+        check_generation: bool,
+    ) -> Result<WalReplicationFrame, StoreError> {
         let (wal_lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
         self.note_replication_skipped(skipped);
         let total_records = wal_lines.len();
+        if let Some(resync) = self.resync_frame(
+            from_generation,
+            from_offset,
+            total_records,
+            check_generation,
+        ) {
+            return Ok(resync);
+        }
+        let lines = wal_lines.into_iter().skip(from_offset).map(Ok);
+        let cut = cut_frame(
+            lines,
+            from_offset,
+            max_records,
+            total_records,
+            self.replication_group_cap,
+        )?;
+        self.finish_frame(from_offset, total_records, cut)
+    }
+
+    /// The resync frame when the follower's position is not in this view:
+    /// another generation, no known generation on a non-fresh WAL, or an
+    /// offset past the end.
+    fn resync_frame(
+        &self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        total_records: usize,
+        check_generation: bool,
+    ) -> Option<WalReplicationFrame> {
         let generation_ok = !check_generation
             || match from_generation {
                 Some(g) => g == self.generation,
                 None => from_offset == 0 && !self.snapshot_path().exists(),
             };
-        if !generation_ok || from_offset > total_records {
-            return Ok(WalReplicationFrame {
-                generation: self.generation,
-                from_offset,
-                next_offset: total_records,
-                total_records,
-                needs_resync: true,
-                wal_lines: Vec::new(),
-            });
+        if generation_ok && from_offset <= total_records {
+            return None;
         }
-        let limit = max_records.max(1);
-        let next_offset = from_offset.saturating_add(limit).min(total_records);
-        // Never cut a frame inside a commit group when it can be avoided.
-        let next_offset = match extend_to_group_end(
-            &wal_lines,
-            from_offset,
-            next_offset,
-            self.replication_group_cap,
-        ) {
-            Ok(next) => next,
-            Err(too_large) => {
-                self.replication_group_too_large_total =
-                    self.replication_group_too_large_total.saturating_add(1);
-                return Err(StoreError::Io(format!(
-                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
-                    too_large.start, too_large.cap
-                )));
-            }
-        };
-        Ok(WalReplicationFrame {
+        Some(WalReplicationFrame {
             generation: self.generation,
             from_offset,
-            next_offset,
+            next_offset: total_records,
             total_records,
-            needs_resync: false,
-            wal_lines: wal_lines[from_offset..next_offset].to_vec(),
+            needs_resync: true,
+            wal_lines: Vec::new(),
         })
+    }
+
+    fn finish_frame(
+        &mut self,
+        from_offset: usize,
+        total_records: usize,
+        cut: FrameCut,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        match cut {
+            FrameCut::Lines { next_offset, lines } => Ok(WalReplicationFrame {
+                generation: self.generation,
+                from_offset,
+                next_offset,
+                total_records,
+                needs_resync: false,
+                wal_lines: lines,
+            }),
+            FrameCut::GroupTooLarge(too_large) => {
+                self.replication_group_too_large_total =
+                    self.replication_group_too_large_total.saturating_add(1);
+                Err(StoreError::Io(format!(
+                    "replication_group_too_large: the commit group starting at offset {} exceeds {} records and cannot be replicated",
+                    too_large.start, too_large.cap
+                )))
+            }
+        }
     }
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
@@ -949,6 +1079,7 @@ impl FileWal {
 
         self.write_snapshot_lines_raw(&export.snapshot_lines)?;
         self.bump_generation()?;
+        self.replication_index.reset();
         self.write_wal_lines_raw(&export.wal_lines)?;
         self.wal_records = export.wal_lines.len();
         self.unsynced_records = 0;
@@ -1244,6 +1375,7 @@ impl FileWal {
         // only causes a spurious resync, never a silent skip.
         self.bump_generation()?;
         failpoint!("wal.generation_bumped");
+        self.replication_index.reset();
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -1771,33 +1903,14 @@ fn check_replicated_line(line: &str) -> Result<(), StoreError> {
 /// `InMemoryStore::apply_persisted_record_line_lenient`). Returns the kept
 /// lines and the number dropped.
 fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
-    let mut parser = ReplayParser::new(ReplayPolicy::Lenient);
-    parser.quiet = true;
-    let mut sink = QuarantineSink::detached();
-    let mut bad_claims: HashSet<String> = HashSet::new();
+    let mut filter = ReplicationFilter::new();
     let mut kept = Vec::with_capacity(lines.len());
     let mut skipped = 0usize;
     for line in lines {
-        // Fast path: only legacy lines (and fragments following a failed
-        // one) can be quarantined at parse level.
-        if !parser.prev_failed && bad_claims.is_empty() && !is_legacy_kind(record_kind(&line)) {
+        if filter.keep(&line) {
             kept.push(line);
-            continue;
-        }
-        match parser.parse(line.clone(), String::new(), &mut sink) {
-            Ok(Some(item)) => {
-                if !bad_claims.is_empty() && item.depends_on(&bad_claims) {
-                    skipped += 1;
-                } else {
-                    kept.push(line);
-                }
-            }
-            Ok(None) => {
-                skipped += 1;
-                bad_claims.extend(parser.quarantined_claim_ids.iter().cloned());
-            }
-            // Not quarantinable: serve it unchanged, the receiver rejects it.
-            Err(_) => kept.push(line),
+        } else {
+            skipped += 1;
         }
     }
     (kept, skipped)
