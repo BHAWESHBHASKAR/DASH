@@ -66,6 +66,11 @@ to [Semantic Versioning](https://semver.org/).
   zero deadline now leaves only the per-read timeout, which failover
   followers use for WAL polls and acks so a dead or paused leader is given up
   on within seconds.
+- New connections waited up to 50 ms (25 ms on average) to be accepted while
+  a server was idle: the accept loop slept 50 ms between attempts. It now
+  sleeps 5 ms and classifies a new connection right after accepting it. This
+  shortens every request on a fresh connection (clients without keep-alive,
+  replication polls) and the synchronous-replication round trip.
 
 ### Added (encryption at rest, SEC-16, ADR 0005)
 

@@ -107,6 +107,12 @@ impl Acceptor for TcpListener {
     }
 }
 
+/// Sleep between accept attempts while no connection is pending. A new
+/// connection waits up to this long before it is accepted; at 50 ms (the
+/// earlier value) a request on a fresh connection, such as a replication
+/// poll or a client without keep-alive, waited 25 ms on average.
+const IDLE_ACCEPT_NAP: Duration = Duration::from_millis(5);
+
 /// Bounded exponential backoff (10ms .. 100ms) for repeated accept failures.
 fn accept_error_backoff(streak: u32) -> Duration {
     let millis = 10u64.saturating_mul(1u64 << streak.saturating_sub(1).min(4));
@@ -282,8 +288,10 @@ pub fn serve<A: Acceptor>(
 
         if polling {
             // Set the listener non-blocking so we can interleave accept()
-            // calls with shutdown-flag polling. The 50ms sleep caps shutdown
-            // latency and bounds CPU usage when idle.
+            // calls with shutdown-flag polling. The idle nap
+            // (`IDLE_ACCEPT_NAP`) caps shutdown latency and bounds CPU usage
+            // when idle; it is also how long a new connection may wait to be
+            // accepted, so it is kept short.
             listener.set_nonblocking(true)?;
         }
         let mut accept_error_streak: u32 = 0;
@@ -329,6 +337,11 @@ pub fn serve<A: Acceptor>(
                     match frontend.admit(stream) {
                         Ok(()) => {
                             frontend.take_immediate(&mut ready);
+                            // Classify at once: the request line usually
+                            // arrives with the connection.
+                            if frontend.has_pending() {
+                                frontend.poll(&mut ready);
+                            }
                             dispatch(&mut ready);
                         }
                         Err(Rejected(stream)) => {
@@ -347,7 +360,7 @@ pub fn serve<A: Acceptor>(
                     let nap = if frontend.has_pending() {
                         PENDING_POLL_INTERVAL
                     } else {
-                        Duration::from_millis(50)
+                        IDLE_ACCEPT_NAP
                     };
                     std::thread::sleep(nap);
                 }

@@ -78,7 +78,9 @@ In both modes:
 the current term have polled from a WAL position at or after it (a poll from
 offset `p` proves the follower fsynced its WAL up to `p`). Followers long-poll
 a caught-up leader, so a write waits for about two round trips and one
-follower fsync, not a poll interval. If the confirmations do not arrive
+follower fsync, not a poll interval (measured on loopback with release
+builds, sequential single ingests: p50 5.1 ms asynchronous, 10.2 ms with
+`DASH_INGEST_MIN_SYNC_REPLICAS=1`). If the confirmations do not arrive
 within `DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS`:
 
 * `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT=fail` (default): `503
