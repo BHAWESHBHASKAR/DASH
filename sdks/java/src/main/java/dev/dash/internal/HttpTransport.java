@@ -135,7 +135,7 @@ public class HttpTransport {
      * The DASH delete routes are idempotent, so the request is retried on
      * 429/5xx and I/O errors like a GET.
      */
-    public <T> T delete(String path, Class<T> responseType) {
+    public <T> T httpDelete(String path, Class<T> responseType) {
         RawResponse raw = execute("DELETE", path, null, RequestOptions.IDEMPOTENT);
         return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
     }

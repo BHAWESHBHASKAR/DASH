@@ -252,7 +252,7 @@ public class DashClient {
                     "ingestionBaseUrl is not configured; pass it to the constructor "
                             + "or call withIngestionBaseUrl(...)");
         }
-        return ingestTransport.delete(path, DeleteResponse.class);
+        return ingestTransport.httpDelete(path, DeleteResponse.class);
     }
 
     /** Percent-encodes one path segment or query value (space as %20). */

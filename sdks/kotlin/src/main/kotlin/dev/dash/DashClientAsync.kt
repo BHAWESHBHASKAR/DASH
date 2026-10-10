@@ -1,5 +1,6 @@
 package dev.dash
 
+import dev.dash.model.DeleteResponse
 import dev.dash.model.EmbedRequest
 import dev.dash.model.EmbeddingResponse
 import dev.dash.model.HealthResponse
@@ -49,6 +50,27 @@ class DashClientAsync(
         options: RequestOptions = RequestOptions.NONE,
     ): IngestResponse =
         withContext(Dispatchers.IO) { delegate.ingest(req, options) }
+
+    /**
+     * Call `DELETE /v1/claims/{claimId}?tenant_id=...` on the ingestion
+     * service (see [DashClient.deleteClaim]). Idempotent.
+     */
+    suspend fun deleteClaim(tenantId: String, claimId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteClaim(tenantId, claimId) }
+
+    /**
+     * Call `DELETE /v1/evidence/{evidenceId}?tenant_id=...` on the ingestion
+     * service (see [DashClient.deleteEvidence]).
+     */
+    suspend fun deleteEvidence(tenantId: String, evidenceId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteEvidence(tenantId, evidenceId) }
+
+    /**
+     * Call `DELETE /v1/tenants/{tenantId}` on the ingestion service: erase
+     * all of the tenant's data (admin role). See [DashClient.deleteTenant].
+     */
+    suspend fun deleteTenant(tenantId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteTenant(tenantId) }
 
     /**
      * Call `POST /v1/retrieve` and return the structured
