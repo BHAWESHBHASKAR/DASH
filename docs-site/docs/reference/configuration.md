@@ -279,6 +279,7 @@ An ingestion node can itself follow another ingestion node; it then pulls WAL fr
 | `DASH_INGEST_REPLICATION_POLL_INTERVAL_MS` | `500` | milliseconds >= 1 | Poll interval for ingestion-to-ingestion pulls. |  |
 | `DASH_INGEST_REPLICATION_MAX_RECORDS` | `512` | integer >= 1 | Records per pull. |  |
 | `DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES` | 67108864 (64 MiB) | integer >= 1 | Upper bound for one response body. |  |
+| `DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES` | 4194304 (4 MiB) | integer >= 1 | Bytes requested per chunk when a follower downloads the leader's export for a full resync; capped below `DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES` (the leader serves at most 32 MiB per chunk). |  |
 | `DASH_INGEST_REPLICATION_MAX_BACKOFF_MS` | `30000` | milliseconds >= 1 | Upper bound for the failure backoff. |  |
 | `DASH_INGEST_REPLICATION_MAX_LAG_RECORDS` | `100000` | integer >= 1 | Readiness lag threshold. |  |
 | `DASH_INGEST_REPLICATION_MAX_STALENESS_MS` | `300000` | milliseconds >= 1 | Readiness staleness threshold. |  |
@@ -369,6 +370,7 @@ Both followers pull WAL frames from an ingestion node, persist `(generation, off
 | `DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS` | `1000` | milliseconds >= 1 | Poll interval. |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_RECORDS` | `512` | integer >= 1 | Records per pull (the leader caps a pull at 10000). |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_RESPONSE_BYTES` | 67108864 (64 MiB) | integer >= 1 | Upper bound for one response body. |  |
+| `DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES` | 4194304 (4 MiB) | integer >= 1 | Bytes requested per chunk when the follower downloads the leader's export for a full resync; capped below `DASH_RETRIEVAL_REPLICATION_MAX_RESPONSE_BYTES` (the leader serves at most 32 MiB per chunk). |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_BACKOFF_MS` | `30000` | milliseconds >= 1 | Upper bound for the failure backoff (the poll interval doubles per consecutive failure). |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_LAG_RECORDS` | `100000` | integer >= 1 | `/ready` fails with `replication_lag_exceeded` when the leader is further ahead than this. |  |
 | `DASH_RETRIEVAL_REPLICATION_MAX_STALENESS_MS` | `300000` | milliseconds >= 1 | `/ready` fails with `replication_stale` when the last successful poll is older than this. `/ready` also fails with `replication_initial_sync_pending` until the first sync completes. |  |

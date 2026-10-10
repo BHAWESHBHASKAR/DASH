@@ -1308,6 +1308,15 @@ pub static REGISTRY: &[Entry] = &[
     )
     .eme(),
     Entry::new(
+        "DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES",
+        Ingestion,
+        T_REPLICATION,
+        Kind::POSITIVE,
+        "4194304 (4 MiB)",
+        "Bytes requested per chunk when a follower downloads the leader's export for a full resync; capped below `DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES` (the leader serves at most 32 MiB per chunk).",
+    )
+    .eme(),
+    Entry::new(
         "DASH_INGEST_REPLICATION_MAX_BACKOFF_MS",
         Ingestion,
         T_REPLICATION,
@@ -1624,6 +1633,15 @@ pub static REGISTRY: &[Entry] = &[
         Kind::POSITIVE,
         "67108864 (64 MiB)",
         "Upper bound for one response body.",
+    )
+    .eme(),
+    Entry::new(
+        "DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES",
+        Retrieval,
+        T_REPLICATION,
+        Kind::POSITIVE,
+        "4194304 (4 MiB)",
+        "Bytes requested per chunk when the follower downloads the leader's export for a full resync; capped below `DASH_RETRIEVAL_REPLICATION_MAX_RESPONSE_BYTES` (the leader serves at most 32 MiB per chunk).",
     )
     .eme(),
     Entry::new(
