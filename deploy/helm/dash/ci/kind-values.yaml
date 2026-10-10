@@ -1,0 +1,57 @@
+# Values for the kind end-to-end test (scripts/kind_e2e.sh).
+#
+# Small resource requests so a whole release fits on one kind node of a
+# 4-vCPU CI runner, small PVCs on kind's default StorageClass
+# (rancher.io/local-path), and the locally built image loaded with
+# `kind load docker-image` (never pulled). Secrets are NOT set here: the
+# script generates them and passes them in a separate values file.
+image:
+  registry: dash.local
+  repository: dash
+  tag: e2e
+  pullPolicy: Never
+
+replicas:
+  retrieval: 2
+
+config:
+  logLevel: info
+  replication:
+    pollIntervalMs: 200
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClassName: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+    ephemeral-storage: 64Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+    ephemeral-storage: 256Mi
+  controlPlane:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+# No ingress controller in the test cluster; the script uses port-forward.
+ingress:
+  enabled: false
+
+# kindnet enforces NetworkPolicy, so keeping it on proves the policies let
+# replication, DNS and the control plane through.
+networkPolicy:
+  enabled: true
+
+probes:
+  startup:
+    initialDelaySeconds: 2
+    periodSeconds: 2
+    failureThreshold: 90

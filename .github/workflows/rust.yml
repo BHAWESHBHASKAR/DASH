@@ -116,6 +116,8 @@ jobs:
             scripts/deploy_container.sh \
             scripts/backup_restore_drill.sh \
             scripts/check_observability.sh \
+            scripts/kind_e2e.sh \
+            scripts/k8s_backup_restore.sh \
             deploy/container/scripts/entrypoint.sh \
             deploy/container/scripts/healthcheck.sh
 
@@ -198,12 +200,26 @@ jobs:
             echo "helm template rendered a ServiceMonitor without a scrape credential" >&2
             exit 1
           fi
-          kubeconform -strict -summary -kubernetes-version 1.29.0 \
-            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml
           # The Prometheus Operator kinds have no built-in schema; their rule
           # content is checked by scripts/check_observability.sh.
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
             -skip ServiceMonitor,PrometheusRule helm-monitoring.yaml helm-monitoring-tls.yaml
+          # Values used by the kind end-to-end test (kind-e2e.yml), rendered
+          # into another namespace: every object must follow the release.
+          helm lint deploy/helm/dash --strict "${args[@]}" -f deploy/helm/dash/ci/kind-values.yaml
+          helm template dash deploy/helm/dash --namespace dash-e2e "${args[@]}" \
+            -f deploy/helm/dash/ci/kind-values.yaml > helm-kind.yaml
+          if grep -E '^  namespace: ' helm-kind.yaml | grep -qv 'namespace: dash-e2e'; then
+            echo "helm template --namespace dash-e2e rendered objects in another namespace" >&2
+            exit 1
+          fi
+          # Integers must not be rendered in exponent form (5.24288e+07).
+          if grep -qE '"[0-9.]+e\+[0-9]+"' helm-default.yaml; then
+            echo "helm template rendered a number in exponent form" >&2
+            exit 1
+          fi
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml helm-kind.yaml
 
       - name: Kustomize build and kubeconform
         run: |
