@@ -138,6 +138,33 @@ Secret; `encryption.previousKeyNames` lists retired keys that must still
 decrypt during a rotation. Store a copy of every key outside the cluster:
 PVC snapshots hold ciphertext only. See `docs/operations/encryption.md`.
 
+The key-encryption key can live in a key manager instead
+(`encryption.provider`):
+
+```bash
+# Vault / OpenBao Transit: the token file comes from a Secret (key
+# `vault-token`) or a Vault Agent sidecar (set encryption.vault.tokenFile).
+kubectl -n dash-system create secret generic dash-vault-token --from-file=vault-token=token.txt
+helm upgrade --install dash ./deploy/helm/dash -n dash-system \
+  --set encryption.enabled=true --set encryption.provider=vault \
+  --set encryption.secretName=dash-vault-token \
+  --set encryption.vault.addr=https://vault.vault.svc:8200 --set encryption.vault.key=dash \
+  --set networkPolicy.keyManager.enabled=true ...
+
+# AWS KMS with IRSA (or EKS Pod Identity) on the service account.
+helm upgrade --install dash ./deploy/helm/dash -n dash-system \
+  --set encryption.enabled=true --set encryption.provider=aws-kms \
+  --set encryption.awsKms.keyId=alias/dash --set encryption.awsKms.region=eu-west-1 \
+  --set-string serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=arn:aws:iam::111122223333:role/dash ...
+```
+
+`encryption.secretName` is optional for a key manager; when set, it is
+mounted at `encryption.mountPath` and `encryption.previousKeyNames` can keep
+local keys readable while migrating (then run `wal-inspect rewrap`).
+`networkPolicy.keyManager` opens egress to an in-cluster Vault (port 8200 on
+`networkPolicy.internalCIDRs` by default); AWS KMS uses public HTTPS, which
+`networkPolicy.externalEgressPorts` already allows.
+
 ## Persistence layout (per pod, mounted at `config.persistencePath`)
 
 ```

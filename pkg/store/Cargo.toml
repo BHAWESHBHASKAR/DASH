@@ -35,4 +35,6 @@ encryption = { path = "../encryption" }
 [dev-dependencies]
 tempfile = "3"
 embeddings = { path = "../embeddings" }
+# In-process mock Vault Transit for the key manager end-to-end test.
+encryption = { path = "../encryption", features = ["mock-kms"] }
 serde_json = { workspace = true }

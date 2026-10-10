@@ -20,7 +20,7 @@ pub struct FileHeader {
     pub wrapped: Vec<u8>,
 }
 
-fn valid_key_id(id: &str) -> bool {
+pub(crate) fn valid_key_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= KEY_ID_MAX
         && id

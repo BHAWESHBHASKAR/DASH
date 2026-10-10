@@ -6,6 +6,45 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (key managers for encryption at rest, P4, ADR 0005 section 6)
+
+- **Vault / OpenBao Transit and AWS KMS key providers.**
+  `DASH_ENCRYPTION_PROVIDER=vault` wraps every file's data key with a Transit
+  key (`DASH_ENCRYPTION_VAULT_ADDR`, `_TOKEN_FILE`, `_MOUNT`, `_KEY`, optional
+  `_CA_FILE`, `_NAMESPACE`, `_PREVIOUS_KEYS`); `DASH_ENCRYPTION_PROVIDER=aws-kms`
+  uses KMS `Encrypt` / `Decrypt` (`DASH_ENCRYPTION_AWS_KMS_KEY_ID`, `_REGION`,
+  `_KMS_ENDPOINT`, `_KMS_PREVIOUS_KEY_IDS`) with the file id as encryption
+  context. The KEK never leaves the key manager; files record
+  `vault:<mount>/<key>` or `aws-kms:<key>` as key id, and key rotation inside
+  Vault or KMS keeps every file readable without a rewrap. Default and
+  existing deployments are unchanged (`local`, key files).
+- **AWS credentials** from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  `AWS_SESSION_TOKEN`, a web identity (EKS IRSA) or the container credentials
+  endpoint (ECS, EKS Pod Identity), refreshed before expiry. Requests are
+  signed with an in-tree SigV4 implementation checked against AWS's published
+  test vectors; no AWS SDK dependency. Instance metadata and `~/.aws` files are
+  not read.
+- **Vault token rotation**: the token file is re-read when Vault answers 403.
+- **Robustness**: per-attempt timeout (`DASH_ENCRYPTION_KMS_TIMEOUT_MS`,
+  default 5000), bounded retries with jittered backoff on connection errors,
+  timeouts, 429, 5xx and KMS throttling (`DASH_ENCRYPTION_KMS_MAX_RETRIES`,
+  default 3), no redirects, plain http only to loopback unless
+  `DASH_ENCRYPTION_KMS_ALLOW_INSECURE_HTTP=1`, tokens and key material never in
+  errors or logs, unwrapped data keys zeroized and cached per process. A key
+  manager provider wraps and unwraps a test key at start-up, so a wrong
+  address, token, key or policy stops the service with exit code 2.
+- **Migration from local keys**: with a key manager active,
+  `DASH_ENCRYPTION_PREVIOUS_KEY_FILES` keeps files under local keys readable and
+  `wal-inspect rewrap` moves them to the key manager.
+- **Helm**: `encryption.provider` with `encryption.vault.*` /
+  `encryption.awsKms.*`; the key Secret is optional for key managers;
+  `networkPolicy.keyManager` opens egress to an in-cluster Vault. systemd env
+  examples show both providers.
+- Tests: in-process mock Vault Transit and KMS servers (`mock-kms` feature of
+  `pkg/encryption`) cover round trips, file binding, key and token rotation,
+  retries, timeouts and start-up failures; a store end-to-end test writes,
+  reopens and migrates a node on Vault; claims ledger C119 to C121.
+
 ### Added (automatic failover of the ingestion leader, P3 step 1, ADR 0006)
 
 - **Leader failover, off by default.** With `DASH_CONTROL_PLANE_INGEST_FAILOVER=1`

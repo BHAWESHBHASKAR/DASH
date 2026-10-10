@@ -244,6 +244,7 @@ fn key_file(dir: &Path, name: &str, byte: u8) -> std::path::PathBuf {
 fn run_with_keys(args: &[&str], active: Option<&Path>, previous: Option<&Path>) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wal-inspect"));
     cmd.args(args)
+        .env_remove("DASH_ENCRYPTION_PROVIDER")
         .env_remove("DASH_ENCRYPTION_KEY_FILE")
         .env_remove("DASH_ENCRYPTION_PREVIOUS_KEY_FILES");
     if let Some(active) = active {
@@ -296,6 +297,58 @@ fn encrypted_files_are_verified_listed_and_rewrapped_with_the_configured_keys() 
     assert_eq!(code(&out), 0, "{}", text(&out));
     let out = run_with_keys(&["keys", dir_arg], None, None);
     assert!(text(&out).contains(&local_key_id(&[0x22; 32])));
+}
+
+#[test]
+fn rewrap_moves_local_key_files_to_vault_transit() {
+    use encryption::kms::mock::{MockVault, write_token};
+    use std::sync::Arc;
+    use store::encryption::{Keyring, local_key_id, with_keyring};
+    let dir = TempDir::new().unwrap();
+    let keys = TempDir::new().unwrap();
+    let vault = MockVault::start("s.cli-token");
+    let token = write_token(keys.path(), "vault-token", "s.cli-token");
+    let old_key = key_file(keys.path(), "old.key", 0x33);
+    let wal = dir.path().join("dash.wal");
+    with_keyring(
+        Some(Arc::new(Keyring::local([0x33; 32], &[]).unwrap())),
+        || write_encrypted(&wal),
+    );
+    let dir_arg = dir.path().to_str().unwrap();
+    let wal_arg = wal.to_str().unwrap();
+    let with_vault = |args: &[&str], previous: Option<&Path>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wal-inspect"));
+        cmd.args(args)
+            .env_remove("DASH_ENCRYPTION_KEY_FILE")
+            .env_remove("DASH_ENCRYPTION_PREVIOUS_KEY_FILES")
+            .env("DASH_ENCRYPTION_PROVIDER", "vault")
+            .env("DASH_ENCRYPTION_VAULT_ADDR", vault.addr())
+            .env("DASH_ENCRYPTION_VAULT_TOKEN_FILE", &token)
+            .env("DASH_ENCRYPTION_VAULT_KEY", "dash");
+        if let Some(previous) = previous {
+            cmd.env("DASH_ENCRYPTION_PREVIOUS_KEY_FILES", previous);
+        }
+        cmd.output().unwrap()
+    };
+
+    // Vault alone cannot read the file written under the local key.
+    let out = with_vault(&["verify", wal_arg], None);
+    assert_eq!(code(&out), 2);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains(&local_key_id(&[0x33; 32])), "{err}");
+    assert!(err.contains("DASH_ENCRYPTION_PREVIOUS_KEY_FILES"), "{err}");
+
+    // With the local key as previous, rewrap moves it to Vault.
+    let out = with_vault(&["rewrap", dir_arg], Some(&old_key));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("vault:transit/dash"), "{}", text(&out));
+    let out = run_with_keys(&["keys", dir_arg], None, None);
+    assert!(text(&out).contains("vault:transit/dash"), "{}", text(&out));
+
+    // Now Vault alone reads it.
+    let out = with_vault(&["verify", wal_arg], None);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("ok: 3 valid records"), "{}", text(&out));
 }
 
 fn write_encrypted(path: &Path) {

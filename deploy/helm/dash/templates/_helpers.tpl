@@ -213,9 +213,18 @@ Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
 {{- end }}
 {{- end -}}
 
-{{/* Read-only mount of the encryption key Secret (docs/operations/encryption.md). */}}
+{{/* Read-only mount of the encryption key Secret (docs/operations/encryption.md).
+     Required for the local provider; optional for a key manager (Vault
+     token, CA bundle, local keys kept readable during a migration). */}}
+{{- define "dash.encryptionSecretMounted" -}}
+{{- $enc := .Values.encryption -}}
+{{- if and $enc.enabled (or (eq (default "local" $enc.provider) "local") $enc.secretName) -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "dash.encryptionVolumeMount" -}}
-{{- if .Values.encryption.enabled }}
+{{- if include "dash.encryptionSecretMounted" . }}
 - name: encryption-key
   mountPath: {{ .Values.encryption.mountPath }}
   readOnly: true
@@ -223,10 +232,10 @@ Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
 {{- end -}}
 
 {{- define "dash.encryptionVolume" -}}
-{{- if .Values.encryption.enabled }}
+{{- if include "dash.encryptionSecretMounted" . }}
 - name: encryption-key
   secret:
-    secretName: {{ required "encryption.secretName is required when encryption.enabled=true (a Secret holding the key under encryption.keyName)" .Values.encryption.secretName }}
+    secretName: {{ required "encryption.secretName is required when encryption.enabled=true with encryption.provider=local (a Secret holding the key under encryption.keyName)" .Values.encryption.secretName }}
     defaultMode: 0400
 {{- end }}
 {{- end -}}

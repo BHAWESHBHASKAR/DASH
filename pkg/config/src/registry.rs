@@ -947,10 +947,161 @@ pub static REGISTRY: &[Entry] = &[
         T_ENCRYPTION,
         Kind::CSV,
         "",
-        "Comma-separated paths of retired key files that still decrypt (key rotation). Files written under them stay readable; new files use `DASH_ENCRYPTION_KEY_FILE`. Requires `DASH_ENCRYPTION_KEY_FILE`.",
+        "Comma-separated paths of retired key files that still decrypt (key rotation). Files written under them stay readable; new files use the active key. Requires `DASH_ENCRYPTION_KEY_FILE`, or a key manager (`DASH_ENCRYPTION_PROVIDER=vault` / `aws-kms`): there it keeps files under local keys readable while migrating to the key manager with `wal-inspect rewrap`.",
     )
     .readers(DATA | TOOLS)
     .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_PROVIDER",
+        Common,
+        T_ENCRYPTION,
+        Kind::Enum {
+            values: &["local", "vault", "aws-kms"],
+        },
+        "local",
+        "Who holds the key-encryption key. `local`: key files (`DASH_ENCRYPTION_KEY_FILE`; encryption is on when it is set). `vault`: HashiCorp Vault or OpenBao Transit (`DASH_ENCRYPTION_VAULT_*`). `aws-kms`: AWS KMS (`DASH_ENCRYPTION_AWS_*` and the standard AWS credential variables). With `vault` or `aws-kms` encryption is on, `DASH_ENCRYPTION_KEY_FILE` must be unset, and the process wraps and unwraps a test data key at start-up (a wrong address, token, key or policy stops it with exit code 2). Setting key manager variables without this one is an error.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_ADDR",
+        Common,
+        T_ENCRYPTION,
+        Kind::Url,
+        "",
+        "Vault / OpenBao address (`https://vault.example:8200`). Plain `http://` is refused for non-loopback hosts unless `DASH_ENCRYPTION_KMS_ALLOW_INSECURE_HTTP=1`. Required with `DASH_ENCRYPTION_PROVIDER=vault`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_TOKEN_FILE",
+        Common,
+        T_ENCRYPTION,
+        Kind::Path,
+        "",
+        "File holding the Vault token (for example a Vault Agent sink). It must not be readable by other users. Re-read when Vault answers 403, so a renewed token is picked up without a restart. The token needs `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`. Required with `DASH_ENCRYPTION_PROVIDER=vault`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_MOUNT",
+        Common,
+        T_ENCRYPTION,
+        Kind::Str,
+        "transit",
+        "Mount path of the Transit secrets engine.",
+    )
+    .readers(DATA | TOOLS),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_KEY",
+        Common,
+        T_ENCRYPTION,
+        Kind::Str,
+        "",
+        "Transit key that wraps the data keys of new files. File headers record `vault:<mount>/<key>`. Rotating the key inside Vault keeps old files readable (the ciphertext names the key version). Required with `DASH_ENCRYPTION_PROVIDER=vault`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_PREVIOUS_KEYS",
+        Common,
+        T_ENCRYPTION,
+        Kind::CSV,
+        "",
+        "Comma-separated Transit keys (same mount) that still unwrap, after switching `DASH_ENCRYPTION_VAULT_KEY` to another key.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_CA_FILE",
+        Common,
+        T_ENCRYPTION,
+        Kind::Path,
+        "",
+        "PEM bundle of extra CA certificates to trust for the Vault server (added to the public web roots).",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_VAULT_NAMESPACE",
+        Common,
+        T_ENCRYPTION,
+        Kind::Str,
+        "",
+        "Vault Enterprise / OpenBao namespace, sent as `X-Vault-Namespace`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_AWS_KMS_KEY_ID",
+        Common,
+        T_ENCRYPTION,
+        Kind::Str,
+        "",
+        "KMS key that wraps the data keys of new files: key id, key ARN, alias name (`alias/dash`) or alias ARN. File headers record `aws-kms:<value>`; the file id is bound as encryption context `dash-file-id`. Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, a web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`, EKS IRSA) or the container credentials endpoint (ECS, EKS Pod Identity); instance metadata and `~/.aws` files are not read. Required with `DASH_ENCRYPTION_PROVIDER=aws-kms`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_AWS_KMS_PREVIOUS_KEY_IDS",
+        Common,
+        T_ENCRYPTION,
+        Kind::CSV,
+        "",
+        "Comma-separated KMS keys that still unwrap, after switching `DASH_ENCRYPTION_AWS_KMS_KEY_ID` to another key. Automatic rotation inside KMS needs no entry.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_AWS_REGION",
+        Common,
+        T_ENCRYPTION,
+        Kind::Str,
+        "",
+        "AWS region of the KMS key. Unset: `AWS_REGION`, then `AWS_DEFAULT_REGION`, then the region of a key ARN.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_AWS_KMS_ENDPOINT",
+        Common,
+        T_ENCRYPTION,
+        Kind::Url,
+        "",
+        "KMS endpoint override (a VPC endpoint, or LocalStack in tests). Unset: `AWS_ENDPOINT_URL_KMS`, then `https://kms.<region>.amazonaws.com`.",
+    )
+    .readers(DATA | TOOLS)
+    .blank_ok(),
+    Entry::new(
+        "DASH_ENCRYPTION_KMS_TIMEOUT_MS",
+        Common,
+        T_ENCRYPTION,
+        Kind::Millis {
+            min: 1,
+            max: 600_000,
+        },
+        "5000",
+        "Timeout of one Vault / KMS request (connect, send, receive). Key manager calls happen once per file created or opened, never per record.",
+    )
+    .readers(DATA | TOOLS),
+    Entry::new(
+        "DASH_ENCRYPTION_KMS_MAX_RETRIES",
+        Common,
+        T_ENCRYPTION,
+        Kind::Int { min: 0, max: 10 },
+        "3",
+        "Retries of a Vault / KMS request after connection errors, timeouts, 429, 5xx and KMS throttling, with jittered exponential backoff (100 ms doubling, at most 2 s; `Retry-After` honoured up to 5 s).",
+    )
+    .readers(DATA | TOOLS),
+    Entry::new(
+        "DASH_ENCRYPTION_KMS_ALLOW_INSECURE_HTTP",
+        Common,
+        T_ENCRYPTION,
+        Kind::Bool(Honors::One),
+        "off",
+        "Set to exactly `1` to allow plain `http://` to a non-loopback Vault or KMS endpoint (the Vault token or AWS signature would cross the network unencrypted). Off by default.",
+    )
+    .readers(DATA | TOOLS),
     // ---- container / compose (not read by Rust)
     Entry::new(
         "DASH_BIN",

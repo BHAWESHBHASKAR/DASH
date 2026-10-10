@@ -137,6 +137,40 @@ spec:
     - port: {{ .Values.networkPolicy.ollama.port }}
       protocol: TCP
 {{- end }}
+{{- if .Values.networkPolicy.keyManager.enabled }}
+---
+# Key manager for encryption at rest (Vault / OpenBao Transit on private
+# CIDRs, or the EKS Pod Identity agent): retrieval and ingestion pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-key-manager-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app.kubernetes.io/instance
+      operator: In
+      values: [{{ .Release.Name | quote }}]
+    - key: app.kubernetes.io/component
+      operator: In
+      values: [retrieval, ingestion]
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    {{- range (default $cidrs .Values.networkPolicy.keyManager.cidrs) }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+    ports:
+    {{- range .Values.networkPolicy.keyManager.ports }}
+    - port: {{ .port }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+{{- end }}
 ---
 # Ingress controller -> retrieval and ingestion HTTP ports.
 apiVersion: networking.k8s.io/v1

@@ -245,13 +245,43 @@ tls:
 # Secret, make it `keyName` and list the old one in `previousKeyNames`.
 # Keep a copy of every key outside the cluster: backups of the volumes hold
 # ciphertext only and are useless without the key.
+#
+# provider picks who holds the key-encryption key:
+#   local    key files from secretName (above).
+#   vault    HashiCorp Vault / OpenBao Transit (encryption.vault). The token
+#            file comes from secretName (key `vault-token` by default) or a
+#            Vault Agent sidecar; set vault.tokenFile to its path.
+#   aws-kms  AWS KMS (encryption.awsKms). Credentials from IRSA or EKS Pod
+#            Identity on the service account (serviceAccount.annotations).
+# With vault or aws-kms, secretName is optional; previousKeyNames still names
+# local keys in that Secret that must stay readable while migrating
+# (then run `wal-inspect rewrap`). See docs/operations/encryption.md.
 # -----------------------------------------------------------------------------
 encryption:
   enabled: false
+  provider: local
   secretName: ""
   keyName: active.key
   previousKeyNames: []
   mountPath: /etc/dash/encryption
+  vault:
+    addr: ""
+    mount: transit
+    key: ""
+    previousKeys: []
+    namespace: ""
+    # Empty -> <mountPath>/vault-token (from secretName).
+    tokenFile: ""
+    # Path of an extra CA bundle (PEM), for example <mountPath>/vault-ca.pem.
+    caFile: ""
+  awsKms:
+    keyId: ""
+    previousKeyIds: []
+    region: ""
+    endpoint: ""
+  # Timeout (ms) of one key manager request and retries after the first.
+  kmsTimeoutMs: 5000
+  kmsMaxRetries: 3
 
 # -----------------------------------------------------------------------------
 # Persistent storage. Per-pod PVCs via StatefulSet volumeClaimTemplates.
@@ -391,6 +421,17 @@ networkPolicy:
     port: 11434
     # Empty -> networkPolicy.internalCIDRs.
     cidrs: []
+  # Allow retrieval and ingestion to reach the encryption key manager on
+  # private CIDRs (an in-cluster Vault / OpenBao on 8200). AWS KMS and STS
+  # use public HTTPS, already allowed by externalEgressPorts. For EKS Pod
+  # Identity set cidrs to [169.254.170.23/32] and ports to [{port: 80}].
+  keyManager:
+    enabled: false
+    # Empty -> networkPolicy.internalCIDRs.
+    cidrs: []
+    ports:
+      - port: 8200
+        protocol: TCP
   ingressNamespace: ingress-nginx
   ingressPodSelector:
     matchLabels:

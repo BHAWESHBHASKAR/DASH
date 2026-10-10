@@ -3,7 +3,9 @@
 //! `docs/operations/wal-recovery.md`.
 //!
 //! Encrypted files (ADR 0005, `docs/operations/encryption.md`) are read with
-//! the keys in `DASH_ENCRYPTION_KEY_FILE` / `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`.
+//! the keyring the environment describes: `DASH_ENCRYPTION_KEY_FILE` /
+//! `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`, or a key manager selected with
+//! `DASH_ENCRYPTION_PROVIDER` (`vault`, `aws-kms`).
 //! `keys` lists the key id of every file under a path and `rewrap` moves
 //! every file to the active key (offline; only file headers change).
 //!
@@ -75,7 +77,7 @@ fn list_keys(path: &Path) -> Result<ExitCode, String> {
 /// `rewrap`: every encrypted file under `path` to the active KEK.
 fn rewrap(path: &Path) -> Result<ExitCode, String> {
     let Some(keyring) = encryption::current() else {
-        return Err("rewrap needs DASH_ENCRYPTION_KEY_FILE (the new key) and DASH_ENCRYPTION_PREVIOUS_KEY_FILES (the old ones)".to_string());
+        return Err("rewrap needs an active key: DASH_ENCRYPTION_KEY_FILE (a new local key) or DASH_ENCRYPTION_PROVIDER=vault or aws-kms, with the old local keys in DASH_ENCRYPTION_PREVIOUS_KEY_FILES".to_string());
     };
     let mut failed = 0usize;
     for file in files_under(path) {

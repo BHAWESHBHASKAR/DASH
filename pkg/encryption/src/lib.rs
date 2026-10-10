@@ -1,9 +1,11 @@
 //! Envelope encryption for the files DASH writes (ADR 0005,
 //! `docs/adr/0005-encryption-at-rest.md`).
 //!
-//! * A **key-encryption key** (KEK) comes from a [`KekProvider`]. The
-//!   shipped provider, [`LocalKekProvider`], reads 32-byte keys from files
-//!   (`DASH_ENCRYPTION_KEY_FILE`, `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`).
+//! * A **key-encryption key** (KEK) comes from a [`KekProvider`]:
+//!   [`LocalKekProvider`] reads 32-byte keys from files
+//!   (`DASH_ENCRYPTION_KEY_FILE`, `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`),
+//!   [`VaultTransitKekProvider`] uses a Vault / OpenBao Transit engine and
+//!   [`AwsKmsKekProvider`] uses AWS KMS (`DASH_ENCRYPTION_PROVIDER`).
 //! * Every file gets a fresh random **data-encryption key** (DEK), stored in
 //!   the file header wrapped by the KEK ([`FileHeader`], [`FileKey`]).
 //! * Two framings use the DEK:
@@ -25,6 +27,7 @@ mod error;
 mod global;
 mod header;
 mod kek;
+pub mod kms;
 mod lines;
 mod reader;
 mod record;
@@ -32,7 +35,11 @@ mod stream;
 
 pub use error::EncryptionError;
 pub use global::{
-    KEY_FILE_ENV, PREVIOUS_KEY_FILES_ENV, current, install, keyring_from_env, keyring_from_values,
+    AWS_KMS_ENDPOINT_ENV, AWS_KMS_KEY_ID_ENV, AWS_KMS_PREVIOUS_KEY_IDS_ENV, AWS_REGION_ENV,
+    KEY_FILE_ENV, KMS_MAX_RETRIES_ENV, KMS_TIMEOUT_MS_ENV, PREVIOUS_KEY_FILES_ENV, PROVIDER_ENV,
+    VAULT_ADDR_ENV, VAULT_CA_FILE_ENV, VAULT_KEY_ENV, VAULT_MOUNT_ENV, VAULT_NAMESPACE_ENV,
+    VAULT_PREVIOUS_KEYS_ENV, VAULT_TOKEN_FILE_ENV, aws_kms_config_from_lookup, current, install,
+    keyring_from_env, keyring_from_lookup, keyring_from_values, vault_config_from_lookup,
     with_keyring,
 };
 pub use header::{FILE_ID_LEN, FileHeader, FileKey};
@@ -40,6 +47,11 @@ pub use kek::{
     DEK_LEN, KEK_LEN, KekProvider, LocalKekProvider, WrappedDek, generate_key, local_key_id,
     parse_key_material, read_key_file,
 };
+pub use kms::aws::{AwsKmsConfig, AwsKmsKekProvider, aws_kms_key_id};
+pub use kms::aws_creds::{AwsCredentials, CredentialSource};
+pub use kms::chain::{ChainedKekProvider, check_provider};
+pub use kms::vault::{VaultTransitConfig, VaultTransitKekProvider, vault_key_id};
+pub use kms::{ALLOW_INSECURE_HTTP_ENV, KmsHttpOptions};
 pub use lines::{
     HEADER_LINE_PREFIX, LineCipher, RECORD_LINE_PREFIX, is_encrypted_line, is_header_line,
     parse_header_line, render_header_line,

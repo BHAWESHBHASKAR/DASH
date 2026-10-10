@@ -93,7 +93,43 @@ data:
   {{- if .Values.encryption.enabled }}
   # ----- encryption at rest (docs/operations/encryption.md) -----
   {{- $enc := .Values.encryption }}
+  {{- $provider := default "local" $enc.provider }}
+  {{- if eq $provider "local" }}
   DASH_ENCRYPTION_KEY_FILE: {{ printf "%s/%s" $enc.mountPath $enc.keyName | quote }}
+  {{- else if eq $provider "vault" }}
+  DASH_ENCRYPTION_PROVIDER: "vault"
+  DASH_ENCRYPTION_VAULT_ADDR: {{ required "encryption.vault.addr is required when encryption.provider=vault" $enc.vault.addr | quote }}
+  DASH_ENCRYPTION_VAULT_TOKEN_FILE: {{ default (printf "%s/vault-token" $enc.mountPath) $enc.vault.tokenFile | quote }}
+  DASH_ENCRYPTION_VAULT_MOUNT: {{ default "transit" $enc.vault.mount | quote }}
+  DASH_ENCRYPTION_VAULT_KEY: {{ required "encryption.vault.key is required when encryption.provider=vault" $enc.vault.key | quote }}
+  {{- if $enc.vault.previousKeys }}
+  DASH_ENCRYPTION_VAULT_PREVIOUS_KEYS: {{ join "," $enc.vault.previousKeys | quote }}
+  {{- end }}
+  {{- if $enc.vault.namespace }}
+  DASH_ENCRYPTION_VAULT_NAMESPACE: {{ $enc.vault.namespace | quote }}
+  {{- end }}
+  {{- if $enc.vault.caFile }}
+  DASH_ENCRYPTION_VAULT_CA_FILE: {{ $enc.vault.caFile | quote }}
+  {{- end }}
+  {{- else if eq $provider "aws-kms" }}
+  DASH_ENCRYPTION_PROVIDER: "aws-kms"
+  DASH_ENCRYPTION_AWS_KMS_KEY_ID: {{ required "encryption.awsKms.keyId is required when encryption.provider=aws-kms" $enc.awsKms.keyId | quote }}
+  {{- if $enc.awsKms.previousKeyIds }}
+  DASH_ENCRYPTION_AWS_KMS_PREVIOUS_KEY_IDS: {{ join "," $enc.awsKms.previousKeyIds | quote }}
+  {{- end }}
+  {{- if $enc.awsKms.region }}
+  DASH_ENCRYPTION_AWS_REGION: {{ $enc.awsKms.region | quote }}
+  {{- end }}
+  {{- if $enc.awsKms.endpoint }}
+  DASH_ENCRYPTION_AWS_KMS_ENDPOINT: {{ $enc.awsKms.endpoint | quote }}
+  {{- end }}
+  {{- else }}
+  {{- fail "encryption.provider must be local, vault or aws-kms" }}
+  {{- end }}
+  {{- if ne $provider "local" }}
+  DASH_ENCRYPTION_KMS_TIMEOUT_MS: {{ $enc.kmsTimeoutMs | int64 | quote }}
+  DASH_ENCRYPTION_KMS_MAX_RETRIES: {{ $enc.kmsMaxRetries | int64 | quote }}
+  {{- end }}
   {{- if $enc.previousKeyNames }}
   {{- $prev := list }}
   {{- range $enc.previousKeyNames }}

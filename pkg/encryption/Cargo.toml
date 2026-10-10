@@ -14,6 +14,16 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom", "zeroize"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# External key managers (Vault Transit, AWS KMS): the blocking HTTP client and
+# TLS setup the rest of the workspace already uses.
+serde_json = { workspace = true }
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
+dash-http = { path = "../http" }
+
+[features]
+# In-process mock Vault Transit / AWS KMS servers for tests in other crates.
+mock-kms = []
 
 [dev-dependencies]
 tempfile = "3"

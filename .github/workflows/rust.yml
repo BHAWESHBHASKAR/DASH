@@ -189,6 +189,24 @@ jobs:
             echo "helm template with encryption.enabled succeeded without encryption.secretName" >&2
             exit 1
           fi
+          # Key managers: Vault Transit (no Secret needed) and AWS KMS.
+          vault=(--set encryption.enabled=true --set encryption.provider=vault
+            --set encryption.vault.addr=https://vault.vault.svc:8200 --set encryption.vault.key=dash
+            --set networkPolicy.keyManager.enabled=true)
+          helm lint deploy/helm/dash --strict "${args[@]}" "${vault[@]}"
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" "${vault[@]}" \
+            > helm-encryption-vault.yaml
+          grep -q 'DASH_ENCRYPTION_PROVIDER: "vault"' helm-encryption-vault.yaml
+          grep -q 'DASH_ENCRYPTION_VAULT_TOKEN_FILE: "/etc/dash/encryption/vault-token"' helm-encryption-vault.yaml
+          if grep -q 'DASH_ENCRYPTION_KEY_FILE' helm-encryption-vault.yaml; then
+            echo "helm template set DASH_ENCRYPTION_KEY_FILE with encryption.provider=vault" >&2
+            exit 1
+          fi
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set encryption.enabled=true --set encryption.provider=aws-kms \
+            --set encryption.awsKms.keyId=alias/dash --set encryption.awsKms.region=eu-west-1 \
+            > helm-encryption-aws.yaml
+          grep -q 'DASH_ENCRYPTION_AWS_KMS_KEY_ID: "alias/dash"' helm-encryption-aws.yaml
           # Ingestion leader failover (docs/operations/failover.md): several
           # ingestion pods, leader-only readiness, peers Service, PDB.
           helm lint deploy/helm/dash --strict "${args[@]}" --set failover.enabled=true
@@ -250,7 +268,7 @@ jobs:
           fi
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
             helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml helm-kind.yaml \
-            helm-encryption.yaml
+            helm-encryption.yaml helm-encryption-vault.yaml helm-encryption-aws.yaml
 
       - name: Kustomize build and kubeconform
         run: |

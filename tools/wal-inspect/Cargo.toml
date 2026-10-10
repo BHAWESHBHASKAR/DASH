@@ -12,3 +12,5 @@ store = { path = "../../pkg/store" }
 [dev-dependencies]
 tempfile = "3"
 schema = { path = "../../pkg/schema" }
+# In-process mock Vault Transit for the local-to-Vault migration test.
+encryption = { path = "../../pkg/encryption", features = ["mock-kms"] }
