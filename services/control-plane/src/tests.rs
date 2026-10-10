@@ -1075,6 +1075,10 @@ fn duplicate_authorization_headers_are_rejected_with_400() {
     stream.write_all(raw.as_bytes()).unwrap();
     let mut out = String::new();
     stream.read_to_string(&mut out).unwrap();
-    // Debug formatting escapes control characters from the raw response.
-    assert!(out.starts_with("HTTP/1.1 400"), "{out:?}");
+    // Report the status line only: the rest is unvalidated network data.
+    let status_line = out.lines().next().unwrap_or("").escape_debug().to_string();
+    assert!(
+        out.starts_with("HTTP/1.1 400"),
+        "unexpected status line: {status_line}"
+    );
 }

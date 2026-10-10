@@ -24,34 +24,34 @@ use dash_http::{TlsAcceptor, TlsSettings};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenerTlsEnv {
     pub service: &'static str,
-    pub cert_file: &'static str,
-    pub key_file: &'static str,
-    pub client_ca_file: &'static str,
-    pub require_client_cert: &'static str,
+    pub cert_file_name: &'static str,
+    pub key_file_name: &'static str,
+    pub client_ca_file_name: &'static str,
+    pub require_client_cert_name: &'static str,
 }
 
 pub const INGEST_TLS_ENV: ListenerTlsEnv = ListenerTlsEnv {
     service: "ingestion",
-    cert_file: "DASH_INGEST_TLS_CERT_FILE",
-    key_file: "DASH_INGEST_TLS_KEY_FILE",
-    client_ca_file: "DASH_INGEST_TLS_CLIENT_CA_FILE",
-    require_client_cert: "DASH_INGEST_TLS_REQUIRE_CLIENT_CERT",
+    cert_file_name: "DASH_INGEST_TLS_CERT_FILE",
+    key_file_name: "DASH_INGEST_TLS_KEY_FILE",
+    client_ca_file_name: "DASH_INGEST_TLS_CLIENT_CA_FILE",
+    require_client_cert_name: "DASH_INGEST_TLS_REQUIRE_CLIENT_CERT",
 };
 
 pub const RETRIEVAL_TLS_ENV: ListenerTlsEnv = ListenerTlsEnv {
     service: "retrieval",
-    cert_file: "DASH_RETRIEVAL_TLS_CERT_FILE",
-    key_file: "DASH_RETRIEVAL_TLS_KEY_FILE",
-    client_ca_file: "DASH_RETRIEVAL_TLS_CLIENT_CA_FILE",
-    require_client_cert: "DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT",
+    cert_file_name: "DASH_RETRIEVAL_TLS_CERT_FILE",
+    key_file_name: "DASH_RETRIEVAL_TLS_KEY_FILE",
+    client_ca_file_name: "DASH_RETRIEVAL_TLS_CLIENT_CA_FILE",
+    require_client_cert_name: "DASH_RETRIEVAL_TLS_REQUIRE_CLIENT_CERT",
 };
 
 pub const CONTROL_PLANE_TLS_ENV: ListenerTlsEnv = ListenerTlsEnv {
     service: "control-plane",
-    cert_file: "DASH_CONTROL_PLANE_TLS_CERT_FILE",
-    key_file: "DASH_CONTROL_PLANE_TLS_KEY_FILE",
-    client_ca_file: "DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE",
-    require_client_cert: "DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT",
+    cert_file_name: "DASH_CONTROL_PLANE_TLS_CERT_FILE",
+    key_file_name: "DASH_CONTROL_PLANE_TLS_KEY_FILE",
+    client_ca_file_name: "DASH_CONTROL_PLANE_TLS_CLIENT_CA_FILE",
+    require_client_cert_name: "DASH_CONTROL_PLANE_TLS_REQUIRE_CLIENT_CERT",
 };
 
 /// Raw values of one service's TLS variables (blank counts as unset).
@@ -72,10 +72,10 @@ impl RawListenerTls {
                 .filter(|value| !value.is_empty())
         };
         Self {
-            cert_file: get(env.cert_file),
-            key_file: get(env.key_file),
-            client_ca_file: get(env.client_ca_file),
-            require_client_cert: get(env.require_client_cert),
+            cert_file: get(env.cert_file_name),
+            key_file: get(env.key_file_name),
+            client_ca_file: get(env.client_ca_file_name),
+            require_client_cert: get(env.require_client_cert_name),
         }
     }
 }
@@ -96,13 +96,19 @@ pub fn listener_tls_settings(
     env: &ListenerTlsEnv,
     raw: &RawListenerTls,
 ) -> Result<Option<TlsSettings>, String> {
-    let require = parse_flag(env.require_client_cert, raw.require_client_cert.as_deref())?;
+    let require = parse_flag(
+        env.require_client_cert_name,
+        raw.require_client_cert.as_deref(),
+    )?;
     let (cert, key) = match (raw.cert_file.as_deref(), raw.key_file.as_deref()) {
         (None, None) => {
             if raw.client_ca_file.is_some() || require {
                 return Err(format!(
                     "{} / {} require {} and {} (TLS is off without them)",
-                    env.client_ca_file, env.require_client_cert, env.cert_file, env.key_file
+                    env.client_ca_file_name,
+                    env.require_client_cert_name,
+                    env.cert_file_name,
+                    env.key_file_name
                 ));
             }
             return Ok(None);
@@ -111,20 +117,20 @@ pub fn listener_tls_settings(
         (Some(_), None) => {
             return Err(format!(
                 "{} is set but {} is not",
-                env.cert_file, env.key_file
+                env.cert_file_name, env.key_file_name
             ));
         }
         (None, Some(_)) => {
             return Err(format!(
                 "{} is set but {} is not",
-                env.key_file, env.cert_file
+                env.key_file_name, env.cert_file_name
             ));
         }
     };
     if require && raw.client_ca_file.is_none() {
         return Err(format!(
             "{} needs {} (the CA client certificates must chain to)",
-            env.require_client_cert, env.client_ca_file
+            env.require_client_cert_name, env.client_ca_file_name
         ));
     }
     Ok(Some(TlsSettings {
