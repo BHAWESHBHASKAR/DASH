@@ -111,6 +111,10 @@ wal-inspect keys /var/lib/dash/ingestion
 Files show as `encrypted lines`, `sealed`, `redb (encrypted values)` or
 `plaintext`.
 
+`DASH_CHECKPOINT_MAX_WAL_BYTES` counts the bytes on disk, which grow by
+about a third with encryption: with the same threshold checkpoints come
+earlier.
+
 ## Fail closed
 
 * A service started **without** `DASH_ENCRYPTION_KEY_FILE` that finds an
