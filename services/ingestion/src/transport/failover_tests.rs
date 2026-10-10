@@ -541,6 +541,36 @@ fn heartbeat_reply_and_config_parsing() {
     );
 }
 
+#[test]
+fn a_follower_reports_its_cursor_and_recent_crossings() {
+    let runtime = member(IngestionRuntime::in_memory(InMemoryStore::new()), "c", None);
+    let mut c = runtime.lock().unwrap();
+    c.failover.role = NodeRole::Follower;
+    c.failover.term = 3;
+    c.replication_follower.state_loaded = true;
+    c.replication_follower.synced_once = true;
+    c.replication_follower.generation = Some(7);
+    c.replication_last_offset = 4;
+    for (from, to) in [(5, 6), (6, 7)] {
+        c.failover.record_switch(RecordedSwitch {
+            from: store::WalPosition {
+                generation: from,
+                records: 30,
+            },
+            to,
+            term: 3,
+        });
+    }
+    let query = c.failover_heartbeat_query(&ReplicationPullConfig::new("http://unused"));
+    assert!(query.contains("&generation=7&records=4"), "{query}");
+    assert!(query.contains("&synced=1"), "{query}");
+    assert!(
+        query.contains("&fchain=5%3A30%3A6%3A3%2C6%3A30%3A7%3A3"),
+        "{query}"
+    );
+    assert!(query.contains("role=follower"), "{query}");
+}
+
 fn follower_reply_with(term: u64, node: &str, url: &str) -> HeartbeatReply {
     HeartbeatReply {
         term,

@@ -29,8 +29,27 @@ pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SYNC_TIMEOUT_MS: u64 = 5_000;
 /// Longest a caught-up follower's poll is held open (`wait_ms`).
 pub(crate) const MAX_LONG_POLL_MS: u64 = 1_000;
-/// Checkpoint transitions a node reports with its own WAL position.
-const HEARTBEAT_CHAIN_MAX: usize = 8;
+/// Checkpoint transitions a node reports with its own WAL position (the
+/// WAL keeps the newest 16), and crossings a follower reports.
+const HEARTBEAT_CHAIN_MAX: usize = 16;
+
+/// A checkpoint crossing a follower made: from `from` (at its end) into
+/// generation `to`, served by a leader of `term`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedSwitch {
+    pub(crate) from: store::WalPosition,
+    pub(crate) to: u64,
+    pub(crate) term: u64,
+}
+
+impl FailoverState {
+    pub(crate) fn record_switch(&mut self, switch: RecordedSwitch) {
+        self.recent_switches.push_back(switch);
+        while self.recent_switches.len() > HEARTBEAT_CHAIN_MAX {
+            self.recent_switches.pop_front();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------
 // Configuration
@@ -267,7 +286,7 @@ pub(crate) struct FailoverState {
     /// The checkpoint transition this follower crossed last
     /// (`switch_from`), reported so the control plane can order a
     /// generation the leader had no time to report.
-    pub(crate) last_switch: Option<(store::WalPosition, u64)>,
+    pub(crate) recent_switches: std::collections::VecDeque<RecordedSwitch>,
     pub(crate) promotions_total: u64,
     pub(crate) demotions_total: u64,
     pub(crate) promotion_failures_total: u64,
@@ -295,7 +314,7 @@ impl Default for FailoverState {
             leader_url: None,
             lease_until: None,
             state_path: None,
-            last_switch: None,
+            recent_switches: std::collections::VecDeque::new(),
             promotions_total: 0,
             demotions_total: 0,
             promotion_failures_total: 0,
@@ -555,18 +574,32 @@ impl IngestionRuntime {
         // the one this node would continue from.
         let _ = self.replication_cursor(pull);
         let follower = &self.replication_follower;
-        // A follower reports its cursor and the crossing it made last (with
-        // the term of the leader that served it); a node on its own WAL
-        // reports that WAL and its recent checkpoint chain.
+        // A follower reports its cursor and its recent checkpoint crossings
+        // (each with the term of the leader that served it); a node on its
+        // own WAL reports that WAL and its recent checkpoint chain.
         let mut chain = Vec::new();
-        let (position, prev, synced) = match follower.generation {
-            Some(generation) if self.failover.role != NodeRole::Leader => (
-                Some((generation, self.replication_last_offset as u64)),
-                self.failover
-                    .last_switch
-                    .map(|(p, term)| (p.generation, p.records as u64, term)),
-                follower.synced_once && !follower.force_resync && follower.blocked_reason.is_none(),
-            ),
+        let mut fchain = String::new();
+        let (position, synced): (Option<(u64, u64)>, bool) = match follower.generation {
+            Some(generation) if self.failover.role != NodeRole::Leader => {
+                fchain = self
+                    .failover
+                    .recent_switches
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}:{}:{}:{}",
+                            s.from.generation, s.from.records, s.to, s.term
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    Some((generation, self.replication_last_offset as u64)),
+                    follower.synced_once
+                        && !follower.force_resync
+                        && follower.blocked_reason.is_none(),
+                )
+            }
             _ => match self.wal.as_ref() {
                 Some(wal) => {
                     let mut wal = lock_wal(wal);
@@ -578,12 +611,12 @@ impl IngestionRuntime {
                                 .iter()
                                 .map(|t| (t.from_generation, t.from_records, t.to_generation))
                                 .collect();
-                            (Some((generation, records as u64)), None, true)
+                            (Some((generation, records as u64)), true)
                         }
-                        Err(_) => (None, None, false),
+                        Err(_) => (None, false),
                     }
                 }
-                None => (Some((0, 0)), None, true),
+                None => (Some((0, 0)), true),
             },
         };
         let synced = synced && !self.failover.promotion_refused;
@@ -601,10 +634,8 @@ impl IngestionRuntime {
         if let Some((generation, records)) = position {
             query.push_str(&format!("&generation={generation}&records={records}"));
         }
-        if let Some((generation, records, term)) = prev {
-            query.push_str(&format!(
-                "&prev_generation={generation}&prev_records={records}&prev_term={term}"
-            ));
+        if !fchain.is_empty() {
+            query.push_str(&format!("&fchain={}", url_encode(&fchain)));
         }
         if !chain.is_empty() {
             let chain = chain
@@ -666,7 +697,7 @@ impl IngestionRuntime {
         state.lease_until = Some(lease_until);
         state.leader_node_id = Some(state.node_id.clone());
         state.leader_url = Some(state.advertise_url.clone());
-        state.last_switch = None;
+        state.recent_switches.clear();
         state.promotion_refused = false;
         state.promotions_total = state.promotions_total.saturating_add(1);
         state.persist_term();

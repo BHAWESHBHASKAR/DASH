@@ -238,6 +238,26 @@ impl Cluster {
         let mut out = String::new();
         if let Some(cp) = &self.cp {
             out.push_str(&format!("--- control plane ---\n{}\n", cp.log()));
+            let mut client = Client::new(self.cp_addr());
+            client.timeout = Duration::from_secs(2);
+            if let Ok(status) = client.request(
+                "GET",
+                "/v1/control-plane/ingest",
+                &[("Authorization", &format!("Bearer {}", self.token))],
+                None,
+            ) {
+                out.push_str(&format!(
+                    "--- ingest failover status ---\n{}\n",
+                    status.body
+                ));
+            }
+        }
+        for node in &self.nodes {
+            let mut client = node.client();
+            client.timeout = Duration::from_secs(2);
+            if let Ok(ready) = client.request("GET", "/v1/ready", &[], None) {
+                out.push_str(&format!("--- {} /v1/ready ---\n{}\n", node.id, ready.body));
+            }
         }
         for node in &self.nodes {
             out.push_str(&format!("--- {} ---\n{}\n", node.id, node.log()));

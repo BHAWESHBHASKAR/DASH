@@ -905,7 +905,12 @@ impl IngestionRuntime {
     ) -> Result<(), StoreError> {
         if let Some(from) = frame.switch_from {
             self.switch_replication_generation(frame.generation)?;
-            self.failover.last_switch = Some((from, frame.term.unwrap_or(0)));
+            self.failover
+                .record_switch(super::failover::RecordedSwitch {
+                    from,
+                    to: frame.generation,
+                    term: frame.term.unwrap_or(0),
+                });
         }
         self.replication_follower.last_frame_records = frame.wal_lines.len();
         if !frame.wal_lines.is_empty() {
@@ -1091,6 +1096,8 @@ impl IngestionRuntime {
         offset: usize,
         applied: u64,
     ) {
+        // The crossings made before the resync belong to the replaced state.
+        self.failover.recent_switches.clear();
         // Tenants the export no longer holds (erased on the leader) get their
         // segments refreshed to an empty claim set as well.
         let mut tenants: std::collections::BTreeSet<String> =

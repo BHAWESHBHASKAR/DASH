@@ -47,6 +47,7 @@ fn report(
         }),
         prev: None,
         prev_term: None,
+        follower_chain: Vec::new(),
         chain: Vec::new(),
         synced: true,
         bootstrap: false,
@@ -902,4 +903,41 @@ fn an_old_leaders_checkpoint_never_extends_the_new_leaders_lineage() {
         })
         .is_none()
     );
+}
+
+#[test]
+fn a_follower_reports_several_crossings_the_dead_leader_never_reported() {
+    let mut f = running_cluster();
+    leader_beat(&mut f, "a", 10, 6_000);
+    beat_followers(&mut f, 11_500, &[("b", 30), ("c", 30)]);
+    let after = 6_000 + LEASE + GRACE + 1;
+    // The leader checkpointed G1 -> G2 -> G3 within its last heartbeat
+    // interval and died; c crossed both checkpoints, b stayed in G1.
+    let mut c = report("c", 1, ReportedRole::Follower, Some((G3, 4)));
+    c.follower_chain = vec![
+        (
+            Transition {
+                from: G1,
+                records: 30,
+                to: G2,
+            },
+            1,
+        ),
+        (
+            Transition {
+                from: G2,
+                records: 30,
+                to: G3,
+            },
+            1,
+        ),
+    ];
+    f.heartbeat(c, after).unwrap();
+    let (_, promotion) = f
+        .heartbeat(
+            report("b", 1, ReportedRole::Follower, Some((G1, 30))),
+            after,
+        )
+        .unwrap();
+    assert_eq!(promotion.unwrap().new_leader, "c", "c holds the most");
 }

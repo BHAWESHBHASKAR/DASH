@@ -119,6 +119,10 @@ pub struct HeartbeatReport {
     /// by the current term's leader may extend the lineage: an old leader's
     /// checkpoint that the new leader never saw is a divergent history.
     pub prev_term: Option<u64>,
+    /// A follower's recent checkpoint crossings, oldest first, each with the
+    /// term of the leader that served it (several checkpoints can be
+    /// crossed between two heartbeats).
+    pub follower_chain: Vec<(Transition, u64)>,
     /// The node's own recent checkpoint transitions, oldest first (reported
     /// for its own WAL: by the leader and by a node without a follower
     /// cursor). The current leader's chain is authoritative.
@@ -570,14 +574,32 @@ impl IngestFailover {
     /// not reported (it may have died right after it): extend the lineage
     /// if the crossing was served by the current leader and fits.
     fn observe_follower_lineage(&mut self, report: &HeartbeatReport) -> bool {
-        let (Some(position), Some(prev)) = (report.position, report.prev) else {
-            return false;
-        };
-        if report.prev_term != Some(self.term) || self.lineage_index(position.generation).is_some()
+        let mut hops: Vec<(Transition, u64)> = report.follower_chain.clone();
+        if let (Some(position), Some(prev), Some(term)) =
+            (report.position, report.prev, report.prev_term)
         {
+            hops.push((
+                Transition {
+                    from: prev.generation,
+                    records: prev.records,
+                    to: position.generation,
+                },
+                term,
+            ));
+        }
+        let mut changed = false;
+        for (hop, term) in hops {
+            changed |= self.observe_follower_hop(hop, term);
+        }
+        changed
+    }
+
+    /// One crossing `from@records -> to` served by a leader of `term`.
+    fn observe_follower_hop(&mut self, hop: Transition, term: u64) -> bool {
+        if term != self.term || self.lineage_index(hop.to).is_some() {
             return false;
         }
-        let Some(from) = self.lineage_index(prev.generation) else {
+        let Some(from) = self.lineage_index(hop.from) else {
             return false;
         };
         if from + 1 < self.lineage.len() {
@@ -587,15 +609,15 @@ impl IngestFailover {
         let entry = self.lineage[from];
         let fits = match entry.end {
             None => true,
-            Some(end) if entry.provisional => prev.records >= end,
-            Some(end) => prev.records == end,
+            Some(end) if entry.provisional => hop.records >= end,
+            Some(end) => hop.records == end,
         };
         if !fits {
             return false;
         }
-        self.lineage[from].end = Some(prev.records);
+        self.lineage[from].end = Some(hop.records);
         self.lineage[from].provisional = false;
-        self.push_lineage(position.generation);
+        self.push_lineage(hop.to);
         true
     }
 
@@ -1011,6 +1033,27 @@ pub fn parse_heartbeat_query(
             }
         }
     }
+    let mut follower_chain = Vec::new();
+    if let Some(raw) = get("fchain").filter(|raw| !raw.is_empty()) {
+        for item in raw.split(',') {
+            let parts: Vec<&str> = item.split(':').collect();
+            let invalid = || "fchain must list from:records:to:term crossings".to_string();
+            let [from, records, to, term] = parts[..] else {
+                return Err(invalid());
+            };
+            follower_chain.push((
+                Transition {
+                    from: from.parse().map_err(|_| invalid())?,
+                    records: records.parse().map_err(|_| invalid())?,
+                    to: to.parse().map_err(|_| invalid())?,
+                },
+                term.parse().map_err(|_| invalid())?,
+            ));
+            if follower_chain.len() > MAX_LINEAGE {
+                return Err("fchain is too long".to_string());
+            }
+        }
+    }
     Ok(HeartbeatReport {
         node_id: required("node_id")?,
         url: required("url")?,
@@ -1020,6 +1063,7 @@ pub fn parse_heartbeat_query(
         position,
         prev,
         prev_term: parse_u64("prev_term")?,
+        follower_chain,
         chain,
         synced: flag("synced"),
         bootstrap: flag("bootstrap"),
