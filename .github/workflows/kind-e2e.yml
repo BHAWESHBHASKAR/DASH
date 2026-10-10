@@ -108,6 +108,8 @@ jobs:
           DASH_E2E_UPGRADE_FROM_REF: ${{ steps.upgrade-from.outputs.ref }}
           DASH_E2E_UPGRADE_FROM_OPTIONAL: "1"
           DASH_E2E_TIMEOUT: "300"
+          # Fail instead of warning when NetworkPolicy is not enforced.
+          DASH_E2E_REQUIRE_NETPOL: "1"
         run: scripts/kind_e2e.sh
 
       - name: Upload diagnostics

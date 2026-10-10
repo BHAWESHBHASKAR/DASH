@@ -59,6 +59,8 @@
 #   DASH_E2E_KEEP_CLUSTER=1   do not delete the cluster at the end
 #   DASH_E2E_TIMEOUT          seconds for each rollout / replication wait
 #                             (default: 300)
+#   DASH_E2E_REQUIRE_NETPOL=1 fail when the cluster does not enforce
+#                             NetworkPolicy (default: warn and go on; CI sets 1)
 
 set -euo pipefail
 
@@ -307,6 +309,53 @@ build_and_load_image() {
     names+=("${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}-${svc}:${IMAGE_TAG}")
   done
   kind load docker-image --name "${CLUSTER}" "${names[@]}" || fail "kind load docker-image failed"
+}
+
+# kindnet enforces NetworkPolicy through an nftables queue rule. On a kernel
+# built without CONFIG_NFT_QUEUE it logs "netlink receive: no such file or
+# directory" and lets everything through, so a broken policy (for example one
+# that blocks DNS) passes unnoticed. Check that a deny-all egress policy
+# really stops a DNS lookup before trusting the policy tests.
+check_networkpolicy_enforced() {
+  local ns="dash-netpol-probe" i blocked=0
+  local image="${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}-retrieval:${IMAGE_TAG}"
+  local lookup=(getent hosts kubernetes.default.svc.cluster.local)
+  step "check that the cluster enforces NetworkPolicy"
+  kubectl create namespace "${ns}" >/dev/null
+  kubectl -n "${ns}" run probe --image="${image}" --image-pull-policy=Never \
+    --restart=Never --command -- sleep 600 >/dev/null
+  kubectl -n "${ns}" wait --for=condition=Ready pod/probe --timeout="${TIMEOUT}s" >/dev/null \
+    || fail "network-policy probe pod not ready within ${TIMEOUT}s"
+  kubectl -n "${ns}" exec probe -- "${lookup[@]}" >/dev/null \
+    || fail "DNS does not work in a namespace without NetworkPolicy"
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-egress
+  namespace: ${ns}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+EOF
+  for i in $(seq 1 10); do
+    if ! kubectl -n "${ns}" exec probe -- timeout 5 "${lookup[@]}" >/dev/null 2>&1; then
+      blocked=1
+      break
+    fi
+    sleep 2
+  done
+  kubectl delete namespace "${ns}" --wait=false >/dev/null 2>&1 || true
+  if [[ "${blocked}" -eq 1 ]]; then
+    log "NetworkPolicy is enforced (deny-all egress blocked DNS)"
+    return 0
+  fi
+  if [[ "${DASH_E2E_REQUIRE_NETPOL:-0}" == "1" ]]; then
+    fail "NetworkPolicy is NOT enforced: DNS still resolved under a deny-all egress policy"
+  fi
+  log "WARNING: NetworkPolicy is NOT enforced on this cluster (kindnet needs CONFIG_NFT_QUEUE);"
+  log "WARNING: the policies are applied but a policy that blocks traffic will not fail this run"
+  SKIPPED+=" networkpolicy-enforcement"
 }
 
 # --- secrets ------------------------------------------------------------------
@@ -849,6 +898,7 @@ main() {
   install_tools
   create_cluster
   build_and_load_image
+  check_networkpolicy_enforced
   generate_secrets
   for p in ${PHASES}; do
     case "${p}" in

@@ -196,7 +196,11 @@ What it does:
 3. installs the chart with `deploy/helm/dash/ci/kind-values.yaml` and secrets
    from `scripts/generate-secrets.sh`, in a namespace enforcing Pod Security
    "restricted", with NetworkPolicy enforced by kindnet and PVCs from kind's
-   default StorageClass;
+   default StorageClass. Before that it checks that a deny-all egress policy
+   really blocks DNS: kindnet needs a kernel with `CONFIG_NFT_QUEUE` and
+   otherwise lets everything through. Without enforcement the run warns and
+   reports `skipped: networkpolicy-enforcement` (CI sets
+   `DASH_E2E_REQUIRE_NETPOL=1` and fails instead);
 4. checks authentication, ingests claims, retrieves them from every retrieval
    pod, deletes one, kills the ingestion pod, kills a retrieval pod, deletes
    a retrieval pod together with its PVC, backs up, writes, restores (the
