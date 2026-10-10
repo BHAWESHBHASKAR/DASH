@@ -28,8 +28,17 @@ use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 
 use crate::StoreError;
 
+mod replication_export;
 mod replication_index;
 
+pub(crate) use replication_export::ExportFreeze;
+pub use replication_export::{
+    ChunkFetch, ChunkRead, DownloadOutcome, DownloadPaths, DownloadedExport,
+    EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
+    EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, HttpExportSource,
+    LocalExportSource, ReplicationExportChunk, ReplicationExportFile, ReplicationExportManifest,
+    ReplicationExportStore, download_export, hash_file, valid_export_id,
+};
 use replication_index::{ReplicationFilter, ReplicationIndex};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,7 +243,28 @@ pub struct WalReplicationFrame {
     pub total_records: usize,
     pub needs_resync: bool,
     pub wal_lines: Vec<String>,
+    /// Set when the follower's position was the exact end of an earlier
+    /// generation that a checkpoint closed: the frame then starts at offset
+    /// 0 of the current generation, and the follower continues there without
+    /// a full resync (see [`GenerationTransition`]).
+    pub switched_from: Option<WalPosition>,
 }
+
+/// A checkpoint closed WAL generation `from_generation` after its
+/// replication view held `from_records` lines and opened `to_generation`
+/// with an empty WAL and a snapshot of exactly the state those lines (on top
+/// of the previous snapshot) produce. A follower whose cursor is
+/// `(from_generation, from_records)` therefore holds the new snapshot's
+/// state and may continue from `(to_generation, 0)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationTransition {
+    pub from_generation: u64,
+    pub from_records: usize,
+    pub to_generation: u64,
+}
+
+/// Transitions kept in `<wal>.gen.transitions` (newest last).
+pub const GENERATION_TRANSITIONS_KEPT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalReplicationExport {
@@ -505,6 +535,9 @@ pub struct FileWal {
     /// Incremental index of the replication view, so a replication frame
     /// reads only the lines it ships instead of the whole file.
     replication_index: ReplicationIndex,
+    /// Recent checkpoint transitions, oldest first (see
+    /// [`GenerationTransition`]).
+    transitions: Vec<GenerationTransition>,
     /// Set after an fsync failure. Once set, every write path fails closed:
     /// after a failed fsync the kernel may already have dropped the dirty
     /// pages, so retrying the fsync could report success for data that never
@@ -577,6 +610,7 @@ impl FileWal {
         let torn_tail_dropped = repair_torn_tail(&path)? + truncate_unterminated_group(&path)?;
         let wal_records = count_non_empty_lines(&path)?;
         let generation = load_or_create_generation(&generation_path_for(&path))?;
+        let transitions = load_transitions(&transitions_path_for(&path));
         Ok(Self {
             path,
             wal_records,
@@ -593,6 +627,7 @@ impl FileWal {
             replication_group_cap: REPLICATION_GROUP_EXTENSION_MAX,
             replication_group_too_large_total: 0,
             replication_index: ReplicationIndex::default(),
+            transitions,
             poisoned: None,
         })
     }
@@ -928,6 +963,67 @@ impl FileWal {
         self.replication_frame_inner(from_generation, from_offset, max_records, true)
     }
 
+    /// [`FileWal::replication_frame_from`] for a follower that can switch
+    /// generations: when `(from_generation, from_offset)` is the exact end
+    /// of a generation that checkpoints have since closed (following the
+    /// recorded transitions up to the current generation), the frame starts
+    /// at offset 0 of the current generation with `switched_from` set,
+    /// instead of asking for a resync.
+    pub fn replication_frame_with_switch(
+        &mut self,
+        from_generation: Option<u64>,
+        from_offset: usize,
+        max_records: usize,
+    ) -> Result<WalReplicationFrame, StoreError> {
+        if let Some(generation) = from_generation
+            && generation != self.generation
+            && self.resolve_transition(generation, from_offset)
+        {
+            let current = self.generation;
+            let mut frame = self.replication_frame_inner(Some(current), 0, max_records, true)?;
+            if !frame.needs_resync {
+                frame.switched_from = Some(WalPosition {
+                    generation,
+                    records: from_offset,
+                });
+            }
+            return Ok(frame);
+        }
+        self.replication_frame_inner(from_generation, from_offset, max_records, true)
+    }
+
+    /// `true` when the recorded transitions lead from the end position
+    /// `(generation, records)` to the current generation.
+    fn resolve_transition(&self, generation: u64, records: usize) -> bool {
+        let (mut generation, mut records) = (generation, records);
+        // Each step moves to a newer generation; the bound only guards
+        // against a corrupt file with a cycle.
+        for _ in 0..=self.transitions.len() {
+            if generation == self.generation {
+                return records == 0;
+            }
+            let Some(step) = self
+                .transitions
+                .iter()
+                .rev()
+                .find(|t| t.from_generation == generation)
+            else {
+                return false;
+            };
+            if step.from_records != records {
+                return false;
+            }
+            generation = step.to_generation;
+            records = 0;
+        }
+        false
+    }
+
+    /// Recorded checkpoint transitions, oldest first.
+    pub fn generation_transitions(&self) -> &[GenerationTransition] {
+        &self.transitions
+    }
+
     fn replication_frame_inner(
         &mut self,
         from_generation: Option<u64>,
@@ -1026,6 +1122,7 @@ impl FileWal {
             total_records,
             needs_resync: true,
             wal_lines: Vec::new(),
+            switched_from: None,
         })
     }
 
@@ -1043,6 +1140,7 @@ impl FileWal {
                 total_records,
                 needs_resync: false,
                 wal_lines: lines,
+                switched_from: None,
             }),
             FrameCut::GroupTooLarge(too_large) => {
                 self.replication_group_too_large_total =
@@ -1053,6 +1151,71 @@ impl FileWal {
                 )))
             }
         }
+    }
+
+    /// `(generation, replication view length)` after flushing.
+    pub fn replication_position(&mut self) -> Result<(u64, usize), StoreError> {
+        self.flush_pending_sync()?;
+        Ok((self.generation, self.replication_view_len()?))
+    }
+
+    /// Length of the replication view of the flushed WAL.
+    fn replication_view_len(&mut self) -> Result<usize, StoreError> {
+        if self.replication_index.refresh(&self.path)? {
+            self.note_replication_skipped(self.replication_index.skipped());
+            return Ok(self.replication_index.total());
+        }
+        let scanned_bytes = self.wal_size_bytes()?;
+        let (lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.replication_index.note_read(scanned_bytes);
+        self.note_replication_skipped(skipped);
+        Ok(lines.len())
+    }
+
+    /// Freezes the inputs of a chunked export: writes the WAL's replication
+    /// lines to `wal_out` and opens the snapshot, so the export file can be
+    /// built after the WAL lock is released (see `replication_export`).
+    pub(crate) fn freeze_for_export(
+        &mut self,
+        wal_out: &mut dyn Write,
+    ) -> Result<ExportFreeze, StoreError> {
+        self.flush_pending_sync()?;
+        let snapshot = match File::open(self.snapshot_path()) {
+            Ok(file) => Some(file),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        let mut wal_records = 0usize;
+        if self.replication_index.refresh(&self.path)? {
+            self.note_replication_skipped(self.replication_index.skipped());
+            for line in self.replication_index.lines_from(&self.path, 0)? {
+                let line = line?;
+                wal_out.write_all(line.as_bytes())?;
+                wal_out.write_all(b"\n")?;
+                wal_records += 1;
+            }
+            if wal_records != self.replication_index.total() {
+                return Err(StoreError::Io(format!(
+                    "replication view read {wal_records} lines, index holds {}",
+                    self.replication_index.total()
+                )));
+            }
+        } else {
+            let scanned_bytes = self.wal_size_bytes()?;
+            let (lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+            self.replication_index.note_read(scanned_bytes);
+            self.note_replication_skipped(skipped);
+            for line in &lines {
+                wal_out.write_all(line.as_bytes())?;
+                wal_out.write_all(b"\n")?;
+            }
+            wal_records = lines.len();
+        }
+        Ok(ExportFreeze {
+            generation: self.generation,
+            wal_records,
+            snapshot,
+        })
     }
 
     pub fn replication_export(&mut self) -> Result<WalReplicationExport, StoreError> {
@@ -1096,6 +1259,94 @@ impl FileWal {
         self.last_sync_at = Instant::now();
         self.append_buffer.clear();
         Ok(())
+    }
+
+    /// [`FileWal::replace_with_replication_export`] from a verified export
+    /// file, streaming: the snapshot section becomes `<wal>.snapshot`
+    /// (temp file, fsync, rename) and the WAL section the WAL, under a new
+    /// generation. Every line is checked first, so a bad line leaves the
+    /// local files untouched.
+    pub fn replace_with_replication_export_file(
+        &mut self,
+        export: &ReplicationExportFile,
+    ) -> Result<(), StoreError> {
+        self.ensure_writable()?;
+        self.flush_pending_sync()?;
+        export.for_each_line(|_, line| check_replicated_line(line))?;
+
+        let snapshot_path = self.snapshot_path();
+        let mut tmp_path = snapshot_path.clone().into_os_string();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            let mut out = std::io::BufWriter::new(&mut file);
+            out.write_all(SNAPSHOT_HEADER.as_bytes())?;
+            out.write_all(b"\n")?;
+            export.for_each_line(|section, line| {
+                if section == ExportSection::Snapshot {
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Ok(())
+            })?;
+            out.flush()?;
+            drop(out);
+            sync_file(&file)?;
+        }
+        rename_file(&tmp_path, &snapshot_path)?;
+        sync_parent_dir(&snapshot_path)?;
+        failpoint!("export_apply.snapshot_replaced");
+
+        self.bump_generation()?;
+        self.replication_index.reset();
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+            let mut out = std::io::BufWriter::new(&mut file);
+            export.for_each_line(|section, line| {
+                if section == ExportSection::Wal {
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                }
+                Ok(())
+            })?;
+            out.flush()?;
+            drop(out);
+            file.sync_all()?;
+        }
+        sync_parent_dir(&self.path)?;
+        self.wal_records = export.wal_records;
+        self.unsynced_records = 0;
+        self.last_sync_at = Instant::now();
+        self.append_buffer.clear();
+        Ok(())
+    }
+
+    /// Appends replicated lines as one unit: every line is checked first,
+    /// then all are written with one write and one fsync (whatever the
+    /// write policy), instead of one fsync per line.
+    pub fn append_replicated_lines(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        let mut checked = Vec::with_capacity(lines.len());
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                return Err(StoreError::Parse(
+                    "raw WAL record line must not be empty".to_string(),
+                ));
+            }
+            check_replicated_line(line)?;
+            checked.push(line.to_string());
+        }
+        self.append_group_lines(&checked)?;
+        self.flush_pending_sync()
     }
 
     fn append_record(&mut self, record: &PersistedRecord) -> Result<(), StoreError> {
@@ -1408,13 +1659,105 @@ impl FileWal {
         self.ensure_writable()?;
         let truncated_wal_records = self.wal_records;
         self.flush_pending_sync()?;
+        // The view length the snapshot corresponds to. If it cannot be read
+        // no transition is recorded and followers resync, as before.
+        let closed = match self.replication_view_len() {
+            Ok(len) => Some((self.generation, len)),
+            Err(err) => {
+                eprintln!("warning: checkpoint could not measure the replication view: {err:?}");
+                None
+            }
+        };
         self.write_snapshot_records(snapshot_records)?;
         self.truncate_wal()?;
+        // Recorded only after the truncation is durable: a crash before this
+        // point leaves no transition, so followers resync instead of
+        // switching into a WAL that may still hold the old lines.
+        if let Some((from_generation, from_records)) = closed {
+            failpoint!("wal.before_transition_recorded");
+            self.record_transition(GenerationTransition {
+                from_generation,
+                from_records,
+                to_generation: self.generation,
+            });
+        }
         Ok(WalCheckpointStats {
             snapshot_records: snapshot_records.len(),
             truncated_wal_records,
         })
     }
+}
+
+impl FileWal {
+    /// Appends a transition to `<wal>.gen.transitions` (temp file, fsync,
+    /// rename). A failure is logged, not returned: without the record a
+    /// follower falls back to a full resync.
+    fn record_transition(&mut self, transition: GenerationTransition) {
+        let mut next = self.transitions.clone();
+        next.push(transition);
+        let excess = next.len().saturating_sub(GENERATION_TRANSITIONS_KEPT);
+        next.drain(..excess);
+        match write_transitions(&transitions_path_for(&self.path), &next) {
+            Ok(()) => self.transitions = next,
+            Err(err) => eprintln!(
+                "warning: could not record the WAL generation transition (followers will resync): {err:?}"
+            ),
+        }
+    }
+}
+
+fn transitions_path_for(wal_path: &Path) -> PathBuf {
+    let mut path = wal_path.to_path_buf().into_os_string();
+    path.push(".gen.transitions");
+    PathBuf::from(path)
+}
+
+/// One `<from:016x> <records> <to:016x>` line per transition. Unreadable
+/// lines are ignored (a follower that needed one resyncs).
+fn load_transitions(path: &Path) -> Vec<GenerationTransition> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let from_generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let from_records = parts.next()?.parse::<usize>().ok()?;
+            let to_generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(GenerationTransition {
+                from_generation,
+                from_records,
+                to_generation,
+            })
+        })
+        .collect()
+}
+
+fn write_transitions(path: &Path, transitions: &[GenerationTransition]) -> Result<(), StoreError> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut body = String::new();
+    for t in transitions {
+        body.push_str(&format!(
+            "{:016x} {} {:016x}\n",
+            t.from_generation, t.from_records, t.to_generation
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(body.as_bytes())?;
+    sync_file(&file)?;
+    drop(file);
+    rename_file(&tmp, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
 }
 
 impl Drop for FileWal {
@@ -1896,7 +2239,7 @@ impl ReplayParser {
 /// A replicated line must parse, except legacy-format lines, which a
 /// follower mirrors verbatim (its own lenient replay quarantines them just
 /// like the leader's).
-fn check_replicated_line(line: &str) -> Result<(), StoreError> {
+pub(crate) fn check_replicated_line(line: &str) -> Result<(), StoreError> {
     match line_to_record(line) {
         Ok(_) => Ok(()),
         Err(_) if is_legacy_kind(record_kind(line)) => Ok(()),

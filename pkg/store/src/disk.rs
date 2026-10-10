@@ -698,93 +698,106 @@ impl DiskBackedStore {
         Ok(claims_loaded)
     }
 
-    /// Mirror one tombstone (see `delete::DiskDeletion`) in a single write
-    /// transaction: blob rewrites first, then row removals, so a rewritten
-    /// blob of a claim the same tombstone removes is dropped with it.
-    pub(crate) fn apply_deletion(
-        &self,
-        deletion: &crate::delete::DiskDeletion,
-    ) -> Result<(), String> {
+    /// Writes a run of staged mutations (in order) in ONE write transaction
+    /// and one commit, instead of one durable commit per mutation. Used for
+    /// a replicated frame, a batch and an atomic bundle: either all of the
+    /// run reaches redb or none of it does.
+    pub(crate) fn write_ops(&self, ops: &[crate::StagedDiskOp]) -> Result<(), String> {
+        use crate::StagedDiskOp;
+        if ops.is_empty() {
+            return Ok(());
+        }
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
-        {
-            let mut evidence_table = txn
-                .open_table(TABLE_EVIDENCE)
-                .map_err(|e| err("open evidence", e))?;
-            for (claim_id, evidence) in &deletion.evidence_blobs {
-                if evidence.is_empty() {
-                    evidence_table
-                        .remove(claim_id.as_str())
-                        .map_err(|e| err("remove evidence", e))?;
-                } else {
-                    let bytes = value_codec::encode(&dedupe_evidence(evidence))
+        for op in ops {
+            match op {
+                StagedDiskOp::Claim(claim) => {
+                    let bytes = value_codec::encode(claim)
+                        .map_err(|e| map_codec_err("serialize claim", e))?;
+                    let mut table = txn
+                        .open_table(TABLE_CLAIMS)
+                        .map_err(|e| err("open claims", e))?;
+                    table
+                        .insert(claim.claim_id.as_str(), bytes.as_slice())
+                        .map_err(|e| err("write claim", e))?;
+                    let mut set = txn
+                        .open_table(TABLE_TENANT_CLAIMS_SET)
+                        .map_err(|e| err("open tenant_claims_set", e))?;
+                    let key: (&str, &str) = (claim.tenant_id.as_str(), claim.claim_id.as_str());
+                    set.insert(key, ())
+                        .map_err(|e| err("write tenant_claims_set", e))?;
+                }
+                StagedDiskOp::Evidence(evidence) => {
+                    let mut table = txn
+                        .open_table(TABLE_EVIDENCE)
+                        .map_err(|e| err("open evidence", e))?;
+                    let mut current: Vec<Evidence> = match table
+                        .get(evidence.claim_id.as_str())
+                        .map_err(|e| err("read evidence", e))?
+                    {
+                        Some(v) => read_bytes(v.value().to_vec(), "deserialize evidence")?,
+                        None => Vec::new(),
+                    };
+                    crate::upsert_evidence(&mut current, evidence.clone());
+                    let bytes = value_codec::encode(&dedupe_evidence(&current))
                         .map_err(|e| map_codec_err("serialize evidence", e))?;
-                    evidence_table
-                        .insert(claim_id.as_str(), bytes.as_slice())
+                    table
+                        .insert(evidence.claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write evidence", e))?;
                 }
-            }
-            let mut edges_table = txn
-                .open_table(TABLE_EDGES)
-                .map_err(|e| err("open edges", e))?;
-            for (from, edges) in &deletion.edge_blobs {
-                if edges.is_empty() {
-                    edges_table
-                        .remove(from.as_str())
-                        .map_err(|e| err("remove edges", e))?;
-                } else {
-                    let bytes = value_codec::encode(&dedupe_edges(edges))
+                StagedDiskOp::Edge(edge) => {
+                    let mut table = txn
+                        .open_table(TABLE_EDGES)
+                        .map_err(|e| err("open edges", e))?;
+                    let mut current: Vec<ClaimEdge> = match table
+                        .get(edge.from_claim_id.as_str())
+                        .map_err(|e| err("read edges", e))?
+                    {
+                        Some(v) => read_bytes(v.value().to_vec(), "deserialize edges")?,
+                        None => Vec::new(),
+                    };
+                    crate::upsert_edge(&mut current, edge.clone());
+                    let bytes = value_codec::encode(&dedupe_edges(&current))
                         .map_err(|e| map_codec_err("serialize edges", e))?;
-                    edges_table
-                        .insert(from.as_str(), bytes.as_slice())
+                    table
+                        .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write edges", e))?;
                 }
-            }
-            let mut claims_table = txn
-                .open_table(TABLE_CLAIMS)
-                .map_err(|e| err("open claims", e))?;
-            let mut set_table = txn
-                .open_table(TABLE_TENANT_CLAIMS_SET)
-                .map_err(|e| err("open tenant_claims_set", e))?;
-            let mut vectors_table = txn
-                .open_table(TABLE_CLAIM_VECTORS)
-                .map_err(|e| err("open claim_vectors", e))?;
-            for (tenant_id, claim_id) in &deletion.claims {
-                let claim_id = claim_id.as_str();
-                claims_table
-                    .remove(claim_id)
-                    .map_err(|e| err("remove claim", e))?;
-                let key: (&str, &str) = (tenant_id.as_str(), claim_id);
-                set_table
-                    .remove(key)
-                    .map_err(|e| err("remove tenant_claims_set", e))?;
-                evidence_table
-                    .remove(claim_id)
-                    .map_err(|e| err("remove evidence", e))?;
-                edges_table
-                    .remove(claim_id)
-                    .map_err(|e| err("remove edges", e))?;
-                vectors_table
-                    .remove(claim_id)
-                    .map_err(|e| err("remove claim_vector", e))?;
-            }
-            let mut dims_table = txn
-                .open_table(TABLE_TENANT_DIMS)
-                .map_err(|e| err("open tenant_dims", e))?;
-            for tenant_id in &deletion.tenant_dims {
-                dims_table
-                    .remove(tenant_id.as_str())
-                    .map_err(|e| err("remove tenant_dim", e))?;
-            }
-            let mut commits_table = txn
-                .open_table(TABLE_BATCH_COMMITS)
-                .map_err(|e| err("open batch_commits", e))?;
-            for commit_id in &deletion.batch_commits {
-                commits_table
-                    .remove(commit_id.as_str())
-                    .map_err(|e| err("remove batch_commit", e))?;
+                StagedDiskOp::Vector {
+                    claim_id,
+                    tenant_id,
+                    vector,
+                    new_dim,
+                } => {
+                    let bytes = value_codec::encode(vector)
+                        .map_err(|e| map_codec_err("serialize vector", e))?;
+                    let mut table = txn
+                        .open_table(TABLE_CLAIM_VECTORS)
+                        .map_err(|e| err("open claim_vectors", e))?;
+                    table
+                        .insert(claim_id.as_str(), bytes.as_slice())
+                        .map_err(|e| err("write claim_vector", e))?;
+                    if let Some(dim) = new_dim {
+                        let mut dims = txn
+                            .open_table(TABLE_TENANT_DIMS)
+                            .map_err(|e| err("open tenant_dims", e))?;
+                        dims.insert(tenant_id.as_str(), *dim as u64)
+                            .map_err(|e| err("write tenant_dim", e))?;
+                    }
+                }
+                StagedDiskOp::BatchCommit(commit) => {
+                    let bytes = value_codec::encode(commit)
+                        .map_err(|e| map_codec_err("serialize batch_commit", e))?;
+                    let mut table = txn
+                        .open_table(TABLE_BATCH_COMMITS)
+                        .map_err(|e| err("open batch_commits", e))?;
+                    table
+                        .insert(commit.commit_id.as_str(), bytes.as_slice())
+                        .map_err(|e| err("write batch_commit", e))?;
+                }
+                StagedDiskOp::Delete(deletion) => apply_deletion_in(&txn, deletion)?,
             }
         }
-        txn.commit().map_err(|e| err("commit deletion", e))?;
+        txn.commit().map_err(|e| err("commit batch", e))?;
         Ok(())
     }
 
@@ -917,4 +930,91 @@ impl DiskBackedStore {
         txn.commit().map_err(|e| err("commit flush", e))?;
         Ok(())
     }
+}
+
+/// The row changes of one tombstone inside `txn` (see
+/// [`DiskBackedStore::write_ops`]): blob rewrites first, then row removals,
+/// so a rewritten blob of a claim the same tombstone removes is dropped with
+/// it.
+fn apply_deletion_in(
+    txn: &redb::WriteTransaction,
+    deletion: &crate::delete::DiskDeletion,
+) -> Result<(), String> {
+    let mut evidence_table = txn
+        .open_table(TABLE_EVIDENCE)
+        .map_err(|e| err("open evidence", e))?;
+    for (claim_id, evidence) in &deletion.evidence_blobs {
+        if evidence.is_empty() {
+            evidence_table
+                .remove(claim_id.as_str())
+                .map_err(|e| err("remove evidence", e))?;
+        } else {
+            let bytes = value_codec::encode(&dedupe_evidence(evidence))
+                .map_err(|e| map_codec_err("serialize evidence", e))?;
+            evidence_table
+                .insert(claim_id.as_str(), bytes.as_slice())
+                .map_err(|e| err("write evidence", e))?;
+        }
+    }
+    let mut edges_table = txn
+        .open_table(TABLE_EDGES)
+        .map_err(|e| err("open edges", e))?;
+    for (from, edges) in &deletion.edge_blobs {
+        if edges.is_empty() {
+            edges_table
+                .remove(from.as_str())
+                .map_err(|e| err("remove edges", e))?;
+        } else {
+            let bytes = value_codec::encode(&dedupe_edges(edges))
+                .map_err(|e| map_codec_err("serialize edges", e))?;
+            edges_table
+                .insert(from.as_str(), bytes.as_slice())
+                .map_err(|e| err("write edges", e))?;
+        }
+    }
+    let mut claims_table = txn
+        .open_table(TABLE_CLAIMS)
+        .map_err(|e| err("open claims", e))?;
+    let mut set_table = txn
+        .open_table(TABLE_TENANT_CLAIMS_SET)
+        .map_err(|e| err("open tenant_claims_set", e))?;
+    let mut vectors_table = txn
+        .open_table(TABLE_CLAIM_VECTORS)
+        .map_err(|e| err("open claim_vectors", e))?;
+    for (tenant_id, claim_id) in &deletion.claims {
+        let claim_id = claim_id.as_str();
+        claims_table
+            .remove(claim_id)
+            .map_err(|e| err("remove claim", e))?;
+        let key: (&str, &str) = (tenant_id.as_str(), claim_id);
+        set_table
+            .remove(key)
+            .map_err(|e| err("remove tenant_claims_set", e))?;
+        evidence_table
+            .remove(claim_id)
+            .map_err(|e| err("remove evidence", e))?;
+        edges_table
+            .remove(claim_id)
+            .map_err(|e| err("remove edges", e))?;
+        vectors_table
+            .remove(claim_id)
+            .map_err(|e| err("remove claim_vector", e))?;
+    }
+    let mut dims_table = txn
+        .open_table(TABLE_TENANT_DIMS)
+        .map_err(|e| err("open tenant_dims", e))?;
+    for tenant_id in &deletion.tenant_dims {
+        dims_table
+            .remove(tenant_id.as_str())
+            .map_err(|e| err("remove tenant_dim", e))?;
+    }
+    let mut commits_table = txn
+        .open_table(TABLE_BATCH_COMMITS)
+        .map_err(|e| err("open batch_commits", e))?;
+    for commit_id in &deletion.batch_commits {
+        commits_table
+            .remove(commit_id.as_str())
+            .map_err(|e| err("remove batch_commit", e))?;
+    }
+    Ok(())
 }

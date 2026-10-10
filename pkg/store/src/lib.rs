@@ -56,6 +56,14 @@ pub use wal::{
     WalReplicationFrame, WalRollbackPoint, WalWritePolicy, inspect_wal_file, repair_wal_file,
 };
 pub use wal::{
+    ChunkFetch, ChunkRead, DownloadOutcome, DownloadPaths, DownloadedExport,
+    EXPORT_CHUNK_DEFAULT_BYTES, EXPORT_CHUNK_HEADER_RESERVE, EXPORT_CHUNK_MAX_BYTES,
+    EXPORT_IDLE_TTL, EXPORTS_RETAINED, ExportSection, ExportSource, GENERATION_TRANSITIONS_KEPT,
+    GenerationTransition, HttpExportSource, LocalExportSource, ReplicationExportChunk,
+    ReplicationExportFile, ReplicationExportManifest, ReplicationExportStore, download_export,
+    hash_file, valid_export_id,
+};
+pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
     batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
 };
@@ -93,6 +101,18 @@ impl PreparedIngest {
     pub fn claim_id(&self) -> &str {
         &self.claim.claim_id
     }
+}
+
+/// Result of [`InMemoryStore::apply_replicated_lines`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicatedApply {
+    pub applied: usize,
+    /// Lines lenient replay would quarantine (see
+    /// [`InMemoryStore::apply_persisted_record_line_lenient`]).
+    pub skipped: usize,
+    /// The redb write of the frame failed: the handle was detached and the
+    /// disk marked unavailable (the WAL stays the source of truth).
+    pub disk_error: Option<String>,
 }
 
 /// Result of [`InMemoryStore::ingest_atomic_persistent`].
@@ -467,14 +487,12 @@ impl InMemoryStore {
 
         match self.disk.clone() {
             Some(disk) => {
-                for op in &ops {
-                    if let Err(reason) = write_disk_op(&disk, op) {
-                        self.disk = None;
-                        self.disk_status = disk::DiskStatus::Unavailable {
-                            reason: reason.clone(),
-                        };
-                        return Err(StoreError::Io(reason));
-                    }
+                if let Err(reason) = disk.write_ops(&ops) {
+                    self.disk = None;
+                    self.disk_status = disk::DiskStatus::Unavailable {
+                        reason: reason.clone(),
+                    };
+                    return Err(StoreError::Io(reason));
                 }
             }
             None => {
@@ -931,17 +949,14 @@ impl InMemoryStore {
         self.staged_disk_ops = previous_staging;
         self.disk = disk;
         let mut disk_failure = None;
-        if let Some(disk) = self.disk.clone() {
-            for op in &ops {
-                if let Err(reason) = write_disk_op(&disk, op) {
-                    self.disk = None;
-                    self.disk_status = disk::DiskStatus::Unavailable {
-                        reason: reason.clone(),
-                    };
-                    disk_failure = Some(reason);
-                    break;
-                }
-            }
+        if let Some(disk) = self.disk.clone()
+            && let Err(reason) = disk.write_ops(&ops)
+        {
+            self.disk = None;
+            self.disk_status = disk::DiskStatus::Unavailable {
+                reason: reason.clone(),
+            };
+            disk_failure = Some(reason);
         }
         result.map(|()| disk_failure)
     }
@@ -1217,6 +1232,65 @@ impl InMemoryStore {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Applies a run of replicated lines (one delta frame) to this store in
+    /// place, each the way [`Self::apply_persisted_record_line_lenient`]
+    /// does, with the redb writes of the whole run in one transaction.
+    ///
+    /// Unlike staging on [`Self::clone_detached`] this costs time and memory
+    /// proportional to the frame, not to the store. Every line is parsed
+    /// before anything is applied, so a frame with an unreadable record is
+    /// rejected untouched. A record that parses but cannot be applied (the
+    /// follower diverged from the leader) fails the call after a prefix of
+    /// the frame was applied in memory; redb is not written then. The
+    /// caller must restore its state in that case (reload from its WAL,
+    /// which does not hold the frame yet, or resync).
+    ///
+    /// With `keep_wal_events == false` the in-memory event ring is left as
+    /// it was (the retrieval follower does not serve the event stream).
+    pub fn apply_replicated_lines(
+        &mut self,
+        lines: &[String],
+        keep_wal_events: bool,
+    ) -> Result<ReplicatedApply, StoreError> {
+        for line in lines {
+            wal::check_replicated_line(line)?;
+        }
+        let saved_ring = (!keep_wal_events).then(|| std::mem::take(&mut self.wal));
+        let disk = self.disk.take();
+        let previous_staging = self.staged_disk_ops.replace(Vec::new());
+        let mut outcome = ReplicatedApply::default();
+        let result = (|| {
+            for line in lines {
+                if self.apply_persisted_record_line_lenient(line)? {
+                    outcome.applied += 1;
+                } else {
+                    outcome.skipped += 1;
+                }
+            }
+            Ok::<(), StoreError>(())
+        })();
+        let ops = self.staged_disk_ops.take().unwrap_or_default();
+        self.staged_disk_ops = previous_staging;
+        self.disk = disk;
+        if let Some(mut ring) = saved_ring {
+            ring.total = ring.total.max(self.wal.total);
+            self.wal = ring;
+        }
+        result?;
+        if let Some(disk) = self.disk.clone() {
+            if let Err(reason) = disk.write_ops(&ops) {
+                self.disk = None;
+                self.disk_status = disk::DiskStatus::Unavailable {
+                    reason: reason.clone(),
+                };
+                outcome.disk_error = Some(reason);
+            }
+        } else if let Some(buffer) = self.staged_disk_ops.as_mut() {
+            buffer.extend(ops);
+        }
+        Ok(outcome)
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {
@@ -2281,7 +2355,8 @@ impl InMemoryStore {
     /// this is a no-op.
     fn mirror_op(&mut self, op: StagedDiskOp) -> Result<(), StoreError> {
         if let Some(disk) = self.disk.as_ref() {
-            write_disk_op(disk, &op).map_err(StoreError::Io)
+            disk.write_ops(std::slice::from_ref(&op))
+                .map_err(StoreError::Io)
         } else {
             if let Some(buffer) = self.staged_disk_ops.as_mut() {
                 buffer.push(op);
@@ -2952,44 +3027,6 @@ fn upsert_edge(list: &mut Vec<ClaimEdge>, edge: ClaimEdge) -> bool {
             list.push(edge);
             true
         }
-    }
-}
-
-/// Perform one mirrored write on the redb handle. Evidence and edge
-/// blobs are read-modify-write upserts so re-applying a record (retry,
-/// replication re-apply, WAL replay over a snapshot) never duplicates.
-fn write_disk_op(disk: &disk::DiskBackedStore, op: &StagedDiskOp) -> Result<(), String> {
-    match op {
-        StagedDiskOp::Claim(claim) => {
-            disk.put_claim(claim)?;
-            disk.add_claim_to_tenant(&claim.tenant_id, &claim.claim_id)
-        }
-        StagedDiskOp::Evidence(evidence) => {
-            let mut current = disk
-                .get_evidence_blob(&evidence.claim_id)?
-                .unwrap_or_default();
-            upsert_evidence(&mut current, evidence.clone());
-            disk.put_evidence_blob(&evidence.claim_id, &current)
-        }
-        StagedDiskOp::Edge(edge) => {
-            let mut current = disk.get_edge_blob(&edge.from_claim_id)?.unwrap_or_default();
-            upsert_edge(&mut current, edge.clone());
-            disk.put_edge_blob(&edge.from_claim_id, &current)
-        }
-        StagedDiskOp::Vector {
-            claim_id,
-            tenant_id,
-            vector,
-            new_dim,
-        } => {
-            disk.put_vector(claim_id, vector)?;
-            if let Some(dim) = new_dim {
-                disk.put_tenant_dim(tenant_id, *dim)?;
-            }
-            Ok(())
-        }
-        StagedDiskOp::BatchCommit(metadata) => disk.put_batch_commit(metadata),
-        StagedDiskOp::Delete(deletion) => disk.apply_deletion(deletion),
     }
 }
 
