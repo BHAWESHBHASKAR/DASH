@@ -17,7 +17,6 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
 };
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -68,8 +67,9 @@ impl RecordCipher {
     /// ([`LINE_LABEL`], [`REDB_LABEL`]).
     pub fn new(key: &FileKey, label: &'static [u8]) -> Self {
         let dek = Zeroizing::new(*key.dek());
-        let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        // A fresh random salt per writing session, straight from the OS
+        // generator; the session subkey is derived from it.
+        let salt: [u8; SALT_LEN] = rand::Rng::r#gen(&mut rand::rngs::OsRng);
         let session = subkey(&dek, &salt);
         Self {
             dek,
@@ -131,8 +131,10 @@ impl RecordCipher {
                 "encrypted record is too short".to_string(),
             ));
         }
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&sealed[..SALT_LEN]);
+        // The writer's session salt, stored at the start of the record.
+        let salt: [u8; SALT_LEN] = sealed[..SALT_LEN]
+            .try_into()
+            .expect("length checked against RECORD_OVERHEAD");
         let mut counter = [0u8; COUNTER_LEN];
         counter.copy_from_slice(&sealed[SALT_LEN..SALT_LEN + COUNTER_LEN]);
         let counter = u64::from_be_bytes(counter);

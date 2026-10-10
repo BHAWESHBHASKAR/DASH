@@ -104,8 +104,7 @@ impl Keyring {
     pub fn new_file_key(&self) -> Result<FileKey, EncryptionError> {
         let mut dek = Zeroizing::new([0u8; DEK_LEN]);
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, dek.as_mut());
-        let mut file_id = [0u8; FILE_ID_LEN];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut file_id);
+        let file_id: [u8; FILE_ID_LEN] = rand::Rng::r#gen(&mut rand::rngs::OsRng);
         let wrapped = self.provider.wrap(&dek, &file_id)?;
         Ok(FileKey::new(
             FileHeader {

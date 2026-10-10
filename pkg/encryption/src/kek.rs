@@ -210,8 +210,8 @@ impl KekProvider for LocalKekProvider {
 
     fn wrap(&self, dek: &[u8; DEK_LEN], context: &[u8]) -> Result<WrappedDek, EncryptionError> {
         let kek = &self.keys[0];
-        let mut nonce = [0u8; WRAP_NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        // A fresh random nonce per wrap, straight from the OS generator.
+        let nonce: [u8; WRAP_NONCE_LEN] = rand::Rng::r#gen(&mut rand::rngs::OsRng);
         let aad = wrap_aad(&kek.id, context);
         let sealed = kek
             .cipher
