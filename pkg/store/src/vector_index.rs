@@ -1481,6 +1481,42 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_same_ids_over_and_over_keeps_the_index_size_flat() {
+        // usearch has no in-place update: a replace is a soft delete plus an
+        // add. The freed slot must be reused, or a workload that only updates
+        // a fixed set of claims grows the index (and the process) forever.
+        let config = AnnTuningConfig {
+            flat_threshold: 100,
+            expansion_add: 32,
+            ..AnnTuningConfig::default()
+        };
+        let mut index = TenantVectorIndex::new(DIM, config);
+        let ids: Vec<String> = (0..500).map(|i| format!("c{i}")).collect();
+        let mut raw = HashMap::new();
+        let mut after_first_round = 0;
+        for round in 0..30u64 {
+            for (id, v) in ids.iter().zip(clustered(ids.len(), 100 + round)) {
+                index.upsert(id, &v).unwrap();
+                raw.insert(id.clone(), v);
+            }
+            assert!(index.is_hnsw());
+            assert_eq!(index.len(), ids.len());
+            if round == 0 {
+                after_first_round = index.heap_bytes();
+            }
+        }
+        assert_eq!(
+            index.heap_bytes(),
+            after_first_round,
+            "30 rounds of replacements grew the index"
+        );
+        // Every id is still found under its latest vector.
+        for id in ids.iter().step_by(50) {
+            assert_eq!(&index.search(&raw[id], 1, None, &raw)[0].0, id);
+        }
+    }
+
+    #[test]
     fn hnsw_filtered_search_respects_the_predicate() {
         let vectors = clustered(3_000, 11);
         let raw = raw_map(&vectors);

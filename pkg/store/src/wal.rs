@@ -695,6 +695,14 @@ impl FileWal {
 
     /// Overrides the largest commit group (in records) a replication frame
     /// may be extended to cover (default [`REPLICATION_GROUP_EXTENSION_MAX`]).
+    /// Bytes read from the WAL file to serve replication frames since this
+    /// handle was opened. Serving a frame reads the lines appended since the
+    /// previous frame plus the frame itself (and fewer than
+    /// 64 lines before it), never the whole log.
+    pub fn replication_read_bytes_total(&self) -> u64 {
+        self.replication_index.read_bytes()
+    }
+
     pub fn set_replication_group_cap(&mut self, cap: usize) {
         self.replication_group_cap = cap.max(1);
     }
@@ -969,7 +977,9 @@ impl FileWal {
         max_records: usize,
         check_generation: bool,
     ) -> Result<WalReplicationFrame, StoreError> {
+        let scanned_bytes = self.wal_size_bytes()?;
         let (wal_lines, skipped) = filter_replication_lines(self.replay_wal_lines_raw()?);
+        self.replication_index.note_read(scanned_bytes);
         self.note_replication_skipped(skipped);
         let total_records = wal_lines.len();
         if let Some(resync) = self.resync_frame(

@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     QuarantineSink, ReplayParser, ReplayPolicy, is_legacy_kind, is_valid_tail, record_kind,
@@ -96,6 +97,9 @@ pub(super) struct ReplicationIndex {
     /// Byte offsets of the left-out lines.
     dropped: BTreeSet<u64>,
     filter: ReplicationFilter,
+    /// Bytes read from the file for the replication view since the WAL was
+    /// opened (kept across resets).
+    read_bytes: AtomicU64,
 }
 
 impl Default for ReplicationIndex {
@@ -107,6 +111,7 @@ impl Default for ReplicationIndex {
             anchors: Vec::new(),
             dropped: BTreeSet::new(),
             filter: ReplicationFilter::new(),
+            read_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -122,7 +127,20 @@ struct PendingLine {
 
 impl ReplicationIndex {
     pub(super) fn reset(&mut self) {
+        let read_bytes = self.read_bytes.load(Ordering::Relaxed);
         *self = Self::default();
+        self.read_bytes = AtomicU64::new(read_bytes);
+    }
+
+    /// Bytes read from the file for the replication view so far.
+    pub(super) fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Counts `bytes` read for the replication view outside the index (the
+    /// full-scan fallback).
+    pub(super) fn note_read(&self, bytes: u64) {
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Number of lines in the replication view.
@@ -168,6 +186,7 @@ impl ReplicationIndex {
             if n == 0 {
                 break;
             }
+            self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
             let start = pos;
             pos += n as u64;
             let terminated = buf.last() == Some(&b'\n');
@@ -219,7 +238,7 @@ impl ReplicationIndex {
             return false;
         };
         if self.filter.keep(&text) {
-            if self.kept % ANCHOR_STRIDE == 0 {
+            if self.kept.is_multiple_of(ANCHOR_STRIDE) {
                 self.anchors.push(line.start);
             }
             self.kept += 1;
@@ -283,6 +302,7 @@ impl ViewLines<'_> {
             if n == 0 {
                 break;
             }
+            self.index.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
             let start = self.pos;
             self.pos += n as u64;
             let body = self.buf.strip_suffix(b"\n").unwrap_or(&self.buf);
@@ -313,4 +333,254 @@ impl Iterator for ViewLines<'_> {
 pub(super) fn decode_line(body: &[u8]) -> Option<String> {
     let body = body.strip_suffix(b"\r").unwrap_or(body);
     std::str::from_utf8(body).ok().map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use schema::claim_builder;
+    use tempfile::TempDir;
+
+    use super::super::{FileWal, PersistedRecord, record_to_line};
+    use super::ANCHOR_STRIDE;
+
+    /// One single-claim update as the ingestion service writes it: a commit
+    /// group holding the claim and its vector.
+    fn append_update(wal: &mut FileWal, claim: &str, round: u64) {
+        wal.begin_group(&format!("{claim}-{round}"), round).unwrap();
+        wal.append_claim(&claim_builder(
+            claim,
+            "tenant-a",
+            &format!("text of {claim}, revision {round}"),
+            0.9,
+        ))
+        .unwrap();
+        wal.append_claim_vector(claim, &[round as f32 + 1.0, 2.0, 3.0])
+            .unwrap();
+        wal.append_batch_commit(
+            &format!("~tx:{claim}-{round}"),
+            1,
+            round,
+            &[claim.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn append_raw_bytes(wal: &FileWal, bytes: &[u8]) {
+        let mut file = OpenOptions::new().append(true).open(wal.path()).unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    /// The frame served from the index and the frame built from a full scan
+    /// must be identical (or fail identically).
+    fn assert_same_frame(wal: &mut FileWal, generation: Option<u64>, from: usize, max: usize) {
+        let indexed = wal.replication_frame_from(generation, from, max);
+        let scanned = wal.replication_frame_full_scan(generation, from, max, true);
+        assert_eq!(
+            format!("{indexed:?}"),
+            format!("{scanned:?}"),
+            "frame from={from} max={max} generation={generation:?}"
+        );
+    }
+
+    #[test]
+    fn frames_read_only_new_lines_while_the_same_claims_are_updated() {
+        let dir = TempDir::new().unwrap();
+        let mut wal =
+            FileWal::open_with_sync_every_records(dir.path().join("leader.wal"), 256).unwrap();
+        let generation = wal.generation();
+        let mut offset = 0;
+        let mut served = Vec::new();
+        let mut polls = 0usize;
+        // 20 claims updated 200 times each, drained by a follower with small
+        // frames after every round.
+        for round in 0..200u64 {
+            for claim in 0..20 {
+                append_update(&mut wal, &format!("claim-{claim}"), round);
+            }
+            loop {
+                let frame = wal
+                    .replication_frame_from(Some(generation), offset, 64)
+                    .unwrap();
+                assert!(!frame.needs_resync);
+                polls += 1;
+                served.extend(frame.wal_lines);
+                offset = frame.next_offset;
+                if offset == frame.total_records {
+                    break;
+                }
+            }
+        }
+        // The follower received the log exactly.
+        let full = wal.replay_wal_lines_raw().unwrap();
+        assert_eq!(full.len(), 200 * 20 * 4);
+        assert_eq!(served, full);
+
+        // Reading the whole file on every poll would read it about
+        // `polls / 2` times over (here more than 100 times). Indexing reads
+        // each byte once, serving reads each frame once plus fewer than
+        // ANCHOR_STRIDE lines before it.
+        let wal_bytes = wal.wal_size_bytes().unwrap();
+        let read = wal.replication_read_bytes_total();
+        assert!(polls > 200, "{polls} polls");
+        assert!(
+            read <= 4 * wal_bytes,
+            "replication read {read} bytes for a {wal_bytes}-byte WAL in {polls} polls"
+        );
+
+        // A caught-up follower costs no reads at all.
+        let before = wal.replication_read_bytes_total();
+        for _ in 0..10 {
+            let frame = wal
+                .replication_frame_from(Some(generation), offset, 64)
+                .unwrap();
+            assert!(frame.wal_lines.is_empty());
+        }
+        assert_eq!(wal.replication_read_bytes_total(), before);
+
+        // The index holds one offset per ANCHOR_STRIDE lines and nothing per
+        // update.
+        let index = &wal.replication_index;
+        assert_eq!(index.total(), full.len());
+        assert_eq!(index.anchor_count(), full.len().div_ceil(ANCHOR_STRIDE));
+        assert!(index.dropped.is_empty());
+        assert_eq!(index.skipped(), 0);
+
+        // A checkpoint empties the index.
+        wal.compact_with_snapshot(&[]).unwrap();
+        let frame = wal
+            .replication_frame_from(Some(wal.generation()), 0, 64)
+            .unwrap();
+        assert_eq!(frame.total_records, 0);
+        assert_eq!(wal.replication_index.anchor_count(), 0);
+    }
+
+    const TAIL: &str = "null\tnull\tnull\tnull\tnull";
+
+    /// Legacy lines lenient replay quarantines (and their dependents) next
+    /// to readable ones.
+    fn legacy_lines() -> Vec<String> {
+        vec![
+            format!("C\tc-ok\ttenant-a\ttext of c-ok\t0.9\tnull\t3:foo\t\t{TAIL}"),
+            format!("C\tc-ent\ttenant-a\ttext of c-ent\t0.9\tnull\t5:a\tb c\t\t{TAIL}"),
+            "E\te-dep\tc-ent\tsource-1\tsupports\t0.8".to_string(),
+            "E\te-ok\tc-ok\tsource-1\tsupports\t0.8".to_string(),
+            "G\tg-dep\tc-ok\tc-ent\tsupports\t0.5".to_string(),
+            "V\tc-ent\t1,2,3".to_string(),
+            "V\tc-ok\t1,NaN,3".to_string(),
+            "this is not a record".to_string(),
+        ]
+    }
+
+    #[test]
+    fn indexed_frames_match_full_scan_frames_under_random_operations() {
+        for seed in 0..4u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let dir = TempDir::new().unwrap();
+            let mut wal =
+                FileWal::open_with_sync_every_records(dir.path().join("leader.wal"), 1).unwrap();
+            let legacy = legacy_lines();
+            let mut round = 0u64;
+            for _ in 0..300 {
+                round += 1;
+                match rng.gen_range(0..100) {
+                    0..=44 => {
+                        let claim = format!("claim-{}", rng.gen_range(0..5));
+                        append_update(&mut wal, &claim, round);
+                    }
+                    45..=59 => {
+                        let line = &legacy[rng.gen_range(0..legacy.len())];
+                        if line.contains('\t') {
+                            wal.append_raw_record_line(line).unwrap();
+                        } else {
+                            append_raw_bytes(&wal, format!("{line}\n").as_bytes());
+                        }
+                    }
+                    60..=66 => {
+                        let blank: &[u8] = match rng.gen_range(0..3) {
+                            0 => b"\n",
+                            1 => b"   \n",
+                            _ => b"\r\n",
+                        };
+                        append_raw_bytes(&wal, blank);
+                    }
+                    67..=71 => {
+                        // A group left open: a write in progress.
+                        wal.begin_group(&format!("open-{round}"), round).unwrap();
+                        wal.append_claim(&claim_builder("claim-open", "tenant-a", "t", 0.5))
+                            .unwrap();
+                    }
+                    72..=77 => {
+                        let point = wal.begin_rollback_point().unwrap();
+                        append_update(&mut wal, "claim-rolled-back", round);
+                        // Index the lines that are about to be rolled back.
+                        let generation = Some(wal.generation());
+                        assert_same_frame(&mut wal, generation, 0, 64);
+                        wal.rollback_to(point).unwrap();
+                        // Longer lines in their place: the file grows past
+                        // the old indexed length before the next frame.
+                        append_update(&mut wal, "claim-written-after-rollback", round);
+                    }
+                    78..=80 => {
+                        wal.compact_with_snapshot(&[]).unwrap();
+                    }
+                    81..=85 => {
+                        // A terminated line that is not a record: torn while
+                        // it is the last line, served once lines follow it.
+                        append_raw_bytes(&wal, b"C2\ttorn\n");
+                    }
+                    86..=90 => {
+                        // A complete record without its newline (only a
+                        // crash leaves one; opening the WAL repairs it).
+                        let line = record_to_line(&PersistedRecord::Claim(claim_builder(
+                            "claim-tail",
+                            "tenant-a",
+                            "unterminated",
+                            0.5,
+                        )));
+                        append_raw_bytes(&wal, line.as_bytes());
+                        let generation = Some(wal.generation());
+                        assert_same_frame(&mut wal, generation, 0, 1_000_000);
+                        append_raw_bytes(&wal, b"\n");
+                    }
+                    91..=94 => {
+                        wal.set_replication_group_cap(rng.gen_range(1..8));
+                    }
+                    _ => {
+                        wal.set_replication_group_cap(1_000_000);
+                    }
+                }
+                let generation = wal.generation();
+                let total = wal
+                    .replication_frame_full_scan(Some(generation), 0, 1, true)
+                    .map(|f| f.total_records)
+                    .unwrap_or(0);
+                assert_same_frame(&mut wal, None, 0, 64);
+                assert_same_frame(&mut wal, Some(generation ^ 1), 0, 64);
+                for _ in 0..4 {
+                    let from = rng.gen_range(0..=total + 1);
+                    let max = [1, 3, 7, 64, 1_000_000][rng.gen_range(0..5)];
+                    assert_same_frame(&mut wal, Some(generation), from, max);
+                }
+                assert_same_frame(&mut wal, Some(generation), total, 64);
+            }
+        }
+    }
+
+    #[test]
+    fn an_interior_line_that_is_not_utf8_fails_like_a_full_scan() {
+        let dir = TempDir::new().unwrap();
+        let mut wal = FileWal::open(dir.path().join("leader.wal")).unwrap();
+        append_update(&mut wal, "claim-a", 1);
+        append_raw_bytes(&wal, b"C2\t\xff\xfe\n");
+        append_update(&mut wal, "claim-b", 2);
+        let generation = Some(wal.generation());
+        let err = wal.replication_frame_from(generation, 0, 64).unwrap_err();
+        assert!(format!("{err:?}").contains("invalid UTF-8"), "{err:?}");
+        assert_same_frame(&mut wal, generation, 0, 64);
+    }
 }
