@@ -987,3 +987,68 @@ fn a_crash_during_the_followers_local_checkpoint_falls_back_to_a_resync() {
     assert_eq!(follower.resyncs, 1);
     follower.assert_matches(&leader, "after the crashed local checkpoint");
 }
+
+// ---------------------------------------------------------------------
+// In-place apply of a frame
+// ---------------------------------------------------------------------
+
+#[test]
+fn commit_group_spans_cover_every_line_and_keep_groups_whole() {
+    let dir = TempDir::new().unwrap();
+    let mut leader = Leader::open(dir.path());
+    leader.write_n(3);
+    let lines = leader.wal().replication_export().unwrap().wal_lines;
+    let spans = commit_group_spans(&lines);
+    assert_eq!(spans.len(), 3, "one span per bundle");
+    assert_eq!(spans.first().unwrap().start, 0);
+    assert_eq!(spans.last().unwrap().end, lines.len());
+    for pair in spans.windows(2) {
+        assert_eq!(pair[0].end, pair[1].start, "contiguous");
+    }
+    let mut mixed = vec!["C\tlegacy\ttenant-a\tungrouped legacy claim\t0.9\tnull\t\t".to_string()];
+    mixed.extend(lines.iter().cloned());
+    let spans = commit_group_spans(&mixed);
+    assert_eq!(spans[0], 0..1, "an ungrouped record is its own span");
+    assert_eq!(spans.len(), 4);
+    let open_tail = &lines[..lines.len() - 1];
+    let spans = commit_group_spans(open_tail);
+    assert_eq!(
+        spans.last().unwrap().end,
+        open_tail.len(),
+        "an open group runs to the end"
+    );
+}
+
+#[test]
+fn in_place_apply_writes_redb_once_and_rejects_unreadable_frames_untouched() {
+    let dir = TempDir::new().unwrap();
+    let mut leader = Leader::open(dir.path());
+    leader.write_n(12);
+    let lines = leader.wal().replication_export().unwrap().wal_lines;
+
+    let mut follower = InMemoryStore::new().attach_disk(dir.path().join("follower.redb"));
+    let mut bad = lines.clone();
+    bad.insert(5, "this is not a wal record".to_string());
+    assert!(follower.apply_replicated_lines(&bad, false).is_err());
+    assert_eq!(
+        follower.claims_len(),
+        0,
+        "nothing applied from an unreadable frame"
+    );
+
+    let outcome = follower.apply_replicated_lines(&lines, false).unwrap();
+    assert_eq!(outcome.applied, lines.len());
+    assert_eq!(outcome.skipped, 0);
+    assert!(outcome.disk_error.is_none());
+    assert_eq!(state(&follower), state(&leader.store));
+    drop(follower);
+    // The redb mirror holds the same state.
+    let mut wal = FileWal::open(dir.path().join("empty.wal")).unwrap();
+    let (reloaded, _) = InMemoryStore::load_from_disk_and_wal(
+        dir.path().join("follower.redb"),
+        &mut wal,
+        crate::AnnTuningConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(state(&reloaded), state(&leader.store));
+}
