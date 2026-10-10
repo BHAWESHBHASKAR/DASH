@@ -2050,7 +2050,11 @@ mod tests {
             assert!(!text.contains(marker), "{}", path.display());
             assert!(!text.contains("tenant-secret"), "{}", path.display());
             if !path.to_string_lossy().ends_with(FINGERPRINT_FILE_NAME) {
-                assert!(bytes.starts_with(encryption::SEAL_MAGIC), "{}", path.display());
+                assert!(
+                    bytes.starts_with(encryption::SEAL_MAGIC),
+                    "{}",
+                    path.display()
+                );
             }
         }
         // Damage is an integrity error, not garbage.
@@ -2064,7 +2068,10 @@ mod tests {
         fs::write(&segment_path, &bytes).unwrap();
         encryption::with_keyring(Some(keyring), || {
             let err = load_segments_from_manifest(&root, &manifest).unwrap_err();
-            assert!(format!("{err:?}").contains("authentication failed"), "{err:?}");
+            assert!(
+                format!("{err:?}").contains("authentication failed"),
+                "{err:?}"
+            );
         });
         // No key configured: fail closed with the key id named.
         encryption::with_keyring(None, || {

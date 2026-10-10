@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use store::encryption::{self, FileFormat, RewrapOutcome};
-use store::{
-    DiskBackedStore, WalInspection, WalRepairOptions, inspect_wal_file, repair_wal_file,
-};
+use store::{DiskBackedStore, WalInspection, WalRepairOptions, inspect_wal_file, repair_wal_file};
 
 const USAGE: &str = "usage:
   wal-inspect inspect <wal>
@@ -87,15 +85,26 @@ fn rewrap(path: &Path) -> Result<ExitCode, String> {
         }
         if is_redb(&file) {
             match DiskBackedStore::stored_encryption_key_id(&file) {
-                Ok(None) => println!("{}\tplaintext values (rewritten encrypted by the next checkpoint)", file.display()),
-                Ok(Some(id)) if id == keyring.active_key_id() => println!("{}\tcurrent", file.display()),
-                Ok(Some(id)) => match DiskBackedStore::new_with_keyring(&file, Some(keyring.clone())) {
-                    Ok(_) => println!("{}\trewrapped ({id} -> {})", file.display(), keyring.active_key_id()),
-                    Err(err) => {
-                        failed += 1;
-                        println!("{}\tFAILED: {err}", file.display());
+                Ok(None) => println!(
+                    "{}\tplaintext values (rewritten encrypted by the next checkpoint)",
+                    file.display()
+                ),
+                Ok(Some(id)) if id == keyring.active_key_id() => {
+                    println!("{}\tcurrent", file.display())
+                }
+                Ok(Some(id)) => {
+                    match DiskBackedStore::new_with_keyring(&file, Some(keyring.clone())) {
+                        Ok(_) => println!(
+                            "{}\trewrapped ({id} -> {})",
+                            file.display(),
+                            keyring.active_key_id()
+                        ),
+                        Err(err) => {
+                            failed += 1;
+                            println!("{}\tFAILED: {err}", file.display());
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     failed += 1;
                     println!("{}\tFAILED: {err}", file.display());
