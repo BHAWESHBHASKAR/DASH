@@ -38,11 +38,13 @@ nameOverride: ""
 fullnameOverride: ""
 
 # -----------------------------------------------------------------------------
-# Namespace handling. The chart does NOT create the namespace by default;
-# `helm install --create-namespace` is the recommended path.
+# Namespace handling. Resources go to the release namespace
+# (`helm install --namespace dash-system`) unless `name` overrides it. The
+# chart does NOT create the namespace by default; `helm install
+# --create-namespace` is the recommended path.
 # -----------------------------------------------------------------------------
 namespace:
-  name: dash-system
+  name: ""
   create: false
 
 # -----------------------------------------------------------------------------

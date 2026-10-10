@@ -147,9 +147,14 @@ Usage: include "dash.secretValue" (list .Values.secret.retrieval.apiKey "secret.
 {{- default (printf "%s-control-plane-secrets" (include "dash.fullname" .)) .Values.secret.existingSecret.controlPlane -}}
 {{- end -}}
 
-{{/* Release namespace used by every namespaced resource. */}}
+{{/*
+Namespace of every namespaced resource: namespace.name when set, otherwise
+the release namespace (`helm install --namespace`). Before, the default was a
+hard-coded "dash-system", so `helm install -n other` put the objects outside
+the release namespace (and failed when dash-system did not exist).
+*/}}
 {{- define "dash.namespace" -}}
-{{- default "dash-system" .Values.namespace.name -}}
+{{- default .Release.Namespace .Values.namespace.name -}}
 {{- end -}}
 
 {{/*
