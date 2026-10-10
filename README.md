@@ -173,7 +173,7 @@ Counts are static (computed 2026-10-10: the Rust figure with `cargo test --works
 
 | Suite | Declared tests |
 |---|---|
-| Rust workspace (`#[test]` and `#[tokio::test]`) | 1377 |
+| Rust workspace (`#[test]` and `#[tokio::test]`) | 1405 |
 | Python SDK | 77 |
 | Go SDK | 98 |
 | TypeScript SDK | 77 |
