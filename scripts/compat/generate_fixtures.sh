@@ -111,7 +111,7 @@ ref: ${REF:-<prebuilt binaries>}
 commit: $COMMIT
 generated: $(date -u +%Y-%m-%d)
 generator: scripts/compat/generate_fixtures.sh
-dataset: tests/compat/dataset (ingest.jsonl, retrieve.jsonl, placements.csv)
+dataset: tests/compat/dataset (ingest.jsonl, deletes.jsonl, retrieve.jsonl, placements.csv)
 EOF
 
 echo "fixture written to $OUT"
