@@ -11,7 +11,9 @@ Helm chart for the DASH evidence-first vector store. It deploys three
 
 There is **no HorizontalPodAutoscaler**: replicas of a StatefulSet that each
 own a PVC are not interchangeable until the clustering phase. Scale retrieval
-manually (`kubectl -n <ns> scale statefulset <release>-dash-retrieval --replicas=N`);
+manually (`kubectl -n <ns> scale statefulset dash-retrieval --replicas=N` for a
+release named `dash`; the prefix is `<release>-dash` when the release name
+does not contain `dash`);
 a new replica starts empty and catches up from ingestion. Never scale
 ingestion or the control plane above 1.
 
@@ -131,7 +133,8 @@ container creates the data directories on a fresh PVC.
 | `config.persistencePath` | `/var/lib/dash` | PVC mount path |
 | `config.audit.enabled` | `true` | Audit logs on the PVC |
 | `persistence.size` / `persistence.storageClassName` | `10Gi` / cluster default | Per-pod volume |
-| `probes.*` | `/v1/live`, `/v1/ready` | Liveness, readiness and startup paths |
+| `probes.*` | `/v1/live` (liveness, startup), `/v1/ready` (readiness) | Probe paths. Startup must not use `/v1/ready`: on retrieval it also needs a reachable, caught-up leader |
+| `namespace.name` | `""` (release namespace) | Override the namespace of every object |
 | `ingress.*` | nginx, `dash.example.com` | `/v1/ingest` to ingestion, `/v1` and `/health` to retrieval |
 | `networkPolicy.enabled` | `true` | Default deny plus allow rules |
 | `networkPolicy.ollama.enabled` | `false` | Egress to in-cluster Ollama on private CIDRs (port 11434) |
@@ -153,6 +156,11 @@ scripts/check_deploy_env.sh          # every DASH_* env var must be read by the 
 CI (`.github/workflows/rust.yml`, job `deploy-manifests`) runs these with
 generated secrets.
 
+`scripts/kind_e2e.sh` installs the chart on a local kind cluster and runs
+ingest, retrieve, delete, pod kills, backup/restore, `helm upgrade` (also from
+an older chart), the raw manifests and the TLS variant; CI runs it in
+`.github/workflows/kind-e2e.yml`. See `docs/operations/kubernetes.md`.
+
 ## Upgrade, rollback, uninstall
 
 ```bash
@@ -161,6 +169,11 @@ helm history dash -n dash-system
 helm rollback dash <revision> -n dash-system
 helm uninstall dash -n dash-system
 ```
+
+A change to `config.*` or to chart-managed `secret.*` rolls every pod (the
+pod templates carry `checksum/config` and `checksum/secrets` annotations).
+Back up first (`scripts/k8s_backup_restore.sh`, see
+`docs/operations/kubernetes.md`).
 
 PVCs are owned by the StatefulSets and are **not** deleted on uninstall or
 rollback. Back up before deleting them; to wipe state:

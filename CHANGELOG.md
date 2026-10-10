@@ -6,6 +6,53 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (P7 Kubernetes end-to-end test on kind)
+
+- **`scripts/kind_e2e.sh`** installs the Helm chart on a kind cluster (node
+  image pinned by digest; kind, helm and kubectl downloaded at pinned
+  versions and verified against their sha256 files), with the image built
+  from `deploy/container/Dockerfile`, secrets from `generate-secrets.sh`, Pod
+  Security "restricted" and NetworkPolicy enforced. It checks authenticated
+  ingest, retrieval from every retrieval replica, a delete, ingestion and
+  retrieval pod kills (and a follower whose PVC is deleted), backup and
+  restore, `helm upgrade` with changed values and from the chart of an older
+  commit, the raw manifests (`kubectl apply -k deploy/k8s`), and the TLS
+  variant with a self-signed CA. Diagnostics (pod logs, `kubectl describe`,
+  events, node logs) are written on failure. CI: `.github/workflows/kind-e2e.yml`
+  on pull requests touching the deployment or the services, and nightly.
+- **`scripts/k8s_backup_restore.sh`**: cold backup and restore of a release's
+  ingestion PVC through a helper pod, in the `backup_state_bundle.sh` format
+  (WAL, snapshot, segments, checksums) plus the audit log. A restore removes
+  the derived files so every retrieval follower resyncs to the restored
+  state.
+- **Operator guide `docs/operations/kubernetes.md`**: install, verify,
+  upgrade, backup and restore, failure behavior, scaling notes and current
+  limits (one ingestion pod without failover, manual retrieval scaling).
+
+### Fixed (Helm chart and manifests, found by the kind test)
+
+- **A default Helm install never became ready.** Helm renders YAML numbers
+  as float64, so `config.checkpoint.maxWalBytes` (52428800) reached the
+  ConfigMap as `DASH_CHECKPOINT_MAX_WAL_BYTES="5.24288e+07"` and ingestion
+  refused to start (`must be an integer`). Integer settings are now rendered
+  through `int64`; CI rejects numbers in exponent form.
+- **Retrieval pods were restarted in a loop while ingestion was down.** The
+  startup probe used `/v1/ready`, which on retrieval also requires a
+  reachable, caught-up replication leader. Startup now checks `/v1/live`
+  (chart and `deploy/k8s`); readiness still uses `/v1/ready`.
+- **`helm upgrade` did not apply configuration or secret changes.** Pods read
+  them through `envFrom` at start and nothing in the pod templates changed,
+  so they kept running with the old values. The pod templates now carry
+  `checksum/config` and `checksum/secrets`, so such an upgrade rolls the
+  StatefulSets.
+- **The chart ignored the release namespace.** `namespace.name` defaulted to
+  `dash-system`, so `helm install -n other` created every object in
+  `dash-system`. It now defaults to empty and the release namespace is used;
+  set it to override. Installs that pass `-n dash-system` (the documented
+  command) render unchanged. Upgrade note: a release installed into another
+  namespace that relied on the old default must set
+  `namespace.name=dash-system` on upgrade.
+
 ### Changed (replication across checkpoints, follower throughput)
 
 - **Followers cross leader checkpoints without a full resync.** A checkpoint

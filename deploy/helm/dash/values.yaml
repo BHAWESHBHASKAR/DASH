@@ -54,7 +54,10 @@ namespace:
 # lease, so both are fixed at ONE replica (not configurable). Each retrieval
 # replica has its own PVC and follows the single ingestion pod via WAL
 # replication. Scale retrieval manually:
-#   kubectl -n <ns> scale statefulset <release>-dash-retrieval --replicas=N
+#   kubectl -n <ns> scale statefulset dash-retrieval --replicas=N
+# (release "dash"; the prefix is <release>-dash when the release name does
+# not contain "dash"). Prefer `--set replicas.retrieval=N` with helm upgrade
+# so the next upgrade does not scale it back.
 # There is no HorizontalPodAutoscaler until the clustering phase.
 # -----------------------------------------------------------------------------
 replicas:
