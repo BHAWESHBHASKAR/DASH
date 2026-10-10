@@ -930,6 +930,14 @@ fn checkpoints_on_the_leader_are_crossed_without_a_resync() {
     );
     let follower_wal = dir.path().join("follower.wal");
     let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    // The follower must be inside the leader's first generation before the
+    // first checkpoint. A follower whose first poll comes after a checkpoint
+    // has never seen that generation and correctly takes a full resync,
+    // which is a different case (covered by the resync tests).
+    let (start_generation, _) = leader.frame();
+    wait_until("follower joined", Duration::from_secs(10), || {
+        follower.metric("dash_ingest_replication_generation") == Some(start_generation)
+    });
     let mut expected = Vec::new();
     for i in 0..5u64 {
         let id = format!("s{i}");
