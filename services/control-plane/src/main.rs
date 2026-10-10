@@ -125,7 +125,7 @@ fn main() {
             .ok()
             .as_deref()
             .map(str::trim),
-        Some("1") | Some("true")
+        Some("1") | Some("true") | Some("yes")
     ) {
         let parse_ms = |name: &str, default: u64| {
             std::env::var(name)

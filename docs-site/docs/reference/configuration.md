@@ -288,6 +288,17 @@ An ingestion node can itself follow another ingestion node; it then pulls WAL fr
 | `DASH_INGEST_REPLICATION_MAX_STALENESS_MS` | `300000` | milliseconds >= 1 | Readiness staleness threshold. |  |
 | `DASH_INGEST_REPLICATION_OFFSET_PATH` | derived from the ingestion WAL path (`<wal>.replication`) | path | File storing the last applied generation and offset. |  |
 
+### Leader failover and synchronous replication
+
+| Variable | Default | Type | Description | Notes |
+|---|---|---|---|---|
+| `DASH_INGEST_FAILOVER_CONTROL_PLANE_URL` | unset (off) | URL | Base URL of the control plane that coordinates automatic failover of the ingestion leader. When set, this node heartbeats it, accepts writes only while the control plane names it leader (and its lease is valid), and otherwise follows the leader it names. Requires `DASH_NODE_ID` (unique per node), `DASH_INGEST_FAILOVER_ADVERTISE_URL` and the control-plane token (`DASH_ROUTER_CONTROL_PLANE_TOKEN` or `DASH_CONTROL_PLANE_TOKEN`). See docs/operations/failover.md. | DASH only. |
+| `DASH_INGEST_FAILOVER_ADVERTISE_URL` | unset (required with failover) | URL | Base URL (`http://host:port` or `https://...`) at which the other nodes reach this ingestion node; followers pull from it when it is leader and clients get it in `X-Dash-Leader-Url`. | DASH only. |
+| `DASH_INGEST_FAILOVER_HEARTBEAT_INTERVAL_MS` | `1000` | milliseconds >= 1 | Interval between heartbeats to the control plane. Keep it well below `DASH_CONTROL_PLANE_INGEST_LEASE_MS` (a fifth or less): the leader's lease is renewed only by a successful heartbeat. | DASH only. |
+| `DASH_INGEST_MIN_SYNC_REPLICAS` | 0 (asynchronous) | integer | Synchronous replication: a write is answered only after at least this many ingestion followers (of the current term) have durably applied it. With 1 and at least one follower an acknowledged write survives the loss of any single node. 0 answers as soon as the leader's WAL holds the write. | DASH only. |
+| `DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS` | `5000` | milliseconds >= 1 | How long a synchronous write waits for its follower confirmations before `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT` applies. | DASH only. |
+| `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT` | `fail` | `fail` \| `degrade` | `fail`: answer 503 `sync_replication_timeout` (the write is on the leader and may still replicate; clients retry, writes are idempotent). `degrade`: answer 200 with `commit_status: sync_degraded` and `X-Dash-Sync-Replication: degraded`, waiving the guarantee for that write. | DASH only. |
+
 ### Placement and routing
 
 | Variable | Default | Type | Description | Notes |
@@ -449,6 +460,15 @@ All six server settings are DASH only and the server ignores values of 0 or unpa
 | `DASH_CONTROL_PLANE_LEASE_DURATION_MS` | `30000` | milliseconds | Lease length. |  |
 | `DASH_CONTROL_PLANE_LEASE_RENEWAL_MS` | `10000` | milliseconds | Renewal interval. |  |
 | `DASH_CONTROL_PLANE_LEASE_SAFETY_MARGIN_MS` | `1000` | milliseconds | Clock-skew margin: a leader stops reporting leadership this long before the lease expires, and other nodes wait this long after expiry before taking over (capped at half the lease duration). |  |
+
+### Leader failover and synchronous replication
+
+| Variable | Default | Type | Description | Notes |
+|---|---|---|---|---|
+| `DASH_CONTROL_PLANE_INGEST_FAILOVER` | `off` | bool | Coordinate automatic failover of the ingestion leader: serve `POST /v1/control-plane/ingest/heartbeat`, `GET /v1/control-plane/ingest` and `POST /v1/control-plane/ingest/step-down`, and promote the most up-to-date follower when the leader's lease lapses. | DASH only. Enabled by `1`, `true`, `yes`. |
+| `DASH_CONTROL_PLANE_INGEST_LEASE_MS` | `5000` | milliseconds >= 1 | Lease of the ingestion leader. The leader stops accepting writes this long after the heartbeat that last renewed it was sent; failover starts this long plus the promotion grace after the control plane processed it. A control-plane outage longer than this pauses writes. | DASH only. |
+| `DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS` | `1000` | milliseconds >= 1 | Extra wait after the leader's lease before a promotion. Covers clock-rate drift between the leader and the control plane and the time between a write's lease check and its WAL append. | DASH only. |
+| `DASH_CONTROL_PLANE_INGEST_STATE_PATH` | ``<DASH_CONTROL_PLANE_STATE_PATH>.ingest-failover`` | path | Durable record of the ingestion term, leader and WAL lineage (written before any node learns a new term). Put it on the volume the control-plane replicas share. Without it and without `DASH_CONTROL_PLANE_STATE_PATH` the term is kept in memory only. | DASH only. |
 
 ## Benchmarks and load tests
 
