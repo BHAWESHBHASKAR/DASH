@@ -760,6 +760,7 @@ dependencies = [
  "dash-http",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

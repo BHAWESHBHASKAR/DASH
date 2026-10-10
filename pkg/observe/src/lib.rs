@@ -10,7 +10,14 @@
 //! * `http` (feature `http`, on by default): instrumentation for `dash-http`
 //!   handlers: per-route request counters by status code, latency histograms,
 //!   an in-flight gauge and a request-scoped tracing span carrying the
-//!   request id.
+//!   request id; with tracing on, the request also gets an OpenTelemetry
+//!   server span (W3C `traceparent` in, route/status/request id attributes).
+//! * [`trace`]: the distributed tracing core (W3C Trace Context parsing and
+//!   propagation, samplers, thread-scoped and detached spans). Always
+//!   compiled, dependency-free, and a single atomic load per instrumented
+//!   point while tracing is off.
+//! * `otlp` (feature `otlp`): the OTLP/HTTP protobuf exporter (batch thread,
+//!   blocking client) configured from the standard `OTEL_*` variables.
 //!
 //! Label cardinality is bounded by construction: route labels come from a
 //! per-service classifier that maps every path to a fixed set of names,
@@ -21,7 +28,10 @@ pub mod exposition;
 pub mod histogram;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 pub mod process;
+pub mod trace;
 
 pub use exposition::{MetricKind, MetricsWriter, ValidationReport, validate};
 pub use histogram::{
