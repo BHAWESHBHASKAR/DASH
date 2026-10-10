@@ -162,6 +162,8 @@ pub struct IngestionRuntime {
     /// Saves the vector indexes (persistent mode only); see
     /// `with_vector_index_persistence`.
     vector_index_persistence: Option<Arc<VectorIndexPersistence>>,
+    /// Chunked exports served to followers that resync (`<wal>.exports`).
+    replication_exports: Option<Arc<store::ReplicationExportStore>>,
     /// Counters of the delete routes (`delete_routes`).
     delete_metrics: delete_routes::DeleteMetrics,
 }
@@ -282,6 +284,7 @@ impl IngestionRuntime {
             transport_backpressure: None,
             started_at: Instant::now(),
             vector_index_persistence: None,
+            replication_exports: None,
             delete_metrics: delete_routes::DeleteMetrics::default(),
         }
     }
@@ -293,6 +296,8 @@ impl IngestionRuntime {
     ) -> Self {
         let wal_async_flush_interval =
             resolve_wal_async_flush_interval(Some(&wal), DEFAULT_ASYNC_WAL_FLUSH_INTERVAL_MS);
+        let replication_exports =
+            Some(Arc::new(store::ReplicationExportStore::for_wal(wal.path())));
         let wal = Arc::new(Mutex::new(wal));
         let group_commit = group_commit::resolve_group_commit_config().and_then(|config| {
             match store::GroupCommitter::start(Arc::clone(&wal), config) {
@@ -363,6 +368,7 @@ impl IngestionRuntime {
             transport_backpressure: None,
             started_at: Instant::now(),
             vector_index_persistence: None,
+            replication_exports,
             delete_metrics: delete_routes::DeleteMetrics::default(),
         }
     }
@@ -1153,16 +1159,39 @@ impl IngestionRuntime {
         }
     }
 
+    /// A delta frame for a follower. With `allow_switch` (the follower sent
+    /// `gen_switch=1`) a follower at the exact end of a generation a
+    /// checkpoint closed is moved to offset 0 of the current generation
+    /// instead of being sent to a resync.
     fn replication_delta_for_followers(
         &mut self,
         from_generation: Option<u64>,
         from_offset: usize,
         max_records: usize,
+        allow_switch: bool,
     ) -> Result<WalReplicationFrame, StoreError> {
         let wal = self.wal.as_ref().ok_or_else(|| {
             StoreError::Io("replication source requires persistent WAL mode".to_string())
         })?;
-        lock_wal(wal).replication_frame_from(from_generation, from_offset, max_records)
+        let mut wal = lock_wal(wal);
+        if allow_switch {
+            wal.replication_frame_with_switch(from_generation, from_offset, max_records)
+        } else {
+            wal.replication_frame_from(from_generation, from_offset, max_records)
+        }
+    }
+
+    /// The export store and the WAL it exports, for serving a chunked
+    /// export without holding the runtime lock.
+    fn replication_export_handles(
+        &self,
+    ) -> Result<(Arc<store::ReplicationExportStore>, SharedWal), StoreError> {
+        match (self.replication_exports.as_ref(), self.wal.as_ref()) {
+            (Some(exports), Some(wal)) => Ok((Arc::clone(exports), Arc::clone(wal))),
+            _ => Err(StoreError::Io(
+                "replication source requires persistent WAL mode".to_string(),
+            )),
+        }
     }
 
     /// Full export plus the WAL generation it was taken at (read under the

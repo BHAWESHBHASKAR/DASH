@@ -129,6 +129,12 @@ pub(super) fn handle_get_request(
         "/internal/replication/export" => {
             handle_replication_export_get(runtime, request, auth_policy)
         }
+        "/internal/replication/export/begin" => {
+            handle_replication_export_begin(runtime, request, query, auth_policy)
+        }
+        "/internal/replication/export/chunk" => {
+            handle_replication_export_chunk(runtime, request, query, auth_policy)
+        }
         "/internal/replication/commit-status" => {
             handle_replication_commit_status_get(runtime, request, query, auth_policy)
         }
@@ -223,10 +229,20 @@ fn handle_replication_wal_get(
             }
         },
     };
+    // Followers that understand generation switches say so; the frame then
+    // carries a `switch_from=` line (older followers get the old layout).
+    let allow_switch = query.get("gen_switch").is_some_and(|v| v == "1");
     match runtime.lock() {
         Ok(mut rt) => {
-            match rt.replication_delta_for_followers(from_generation, from_offset, max_records) {
-                Ok(delta) => HttpResponse::ok_plain(render_replication_delta_frame(&delta)),
+            match rt.replication_delta_for_followers(
+                from_generation,
+                from_offset,
+                max_records,
+                allow_switch,
+            ) {
+                Ok(delta) => {
+                    HttpResponse::ok_plain(render_replication_delta_frame(&delta, allow_switch))
+                }
                 Err(err) => {
                     let (status, message) = map_store_error(&err);
                     HttpResponse::error_with_status(status, &message)
@@ -256,6 +272,102 @@ fn handle_replication_export_get(
             }
         },
         Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
+    }
+}
+
+/// `GET /internal/replication/export/begin[?avoid=<export id>]`: freezes
+/// (or reuses) a chunked export of the leader's state and answers its
+/// manifest. The runtime lock is held only to look up the WAL; the WAL lock
+/// only while the view is frozen.
+fn handle_replication_export_begin(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
+    if !is_replication_request_authorized(request, auth_policy) {
+        return HttpResponse::forbidden("replication request is not authorized");
+    }
+    let avoid = match query.get("avoid") {
+        None => None,
+        Some(id) if store::valid_export_id(id) => Some(id.as_str()),
+        Some(_) => {
+            return HttpResponse::bad_request("query parameter 'avoid' must be an export id");
+        }
+    };
+    let handles = match runtime.lock() {
+        Ok(rt) => rt.replication_export_handles(),
+        Err(_) => {
+            return HttpResponse::internal_server_error("failed to acquire ingestion runtime lock");
+        }
+    };
+    let (exports, wal) = match handles {
+        Ok(handles) => handles,
+        Err(err) => {
+            let (status, message) = map_store_error(&err);
+            return HttpResponse::error_with_status(status, &message);
+        }
+    };
+    match exports.begin(&wal, avoid) {
+        Ok(manifest) => HttpResponse::ok_plain(manifest.render_response()),
+        Err(err) => {
+            eprintln!("ingestion replication export failed: {err:?}");
+            let (status, message) = map_store_error(&err);
+            HttpResponse::error_with_status(status, &message)
+        }
+    }
+}
+
+/// `GET /internal/replication/export/chunk?export_id=&offset=&max_bytes=`:
+/// one chunk of a retained export, read from its file without any lock.
+/// 404 when the export is no longer retained (the follower starts over).
+fn handle_replication_export_chunk(
+    runtime: &SharedRuntime,
+    request: &HttpRequest,
+    query: &HashMap<String, String>,
+    auth_policy: &AuthPolicy,
+) -> HttpResponse {
+    if !is_replication_request_authorized(request, auth_policy) {
+        return HttpResponse::forbidden("replication request is not authorized");
+    }
+    let export_id = match query.get("export_id") {
+        Some(id) if store::valid_export_id(id) => id.clone(),
+        _ => return HttpResponse::bad_request("query parameter 'export_id' must be an export id"),
+    };
+    let offset = match query.get("offset").map(|v| v.parse::<u64>()) {
+        None => 0,
+        Some(Ok(offset)) => offset,
+        Some(Err(_)) => {
+            return HttpResponse::bad_request("query parameter 'offset' must be a valid u64");
+        }
+    };
+    let max_bytes = match parse_query_usize(query, "max_bytes") {
+        Ok(value) => value.unwrap_or(store::EXPORT_CHUNK_DEFAULT_BYTES),
+        Err(err) => return HttpResponse::bad_request(&err),
+    };
+    let exports = match runtime.lock() {
+        Ok(rt) => rt.replication_export_handles().map(|(exports, _)| exports),
+        Err(_) => {
+            return HttpResponse::internal_server_error("failed to acquire ingestion runtime lock");
+        }
+    };
+    let exports = match exports {
+        Ok(exports) => exports,
+        Err(err) => {
+            let (status, message) = map_store_error(&err);
+            return HttpResponse::error_with_status(status, &message);
+        }
+    };
+    match exports.read_chunk(&export_id, offset, max_bytes) {
+        Ok(store::ChunkRead::Chunk(chunk)) => HttpResponse::ok_plain(chunk.render_response()),
+        Ok(store::ChunkRead::NotFound) => {
+            HttpResponse::not_found("replication export is no longer available")
+        }
+        Ok(store::ChunkRead::BadOffset(reason)) => HttpResponse::bad_request(&reason),
+        Err(err) => {
+            let (status, message) = map_store_error(&err);
+            HttpResponse::error_with_status(status, &message)
+        }
     }
 }
 

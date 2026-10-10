@@ -50,6 +50,9 @@ const DEFAULT_MAX_BACKOFF_MS: u64 = 30_000;
 const DEFAULT_MAX_LAG_RECORDS: usize = 100_000;
 const DEFAULT_MAX_STALENESS_MS: u64 = 300_000;
 const PREALLOC_CAP: usize = 4096;
+/// Replicated lines applied per hold of the store's write lock (rounded up
+/// to whole commit groups): readers wait for at most this much work.
+const APPLY_LOCK_RECORDS: usize = 64;
 
 /// Configuration for the retrieval follower that pulls WAL records from
 /// an upstream ingestion service. If no source URL is configured the
@@ -72,6 +75,9 @@ pub struct ReplicationFollowerConfig {
     pub max_lag_records: usize,
     /// `/ready` fails when the last successful poll is older than this.
     pub max_staleness_ms: u64,
+    /// Bytes requested per chunk of a full resync (chunked export); capped
+    /// so a chunk response fits in `max_response_bytes`.
+    pub export_chunk_bytes: usize,
 }
 
 impl ReplicationFollowerConfig {
@@ -90,6 +96,7 @@ impl ReplicationFollowerConfig {
             max_backoff: Duration::from_millis(DEFAULT_MAX_BACKOFF_MS),
             max_lag_records: DEFAULT_MAX_LAG_RECORDS,
             max_staleness_ms: DEFAULT_MAX_STALENESS_MS,
+            export_chunk_bytes: store::EXPORT_CHUNK_DEFAULT_BYTES,
         }
     }
 
@@ -138,6 +145,12 @@ impl ReplicationFollowerConfig {
         ) {
             config.max_staleness_ms = ms;
         }
+        if let Some(n) = env_u64(
+            "DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES",
+            "EME_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES",
+        ) {
+            config.export_chunk_bytes = n as usize;
+        }
         config.token = [
             "DASH_RETRIEVAL_REPLICATION_TOKEN",
             "EME_RETRIEVAL_REPLICATION_TOKEN",
@@ -157,8 +170,11 @@ impl ReplicationFollowerConfig {
     }
 
     fn wal_pull_url(&self, from_offset: usize, from_generation: Option<u64>) -> String {
+        // `gen_switch=1`: this follower can continue across a checkpoint
+        // from the exact end of the previous generation (see
+        // `FileWal::replication_frame_with_switch`).
         let mut url = format!(
-            "{}/internal/replication/wal?from_offset={from_offset}&max_records={}",
+            "{}/internal/replication/wal?from_offset={from_offset}&max_records={}&gen_switch=1",
             self.source_base_url, self.max_records
         );
         if let Some(generation) = from_generation {
@@ -169,6 +185,17 @@ impl ReplicationFollowerConfig {
 
     fn export_url(&self) -> String {
         format!("{}/internal/replication/export", self.source_base_url)
+    }
+
+    /// Chunk size actually requested: the configured size, capped so the
+    /// chunk plus its header fits in one response.
+    fn effective_chunk_bytes(&self) -> usize {
+        self.export_chunk_bytes
+            .min(
+                self.max_response_bytes
+                    .saturating_sub(store::EXPORT_CHUNK_HEADER_RESERVE),
+            )
+            .max(1)
     }
 
     /// Delay before the next poll after `consecutive_failures` failures in a
@@ -200,6 +227,10 @@ pub struct FollowerStatus {
     consecutive_failures: AtomicU64,
     failures_total: AtomicU64,
     resyncs_total: AtomicU64,
+    /// Leader checkpoints crossed without a resync (generation switches).
+    generation_switches_total: AtomicU64,
+    /// Bytes of chunked exports downloaded.
+    export_bytes_total: AtomicU64,
     applied_total: AtomicU64,
     synced_once: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -258,6 +289,8 @@ pub struct FollowerStatusSnapshot {
     pub consecutive_failures: u64,
     pub failures_total: u64,
     pub resyncs_total: u64,
+    pub generation_switches_total: u64,
+    pub export_bytes_total: u64,
     pub applied_records_total: u64,
     pub synced_once: bool,
     pub last_error: Option<String>,
@@ -275,6 +308,8 @@ impl FollowerStatus {
             consecutive_failures: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
             resyncs_total: AtomicU64::new(0),
+            generation_switches_total: AtomicU64::new(0),
+            export_bytes_total: AtomicU64::new(0),
             applied_total: AtomicU64::new(0),
             synced_once: AtomicBool::new(false),
             last_error: Mutex::new(None),
@@ -306,6 +341,8 @@ impl FollowerStatus {
             consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
             failures_total: self.failures_total.load(Ordering::Relaxed),
             resyncs_total: self.resyncs_total.load(Ordering::Relaxed),
+            generation_switches_total: self.generation_switches_total.load(Ordering::Relaxed),
+            export_bytes_total: self.export_bytes_total.load(Ordering::Relaxed),
             applied_records_total: self.applied_total.load(Ordering::Relaxed),
             synced_once: self.synced_once.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|guard| guard.clone()),
@@ -348,13 +385,14 @@ impl FollowerStatus {
             None => "null".to_string(),
         };
         format!(
-            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"skipped_records_total\":{},\"blocked_reason\":{blocked},\"last_error\":{last_error}}}",
+            "{{\"generation\":{generation},\"offset\":{},\"leader_total_records\":{},\"lag_records\":{},\"last_success_age_ms\":{},\"consecutive_failures\":{},\"resyncs_total\":{},\"generation_switches_total\":{},\"skipped_records_total\":{},\"blocked_reason\":{blocked},\"last_error\":{last_error}}}",
             snap.offset,
             snap.leader_total_records,
             snap.lag_records,
             snap.last_success_age_ms,
             snap.consecutive_failures,
             snap.resyncs_total,
+            snap.generation_switches_total,
             self.skipped_total.load(Ordering::Relaxed),
         )
     }
@@ -379,6 +417,10 @@ dash_retrieval_replication_consecutive_failures {}\n\
 dash_retrieval_replication_failures_total {}\n\
 # TYPE dash_retrieval_replication_resyncs_total counter\n\
 dash_retrieval_replication_resyncs_total {}\n\
+# TYPE dash_retrieval_replication_generation_switches_total counter\n\
+dash_retrieval_replication_generation_switches_total {}\n\
+# TYPE dash_retrieval_replication_export_bytes_total counter\n\
+dash_retrieval_replication_export_bytes_total {}\n\
 # TYPE dash_retrieval_replication_applied_records_total counter\n\
 dash_retrieval_replication_applied_records_total {}\n\
 # TYPE dash_retrieval_replication_generation gauge\n\
@@ -395,6 +437,8 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
             snap.consecutive_failures,
             snap.failures_total,
             snap.resyncs_total,
+            snap.generation_switches_total,
+            snap.export_bytes_total,
             snap.applied_records_total,
             snap.generation.unwrap_or(0),
             self.skipped_total.load(Ordering::Relaxed),
@@ -739,7 +783,21 @@ impl Follower {
             ));
         }
         let frame = parse_delta_frame(&response.body, self.config.max_records)?;
-        if frame.from_offset != self.state.offset {
+        if let Some(from) = frame.switch_from {
+            // The leader checkpointed exactly at our position: continue in
+            // the new generation from offset 0 (no resync). Only accepted
+            // when it names the position this follower is at.
+            if frame.needs_resync
+                || frame.from_offset != 0
+                || Some(from.generation) != self.state.generation
+                || from.records != self.state.offset
+            {
+                return Err(format!(
+                    "replication frame switches generation from {}:{}, but this follower is at {:?}:{}",
+                    from.generation, from.records, self.state.generation, self.state.offset
+                ));
+            }
+        } else if frame.from_offset != self.state.offset {
             return Err(format!(
                 "replication frame from_offset {} does not match requested {}",
                 frame.from_offset, self.state.offset
@@ -752,11 +810,14 @@ impl Follower {
             .state
             .generation
             .is_some_and(|ours| ours != frame.generation);
-        if frame.needs_resync || generation_changed {
+        if frame.needs_resync || (generation_changed && frame.switch_from.is_none()) {
             return self.resync();
         }
         if frame.next_offset > frame.total_records {
             return Err("replication frame next_offset exceeds total_records".to_string());
+        }
+        if frame.switch_from.is_some() {
+            self.switch_generation(frame.generation)?;
         }
         // Apply only whole commit groups; an unterminated trailing group is
         // held back and re-fetched from its first line on the next poll.
@@ -785,34 +846,63 @@ impl Follower {
         })
     }
 
-    /// Apply one batch atomically: stage on a detached clone, mirror to the
-    /// WAL, then commit. Any failure leaves the live store untouched.
-    fn apply_delta(&mut self, lines: &[String]) -> Result<(), String> {
-        let mut staged = {
-            let guard = self.store.read().unwrap_or_else(|p| p.into_inner());
-            guard.clone_detached()
-        };
-        let mut skipped = 0u64;
-        for line in lines {
-            let applied = staged
-                .apply_persisted_record_line_lenient(line)
-                .map_err(|err| format!("failed to apply replicated record: {err:?}"))?;
-            if !applied {
-                skipped += 1;
+    /// The leader closed our generation with a checkpoint exactly at our
+    /// position, so our state is the leader's new snapshot. Compact the
+    /// local WAL the same way (snapshot of the current state, empty WAL, new
+    /// local generation) so the saved offset keeps matching the local WAL,
+    /// and continue at offset 0 of `generation`.
+    fn switch_generation(&mut self, generation: u64) -> Result<(), String> {
+        if let Some(wal) = self.wal.as_mut() {
+            let compacted = {
+                let guard = self.store.read().unwrap_or_else(|p| p.into_inner());
+                guard.checkpoint_and_compact(wal)
+            };
+            if let Err(err) = compacted {
+                // The local WAL may be half compacted: rebuild from the leader.
+                self.force_resync = true;
+                return Err(format!(
+                    "local WAL checkpoint for a generation switch failed: {err:?}"
+                ));
             }
+            let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
+            guard.set_wal_position(Some(wal.position()));
         }
-        staged.clear_wal_events();
+        self.state = FollowerState {
+            generation: Some(generation),
+            offset: 0,
+        };
+        self.persist_state();
+        self.status.record_state(&self.state);
+        self.status
+            .generation_switches_total
+            .fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "retrieval replication follower: leader checkpoint crossed without resync, now at generation={generation} offset=0"
+        );
+        Ok(())
+    }
+
+    /// Apply one frame: mirror it to the WAL (one write, one fsync), then
+    /// apply it to the live store in place, whole commit groups per
+    /// write-lock hold, so readers never see part of a group and the cost
+    /// does not grow with the store. The store's WAL position is advanced
+    /// only once the whole frame is applied.
+    ///
+    /// Every line is parsed first: a frame with an unreadable record is
+    /// rejected before anything is written. A record that parses but cannot
+    /// be applied means this follower diverged from the leader; the WAL
+    /// append is rolled back and the follower rebuilds from a full resync.
+    fn apply_delta(&mut self, lines: &[String]) -> Result<(), String> {
+        for line in lines {
+            store::check_replicated_line(line)
+                .map_err(|err| format!("failed to apply replicated record: {err:?}"))?;
+        }
+        let mut rollback_point = None;
         if let Some(wal) = self.wal.as_mut() {
             let point = wal
                 .begin_rollback_point()
                 .map_err(|err| format!("failed to open WAL rollback point: {err:?}"))?;
-            let appended = (|| {
-                for line in lines {
-                    wal.append_raw_record_line(line)?;
-                }
-                wal.flush_pending_sync()
-            })();
-            if let Err(err) = appended {
+            if let Err(err) = wal.append_replicated_lines(lines) {
                 if let Err(rollback) = wal.rollback_to(point) {
                     eprintln!("retrieval replication WAL rollback failed: {rollback:?}");
                 }
@@ -820,24 +910,167 @@ impl Follower {
                     "failed to append replicated records to WAL: {err:?}"
                 ));
             }
+            rollback_point = Some(point);
+        }
+        let mut batch = store::ReplicatedBatch::default();
+        let mut failure = None;
+        let spans = store::commit_group_spans(lines);
+        let mut spans = spans.into_iter().peekable();
+        let mut start = 0usize;
+        while spans.peek().is_some() {
+            // Whole groups, about APPLY_LOCK_RECORDS lines per lock hold.
+            let mut end = start;
+            while let Some(span) = spans.peek() {
+                if end > start && span.end - start > APPLY_LOCK_RECORDS {
+                    break;
+                }
+                end = span.end;
+                spans.next();
+            }
+            let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
+            let applied = guard.apply_replicated_group(&lines[start..end], false, &mut batch);
+            drop(guard);
+            if let Err(err) = applied {
+                failure = Some(err);
+                break;
+            }
+            start = end;
+        }
+        if let Some(err) = failure {
+            if let (Some(wal), Some(point)) = (self.wal.as_mut(), rollback_point)
+                && let Err(rollback) = wal.rollback_to(point)
+            {
+                eprintln!("retrieval replication WAL rollback failed: {rollback:?}");
+            }
+            self.force_resync = true;
+            return Err(format!(
+                "failed to apply replicated record (follower diverged, resyncing): {err:?}"
+            ));
         }
         let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
-        if let Err(err) = guard.commit_staged(staged) {
-            eprintln!("retrieval replication: disk mirror degraded after commit: {err:?}");
+        let outcome = guard.finish_replicated_batch(batch);
+        if let Some(reason) = outcome.disk_error {
+            eprintln!("retrieval replication: disk mirror degraded after commit: {reason}");
         }
         // Under the write lock, so a vector index snapshot always pairs the
         // state with the WAL position that produced it.
         if let Some(wal) = self.wal.as_ref() {
             guard.set_wal_position(Some(wal.position()));
         }
+        drop(guard);
         self.status
             .skipped_total
-            .fetch_add(skipped, Ordering::Relaxed);
+            .fetch_add(outcome.skipped as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Replace the follower's state with the leader's full export.
+    /// Where a chunked export is downloaded: next to the WAL, next to the
+    /// offset file, or (no persistent state at all) in the temp directory.
+    fn download_paths(&self) -> store::DownloadPaths {
+        match (&self.wal, &self.config.offset_path) {
+            (Some(wal), _) => store::DownloadPaths::for_wal(wal.path()),
+            (None, Some(path)) => store::DownloadPaths::new(format!("{path}.resync")),
+            (None, None) => store::DownloadPaths::new(std::env::temp_dir().join(format!(
+                "dash-retrieval-resync-{}-{:x}",
+                std::process::id(),
+                Arc::as_ptr(&self.store) as usize
+            ))),
+        }
+    }
+
+    /// Replace the follower's state with the leader's export, downloaded in
+    /// chunks (resumable, checksummed). Falls back to the single-response
+    /// export when the leader does not serve chunks.
     fn resync(&mut self) -> Result<PollOutcome, String> {
+        let paths = self.download_paths();
+        let base = self.config.source_base_url.clone();
+        let token = self.config.token.clone();
+        let max_bytes = self.config.max_response_bytes;
+        let mut source = store::HttpExportSource::new(|path: &str| {
+            http_get(&format!("{base}{path}"), token.as_deref(), max_bytes)
+                .map(|response| (response.status, response.body))
+        });
+        let outcome =
+            store::download_export(&mut source, &paths, self.config.effective_chunk_bytes())?;
+        match outcome {
+            store::DownloadOutcome::Unsupported => self.resync_single_response(),
+            store::DownloadOutcome::Complete(download) => {
+                self.status
+                    .export_bytes_total
+                    .fetch_add(download.fetched_bytes, Ordering::Relaxed);
+                self.apply_export_file(&download, &paths)
+            }
+        }
+    }
+
+    /// Builds a fresh store from a verified export file and swaps it in
+    /// with the local WAL. The saved cursor is removed before the local
+    /// files are replaced and written again after, so a crash in between
+    /// restarts with a resync (which reuses the downloaded file) instead of
+    /// resuming a cursor that no longer matches the WAL.
+    fn apply_export_file(
+        &mut self,
+        download: &store::DownloadedExport,
+        paths: &store::DownloadPaths,
+    ) -> Result<PollOutcome, String> {
+        let ann_tuning = {
+            let guard = self.store.read().unwrap_or_else(|p| p.into_inner());
+            guard.ann_tuning().clone()
+        };
+        let mut fresh = InMemoryStore::new_with_ann_tuning(ann_tuning);
+        let mut skipped = 0u64;
+        let mut applied = 0u64;
+        download
+            .file
+            .for_each_line(|_, line| {
+                if !fresh.apply_persisted_record_line_lenient(line)? {
+                    skipped += 1;
+                }
+                applied += 1;
+                Ok(())
+            })
+            .map_err(|err| format!("failed to apply exported record: {err:?}"))?;
+        self.status
+            .skipped_total
+            .fetch_add(skipped, Ordering::Relaxed);
+        fresh.clear_wal_events();
+        if let Some(wal) = self.wal.as_mut() {
+            if let Some(path) = self.state_path.as_deref() {
+                remove_state(path)
+                    .map_err(|err| format!("failed to clear replication state: {err}"))?;
+            }
+            crash_point("retrieval.resync.cursor_cleared")?;
+            wal.replace_with_replication_export_file(&download.file)
+                .map_err(|err| format!("failed to replace local WAL with export: {err:?}"))?;
+            crash_point("retrieval.resync.wal_replaced")?;
+        }
+        {
+            let mut guard = self.store.write().unwrap_or_else(|p| p.into_inner());
+            if let Err(err) = guard.replace_state_from(fresh) {
+                eprintln!("retrieval replication: disk resync degraded: {err:?}");
+            }
+            guard.set_wal_position(self.wal.as_ref().map(FileWal::position));
+        }
+        let wal_len = download.manifest.wal_records;
+        self.state = FollowerState {
+            generation: Some(download.manifest.generation),
+            offset: wal_len,
+        };
+        self.force_resync = false;
+        self.persist_state();
+        paths.remove();
+        self.status.leader_total.store(wal_len, Ordering::Relaxed);
+        self.status.resyncs_total.fetch_add(1, Ordering::Relaxed);
+        self.status
+            .applied_total
+            .fetch_add(applied, Ordering::Relaxed);
+        self.status.record_state(&self.state);
+        Ok(PollOutcome::MoreAvailable)
+    }
+
+    /// Replace the follower's state with the leader's full export in one
+    /// response (leaders without chunked export).
+    fn resync_single_response(&mut self) -> Result<PollOutcome, String> {
         let response = http_get(
             &self.config.export_url(),
             self.config.token.as_deref(),
@@ -973,6 +1206,9 @@ fn http_get(
 struct DeltaFrame {
     generation: u64,
     needs_resync: bool,
+    /// The leader switched this follower from the exact end of an earlier
+    /// generation (`switch_from=<generation>:<offset>`).
+    switch_from: Option<store::WalPosition>,
     from_offset: usize,
     next_offset: usize,
     total_records: usize,
@@ -990,6 +1226,7 @@ fn parse_delta_frame(body: &str, max_records: usize) -> Result<DeltaFrame, Strin
     expect_kv(&mut lines, "status", "ok")?;
     let generation = parse_generation(&mut lines)?;
     let needs_resync = parse_kv_bool01(&mut lines, "needs_resync")?;
+    let switch_from = parse_switch_from(&mut lines)?;
     let from_offset = parse_kv_usize(&mut lines, "from_offset")?;
     let next_offset = parse_kv_usize(&mut lines, "next_offset")?;
     let total_records = parse_kv_usize(&mut lines, "total_records")?;
@@ -1018,6 +1255,7 @@ fn parse_delta_frame(body: &str, max_records: usize) -> Result<DeltaFrame, Strin
     Ok(DeltaFrame {
         generation,
         needs_resync,
+        switch_from,
         from_offset,
         next_offset,
         total_records,
@@ -1067,6 +1305,39 @@ fn parse_export_frame(body: &str) -> Result<ExportFrame, String> {
             wal_lines,
         },
     })
+}
+
+/// The optional `switch_from=` line a leader sends to a follower that asked
+/// with `gen_switch=1`: `none`, or `<generation>:<offset>` when the frame
+/// moves the follower from the exact end of that generation to offset 0 of
+/// the frame's generation.
+fn parse_switch_from<'a, I>(
+    lines: &mut std::iter::Peekable<I>,
+) -> Result<Option<store::WalPosition>, String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    match lines.peek() {
+        Some(line) if line.starts_with("switch_from=") => {
+            let line = lines.next().unwrap_or_default();
+            let (_, value) = parse_kv_line(line, "switch_from")?;
+            if value == "none" {
+                return Ok(None);
+            }
+            let (generation, records) = value
+                .split_once(':')
+                .ok_or_else(|| "replication payload has invalid switch_from".to_string())?;
+            Ok(Some(store::WalPosition {
+                generation: generation
+                    .parse()
+                    .map_err(|_| "replication payload has invalid switch_from".to_string())?,
+                records: records
+                    .parse()
+                    .map_err(|_| "replication payload has invalid switch_from".to_string())?,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The WAL generation line every frame of a 0.3.0+ leader carries; a frame
@@ -1224,6 +1495,48 @@ fn write_state(path: &str, state: &FollowerState) -> std::io::Result<()> {
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
+
+/// Removes the saved cursor (and syncs the directory), so a crash before
+/// the next [`write_state`] restarts with a full resync.
+fn remove_state(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    if let Some(dir) = std::path::Path::new(path).parent()
+        && !dir.as_os_str().is_empty()
+        && let Ok(dir_file) = std::fs::File::open(dir)
+    {
+        dir_file.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Test-only crash points inside a resync: an armed point makes the resync
+/// stop there with an error, leaving the files as a crash would.
+#[cfg(test)]
+static CRASH_POINT: Mutex<Option<&'static str>> = Mutex::new(None);
+
+#[cfg(test)]
+fn arm_crash_point(name: &'static str) {
+    *CRASH_POINT.lock().unwrap_or_else(|p| p.into_inner()) = Some(name);
+}
+
+#[cfg(test)]
+fn crash_point(name: &'static str) -> Result<(), String> {
+    let mut armed = CRASH_POINT.lock().unwrap_or_else(|p| p.into_inner());
+    if *armed == Some(name) {
+        *armed = None;
+        return Err(format!("crash point {name}"));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn crash_point(_name: &'static str) -> Result<(), String> {
+    Ok(())
+}
 
 fn env_with_fallback(primary: &str, fallback: &str) -> Option<String> {
     std::env::var(primary)

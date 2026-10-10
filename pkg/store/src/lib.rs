@@ -65,7 +65,8 @@ pub use wal::{
 };
 pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
-    batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
+    batch_commit_id_from_wal_line, check_replicated_line, commit_group_spans,
+    complete_group_prefix_len, is_group_marker_commit_id,
 };
 pub use wal::{Tombstone, tombstone_from_wal_line};
 
@@ -113,6 +114,27 @@ pub struct ReplicatedApply {
     /// The redb write of the frame failed: the handle was detached and the
     /// disk marked unavailable (the WAL stays the source of truth).
     pub disk_error: Option<String>,
+}
+
+/// Replicated lines applied in memory whose redb writes are still pending
+/// (see [`InMemoryStore::apply_replicated_group`]).
+#[derive(Debug, Default)]
+pub struct ReplicatedBatch {
+    ops: Vec<StagedDiskOp>,
+    applied: usize,
+    skipped: usize,
+}
+
+impl ReplicatedBatch {
+    /// Lines applied so far.
+    pub fn applied(&self) -> usize {
+        self.applied
+    }
+
+    /// Lines skipped so far (lenient replay would quarantine them).
+    pub fn skipped(&self) -> usize {
+        self.skipped
+    }
 }
 
 /// Result of [`InMemoryStore::ingest_atomic_persistent`].
@@ -1235,52 +1257,77 @@ impl InMemoryStore {
     }
 
     /// Applies a run of replicated lines (one delta frame) to this store in
-    /// place, each the way [`Self::apply_persisted_record_line_lenient`]
-    /// does, with the redb writes of the whole run in one transaction.
-    ///
-    /// Unlike staging on [`Self::clone_detached`] this costs time and memory
-    /// proportional to the frame, not to the store. Every line is parsed
-    /// before anything is applied, so a frame with an unreadable record is
-    /// rejected untouched. A record that parses but cannot be applied (the
-    /// follower diverged from the leader) fails the call after a prefix of
-    /// the frame was applied in memory; redb is not written then. The
-    /// caller must restore its state in that case (reload from its WAL,
-    /// which does not hold the frame yet, or resync).
-    ///
-    /// With `keep_wal_events == false` the in-memory event ring is left as
-    /// it was (the retrieval follower does not serve the event stream).
+    /// place: [`Self::apply_replicated_group`] for the whole run, then
+    /// [`Self::finish_replicated_batch`]. See those for the failure
+    /// contract.
     pub fn apply_replicated_lines(
         &mut self,
         lines: &[String],
         keep_wal_events: bool,
     ) -> Result<ReplicatedApply, StoreError> {
+        let mut batch = ReplicatedBatch::default();
+        self.apply_replicated_group(lines, keep_wal_events, &mut batch)?;
+        Ok(self.finish_replicated_batch(batch))
+    }
+
+    /// Applies replicated lines in place, each the way
+    /// [`Self::apply_persisted_record_line_lenient`] does, and collects
+    /// their redb writes in `batch` instead of writing them.
+    ///
+    /// Unlike staging on [`Self::clone_detached`] this costs time and memory
+    /// proportional to the lines, not to the store. Every line is parsed
+    /// before anything is applied, so a run with an unreadable record is
+    /// rejected untouched. A record that parses but cannot be applied (the
+    /// follower diverged from the leader) fails the call after a prefix of
+    /// the run was applied in memory; the caller must then drop `batch` and
+    /// rebuild its state (a follower resyncs).
+    ///
+    /// With `keep_wal_events == false` the in-memory event ring is left as
+    /// it was (the retrieval follower does not serve the event stream).
+    pub fn apply_replicated_group(
+        &mut self,
+        lines: &[String],
+        keep_wal_events: bool,
+        batch: &mut ReplicatedBatch,
+    ) -> Result<(), StoreError> {
         for line in lines {
             wal::check_replicated_line(line)?;
         }
         let saved_ring = (!keep_wal_events).then(|| std::mem::take(&mut self.wal));
         let disk = self.disk.take();
-        let previous_staging = self.staged_disk_ops.replace(Vec::new());
-        let mut outcome = ReplicatedApply::default();
+        let previous_staging = self.staged_disk_ops.replace(std::mem::take(&mut batch.ops));
         let result = (|| {
             for line in lines {
                 if self.apply_persisted_record_line_lenient(line)? {
-                    outcome.applied += 1;
+                    batch.applied += 1;
                 } else {
-                    outcome.skipped += 1;
+                    batch.skipped += 1;
                 }
             }
             Ok::<(), StoreError>(())
         })();
-        let ops = self.staged_disk_ops.take().unwrap_or_default();
+        batch.ops = self.staged_disk_ops.take().unwrap_or_default();
         self.staged_disk_ops = previous_staging;
         self.disk = disk;
         if let Some(mut ring) = saved_ring {
             ring.total = ring.total.max(self.wal.total);
             self.wal = ring;
         }
-        result?;
+        result
+    }
+
+    /// Writes the redb mutations collected in `batch` in one transaction (a
+    /// store without a disk keeps them for its own staging, if any). A
+    /// failed write detaches the disk and marks it unavailable; the WAL
+    /// stays the source of truth.
+    pub fn finish_replicated_batch(&mut self, batch: ReplicatedBatch) -> ReplicatedApply {
+        let mut outcome = ReplicatedApply {
+            applied: batch.applied,
+            skipped: batch.skipped,
+            disk_error: None,
+        };
         if let Some(disk) = self.disk.clone() {
-            if let Err(reason) = disk.write_ops(&ops) {
+            if let Err(reason) = disk.write_ops(&batch.ops) {
                 self.disk = None;
                 self.disk_status = disk::DiskStatus::Unavailable {
                     reason: reason.clone(),
@@ -1288,9 +1335,9 @@ impl InMemoryStore {
                 outcome.disk_error = Some(reason);
             }
         } else if let Some(buffer) = self.staged_disk_ops.as_mut() {
-            buffer.extend(ops);
+            buffer.extend(batch.ops);
         }
-        Ok(outcome)
+        outcome
     }
 
     pub fn retrieve(&self, req: &RetrievalRequest) -> Vec<RetrievalResult> {

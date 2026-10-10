@@ -312,6 +312,41 @@ fn closes_group(open_id: &str, end_id: &str) -> bool {
     end_id == open_id || end_id.strip_prefix(SINGLE_TX_PREFIX) == Some(open_id)
 }
 
+/// Splits `lines` into the units a reader may observe: each commit group
+/// (begin marker to closing marker) is one span, every ungrouped record its
+/// own span, and an unterminated group runs to the end (or to the next
+/// begin marker). Spans are contiguous and cover all of `lines`.
+pub fn commit_group_spans(lines: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        match group_event(line) {
+            Some(GroupEvent::Begin(id)) => {
+                if let Some((start, _)) = open.take() {
+                    spans.push(start..idx);
+                }
+                open = Some((idx, id));
+            }
+            Some(GroupEvent::End(id))
+                if open.as_ref().is_some_and(|(_, o)| closes_group(o, &id)) =>
+            {
+                if let Some((start, _)) = open.take() {
+                    spans.push(start..idx + 1);
+                }
+            }
+            _ => {
+                if open.is_none() {
+                    spans.push(idx..idx + 1);
+                }
+            }
+        }
+    }
+    if let Some((start, _)) = open {
+        spans.push(start..lines.len());
+    }
+    spans
+}
+
 /// Number of leading `lines` that form complete commit groups (plus
 /// ungrouped legacy records). A trailing unterminated group is excluded, so
 /// a replication follower applies only whole groups and re-fetches from the
@@ -2239,7 +2274,7 @@ impl ReplayParser {
 /// A replicated line must parse, except legacy-format lines, which a
 /// follower mirrors verbatim (its own lenient replay quarantines them just
 /// like the leader's).
-pub(crate) fn check_replicated_line(line: &str) -> Result<(), StoreError> {
+pub fn check_replicated_line(line: &str) -> Result<(), StoreError> {
     match line_to_record(line) {
         Ok(_) => Ok(()),
         Err(_) if is_legacy_kind(record_kind(line)) => Ok(()),

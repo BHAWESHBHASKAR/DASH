@@ -99,6 +99,8 @@ pub(super) fn handle_request_with_policy(
         | (_, "/debug/document-parser")
         | (_, "/internal/replication/wal")
         | (_, "/internal/replication/export")
+        | (_, "/internal/replication/export/begin")
+        | (_, "/internal/replication/export/chunk")
         | (_, "/internal/replication/commit-status") => {
             HttpResponse::method_not_allowed("only GET is supported")
         }
