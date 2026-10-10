@@ -451,7 +451,7 @@ impl DiskBackedStore {
                 Some(v) => self.values.decode(
                     TABLE_EVIDENCE.name(),
                     &evidence.claim_id,
-                    &v.value().to_vec(),
+                    v.value(),
                     "deserialize evidence",
                 )?,
                 None => Vec::new(),
@@ -487,7 +487,7 @@ impl DiskBackedStore {
                 Some(v) => self.values.decode(
                     TABLE_EDGES.name(),
                     &edge.from_claim_id,
-                    &v.value().to_vec(),
+                    v.value(),
                     "deserialize edges",
                 )?,
                 None => Vec::new(),
@@ -1010,7 +1010,7 @@ impl DiskBackedStore {
                         Some(v) => self.values.decode(
                             TABLE_EVIDENCE.name(),
                             &evidence.claim_id,
-                            &v.value().to_vec(),
+                            v.value(),
                             "deserialize evidence",
                         )?,
                         None => Vec::new(),
@@ -1037,7 +1037,7 @@ impl DiskBackedStore {
                         Some(v) => self.values.decode(
                             TABLE_EDGES.name(),
                             &edge.from_claim_id,
-                            &v.value().to_vec(),
+                            v.value(),
                             "deserialize edges",
                         )?,
                         None => Vec::new(),

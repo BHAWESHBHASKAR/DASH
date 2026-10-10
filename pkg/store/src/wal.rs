@@ -609,8 +609,12 @@ pub struct FileWal {
     /// The lines read when the WAL was opened, with the file length then;
     /// the first replay uses them instead of reading (and decrypting) the
     /// file again, when the file has not changed since.
-    open_scan: std::sync::Mutex<Option<(u64, Vec<(usize, String)>)>>,
+    open_scan: std::sync::Mutex<Option<OpenScan>>,
 }
+
+/// The WAL's `(physical line number, line)` pairs read at open, with the
+/// file length at that time.
+type OpenScan = (u64, Vec<(usize, String)>);
 
 /// Prefix of the error returned by every write to a poisoned WAL.
 pub const WAL_POISONED_PREFIX: &str = "wal_poisoned";

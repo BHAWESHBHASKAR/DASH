@@ -281,15 +281,15 @@ pub(crate) fn open_plain(
 /// Writes plaintext either straight through or sealed (format B).
 pub(crate) enum SealSink<W: Write> {
     Plain(W),
-    Sealed(encryption::SealedWriter<W>),
+    Sealed(Box<encryption::SealedWriter<W>>),
 }
 
 impl<W: Write> SealSink<W> {
     pub(crate) fn new(inner: W, keyring: Option<&Keyring>) -> Result<Self, StoreError> {
         match keyring {
-            Some(keyring) => Ok(Self::Sealed(
+            Some(keyring) => Ok(Self::Sealed(Box::new(
                 encryption::SealedWriter::new(inner, keyring).map_err(enc_err)?,
-            )),
+            ))),
             None => Ok(Self::Plain(inner)),
         }
     }
@@ -298,7 +298,7 @@ impl<W: Write> SealSink<W> {
     pub(crate) fn finish(self) -> std::io::Result<W> {
         match self {
             Self::Plain(inner) => Ok(inner),
-            Self::Sealed(writer) => writer.finish(),
+            Self::Sealed(writer) => (*writer).finish(),
         }
     }
 }
