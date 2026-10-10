@@ -86,6 +86,56 @@ pub fn saturating_signal(count: usize, per_source: f32, cap: f32) -> f32 {
     cap * ((count as f32 * per_source) / cap).tanh()
 }
 
+/// The ranking signals that are not query relevance: saturated support
+/// and contradiction, average source quality and claim confidence. Same
+/// weights as the non-lexical part of [`score_claim`]. Range
+/// `[-MAX_CONTRADICTION_PENALTY, MAX_SUPPORT_BONUS + 0.4]`.
+pub fn prior_score(claim: &Claim, avg_source_quality: f32, signals: RankSignals) -> f32 {
+    let support_score = saturating_signal(signals.supports, SUPPORT_PER_SOURCE, MAX_SUPPORT_BONUS);
+    let contradiction_penalty = saturating_signal(
+        signals.contradicts,
+        CONTRADICTION_PER_SOURCE,
+        MAX_CONTRADICTION_PENALTY,
+    );
+    support_score - contradiction_penalty + avg_source_quality * 0.15 + claim.confidence * 0.25
+}
+
+/// Weight of the prior signals ([`prior_score`]) next to query relevance
+/// (in `[0, 1]`) in the final score.
+pub const PRIOR_WEIGHT: f32 = 0.5;
+
+/// Relevance of a lexical-only retrieve: the claim's BM25 divided by the
+/// query's BM25 upper bound (`sum(idf * (k1 + 1))`), so in `[0, 1)`.
+pub fn lexical_relevance(bm25_fraction: f32) -> f32 {
+    if bm25_fraction.is_finite() {
+        bm25_fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Weight of vector similarity in hybrid relevance.
+pub const HYBRID_DENSE_WEIGHT: f32 = 0.7;
+/// Weight of normalised BM25 in hybrid relevance.
+pub const HYBRID_TEXT_WEIGHT: f32 = 0.3;
+
+/// Relevance of a hybrid retrieve (a query vector is present): a
+/// calibrated blend of vector similarity (cosine in `[-1, 1]` mapped to
+/// `[0, 1]`; a claim without a vector counts as orthogonal, 0.5) and
+/// normalised BM25 ([`lexical_relevance`]). In `[0, 1]`. Vector
+/// similarity carries the larger weight, so a claim aligned with the
+/// query vector outranks one that only shares words with the query text.
+pub fn hybrid_relevance(cosine: Option<f32>, bm25_fraction: f32) -> f32 {
+    let cosine = cosine.filter(|c| c.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0);
+    let dense = (cosine + 1.0) * 0.5;
+    HYBRID_DENSE_WEIGHT * dense + HYBRID_TEXT_WEIGHT * lexical_relevance(bm25_fraction)
+}
+
+/// Final retrieve score: relevance plus weighted priors.
+pub fn ranked_score(relevance: f32, priors: f32) -> f32 {
+    relevance + PRIOR_WEIGHT * priors
+}
+
 pub fn score_claim_with_bm25(
     query: &str,
     claim: &Claim,
