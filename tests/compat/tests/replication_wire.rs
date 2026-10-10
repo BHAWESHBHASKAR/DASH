@@ -12,6 +12,11 @@
 //! * A 0.2 follower cannot parse a current frame (its header parser expects
 //!   `needs_resync` on the second line), so it stops replicating instead of
 //!   applying anything: upgrade order is leader first, then followers.
+//! * The recorded leaders have no chunked export (`/export/begin` answers
+//!   404): current followers fall back to the single-response export.
+//! * A current leader keeps the earlier 0.3 frame layout for followers that
+//!   do not ask for generation switches, still serves the single-response
+//!   export, and serves the chunked export with the same records.
 
 mod support;
 
@@ -410,5 +415,97 @@ fn an_upgraded_leader_with_a_legacy_wal_serves_current_followers() {
         let answers = without_env_lock(&mut env, || run_retrieves(&store, Some(&segments)));
         let diffs = diff_against_recorded(fixture, &answers);
         assert!(diffs.is_empty(), "{}:\n{}", fixture.label, diffs.join("\n"));
+    }
+}
+
+/// Same-version and previous-0.3-build compatibility of the chunked export
+/// and the generation switch:
+///
+/// * A frame requested without `gen_switch=1` keeps the layout followers of
+///   the earlier 0.3.0 build parse (no `switch_from=` line), and the
+///   single-response export is still served, so such a follower keeps
+///   working against an upgraded leader.
+/// * A current follower's request (`gen_switch=1`) gets the `switch_from=`
+///   line; the chunked export (`/export/begin`, `/export/chunk`) serves the
+///   same records as the single-response export, verified by its SHA-256.
+#[test]
+fn current_leader_serves_both_the_previous_and_the_chunked_protocol() {
+    let _env = env_lock();
+    for fixture in FIXTURES.iter().filter(|f| f.era == Era::V0_3) {
+        let state = fixture.scratch_state();
+        let leader = Node::start(&state.wal(), None);
+        let token = [("x-replication-token", REPLICATION_TOKEN)];
+
+        let (status, old_layout) = http_get(
+            &leader.addr,
+            "/internal/replication/wal?from_offset=0&max_records=512&from_generation=1",
+            &token,
+        );
+        assert_eq!(status, 200, "{old_layout}");
+        old_readers::v0_3_0_dev_parses_delta_header(&old_layout)
+            .unwrap_or_else(|e| panic!("{}: {e}\n{old_layout}", fixture.label));
+        assert!(!old_layout.contains("switch_from="));
+
+        let (status, new_layout) = http_get(
+            &leader.addr,
+            "/internal/replication/wal?from_offset=0&max_records=512&from_generation=1&gen_switch=1",
+            &token,
+        );
+        assert_eq!(status, 200, "{new_layout}");
+        assert_eq!(
+            new_layout.lines().nth(3),
+            Some("switch_from=none"),
+            "{new_layout}"
+        );
+        assert!(old_readers::v0_3_0_dev_parses_delta_header(&new_layout).is_err());
+
+        let (status, single) = http_get(&leader.addr, "/internal/replication/export", &token);
+        assert_eq!(status, 200, "single-response export still served");
+
+        let (status, manifest) =
+            http_get(&leader.addr, "/internal/replication/export/begin", &token);
+        assert_eq!(status, 200, "{manifest}");
+        let manifest = store::ReplicationExportManifest::parse(&manifest).expect("manifest");
+        let mut body = String::new();
+        while (body.len() as u64) < manifest.total_bytes {
+            let (status, chunk) = http_get(
+                &leader.addr,
+                &format!(
+                    "/internal/replication/export/chunk?export_id={}&offset={}&max_bytes=2048",
+                    manifest.export_id,
+                    body.len()
+                ),
+                &token,
+            );
+            assert_eq!(status, 200, "{chunk}");
+            let chunk = store::ReplicationExportChunk::parse_response(&chunk).expect("chunk");
+            assert!(chunk.data.len() <= 2048 || !chunk.data[..2048].contains('\n'));
+            body.push_str(&chunk.data);
+        }
+        let downloaded = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(downloaded.path(), body.as_bytes()).expect("write download");
+        let (len, sha256) = store::hash_file(downloaded.path()).expect("hash");
+        assert_eq!(
+            (len, sha256),
+            (manifest.total_bytes, manifest.sha256.clone())
+        );
+        // The chunked export carries the same records as the single response
+        // (its counts are zero-padded, the records identical).
+        let records = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|l| *l != "SNAPSHOT")
+                .filter(|l| *l != "SNAPSHOT" && *l != "WAL")
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(records(&body), records(&single), "{}", fixture.label);
+
+        // An unknown export is a 404 (the follower starts over).
+        let (status, _) = http_get(
+            &leader.addr,
+            "/internal/replication/export/chunk?export_id=0123456789abcdef&offset=0",
+            &token,
+        );
+        assert_eq!(status, 404);
     }
 }

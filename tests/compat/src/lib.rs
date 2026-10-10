@@ -335,6 +335,33 @@ pub mod old_readers {
         Ok(())
     }
 
+    /// Whether a follower of the 0.3.0 development line before chunked
+    /// export (the `v0.3.0-dev` fixture) can parse a delta frame header: its
+    /// parser reads exactly these keys, in this order, one per line (a
+    /// `switch_from=` line in between makes it fail, which is why a leader
+    /// only sends that line to followers that ask with `gen_switch=1`).
+    pub fn v0_3_0_dev_parses_delta_header(body: &str) -> Result<(), String> {
+        let mut lines = body.lines();
+        for key in [
+            "status",
+            "generation",
+            "needs_resync",
+            "from_offset",
+            "next_offset",
+            "total_records",
+            "records",
+        ] {
+            let line = lines.next().ok_or_else(|| format!("missing {key}"))?;
+            let (found, _) = line
+                .split_once('=')
+                .ok_or_else(|| format!("invalid {key} line"))?;
+            if found != key {
+                return Err(format!("expected key '{key}', found '{found}'"));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a 0.2 build can decode an evidence or edge blob from redb.
     /// 0.2 reads the claim's current blob (`Vec<Evidence>` /
     /// `Vec<ClaimEdge>`) with `bincode` 1.x on EVERY evidence or edge write

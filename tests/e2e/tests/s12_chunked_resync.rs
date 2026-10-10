@@ -46,7 +46,9 @@ impl Oracle {
             &bundle(
                 T,
                 &claim,
-                &format!("chunked resync scenario claim number {i} with some text to make it longer"),
+                &format!(
+                    "chunked resync scenario claim number {i} with some text to make it longer"
+                ),
                 3,
             ),
         );
@@ -71,9 +73,7 @@ impl Oracle {
 }
 
 fn metric(s: &Stack, name: &str) -> u64 {
-    let r = s
-        .rc()
-        .get("/metrics", &[("x-api-key", s.ops_key.as_str())]);
+    let r = s.rc().get("/metrics", &[("x-api-key", s.ops_key.as_str())]);
     assert_eq!(r.status, 200, "retrieval metrics: {}", r.body);
     r.body
         .lines()
@@ -130,7 +130,11 @@ fn fresh_follower_resyncs_a_data_set_larger_than_one_chunk() {
     o.write(&s);
     s.wait_caught_up(Duration::from_secs(30));
     o.verify(&s, "after a follower restart");
-    assert_eq!(replication_u64(&s, "resyncs_total"), 0, "resync after restart");
+    assert_eq!(
+        replication_u64(&s, "resyncs_total"),
+        0,
+        "resync after restart"
+    );
 }
 
 #[test]
