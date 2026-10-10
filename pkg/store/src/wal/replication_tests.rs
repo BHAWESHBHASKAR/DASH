@@ -1237,6 +1237,50 @@ mod encrypted {
     }
 
     #[test]
+    fn followers_cross_a_background_checkpoint() {
+        run(super::followers_cross_a_background_checkpoint_while_its_snapshot_is_written);
+    }
+
+    #[test]
+    fn chunked_export_during_a_background_checkpoint() {
+        run(super::a_chunked_export_during_a_background_checkpoint_carries_the_pending_state);
+    }
+
+    /// While a checkpoint is pending, the marker, the base snapshot and the
+    /// closed WAL are encrypted too, and the pending state replays.
+    #[test]
+    fn pending_checkpoint_files_are_encrypted() {
+        run(|| {
+            let dir = TempDir::new().unwrap();
+            let mut leader = Leader::open(dir.path());
+            leader.write_n(10);
+            leader.checkpoint();
+            leader.write_n(5);
+            let job = leader.begin_background();
+            leader.write_n(3);
+            assert!(leader.wal().checkpoint_pending());
+            assert!(leader.wal().base_snapshot_path().exists());
+            assert_no_plaintext(dir.path(), "replicated claim");
+            assert_no_plaintext(dir.path(), "SNAP_PENDING");
+            let reopened = FileWal::open(dir.path().join("leader.wal")).unwrap();
+            assert!(reopened.checkpoint_pending());
+            assert_eq!(
+                state(&InMemoryStore::load_from_wal(&reopened).unwrap()),
+                state(&leader.store)
+            );
+            drop(reopened);
+            leader.finish_background(job);
+            assert_no_plaintext(dir.path(), "replicated claim");
+            let reopened = FileWal::open(dir.path().join("leader.wal")).unwrap();
+            assert!(!reopened.checkpoint_pending());
+            assert_eq!(
+                state(&InMemoryStore::load_from_wal(&reopened).unwrap()),
+                state(&leader.store)
+            );
+        });
+    }
+
+    #[test]
     fn crash_in_the_middle_of_the_swap() {
         run(a_crash_in_the_middle_of_the_swap_is_repaired_by_applying_the_export_again);
     }

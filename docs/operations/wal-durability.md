@@ -199,7 +199,9 @@ being written, the closed WAL and the new WAL. Memory: a shard touched by a
 write while the snapshot is written exists twice until the write finishes;
 in the worst case (every shard touched) that is a second copy of the claim,
 evidence, edge, vector and batch maps. The snapshot file format is
-unchanged.
+unchanged. With encryption at rest on, the marker and the snapshot are
+encrypted line files like the WAL (the base snapshot is a link to an
+encrypted snapshot and the closed files are encrypted WAL files).
 
 The replication side (followers cross the checkpoint as soon as the rotation
 is done; exports during the write) is described in
