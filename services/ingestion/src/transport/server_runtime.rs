@@ -205,7 +205,7 @@ pub(super) fn serve_http_with_workers(
             listener,
             config,
             handler,
-            dash_http::default_health_classifier,
+            super::http::reserved_lane_classifier,
             &|| shutdown.is_triggered(),
             hooks,
         );

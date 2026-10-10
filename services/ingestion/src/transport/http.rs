@@ -5,6 +5,17 @@ use super::json::json_escape;
 pub(super) const SOCKET_TIMEOUT_SECS: u64 = 5;
 /// Workers reserved for health-class requests (`/health`, `/live`, ...).
 const HEALTH_WORKERS: usize = 2;
+/// Extra reserved workers for followers' WAL polls, which share the
+/// reserved lane: a caught-up follower's poll is held open (long poll), and
+/// with synchronous replication every general worker can be busy waiting
+/// for exactly those polls, so they must never queue behind writes.
+const REPLICATION_POLL_WORKERS: usize = 4;
+
+/// Reserved lane: the standard health paths plus followers' WAL polls.
+pub(super) fn reserved_lane_classifier(method: &str, path: &str) -> bool {
+    dash_http::default_health_classifier(method, path)
+        || (method == "GET" && path == "/internal/replication/wal")
+}
 const HEALTH_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,7 +208,7 @@ impl From<HttpResponse> for dash_http::Response {
 pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_http::ServerConfig {
     let env = dash_common::conn::ConnConfig::from_env();
     let mut config = dash_http::ServerConfig::new("ingestion", worker_count, queue_capacity);
-    config.health_workers = HEALTH_WORKERS;
+    config.health_workers = HEALTH_WORKERS + REPLICATION_POLL_WORKERS;
     config.health_queue_capacity = HEALTH_QUEUE_CAPACITY;
     config.write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
     config.reject_write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);

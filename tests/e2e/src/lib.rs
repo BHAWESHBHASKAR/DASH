@@ -5,6 +5,7 @@
 //! loopback ports, with temp directories and freshly generated secrets.
 //! Every child process is owned by a [`Proc`] whose `Drop` kills and reaps it.
 
+pub mod cluster;
 pub mod http;
 pub mod jwt;
 pub mod leader;
