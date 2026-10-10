@@ -3,10 +3,11 @@
 This page is the operator's reference for moving a running deployment from one
 DASH release to another and back: which paths are supported, in which order to
 restart the nodes, what to back up, how to roll back, and which release can
-read which on-disk and wire format. Every statement in the format table and
-the procedures below is checked by the compatibility tests in `tests/compat`
-(see [How this is tested](#how-this-is-tested)); where a test can only check an
-older release's rules instead of running its binary, that is said.
+read which on-disk and wire format. The 0.2.x and 0.3.0 columns of the format
+table and the procedures below are backed by the compatibility tests in
+`tests/compat` (see [How this is tested](#how-this-is-tested)); where a test
+can only check an older release's rules instead of running its binary, or a
+statement rests on other tests, that is said.
 
 The release-specific checklist for 0.2.x to 0.3.0 (secrets, roles, rate limits,
 SDK changes) is the "Upgrading to 0.3.0" section of
@@ -18,7 +19,7 @@ SDK changes) is the "Upgrading to 0.3.0" section of
 |---|---|---|---|
 | 0.2.x (`main` up to `ae86667`) | 0.3.0 | Yes. The WAL, snapshot, redb mirror, segment directories, audit log, lease file and placement state are read and migrated forward as described below. | Only by restoring the backup taken before the upgrade. 0.2.x cannot read what 0.3.0 writes (WAL records, redb rows, lease file). |
 | 0.3.0 pre-release build with deletes | 0.3.0 pre-release build without deletes | Downgrade only after a checkpoint (see [Tombstones](#tombstones-t2)). | n/a |
-| 0.3.x | 0.3.y | Yes; new fixtures are added for every release (see [Release checklist](#release-checklist)). | Rolling back within 0.3 is supported while no newer format is written; the table lists what each release writes. |
+| 0.3.x | 0.3.y | Intended; covered once the 0.3.0 fixture is tagged and later releases add theirs (see [Release checklist](#release-checklist)). | Within a line, a rollback is possible while the newer release has written no format the older one cannot read; the table records what each release writes. |
 
 Skipping releases is not tested: upgrade through each release in turn.
 
@@ -40,8 +41,8 @@ rollback without restoring a backup would face.
 | Control-plane lease (`DASH_CONTROL_PLANE_LEASE_PATH`) | `node_id,epoch,expires_at_ms` | `node_id,epoch,expires_at_ms,instance_id`, plus `leader.lease.epoch` (fencing floor) and `leader.lease.lock` (flock) | Yes; the first acquisition issues a fencing token above the old one | No: 0.2 requires exactly three fields and never becomes leader |
 | Placement state (`DASH_CONTROL_PLANE_STATE_PATH`) | CSV `tenant_id,shard_id,epoch,node_id,role,health` | same | Yes | Yes |
 | Replication frames (`/internal/replication/wal`, `/export`) | no `generation=` line | `generation=<lineage>` as the second line | Refused: both followers apply nothing and report `replication_leader_too_old` | Refused: the 0.2 follower expects `needs_resync=` on the second line and fails every poll |
-| Follower cursor (`<wal>.replication`, `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) | bare offset (retrieval only) | `generation=…` and `offset=…` | A bare offset triggers a full resync on the first poll | n/a |
-| HTTP API `/v1` | | | Request bodies and the API key header of 0.2 clients are accepted; every response field 0.2 returned is still returned | n/a |
+| Follower cursor (`<wal>.replication`, `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) | bare offset (retrieval only) | `generation=…` and `offset=…` | A bare offset is read as a cursor without a generation, which the leader answers with a resync (the parser is unit-tested in `services/retrieval`, not in `tests/compat`) | n/a |
+| HTTP API `/v1` | | | Request bodies and the API key header of 0.2 clients are accepted; every response field 0.2 returned is still returned. Authentication and role defaults changed (CHANGELOG checklist, steps 2 to 5) | n/a |
 
 ### Why a 0.2 leader cannot be followed
 
