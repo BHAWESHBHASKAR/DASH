@@ -708,14 +708,22 @@ impl IngestionRuntime {
         self.replication_follower.started = Instant::now();
         self.replication_follower.force_resync = true;
         self.replication_follower.generation = None;
-        eprintln!(
-            "ingestion failover: this node was deposed (term {old_term} -> {}); following {}",
-            self.failover.term,
-            self.failover
-                .leader_url
-                .as_deref()
-                .unwrap_or("no known leader yet")
-        );
+        let leader = self
+            .failover
+            .leader_url
+            .as_deref()
+            .unwrap_or("no known leader yet");
+        if was_leader {
+            eprintln!(
+                "ingestion failover: this node was deposed (term {old_term} -> {}); following {leader}",
+                self.failover.term
+            );
+        } else {
+            eprintln!(
+                "ingestion failover: following {leader} (term {}); local data is replaced by a resync",
+                self.failover.term
+            );
+        }
     }
 
     /// Apply a heartbeat answer obtained by a heartbeat sent at `sent_at`.
@@ -761,6 +769,17 @@ impl IngestionRuntime {
             self.failover.leader_node_id = None;
             self.failover.leader_url = None;
         } else {
+            if self.failover.role == NodeRole::Follower
+                && reply.leader_url.is_some()
+                && reply.leader_url != self.failover.leader_url
+            {
+                eprintln!(
+                    "ingestion failover: following the new leader {} at {} (term {})",
+                    reply.leader_node_id.as_deref().unwrap_or("?"),
+                    reply.leader_url.as_deref().unwrap_or("?"),
+                    reply.term
+                );
+            }
             self.failover.leader_node_id = reply.leader_node_id.clone();
             self.failover.leader_url = reply.leader_url.clone();
         }
@@ -796,6 +815,8 @@ impl IngestionRuntime {
             config.local_replica_id = Some(self.failover.node_id.clone());
         }
         config.durable_replica = true;
+        config.delta_io_timeout =
+            Some(config.long_poll.unwrap_or(Duration::ZERO) + Duration::from_millis(2_000));
         Some(config)
     }
 
@@ -831,8 +852,9 @@ pub(crate) fn heartbeat_tick(
     .and_then(|response| {
         if response.from_follower || response.status != 200 {
             return Err(format!(
-                "control plane answered the heartbeat with status {}",
-                response.status
+                "control plane answered the heartbeat with status {} ({})",
+                response.status,
+                response.body.chars().take(200).collect::<String>()
             ));
         }
         parse_heartbeat_reply(&response.body)

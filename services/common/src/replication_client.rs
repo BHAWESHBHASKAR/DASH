@@ -65,6 +65,8 @@ pub struct ClientOptions {
     pub client_key_file: Option<PathBuf>,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
+    /// Overall deadline of a request; zero means none (only `io_timeout`
+    /// per read applies).
     pub request_deadline: Duration,
 }
 
@@ -309,8 +311,14 @@ pub fn request(
         .redirects(0)
         .timeout_connect(options.connect_timeout)
         .timeout_read(options.io_timeout)
-        .timeout_write(options.io_timeout)
-        .timeout(options.request_deadline);
+        .timeout_write(options.io_timeout);
+    // An overall deadline takes precedence over the per-read timeout in
+    // ureq. A zero deadline leaves only the per-read timeout: a stalled
+    // peer is detected after `io_timeout` while a large answer that keeps
+    // arriving is never cut off.
+    if !options.request_deadline.is_zero() {
+        builder = builder.timeout(options.request_deadline);
+    }
     if parsed.scheme() == "https" {
         builder = builder.tls_config(options.tls_config()?);
     }

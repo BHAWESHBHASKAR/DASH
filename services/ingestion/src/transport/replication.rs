@@ -62,6 +62,11 @@ pub(crate) struct ReplicationPullConfig {
     pub(crate) durable_replica: bool,
     /// Ask a caught-up leader to hold the poll open (`wait_ms`).
     pub(crate) long_poll: Option<Duration>,
+    /// Per-read timeout of WAL delta polls (frames are bounded, unlike an
+    /// export being built). A failover follower uses a short one so a poll
+    /// stuck on a dead or paused leader does not outlive a failover by
+    /// long: the next poll goes to the new leader.
+    pub(crate) delta_io_timeout: Option<Duration>,
 }
 
 impl ReplicationPullConfig {
@@ -85,6 +90,7 @@ impl ReplicationPullConfig {
             term: None,
             durable_replica: false,
             long_poll: None,
+            delta_io_timeout: None,
         }
     }
 
@@ -270,6 +276,38 @@ pub(crate) fn request_replication_source(
     max_body_bytes: usize,
 ) -> Result<ReplicationSourceResponse, String> {
     request_replication_source_with_method(url, token, "GET", max_body_bytes)
+}
+
+fn request_replication_source_with_io_timeout(
+    url: &str,
+    token: Option<&str>,
+    max_body_bytes: usize,
+    io_timeout: Option<Duration>,
+) -> Result<ReplicationSourceResponse, String> {
+    request_replication_source_with_io_timeout_method(url, token, "GET", max_body_bytes, io_timeout)
+}
+
+fn request_replication_source_with_io_timeout_method(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    max_body_bytes: usize,
+    io_timeout: Option<Duration>,
+) -> Result<ReplicationSourceResponse, String> {
+    let mut options = dash_common::replication_client::ClientOptions::from_env();
+    if let Some(timeout) = io_timeout {
+        // Per-read timeout only: a leader that stops answering (dead,
+        // paused, partitioned) is given up on quickly, a large frame that
+        // keeps arriving is not cut off.
+        options.io_timeout = timeout;
+        options.request_deadline = Duration::ZERO;
+    }
+    let response =
+        dash_common::replication_client::request(method, url, token, max_body_bytes, &options)?;
+    Ok(ReplicationSourceResponse {
+        status: response.status,
+        body: response.body,
+    })
 }
 
 fn request_replication_ack(
@@ -1410,10 +1448,11 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
     if force_resync {
         return resync_from_export(runtime, config);
     }
-    let delta_response = request_replication_source(
+    let delta_response = request_replication_source_with_io_timeout(
         &config.wal_pull_url(from_offset, from_generation),
         config.token.as_deref(),
         config.max_response_bytes,
+        config.delta_io_timeout,
     )?;
     if delta_response.status != 200 {
         return Err(format!(
@@ -1574,7 +1613,16 @@ fn acknowledge_replication_commits(
         let Some(url) = config.ack_url(commit_id) else {
             continue;
         };
-        let response = request_replication_ack(&url, config.token.as_deref())?;
+        let response = match config.delta_io_timeout {
+            Some(timeout) => request_replication_source_with_io_timeout_method(
+                &url,
+                config.token.as_deref(),
+                "POST",
+                ACK_MAX_RESPONSE_BYTES,
+                Some(timeout),
+            )?,
+            None => request_replication_ack(&url, config.token.as_deref())?,
+        };
         // 404: the leader no longer tracks this commit (evicted by its
         // retention policy or restarted). The data is already applied, so a
         // forgotten commit must not fail the pull.

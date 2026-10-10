@@ -712,3 +712,65 @@ fn tempfile_dir() -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+#[test]
+fn heartbeat_values_are_percent_decoded() {
+    let query = [
+        ("node_id", "n1"),
+        ("url", "http%3A%2F%2F127.0.0.1%3A8081"),
+        ("instance", "abc"),
+        ("role", "unknown"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect::<std::collections::HashMap<_, _>>();
+    let report = parse_heartbeat_query(&query).unwrap();
+    assert_eq!(report.url, "http://127.0.0.1:8081");
+    assert_eq!(percent_decode("a%2"), "a%2", "a truncated escape is kept");
+    assert_eq!(percent_decode("%zz"), "%zz");
+}
+
+#[test]
+fn a_named_leader_that_never_takes_over_is_replaced_after_its_lease() {
+    let mut f = running_cluster();
+    leader_beat(&mut f, "a", 10, 6_000);
+    beat_followers(&mut f, 11_500, &[("b", 10), ("c", 9)]);
+    let after = 6_000 + LEASE + GRACE + 1;
+    f.heartbeat(report("c", 1, ReportedRole::Follower, Some((G1, 9))), after)
+        .unwrap();
+    let (_, promotion) = f
+        .heartbeat(
+            report("b", 1, ReportedRole::Follower, Some((G1, 10))),
+            after,
+        )
+        .unwrap();
+    assert_eq!(promotion.unwrap().new_leader, "b");
+    // b cannot take over (say its WAL no longer matches its cursor): it
+    // keeps reporting as an unsynced follower, which is not a renewal.
+    let mut now = after;
+    let mut replaced = None;
+    while now < after + 3 * (LEASE + GRACE) {
+        now += 1_000;
+        let mut b = report("b", 2, ReportedRole::Follower, Some((G1, 10)));
+        b.synced = false;
+        let (reply, _) = f.heartbeat(b, now).unwrap();
+        if f.term() == 2 {
+            assert_eq!(
+                reply.role,
+                AssignedRole::Leader,
+                "still named until replaced"
+            );
+        }
+        let (_, promotion) = f
+            .heartbeat(report("c", 2, ReportedRole::Follower, Some((G1, 9))), now)
+            .unwrap();
+        if let Some(promotion) = promotion {
+            replaced = Some((promotion, now));
+            break;
+        }
+    }
+    let (promotion, at) = replaced.expect("b must be replaced");
+    assert_eq!(promotion.new_leader, "c");
+    assert_eq!(promotion.term, 3);
+    assert!(at > after + LEASE + GRACE, "not before b's lease lapsed");
+}

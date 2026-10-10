@@ -838,11 +838,47 @@ fn read_state(path: &Path) -> Result<Option<PersistedState>, String> {
     }))
 }
 
+/// Decode `%XX` escapes (and `+` as a space). Invalid escapes are kept
+/// verbatim; the result is validated by the caller.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse a heartbeat from its query parameters.
 pub fn parse_heartbeat_query(
     query: &std::collections::HashMap<String, String>,
 ) -> Result<HeartbeatReport, String> {
-    let get = |key: &str| query.get(key).map(|value| value.trim().to_string());
+    // The shared query splitter does not percent-decode; heartbeats carry
+    // URLs, so their values are decoded here.
+    let get = |key: &str| query.get(key).map(|value| percent_decode(value.trim()));
     let required = |key: &str| {
         get(key)
             .filter(|value| !value.is_empty())
