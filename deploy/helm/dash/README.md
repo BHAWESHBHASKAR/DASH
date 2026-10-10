@@ -125,6 +125,7 @@ container creates the data directories on a fresh PVC.
 | `replicas.retrieval` | `2` | Retrieval replicas (manual scaling) |
 | `controlPlane.enabled` | `true` | Deploy the control plane |
 | `config.logLevel` | `info` | `RUST_LOG` filter |
+| `config.logFormat` | `json` | `DASH_LOG_FORMAT` (`json` lines or `text`) |
 | `config.strictSecrets` | `true` | `DASH_STRICT_SECRETS` |
 | `config.embeddingProvider` | `hash` | `DASH_EMBEDDING_PROVIDER` (`hash`, `openai`, `ollama`) |
 | `config.ollamaEndpoint` | in-cluster URL | `DASH_OLLAMA_ENDPOINT` (only when provider is `ollama`) |
@@ -137,10 +138,39 @@ container creates the data directories on a fresh PVC.
 | `networkPolicy.ollama.enabled` | `false` | Egress to in-cluster Ollama on private CIDRs (port 11434) |
 | `pdb.enabled` | `true` | PodDisruptionBudget for retrieval only |
 | `secret.*` | none | See "Secrets are required" |
+| `metrics.public` | `false` | `DASH_METRICS_PUBLIC`: `/metrics` without credentials |
+| `metrics.serviceMonitor.enabled` | `false` | One Prometheus Operator ServiceMonitor per component |
+| `metrics.prometheusRule.enabled` | `false` | PrometheusRule with the DASH recording and alert rules |
+| `metrics.grafanaDashboards.enabled` | `false` | ConfigMap with the Grafana dashboards (sidecar label `grafana_dashboard: "1"`) |
 
 For an in-cluster Ollama, set `config.embeddingProvider=ollama`,
 `config.ollamaEndpoint=http://<service>:11434` and
 `networkPolicy.ollama.enabled=true`.
+
+## Monitoring
+
+With the Prometheus Operator installed:
+
+```bash
+helm upgrade --install dash ./deploy/helm/dash ... \
+  --set metrics.serviceMonitor.enabled=true \
+  --set metrics.serviceMonitor.labels.release=kube-prometheus-stack \
+  --set metrics.serviceMonitor.authorization.retrieval.secretName=dash-scrape \
+  --set metrics.serviceMonitor.authorization.retrieval.key=retrieval \
+  --set metrics.serviceMonitor.authorization.ingestion.secretName=dash-scrape \
+  --set metrics.serviceMonitor.authorization.ingestion.key=ingestion \
+  --set metrics.prometheusRule.enabled=true \
+  --set metrics.grafanaDashboards.enabled=true
+```
+
+`dash-scrape` holds credentials with the `read_only` role for retrieval and
+ingestion (or set `metrics.public=true`); the control plane is scraped with
+its own token. With `networkPolicy.enabled`, `metrics.networkPolicy.from`
+(default: namespace `monitoring`) may reach the HTTP ports. The rules and
+dashboards in `files/` are copies of `deploy/observability/` (CI fails when
+they differ); set `metrics.prometheusRule.runbookBaseUrl` to turn the
+relative runbook paths into links. Alerts, runbooks and SLOs:
+`docs/operations/runbooks/` and `docs/operations/slos.md`.
 
 ## Validation
 
@@ -201,5 +231,7 @@ deploy/helm/dash/
     ├── controlplane.yaml
     ├── ingress.yaml
     ├── networkpolicy.yaml
+    ├── monitoring.yaml
     └── pdb.yaml
+└── files/                # copies of deploy/observability (rules, dashboards)
 ```

@@ -6,6 +6,64 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (observability: metrics, request ids, alerts, runbooks, SLOs)
+
+- **`dash-observe` crate** (`pkg/observe`): lock-free Prometheus histograms,
+  an exposition writer, a strict exposition validator used by the tests,
+  process metrics and request instrumentation for the shared HTTP server.
+- **Shared metrics on every service**, including the control plane, which
+  now serves `GET /metrics` (control-plane token, or `DASH_METRICS_PUBLIC=1`):
+  `dash_http_server_requests_total{component,route,method,code}`, the
+  `dash_http_server_request_duration_seconds` histogram,
+  `dash_http_server_requests_in_flight`, `process_*` (resident memory, file
+  descriptors, CPU, threads, start time), `dash_process_uptime_seconds` and
+  `dash_build_info{component,version,git_sha}` (`DASH_GIT_SHA` at build time;
+  the release workflow passes the commit). Route labels come from a fixed
+  table per service; ids in delete paths never become labels.
+- **Storage, replication and embedding metrics**: WAL append and fsync
+  latency histograms, fsync failures, bytes appended, WAL size, group-commit
+  batch size histogram, checkpoint duration histogram, outcome counters and
+  last-success time, vector index save/load duration; embedding provider call
+  latency, calls, texts, errors by kind and circuit-breaker state;
+  `dash_retrieval_replication_lag_seconds` (time since the follower was last
+  caught up) next to the lag in records. Control-plane leadership, lease and
+  placement gauges.
+- **`X-Request-Id` on every request**: a valid client id (1 to 128 letters,
+  digits or `-_.:/+=@`) is kept, otherwise a 128-bit id is generated; it is
+  returned in the response header, added as `request_id` to JSON error
+  bodies (also for requests rejected while being read), stored in audit
+  records and carried by an `http_request` tracing span around every handler.
+  One `dash_access` log event per request (`debug`, `warn` for 5xx).
+- **Alerts, runbooks, SLOs and dashboards** in `deploy/observability/`: 21
+  alerts (target down, error rate, p99 latency, multi-window error-budget
+  burn, WAL poisoned or failing, disk unavailable or nearly full, slow
+  fsync, checkpoint failures, storage divergence, follower lag, follower not
+  ready, resync storm, visibility lag, control plane without a leader, audit
+  write failures and dropped denial records, embedding breaker open, load
+  shedding, file descriptors), each linked to a runbook in
+  `docs/operations/runbooks/`; SLO recording rules and
+  `docs/operations/slos.md`; three Grafana dashboards. `promtool test rules`
+  unit tests cover every alert.
+- **CI**: a new `observability` job runs `scripts/check_observability.sh`
+  (pinned, checksum-verified promtool; rule checks and tests; runbook,
+  metric-name and dashboard-query checks; Helm chart copies; the rendered
+  PrometheusRule). The deploy job lints and renders the chart with the
+  monitoring options.
+- **Helm**: `metrics.serviceMonitor`, `metrics.prometheusRule`,
+  `metrics.grafanaDashboards` (all off by default), `metrics.public`
+  (`DASH_METRICS_PUBLIC`), a scrape NetworkPolicy, and `config.logFormat`.
+
+### Changed (observability)
+
+- The Helm chart sets `DASH_LOG_FORMAT=json` by default (`config.logFormat`;
+  set `text` for the previous format).
+- The control plane initializes `tracing`, so `RUST_LOG` and
+  `DASH_LOG_FORMAT` apply to it too.
+- `deploy/container/monitoring/prometheus-alert-rules.yml` is replaced by
+  `deploy/observability/prometheus/`; `DashRetrieveServerErrorRate` is
+  superseded by `DashHighErrorRate` and `DashReadyProbeFailing` (which needed
+  a blackbox exporter) by `DashTargetDown` and the specific readiness alerts.
+
 ### Changed (replication across checkpoints, follower throughput)
 
 - **Followers cross leader checkpoints without a full resync.** A checkpoint
