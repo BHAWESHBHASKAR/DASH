@@ -1,0 +1,286 @@
+# DASH alert rules.
+#
+# Every alert links its runbook (docs/operations/runbooks/<alert>.md, a path
+# relative to the repository root) through annotations.runbook_url. Burn-rate
+# alerts use the recording rules in dash-recording.rules.yml; load both files.
+#
+# Validated in CI with `promtool check rules` and unit-tested with
+# `promtool test rules` (deploy/observability/prometheus/tests/); see
+# scripts/check_observability.sh. SLOs: docs/operations/slos.md.
+#
+# Severity: `critical` pages the on-call engineer, `warning` opens a ticket.
+groups:
+  - name: dash-availability
+    rules:
+      - alert: DashTargetDown
+        expr: up{job=~".*dash.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH scrape target {{ $labels.job }} {{ $labels.instance }} is down"
+          description: "Prometheus cannot scrape /metrics: the process is down or unreachable, or the scrape credential is rejected."
+          runbook_url: docs/operations/runbooks/dash-target-down.md
+
+      - alert: DashHighErrorRate
+        expr: |
+          (
+            sum by (job, component) (rate(dash_http_server_requests_total{code=~"5..",route!~"health|live|ready|metrics"}[5m]))
+              / sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics"}[5m]))
+          ) > 0.05
+          and
+          sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH {{ $labels.component }} answers more than 5% of requests with a 5xx"
+          description: "Server errors on {{ $labels.job }} have exceeded 5% of non-probe requests for 5 minutes."
+          runbook_url: docs/operations/runbooks/dash-high-error-rate.md
+
+      - alert: DashHighLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, component, route, le) (rate(dash_http_server_request_duration_seconds_bucket{route=~"retrieve|embeddings|ingest|ingest_raw|ingest_batch|delete_claim|delete_evidence|delete_tenant"}[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH {{ $labels.component }} route {{ $labels.route }} p99 latency is above 1s"
+          description: "The 99th percentile request latency of {{ $labels.route }} on {{ $labels.job }} has been above 1 second for 10 minutes."
+          runbook_url: docs/operations/runbooks/dash-high-latency-p99.md
+
+  - name: dash-slo
+    rules:
+      # Availability SLO 99.9% (error budget 0.1%), multi-window burn rate.
+      - alert: DashErrorBudgetBurn
+        expr: |
+          dash:slo_availability_errors:ratio_rate1h > (14.4 * 0.001)
+          and
+          dash:slo_availability_errors:ratio_rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          window: fast
+        annotations:
+          summary: "DASH {{ $labels.component }} is burning its availability error budget fast"
+          description: "At the current 5xx ratio the 30-day error budget of {{ $labels.component }} is spent in about 2 days (burn rate above 14.4 over 1h and 5m)."
+          runbook_url: docs/operations/runbooks/dash-error-budget-burn.md
+      - alert: DashErrorBudgetBurn
+        expr: |
+          dash:slo_availability_errors:ratio_rate6h > (6 * 0.001)
+          and
+          dash:slo_availability_errors:ratio_rate30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+          window: slow
+        annotations:
+          summary: "DASH {{ $labels.component }} is burning its availability error budget"
+          description: "At the current 5xx ratio the 30-day error budget of {{ $labels.component }} is spent in about 5 days (burn rate above 6 over 6h and 30m)."
+          runbook_url: docs/operations/runbooks/dash-error-budget-burn.md
+
+  - name: dash-storage
+    rules:
+      - alert: DashWalPoisoned
+        expr: dash_ingest_wal_poisoned == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH ingestion WAL on {{ $labels.instance }} is poisoned"
+          description: "A WAL fsync failed; the WAL refuses every write until the process restarts and recovers. Ingestion is down."
+          runbook_url: docs/operations/runbooks/dash-wal-poisoned.md
+
+      - alert: DashWalWriteFailing
+        expr: dash_ingest_wal_write_failing == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH ingestion on {{ $labels.instance }} cannot write its WAL"
+          description: "WAL appends are failing (typically a full volume). /ready reports not ready and ingest requests fail."
+          runbook_url: docs/operations/runbooks/dash-wal-write-failing.md
+
+      - alert: DashDiskUnavailable
+        expr: dash_disk_unavailable == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH {{ $labels.job }} on {{ $labels.instance }} lost its redb disk store"
+          description: "The redb-backed disk store is unavailable; the node serves from memory only and reports not ready."
+          runbook_url: docs/operations/runbooks/dash-disk-unavailable.md
+
+      - alert: DashDiskNearlyFull
+        expr: |
+          (
+            kubelet_volume_stats_available_bytes{persistentvolumeclaim=~".*dash.*"}
+              / kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~".*dash.*"}
+          ) < 0.10
+          or
+          (
+            node_filesystem_avail_bytes{mountpoint=~"/var/lib/dash.*",fstype!~"tmpfs|overlay"}
+              / node_filesystem_size_bytes{mountpoint=~"/var/lib/dash.*",fstype!~"tmpfs|overlay"}
+          ) < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH data volume {{ $labels.persistentvolumeclaim }}{{ $labels.mountpoint }} has less than 10% free space"
+          description: "When the volume fills, WAL appends fail and ingestion stops. Requires kubelet volume stats (Kubernetes) or node_exporter (systemd)."
+          runbook_url: docs/operations/runbooks/dash-disk-nearly-full.md
+
+      - alert: DashWalFsyncSlow
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, instance, le) (rate(dash_wal_fsync_duration_seconds_bucket[5m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH WAL fsync p99 on {{ $labels.instance }} is above 100ms"
+          description: "Slow fdatasync calls delay every acknowledged write (group commit waits for them)."
+          runbook_url: docs/operations/runbooks/dash-wal-fsync-slow.md
+
+      - alert: DashCheckpointFailing
+        expr: increase(dash_wal_checkpoint_failures_total[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH WAL checkpoints are failing on {{ $labels.instance }}"
+          description: "A checkpoint failed in the last 30 minutes; the WAL keeps growing and restarts replay more records."
+          runbook_url: docs/operations/runbooks/dash-checkpoint-failing.md
+
+      - alert: DashStorageDivergence
+        expr: dash_retrieve_storage_last_divergence_warn == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH retrieval storage divergence on {{ $labels.instance }}"
+          description: "Segment and WAL-delta visibility differ beyond the configured threshold."
+          runbook_url: docs/operations/runbooks/dash-storage-divergence.md
+
+  - name: dash-replication
+    rules:
+      - alert: DashReplicationFollowerLagging
+        expr: |
+          dash_retrieval_replication_lag_seconds > 60
+          or
+          dash_retrieval_replication_lag_records > 10000
+          or
+          dash_ingest_replication_lag_records > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH replication follower {{ $labels.instance }} is lagging"
+          description: "The follower has not caught up with the leader for more than 60 seconds or is more than 10000 records behind."
+          runbook_url: docs/operations/runbooks/dash-replication-follower-lagging.md
+
+      - alert: DashReplicationFollowerNotReady
+        expr: dash_retrieval_replication_ready == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH retrieval follower {{ $labels.instance }} has not been ready for 10 minutes"
+          description: "The follower is out of the load balancer (initial sync pending, lag or staleness beyond the limits, or replication blocked)."
+          runbook_url: docs/operations/runbooks/dash-replication-follower-not-ready.md
+
+      - alert: DashReplicationResyncStorm
+        expr: |
+          increase(dash_retrieval_replication_resyncs_total[30m]) > 3
+          or
+          increase(dash_ingest_replication_resync_total[30m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH follower {{ $labels.instance }} keeps resyncing from scratch"
+          description: "More than 3 full resyncs in 30 minutes: the follower repeatedly falls out of the leader's retained WAL generations."
+          runbook_url: docs/operations/runbooks/dash-replication-resync-storm.md
+
+      - alert: DashIngestToVisibleLagHigh
+        expr: dash_ingest_to_visible_lag_ms_p95 > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH writes take more than 5s to become visible on {{ $labels.instance }}"
+          description: "The 95th percentile ingest-to-visible lag observed by retrieval is above 5 seconds."
+          runbook_url: docs/operations/runbooks/dash-ingest-to-visible-lag-high.md
+
+      - alert: DashControlPlaneNoLeader
+        expr: max by (job) (dash_control_plane_is_leader) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No DASH control-plane node in {{ $labels.job }} holds the leader lease"
+          description: "Placement reads and changes are refused until a node acquires the lease. The data path keeps serving with the last placement."
+          runbook_url: docs/operations/runbooks/dash-control-plane-no-leader.md
+
+  - name: dash-security
+    rules:
+      - alert: DashAuditWriteFailures
+        expr: increase(dash_audit_write_failures_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "DASH {{ $labels.job }} on {{ $labels.instance }} failed to write audit records"
+          description: "Audit appends are failing; with fail-closed audit, mutations are refused, otherwise events are missing from the hash chain."
+          runbook_url: docs/operations/runbooks/dash-audit-write-failures.md
+
+      - alert: DashAuditDenialsDropped
+        expr: increase(dash_audit_denials_dropped_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH {{ $labels.job }} on {{ $labels.instance }} is throttling denial audit records"
+          description: "Authentication or authorization denials arrive faster than DASH_AUDIT_DENIAL_MAX_PER_SEC; individual denial records were dropped (a summary record is written)."
+          runbook_url: docs/operations/runbooks/dash-audit-denials-dropped.md
+
+  - name: dash-dependencies
+    rules:
+      - alert: DashEmbeddingBreakerOpen
+        expr: |
+          max by (job, instance, provider) (dash_embedding_breaker_state) == 1
+          or
+          sum by (job, instance, provider) (increase(dash_embedding_errors_total{kind="circuit_open"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH embedding provider {{ $labels.provider }} circuit breaker is open on {{ $labels.instance }}"
+          description: "Requests that need an embedding fail fast with 503 until the provider recovers."
+          runbook_url: docs/operations/runbooks/dash-embedding-breaker-open.md
+
+  - name: dash-capacity
+    rules:
+      - alert: DashRequestsShed
+        expr: |
+          rate(dash_retrieve_transport_queue_full_reject_total[5m]) > 0
+          or
+          rate(dash_ingest_transport_queue_full_reject_total[5m]) > 0
+          or
+          rate(dash_ingest_wal_group_commit_queue_full_reject_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH {{ $labels.job }} on {{ $labels.instance }} is shedding requests"
+          description: "A bounded queue (HTTP accept queue or group-commit queue) has been full for 10 minutes; clients receive 503."
+          runbook_url: docs/operations/runbooks/dash-requests-shed.md
+
+      - alert: DashFileDescriptorsExhausted
+        expr: process_open_fds{job=~".*dash.*"} / process_max_fds{job=~".*dash.*"} > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH {{ $labels.job }} on {{ $labels.instance }} uses more than 90% of its file descriptors"
+          description: "When the limit is reached, accept() and file opens fail."
+          runbook_url: docs/operations/runbooks/dash-file-descriptors-exhausted.md
