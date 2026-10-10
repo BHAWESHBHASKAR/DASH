@@ -77,10 +77,13 @@ fn tenant_tombstone(tenant: &str) -> Tombstone {
     }
 }
 
+/// One atomic ingest: claim, evidence, edges and an optional vector.
+type Write = (Claim, Vec<Evidence>, Vec<ClaimEdge>, Option<Vec<f32>>);
+
 /// Tenant `t1`: `a` (2 evidence, vector, edge a->b), `b`, `c` (edge c->a).
 /// Tenant `t2`: `x` with an evidence id that also exists in `t1`.
 fn seed(store: &mut InMemoryStore, wal: &mut FileWal) {
-    let writes: Vec<(Claim, Vec<Evidence>, Vec<ClaimEdge>, Option<Vec<f32>>)> = vec![
+    let writes: Vec<Write> = vec![
         (
             claim("t1", "b", "beta statement about acme"),
             vec![evidence("eb", "b")],
