@@ -52,6 +52,10 @@ COPY pkg ./pkg
 COPY services ./services
 COPY tests ./tests
 COPY tools ./tools
+# Git commit reported by the dash_build_info metric (build with
+# --build-arg DASH_GIT_SHA=$(git rev-parse --short=12 HEAD)); "unknown" when unset.
+ARG DASH_GIT_SHA=unknown
+ENV DASH_GIT_SHA=${DASH_GIT_SHA}
 RUN cargo build --release --workspace --locked
 
 # Strip debug info from the three service binaries. The image size drops

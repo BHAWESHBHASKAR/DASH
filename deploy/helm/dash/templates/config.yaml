@@ -12,6 +12,10 @@ metadata:
 data:
   # ----- shared tunables -----
   RUST_LOG: {{ .Values.config.logLevel | quote }}
+  DASH_LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  {{- if .Values.metrics.public }}
+  DASH_METRICS_PUBLIC: "1"
+  {{- end }}
   DASH_STRICT_SECRETS: {{ ternary "1" "0" .Values.config.strictSecrets | quote }}
   DASH_EMBEDDING_PROVIDER: {{ .Values.config.embeddingProvider | quote }}
   {{- if eq .Values.config.embeddingProvider "ollama" }}

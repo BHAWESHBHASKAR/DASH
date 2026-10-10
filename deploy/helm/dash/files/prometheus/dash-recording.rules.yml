@@ -1,0 +1,64 @@
+# DASH recording rules: request rates and the SLIs behind docs/operations/slos.md.
+#
+# Validated in CI with `promtool check rules` and unit-tested with
+# `promtool test rules` (deploy/observability/prometheus/tests/); see
+# scripts/check_observability.sh.
+#
+# SLI scope: "API" routes are every route except health, readiness,
+# liveness, metrics, debug and the internal replication routes, which are
+# operator or machine traffic rather than client traffic.
+groups:
+  - name: dash-recording
+    interval: 30s
+    rules:
+      - record: dash:http_requests:rate5m
+        expr: sum by (job, component, route, code) (rate(dash_http_server_requests_total[5m]))
+
+      - record: dash:http_request_duration_seconds:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, component, route, le) (rate(dash_http_server_request_duration_seconds_bucket[5m])))
+
+      - record: dash:http_request_duration_seconds:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (job, component, route, le) (rate(dash_http_server_request_duration_seconds_bucket[5m])))
+
+  - name: dash-slo-availability
+    interval: 30s
+    rules:
+      # Fraction of API requests answered with a 5xx, per component, over the
+      # windows used by the multi-window burn-rate alerts.
+      - record: dash:slo_availability_errors:ratio_rate5m
+        expr: |
+          sum by (job, component) (rate(dash_http_server_requests_total{code=~"5..",route!~"health|live|ready|metrics|debug|replication_.*"}[5m]))
+            / sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics|debug|replication_.*"}[5m]))
+      - record: dash:slo_availability_errors:ratio_rate30m
+        expr: |
+          sum by (job, component) (rate(dash_http_server_requests_total{code=~"5..",route!~"health|live|ready|metrics|debug|replication_.*"}[30m]))
+            / sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics|debug|replication_.*"}[30m]))
+      - record: dash:slo_availability_errors:ratio_rate1h
+        expr: |
+          sum by (job, component) (rate(dash_http_server_requests_total{code=~"5..",route!~"health|live|ready|metrics|debug|replication_.*"}[1h]))
+            / sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics|debug|replication_.*"}[1h]))
+      - record: dash:slo_availability_errors:ratio_rate6h
+        expr: |
+          sum by (job, component) (rate(dash_http_server_requests_total{code=~"5..",route!~"health|live|ready|metrics|debug|replication_.*"}[6h]))
+            / sum by (job, component) (rate(dash_http_server_requests_total{route!~"health|live|ready|metrics|debug|replication_.*"}[6h]))
+
+  - name: dash-slo-latency
+    interval: 30s
+    rules:
+      # Fraction of retrieve requests answered within 0.5 s, and of
+      # single/batch/raw ingests answered within 2.5 s, whatever the status
+      # (the histogram is not split by status code). (Bucket
+      # bounds with a fractional part render identically in Prometheus 2.x and
+      # 3.x, whose scrape normalizes integral `le` values to "1.0".)
+      - record: dash:slo_retrieve_latency_good:ratio_rate30m
+        expr: |
+          sum by (job, component) (rate(dash_http_server_request_duration_seconds_bucket{route="retrieve",le="0.5"}[30m]))
+            / sum by (job, component) (rate(dash_http_server_request_duration_seconds_count{route="retrieve"}[30m]))
+      - record: dash:slo_ingest_latency_good:ratio_rate30m
+        expr: |
+          sum by (job, component) (rate(dash_http_server_request_duration_seconds_bucket{route=~"ingest|ingest_raw|ingest_batch",le="2.5"}[30m]))
+            / sum by (job, component) (rate(dash_http_server_request_duration_seconds_count{route=~"ingest|ingest_raw|ingest_batch"}[30m]))

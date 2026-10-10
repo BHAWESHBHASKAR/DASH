@@ -41,10 +41,12 @@ else
     echo "backup_drill=fail" >> "$EVIDENCE_DIR/repo-metadata.txt"
 fi
 
-# 5. Prometheus alert rules
+# 5. Prometheus alert and recording rules, their unit tests, and the runbooks
 echo "[soc2] alert rules"
 mkdir -p "$EVIDENCE_DIR/monitoring"
-cp "$REPO_ROOT/deploy/container/monitoring/prometheus-alert-rules.yml" "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
+cp "$REPO_ROOT"/deploy/observability/prometheus/*.rules.yml "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
+cp "$REPO_ROOT"/deploy/observability/prometheus/tests/*.yml "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
+cp -r "$REPO_ROOT/docs/operations/runbooks" "$EVIDENCE_DIR/monitoring/" 2>/dev/null || true
 
 # 6. Encryption provider name (non-sensitive)
 echo "[soc2] encryption provider config"

@@ -168,6 +168,7 @@ jobs:
           target: runtime
           build-args: |
             SERVICE=${{ matrix.service }}
+            DASH_GIT_SHA=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

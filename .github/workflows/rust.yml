@@ -1,7 +1,8 @@
 # rust.yml
 # CI for the DASH Rust workspace: fmt, clippy, tests, release build, plus
 # deploy-artifact validation (helm lint/template, kustomize, kubeconform,
-# compose config, shellcheck, env-var check) and a container image build.
+# compose config, shellcheck, env-var check), observability checks (promtool
+# rule tests, dashboards, runbooks) and a container image build.
 # Runs on every push/PR to main across Ubuntu and macOS.
 # Expected runtime: ~8-15 minutes per matrix leg.
 name: Rust CI
@@ -114,6 +115,7 @@ jobs:
             scripts/deploy_systemd.sh \
             scripts/deploy_container.sh \
             scripts/backup_restore_drill.sh \
+            scripts/check_observability.sh \
             deploy/container/scripts/entrypoint.sh \
             deploy/container/scripts/healthcheck.sh
 
@@ -172,8 +174,36 @@ jobs:
             echo "helm template with tls.enabled succeeded without tls.secretName" >&2
             exit 1
           fi
+          # Monitoring: ServiceMonitors, PrometheusRule, Grafana dashboards and
+          # the scrape NetworkPolicy (deploy/observability/).
+          monitoring=(
+            --set metrics.serviceMonitor.enabled=true
+            --set metrics.serviceMonitor.authorization.retrieval.secretName=dash-scrape
+            --set metrics.serviceMonitor.authorization.retrieval.key=retrieval
+            --set metrics.serviceMonitor.authorization.ingestion.secretName=dash-scrape
+            --set metrics.serviceMonitor.authorization.ingestion.key=ingestion
+            --set metrics.prometheusRule.enabled=true
+            --set metrics.grafanaDashboards.enabled=true
+          )
+          helm lint deploy/helm/dash --strict "${args[@]}" "${monitoring[@]}"
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" "${monitoring[@]}" \
+            > helm-monitoring.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set metrics.public=true --set metrics.serviceMonitor.enabled=true \
+            --set metrics.prometheusRule.enabled=true \
+            --set tls.enabled=true --set tls.secretName=dash-internal-tls > helm-monitoring-tls.yaml
+          # A ServiceMonitor needs a scrape credential unless /metrics is public.
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set metrics.serviceMonitor.enabled=true >/dev/null 2>&1; then
+            echo "helm template rendered a ServiceMonitor without a scrape credential" >&2
+            exit 1
+          fi
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
             helm-default.yaml helm-ollama.yaml helm-existing.yaml helm-tls.yaml
+          # The Prometheus Operator kinds have no built-in schema; their rule
+          # content is checked by scripts/check_observability.sh.
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            -skip ServiceMonitor,PrometheusRule helm-monitoring.yaml helm-monitoring-tls.yaml
 
       - name: Kustomize build and kubeconform
         run: |
@@ -212,6 +242,27 @@ jobs:
           if echo "${out}" | grep -v 'is not executable' | grep -q .; then
             exit 1
           fi
+
+  observability:
+    name: Observability (promtool rules and alert tests, runbooks, dashboards)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.16.2
+
+      # Downloads a pinned Prometheus release (checksum verified against the
+      # release's sha256sums.txt and a pinned hash), then runs promtool check
+      # rules, promtool test rules, the runbook/metric-name/dashboard checks
+      # and the rendered PrometheusRule check.
+      - name: Check alert rules, rule tests, runbooks, dashboards and chart copies
+        run: scripts/check_observability.sh
 
   docker-build:
     name: Docker image build (no push)

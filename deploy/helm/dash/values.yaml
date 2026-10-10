@@ -82,7 +82,8 @@ serviceAccount:
 # Runtime configuration. Rendered into a ConfigMap and consumed via envFrom.
 # -----------------------------------------------------------------------------
 config:
-  logLevel: info            # RUST_LOG filter
+  logLevel: info            # RUST_LOG filter (add dash_access=debug for one line per request)
+  logFormat: json           # DASH_LOG_FORMAT: json (JSON lines) or text
   strictSecrets: true       # DASH_STRICT_SECRETS
   embeddingProvider: hash   # one of: hash | openai | ollama
   # Only used when embeddingProvider is ollama. Enable networkPolicy.ollama
@@ -352,3 +353,60 @@ containerSecurityContext:
 # Termination
 # -----------------------------------------------------------------------------
 terminationGracePeriodSeconds: 30
+
+# -----------------------------------------------------------------------------
+# Monitoring (Prometheus Operator and Grafana). All off by default; the
+# ServiceMonitor and PrometheusRule kinds need the Prometheus Operator CRDs.
+# Rules, dashboards, SLOs and runbooks: deploy/observability/,
+# docs/operations/slos.md and docs/operations/runbooks/.
+# -----------------------------------------------------------------------------
+metrics:
+  # DASH_METRICS_PUBLIC=1: serve /metrics without credentials. The ingress
+  # never routes /metrics; with networkPolicy.enabled only the peers in
+  # metrics.networkPolicy.from (and DASH pods) can reach the pods.
+  public: false
+  serviceMonitor:
+    enabled: false
+    # Namespace of the ServiceMonitor objects (empty -> release namespace).
+    namespace: ""
+    # Extra labels, e.g. `release: kube-prometheus-stack`, so the
+    # Prometheus instance selects the ServiceMonitors.
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    # Bearer credential Prometheus presents when metrics.public is false:
+    # a Secret name and key per component. Retrieval and ingestion need a
+    # credential holding the read_only (or admin) role that is unscoped or
+    # admin (see docs/operations/auth.md). The control plane defaults to its
+    # own token (DASH_CONTROL_PLANE_TOKEN in the control-plane Secret).
+    authorization:
+      retrieval:
+        secretName: ""
+        key: ""
+      ingestion:
+        secretName: ""
+        key: ""
+      controlPlane:
+        secretName: ""
+        key: DASH_CONTROL_PLANE_TOKEN
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
+    # Prefix for the relative runbook paths in annotations.runbook_url, e.g.
+    # https://github.com/<org>/<repo>/blob/<ref>/ (empty keeps them relative).
+    runbookBaseUrl: ""
+  grafanaDashboards:
+    # ConfigMap with the dashboards, labelled for the Grafana sidecar.
+    enabled: false
+    namespace: ""
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}
+  networkPolicy:
+    # Peers allowed to scrape the HTTP port when networkPolicy.enabled and
+    # metrics.serviceMonitor.enabled.
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring

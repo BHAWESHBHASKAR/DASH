@@ -1,0 +1,111 @@
+{{- /*
+Prometheus Operator ServiceMonitors (one per component, because each needs its
+own scrape credential), the PrometheusRule with the DASH recording and alert
+rules, and a ConfigMap with the Grafana dashboards. The rule and dashboard
+files under files/ are copies of deploy/observability/ (CI checks that they
+are identical: scripts/check_observability.sh).
+*/ -}}
+{{- $ns := include "dash.namespace" . -}}
+{{- $m := .Values.metrics -}}
+{{- if $m.serviceMonitor.enabled }}
+{{- $components := list (list "retrieval" "retrieval" "http" "dash.retrievalSelectorLabels") (list "ingestion" "ingestion" "http" "dash.ingestionSelectorLabels") -}}
+{{- if .Values.controlPlane.enabled -}}
+{{- $components = append $components (list "control-plane" "controlPlane" "http" "dash.controlPlaneSelectorLabels") -}}
+{{- end -}}
+{{- range $c := $components }}
+{{- $name := index $c 0 -}}
+{{- $key := index $c 1 -}}
+{{- $auth := index $m.serviceMonitor.authorization $key -}}
+{{- $secretName := $auth.secretName -}}
+{{- if and (eq $key "controlPlane") (not $secretName) -}}
+{{- $secretName = include "dash.controlPlaneSecretName" $ -}}
+{{- end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "dash.componentName" (list $ $name) }}
+  namespace: {{ default $ns $m.serviceMonitor.namespace }}
+  labels:
+    {{- include "dash.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+    {{- with $m.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $ns }}
+  selector:
+    matchLabels:
+      {{- include (index $c 3) $ | nindent 6 }}
+  endpoints:
+    - port: {{ index $c 2 }}
+      path: /metrics
+      interval: {{ $m.serviceMonitor.interval }}
+      scrapeTimeout: {{ $m.serviceMonitor.scrapeTimeout }}
+      {{- if $.Values.tls.enabled }}
+      scheme: https
+      tlsConfig:
+        serverName: {{ printf "%s.%s.svc.cluster.local" (include "dash.componentName" (list $ $name)) $ns }}
+        ca:
+          secret:
+            name: {{ $.Values.tls.secretName }}
+            key: ca.crt
+      {{- end }}
+      {{- if not $m.public }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ required (printf "metrics.serviceMonitor.authorization.%s.secretName is required when metrics.public is false (a Secret holding a read_only credential), or set metrics.public=true" $key) $secretName }}
+          key: {{ required (printf "metrics.serviceMonitor.authorization.%s.key is required when metrics.public is false" $key) $auth.key }}
+      {{- end }}
+{{- end }}
+{{- end }}
+{{- if $m.prometheusRule.enabled }}
+{{- $recording := .Files.Get "files/prometheus/dash-recording.rules.yml" | fromYaml -}}
+{{- $alerts := .Files.Get "files/prometheus/dash-alerts.rules.yml" | fromYaml -}}
+{{- $groups := concat $recording.groups $alerts.groups -}}
+{{- if $m.prometheusRule.runbookBaseUrl -}}
+{{- range $g := $groups -}}
+{{- range $r := $g.rules -}}
+{{- if and $r.annotations $r.annotations.runbook_url -}}
+{{- $_ := set $r.annotations "runbook_url" (printf "%s%s" $m.prometheusRule.runbookBaseUrl $r.annotations.runbook_url) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "dash.fullname" . }}
+  namespace: {{ default $ns $m.prometheusRule.namespace }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    {{- with $m.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $groups | nindent 4 }}
+{{- end }}
+{{- if $m.grafanaDashboards.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "dash.fullname" . }}-grafana-dashboards
+  namespace: {{ default $ns $m.grafanaDashboards.namespace }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    {{- with $m.grafanaDashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $m.grafanaDashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{- (.Files.Glob "files/grafana/*.json").AsConfig | nindent 2 }}
+{{- end }}

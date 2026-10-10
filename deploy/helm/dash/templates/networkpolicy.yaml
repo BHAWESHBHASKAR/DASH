@@ -166,6 +166,29 @@ spec:
     ports:
     - port: http
       protocol: TCP
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+# Prometheus -> /metrics on every DASH pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-allow-metrics-scrape
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.selectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    {{- toYaml .Values.metrics.networkPolicy.from | nindent 4 }}
+    ports:
+    - port: http
+      protocol: TCP
+{{- end }}
 ---
 # Retrieval pods -> ingestion (WAL replication).
 apiVersion: networking.k8s.io/v1
