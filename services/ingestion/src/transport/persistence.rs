@@ -34,29 +34,6 @@ pub fn checkpoint_policy_from_values(
     }
 }
 
-#[cfg(test)]
-mod checkpoint_policy_tests {
-    use super::*;
-
-    #[test]
-    fn bytes_default_to_256_mib_and_zero_turns_a_threshold_off() {
-        let policy = checkpoint_policy_from_values(None, None);
-        assert_eq!(policy.max_wal_records, None);
-        assert_eq!(policy.max_wal_bytes, Some(DEFAULT_CHECKPOINT_MAX_WAL_BYTES));
-        let policy = checkpoint_policy_from_values(Some("500"), Some("1048576"));
-        assert_eq!(policy.max_wal_records, Some(500));
-        assert_eq!(policy.max_wal_bytes, Some(1_048_576));
-        let off = checkpoint_policy_from_values(Some("0"), Some("0"));
-        assert_eq!(off, CheckpointPolicy::default(), "both 0: no checkpoints");
-        let garbage = checkpoint_policy_from_values(Some("x"), Some("y"));
-        assert_eq!(garbage.max_wal_records, None);
-        assert_eq!(
-            garbage.max_wal_bytes,
-            Some(DEFAULT_CHECKPOINT_MAX_WAL_BYTES)
-        );
-    }
-}
-
 pub(super) fn map_store_error(error: &StoreError) -> (u16, String) {
     match error {
         StoreError::Validation(err) => (400, format!("validation error: {err:?}")),
@@ -106,4 +83,27 @@ pub(super) fn should_checkpoint_now(
         return Ok(true);
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod checkpoint_policy_tests {
+    use super::*;
+
+    #[test]
+    fn bytes_default_to_256_mib_and_zero_turns_a_threshold_off() {
+        let policy = checkpoint_policy_from_values(None, None);
+        assert_eq!(policy.max_wal_records, None);
+        assert_eq!(policy.max_wal_bytes, Some(DEFAULT_CHECKPOINT_MAX_WAL_BYTES));
+        let policy = checkpoint_policy_from_values(Some("500"), Some("1048576"));
+        assert_eq!(policy.max_wal_records, Some(500));
+        assert_eq!(policy.max_wal_bytes, Some(1_048_576));
+        let off = checkpoint_policy_from_values(Some("0"), Some("0"));
+        assert_eq!(off, CheckpointPolicy::default(), "both 0: no checkpoints");
+        let garbage = checkpoint_policy_from_values(Some("x"), Some("y"));
+        assert_eq!(garbage.max_wal_records, None);
+        assert_eq!(
+            garbage.max_wal_bytes,
+            Some(DEFAULT_CHECKPOINT_MAX_WAL_BYTES)
+        );
+    }
 }
