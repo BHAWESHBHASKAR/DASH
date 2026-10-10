@@ -223,6 +223,46 @@ groups:
           description: "Placement reads and changes are refused until a node acquires the lease. The data path keeps serving with the last placement."
           runbook_url: docs/operations/runbooks/dash-control-plane-no-leader.md
 
+  - name: dash-failover
+    rules:
+      - alert: DashIngestNoLeader
+        expr: max by (job) (dash_ingest_failover_accepts_writes) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No DASH ingestion node in {{ $labels.job }} accepts writes"
+          description: "Leader failover is on and no node holds a valid leader lease: the control plane is unreachable, or no member can be promoted. Writes are refused with 503."
+          runbook_url: docs/operations/runbooks/dash-ingest-no-leader.md
+
+      - alert: DashIngestFailoverBlocked
+        expr: max by (job) (dash_control_plane_ingest_failover_blocked) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The DASH ingestion leader's lease lapsed and no member can be promoted"
+          description: "The control plane in {{ $labels.job }} cannot promote a new ingestion leader (no live, synced follower of the current term and lineage). Writes are unavailable."
+          runbook_url: docs/operations/runbooks/dash-ingest-failover-blocked.md
+
+      - alert: DashIngestFailoverHappened
+        expr: increase(dash_control_plane_ingest_promotions_total[10m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The DASH ingestion leader changed"
+          description: "The control plane in {{ $labels.job }} promoted an ingestion leader in the last 10 minutes (the first election of a new cluster counts too). Check why the previous leader was lost and bring it back as a follower."
+          runbook_url: docs/operations/runbooks/dash-ingest-failover-happened.md
+
+      - alert: DashIngestSyncReplicationTimeouts
+        expr: increase(dash_ingest_sync_replication_timeouts_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "DASH synchronous writes on {{ $labels.instance }} are not confirmed in time"
+          description: "Writes waited longer than DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS for follower confirmations; they were refused (on_timeout=fail) or acknowledged without the guarantee (on_timeout=degrade)."
+          runbook_url: docs/operations/runbooks/dash-ingest-sync-replication-timeouts.md
+
   - name: dash-security
     rules:
       - alert: DashAuditWriteFailures

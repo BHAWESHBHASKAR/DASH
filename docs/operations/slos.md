@@ -43,11 +43,15 @@ Window: rolling 30 days.
 | Retrieve latency | 99% within 0.5 s | 1% of retrieve requests may be slower |
 | Ingest latency | 99% within 2.5 s | 1% of ingest requests may be slower |
 | Freshness | 99.5% of time within 60 s | 3.6 hours of lag above 60 s per follower |
-| Control plane | no SLO | Placement is read at startup and on reload; the data path keeps serving without a leader (`DashControlPlaneNoLeader` is a warning) |
+| Control plane | no SLO | Placement is read at startup and on reload; the data path keeps serving without a leader (`DashControlPlaneNoLeader` is a warning). With ingestion leader failover on, a control-plane outage longer than the leader lease pauses writes (`DashIngestNoLeader` pages) |
 
 Durability is not an SLO with a budget: an acknowledged write must never be
 lost. The alerts `DashWalPoisoned`, `DashWalWriteFailing` and
-`DashDiskUnavailable` page immediately.
+`DashDiskUnavailable` page immediately. With leader failover, what
+"acknowledged" protects against depends on the replication mode
+([failover.md](failover.md#guarantees)): asynchronous replication can lose
+writes the leader acknowledged but had not shipped when its node is lost;
+`DASH_INGEST_MIN_SYNC_REPLICAS=1` survives any single node loss.
 
 ## Burn-rate alerting
 
