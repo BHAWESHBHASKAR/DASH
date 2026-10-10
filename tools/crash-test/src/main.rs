@@ -9,8 +9,9 @@
 //!
 //! * every write acknowledged with a 2xx before the kill is present, with all
 //!   of its evidence and edges;
-//! * nothing that was never sent appears, no evidence record is stored twice,
-//!   and an unacknowledged request is applied completely or not at all;
+//! * nothing that was never sent appears, no evidence record is written twice
+//!   within the snapshot or within the WAL, and an unacknowledged request is
+//!   applied completely or not at all;
 //! * the WAL (and snapshot) verify clean before and after recovery;
 //! * the restarted service reports ready within `--ready-timeout-secs`.
 //!
@@ -351,8 +352,16 @@ fn check_oracle(
             return Err(format!("edge {claim} -> {to} lost"));
         }
     }
-    if let Some((e, n)) = leader.evidence_lines.iter().find(|(_, n)| **n != 1) {
-        return Err(format!("evidence {e} is stored {n} times"));
+    // Once per section: a checkpoint interrupted between the snapshot
+    // rename and the WAL truncation legitimately leaves a record in both.
+    if let Some((e, [snap, wal])) = leader
+        .evidence_lines_by_section
+        .iter()
+        .find(|(_, [snap, wal])| *snap > 1 || *wal > 1)
+    {
+        return Err(format!(
+            "evidence {e} is written more than once (snapshot {snap}, WAL {wal})"
+        ));
     }
     let known: BTreeSet<String> = expected
         .values()

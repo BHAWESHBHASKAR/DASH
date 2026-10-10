@@ -13,8 +13,9 @@ to [Semantic Versioning](https://semver.org/).
   SIGKILL at a seeded random moment, `wal-inspect verify` before and after
   recovery, restart-to-ready time, and an oracle of acknowledged writes (all
   present with every evidence item and edge, nothing never sent, no evidence
-  stored twice, unacknowledged requests all-or-nothing). Seed printed, state
-  directory kept on failure, JSON summary. 25 cycles run on every PR (job
+  written twice within the snapshot or within the WAL, unacknowledged
+  requests all-or-nothing). Seed printed, state directory kept on failure,
+  JSON summary. 25 cycles run on every PR (job
   `crash-test`), 1000 nightly.
 - **Disk-full scenarios** (`tests/e2e/tests/s10_disk_full.rs`): the real
   ingestion binary under `RLIMIT_FSIZE` (writes fail with `EFBIG`) with the WAL

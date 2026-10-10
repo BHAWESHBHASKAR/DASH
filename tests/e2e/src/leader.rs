@@ -12,6 +12,11 @@ pub struct LeaderState {
     pub evidence: BTreeMap<String, String>,
     /// evidence_id -> number of E records carrying it (duplicates show here).
     pub evidence_lines: BTreeMap<String, usize>,
+    /// The same count per section: `[snapshot, wal]`. A record may appear
+    /// once in each after a crash between writing a checkpoint snapshot and
+    /// truncating the WAL (replay is idempotent); twice within one section
+    /// is a duplicated write.
+    pub evidence_lines_by_section: BTreeMap<String, [usize; 2]>,
     /// (from, to, relation)
     pub edges: BTreeSet<(String, String, String)>,
     /// Number of snapshot + WAL record lines.
@@ -30,10 +35,12 @@ impl LeaderState {
     pub fn parse(body: &str) -> LeaderState {
         let mut st = LeaderState::default();
         let mut in_records = false;
+        let mut section = 0usize;
         for line in body.lines() {
             match line {
                 "SNAPSHOT" | "WAL" => {
                     in_records = true;
+                    section = usize::from(line == "WAL");
                     continue;
                 }
                 _ => {}
@@ -54,6 +61,9 @@ impl LeaderState {
                 Some('E') if f.len() > 2 => {
                     st.evidence.insert(f[1].to_string(), f[2].to_string());
                     *st.evidence_lines.entry(f[1].to_string()).or_default() += 1;
+                    st.evidence_lines_by_section
+                        .entry(f[1].to_string())
+                        .or_default()[section] += 1;
                 }
                 Some('G') if f.len() > 4 => {
                     st.edges

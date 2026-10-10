@@ -49,7 +49,12 @@ Each cycle:
      claim without all its evidence is a failure; batch: some but not all
      claims is a failure);
    * no claim that was never sent, no evidence without an expected claim, no
-     evidence record stored twice, and nothing from an earlier cycle vanished;
+     evidence record written twice within the snapshot or within the WAL,
+     and nothing from an earlier cycle vanished. (A kill between a
+     checkpoint's snapshot rename and its WAL truncation legitimately leaves
+     the same records in both files; replay is idempotent and the next
+     checkpoint removes the overlap. The first checkpoint-pressure run found
+     exactly that state, which is why the check is per file.);
    * any non-2xx answer to a valid write before the kill fails the run.
 7. `wal-inspect verify` runs again on the recovered files.
 
