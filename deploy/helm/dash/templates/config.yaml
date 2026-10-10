@@ -29,23 +29,26 @@ data:
   DASH_RETRIEVAL_AUDIT_LOG_PATH: {{ printf "%s/audit/retrieval.audit.jsonl" $p | quote }}
   {{- end }}
 
+  # Integers go through int64: Helm parses YAML numbers as float64 and would
+  # otherwise render values >= 1e6 in exponent form (5.24288e+07), which the
+  # services reject at startup.
   # ----- HTTP -----
-  DASH_INGEST_HTTP_WORKERS: {{ .Values.config.http.ingestWorkers | quote }}
-  DASH_INGEST_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.ingestQueueCapacity | quote }}
-  DASH_RETRIEVAL_HTTP_WORKERS: {{ .Values.config.http.retrievalWorkers | quote }}
-  DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.retrievalQueueCapacity | quote }}
+  DASH_INGEST_HTTP_WORKERS: {{ .Values.config.http.ingestWorkers | int64 | quote }}
+  DASH_INGEST_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.ingestQueueCapacity | int64 | quote }}
+  DASH_RETRIEVAL_HTTP_WORKERS: {{ .Values.config.http.retrievalWorkers | int64 | quote }}
+  DASH_RETRIEVAL_HTTP_QUEUE_CAPACITY: {{ .Values.config.http.retrievalQueueCapacity | int64 | quote }}
 
   # ----- WAL durability -----
-  DASH_INGEST_WAL_SYNC_EVERY_RECORDS: {{ .Values.config.wal.ingestSyncEveryRecords | quote }}
-  DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: {{ .Values.config.wal.ingestAppendBufferRecords | quote }}
-  DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: {{ .Values.config.wal.ingestAsyncFlushIntervalMs | quote }}
+  DASH_INGEST_WAL_SYNC_EVERY_RECORDS: {{ .Values.config.wal.ingestSyncEveryRecords | int64 | quote }}
+  DASH_INGEST_WAL_APPEND_BUFFER_RECORDS: {{ .Values.config.wal.ingestAppendBufferRecords | int64 | quote }}
+  DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS: {{ .Values.config.wal.ingestAsyncFlushIntervalMs | int64 | quote }}
   DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY: {{ .Values.config.wal.ingestBackgroundFlushOnly | quote }}
-  DASH_INGEST_WAL_SYNC_INTERVAL_MS: {{ .Values.config.wal.ingestSyncIntervalMs | quote }}
-  DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: {{ .Values.config.segment.ingestMaintenanceIntervalMs | quote }}
+  DASH_INGEST_WAL_SYNC_INTERVAL_MS: {{ .Values.config.wal.ingestSyncIntervalMs | int64 | quote }}
+  DASH_INGEST_SEGMENT_MAINTENANCE_INTERVAL_MS: {{ .Values.config.segment.ingestMaintenanceIntervalMs | int64 | quote }}
 
   # ----- checkpoint thresholds -----
-  DASH_CHECKPOINT_MAX_WAL_RECORDS: {{ .Values.config.checkpoint.maxWalRecords | quote }}
-  DASH_CHECKPOINT_MAX_WAL_BYTES: {{ .Values.config.checkpoint.maxWalBytes | quote }}
+  DASH_CHECKPOINT_MAX_WAL_RECORDS: {{ .Values.config.checkpoint.maxWalRecords | int64 | quote }}
+  DASH_CHECKPOINT_MAX_WAL_BYTES: {{ .Values.config.checkpoint.maxWalBytes | int64 | quote }}
 
   # ----- bind addresses (inside the pod) -----
   DASH_INGEST_BIND: {{ .Values.config.bind.ingestion | quote }}
@@ -80,12 +83,12 @@ data:
   # network unencrypted. Set tls.enabled=true instead (docs/operations/tls.md).
   DASH_REPLICATION_ALLOW_INSECURE_HTTP: "1"
   {{- end }}
-  DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | quote }}
+  DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | int64 | quote }}
   DASH_RETRIEVAL_REPLICATION_OFFSET_PATH: {{ printf "%s/state/retrieval-replication.offset" $p | quote }}
 
   # ----- control plane -----
   DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" $p | quote }}
   DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" $p | quote }}
   DASH_CONTROL_PLANE_LEASE_PATH: {{ printf "%s/state/control-plane.lease" $p | quote }}
-  DASH_CONTROL_PLANE_LEASE_DURATION_MS: {{ .Values.config.controlPlane.leaseDurationMs | quote }}
-  DASH_CONTROL_PLANE_LEASE_RENEWAL_MS: {{ .Values.config.controlPlane.leaseRenewalMs | quote }}
+  DASH_CONTROL_PLANE_LEASE_DURATION_MS: {{ .Values.config.controlPlane.leaseDurationMs | int64 | quote }}
+  DASH_CONTROL_PLANE_LEASE_RENEWAL_MS: {{ .Values.config.controlPlane.leaseRenewalMs | int64 | quote }}
