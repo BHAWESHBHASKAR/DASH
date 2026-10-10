@@ -280,9 +280,7 @@ EOF
 }
 
 build_and_load_image() {
-  if [[ "${IMAGE_BUILT:-0}" == "1" ]]; then
-    step "reuse image ${SOURCE_IMAGE} built earlier in this run"
-  elif [[ "${DASH_E2E_SKIP_BUILD:-0}" == "1" ]]; then
+  if [[ "${DASH_E2E_SKIP_BUILD:-0}" == "1" ]]; then
     step "use prebuilt image ${SOURCE_IMAGE}"
     docker image inspect "${SOURCE_IMAGE}" >/dev/null 2>&1 \
       || fail "DASH_E2E_SKIP_BUILD=1 but image ${SOURCE_IMAGE} does not exist locally"
@@ -300,7 +298,6 @@ build_and_load_image() {
       "${extra[@]}" \
       "${ROOT_DIR}" || fail "docker build failed"
   fi
-  IMAGE_BUILT=1
   # One image carries every binary; the chart sets DASH_BIN per workload, so
   # the per-service names the chart expects are tags of the same image.
   step "load the image into kind as ${IMAGE_REGISTRY}/${IMAGE_REPOSITORY}-{ingestion,retrieval,control-plane}:${IMAGE_TAG}"
@@ -853,22 +850,7 @@ main() {
   create_cluster
   build_and_load_image
   generate_secrets
-  local first=1
   for p in ${PHASES}; do
-    # The raw manifests hard-code the dash-system namespace that the core
-    # phase also uses. Reusing it right after an uninstall (same namespace
-    # name, recycled pod IPs) left kindnet's network-policy state stale on CI
-    # runners and the new pods could not resolve DNS, so this phase gets a
-    # fresh cluster unless it runs first.
-    if [[ "${p}" == "kustomize" && "${first}" -eq 0 && "${DASH_E2E_REUSE_CLUSTER:-0}" != "1" ]]; then
-      pf_stop_all
-      step "recreate the kind cluster for the kustomize phase"
-      kind delete cluster --name "${CLUSTER}" >/dev/null 2>&1 || true
-      CLUSTER_CREATED=0
-      create_cluster
-      build_and_load_image
-    fi
-    first=0
     case "${p}" in
       core) phase_core ;;
       upgrade-from) phase_upgrade_from ;;
