@@ -47,6 +47,11 @@ const USAGE: &str = "usage: crash-test [options]
                            (default 0: one directory for the whole run)
   --ready-timeout-secs N   longest restart-to-ready time accepted (default 60)
   --env KEY=VALUE          extra environment for the service (repeatable)
+  --encryption             run with encryption at rest: generate a key file
+                           (outside the state directory) and set
+                           DASH_ENCRYPTION_KEY_FILE; the offline checks
+                           also require every WAL and snapshot to be
+                           encrypted
   --json-out PATH          write the summary as JSON
   --keep-state             keep the state directory even when the run passes
 
@@ -66,6 +71,7 @@ struct Config {
     envs: Vec<(String, String)>,
     json_out: Option<PathBuf>,
     keep_state: bool,
+    encryption: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Config, String> {
@@ -81,6 +87,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         envs: vec![],
         json_out: None,
         keep_state: false,
+        encryption: false,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -111,6 +118,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             }
             "--json-out" => cfg.json_out = Some(PathBuf::from(value()?)),
             "--keep-state" => cfg.keep_state = true,
+            "--encryption" => cfg.encryption = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -234,16 +242,30 @@ fn writer(
     out
 }
 
-/// `wal-inspect verify` on the WAL and, when present, the snapshot.
-fn verify_files(state: &Path) -> Result<(), String> {
+/// `wal-inspect verify` on the WAL and, when present, the snapshot (with
+/// the service's encryption settings). With `--encryption` both must also
+/// be encrypted files.
+fn verify_files(cfg: &Config, state: &Path) -> Result<(), String> {
     for name in ["ingest.wal", "ingest.wal.snapshot"] {
         let path = state.join(name);
         if !path.exists() {
             continue;
         }
+        if cfg.encryption {
+            let bytes = std::fs::read(&path).map_err(|e| format!("read {name}: {e}"))?;
+            if !bytes.is_empty() && !bytes.starts_with(b"~DASHENC1 ") {
+                return Err(format!("{name} is not encrypted"));
+            }
+        }
         let out = Command::new(bin_path("wal-inspect"))
             .arg("verify")
             .arg(&path)
+            .envs(
+                cfg.envs
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("DASH_ENCRYPTION_"))
+                    .cloned(),
+            )
             .output()
             .map_err(|e| format!("run wal-inspect: {e}"))?;
         if !out.status.success() {
@@ -471,7 +493,7 @@ fn cycle(
         .map(|h| h.join().expect("writer thread panicked"))
         .collect();
 
-    verify_files(s.dir.path()).map_err(|e| format!("after kill: {e}"))?;
+    verify_files(cfg, s.dir.path()).map_err(|e| format!("after kill: {e}"))?;
     let started = Instant::now();
     s.start_ingest();
     let deadline = started + cfg.ready_timeout;
@@ -489,7 +511,7 @@ fn cycle(
         .recovery_ms
         .push(started.elapsed().as_millis() as u64);
     check_oracle(s, &outcomes, expected, totals)?;
-    verify_files(s.dir.path()).map_err(|e| format!("after recovery: {e}"))
+    verify_files(cfg, s.dir.path()).map_err(|e| format!("after recovery: {e}"))
 }
 
 fn run(cfg: &Config) -> (Result<(), String>, Totals, Option<PathBuf>, usize) {
@@ -550,7 +572,7 @@ fn tempfile_placeholder() -> tempfile::TempDir {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cfg = match parse_args(&args) {
+    let mut cfg = match parse_args(&args) {
         Ok(cfg) => cfg,
         Err(e) => {
             if !e.is_empty() {
@@ -560,15 +582,38 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The key lives outside every state directory, like a mounted Secret.
+    let _key_dir = if cfg.encryption {
+        let dir = tempfile::tempdir().expect("key dir");
+        let path = dir.path().join("dash-kek.key");
+        let key: String = (0..64)
+            .map(|_| char::from_digit(rand::thread_rng().gen_range(0..16), 16).unwrap())
+            .collect();
+        std::fs::write(&path, key).expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key");
+        }
+        cfg.envs.push((
+            "DASH_ENCRYPTION_KEY_FILE".to_string(),
+            path.display().to_string(),
+        ));
+        Some(dir)
+    } else {
+        None
+    };
     println!(
-        "crash-test seed={} cycles={} writers={} max_kill_delay_ms={} batch_percent={} checkpoint_every={:?} fresh_every={}",
+        "crash-test seed={} cycles={} writers={} max_kill_delay_ms={} batch_percent={} checkpoint_every={:?} fresh_every={} encryption={}",
         cfg.seed,
         cfg.cycles,
         cfg.writers,
         cfg.max_kill_delay_ms,
         cfg.batch_percent,
         cfg.checkpoint_every,
-        cfg.fresh_every
+        cfg.fresh_every,
+        cfg.encryption
     );
     let t0 = Instant::now();
     let (result, totals, kept, cycles_done) = run(&cfg);
@@ -582,6 +627,7 @@ fn main() -> ExitCode {
         "cycles_completed": cycles_done,
         "writers": cfg.writers,
         "checkpoint_every": cfg.checkpoint_every,
+        "encryption": cfg.encryption,
         "state_dirs": totals.state_dirs,
         "acked_requests": totals.acked_requests,
         "acked_claims": totals.acked_claims,
