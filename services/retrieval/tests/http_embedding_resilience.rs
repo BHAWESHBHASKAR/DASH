@@ -167,8 +167,12 @@ fn health_stays_fast_while_embedding_calls_are_slow() {
             status_line(&response).contains("200"),
             "{path}: {response:?}"
         );
+        // Every general worker waits on a 3 s embedding stall. A probe queued
+        // behind them would take about 2.5 s more; one served by the health
+        // lane answers at request speed. The bound sits well between the two
+        // so a slow CI runner does not decide it.
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < Duration::from_millis(1_000),
             "{path} took {elapsed:?} while embeddings were slow"
         );
     }
