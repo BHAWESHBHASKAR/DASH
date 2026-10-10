@@ -224,14 +224,50 @@ The same run (`--preload 2000 --id-space 2000 --ingest-percent 100 --dim 384
 | after | 100,475 | 32 / 38 / 37 MiB | 558/s, p99 117 ms |
 
 `pkg/store/tests/memory_bounded_updates.rs` guards both (heap and per-poll
-peak with a counting allocator). With checkpoints on, the RSS still moves
-between about 70 and 140 MiB in this run: each checkpoint builds the
-snapshot in memory and forces every follower to resync, which makes the
-leader build a full export (see `docs/operations/replication-limits.md`).
-That cost follows the data set size, not the WAL length. Without
-checkpoints the WAL still grows on disk and restart replay time grows with
-it, so production deployments should set `DASH_CHECKPOINT_MAX_WAL_BYTES` or
-`DASH_CHECKPOINT_MAX_WAL_RECORDS` (both unset by default).
+peak with a counting allocator). With checkpoints on, the RSS still moved
+between about 70 and 140 MiB in this run: each checkpoint built the snapshot
+in memory and forced every follower to resync, which made the leader build a
+full export in memory. Followers now cross a checkpoint without a resync and
+a resync streams a chunked export from a file
+(`docs/operations/replication-limits.md`); the snapshot itself is still
+built from the in-memory state. Without checkpoints the WAL grows on disk and
+restart replay time grows with it, so the ingestion service now checkpoints
+at 256 MiB of WAL by default (`DASH_CHECKPOINT_MAX_WAL_BYTES`, `0` turns it
+off).
+
+### Follower apply throughput (resolved)
+
+An update-heavy soak showed the retrieval follower's WAL trailing the
+leader's by about half. `loadgen` now samples the follower's lag in WAL
+records every interval (against the leader's live position) and measures how
+long the follower takes to catch up after the load stops. Stack samples of
+the follower thread (gdb, 15 samples during catch-up) found it in
+`fdatasync` 13 times: every replicated record was fsynced on its own in the
+follower WAL, every redb write was its own durable transaction (two for a
+claim), and every frame was staged on a full copy of the store. The follower
+now appends a frame with one write and one fsync, applies it in place
+(whole commit groups per write-lock hold) and writes its redb mutations in
+one transaction; the leader's own ingest path writes a bundle's redb
+mutations in one transaction too.
+
+Same machine, release builds, `--concurrency 16 --ingest-percent 100 --dim
+384 --seed 7`, no checkpoints (retrieval follower with WAL and redb, poll
+interval 100 ms, 512 records per frame):
+
+| Workload | Build | Leader ingests/s | Follower lag (WAL records): mean / max / at stop | Catch-up after stop |
+|---|---|---|---|---|
+| 2,000 claims updated (`--preload 2000 --id-space 2000`), 90 s | before | 647.6 | 106,479 / 178,032 / 177,660 | 70.9 s |
+| same | after | 1,293.8 | 519 / 1,008 / 600 | 0.15 s |
+| 20,000 claims updated (`--preload 20000 --id-space 20000`), 60 s | before | 419.4 | 66,270 / 96,948 / 97,146 | 81.1 s |
+| same | after | 540.5 | 716 / 924 / 636 | 0.06 s |
+
+Before, the follower applied about 1,900 records/s against the leader's
+3,900 in the first run (it trailed by half, as observed); after, it keeps up
+with a leader that is twice as fast, staying within about two frames. The
+50/50 mix (`--preload 1000 --ingest-percent 50`, 30 s) went from 167.6
+ingests/s and 165.0 retrieves/s (retrieve p99 141 ms) to 190.2 and 187.6
+(p99 116 ms): holding the store's write lock per commit group instead of
+swapping in a staged copy did not slow down readers.
 
 ### Reference numbers
 
