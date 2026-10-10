@@ -63,6 +63,8 @@ const USAGE: &str = "usage: loadgen [options]
  spawned servers (default):
   --server-workers N       HTTP workers per service (default 4)
   --checkpoint-every N     DASH_CHECKPOINT_MAX_WAL_RECORDS for ingestion
+  --server-env KEY=VALUE   extra environment for both spawned services
+                           (repeatable; e.g. DASH_ENCRYPTION_KEY_FILE=...)
  external servers:
   --ingest-url URL --retrieve-url URL
   --ingest-key KEY --retrieve-key KEY
@@ -92,6 +94,7 @@ struct Config {
     catch_up_timeout: Duration,
     server_workers: usize,
     checkpoint_every: Option<usize>,
+    server_envs: Vec<(String, String)>,
     ingest_url: Option<String>,
     retrieve_url: Option<String>,
     ingest_key: Option<String>,
@@ -120,6 +123,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         catch_up_timeout: Duration::from_secs(120),
         server_workers: 4,
         checkpoint_every: None,
+        server_envs: vec![],
         ingest_url: None,
         retrieve_url: None,
         ingest_key: None,
@@ -163,6 +167,13 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--catch-up-timeout-secs" => cfg.catch_up_timeout = secs(value()?)?,
             "--server-workers" => cfg.server_workers = num::<usize>(flag, value()?)?.max(1),
             "--checkpoint-every" => cfg.checkpoint_every = Some(num(flag, value()?)?),
+            "--server-env" => {
+                let raw = value()?;
+                let (k, v) = raw
+                    .split_once('=')
+                    .ok_or_else(|| format!("--server-env expects KEY=VALUE, got {raw}"))?;
+                cfg.server_envs.push((k.to_string(), v.to_string()));
+            }
             "--ingest-url" => cfg.ingest_url = Some(value()?),
             "--retrieve-url" => cfg.retrieve_url = Some(value()?),
             "--ingest-key" => cfg.ingest_key = Some(value()?),
@@ -228,8 +239,14 @@ fn spawn_target(cfg: &Config) -> Target {
     let mut s = Stack::new(StackOpts {
         tenants: vec![cfg.tenant.clone()],
         checkpoint_every: cfg.checkpoint_every,
-        extra_ingest_env: vec![("DASH_INGEST_HTTP_WORKERS".into(), workers.clone())],
-        extra_retrieval_env: vec![("DASH_RETRIEVAL_HTTP_WORKERS".into(), workers)],
+        extra_ingest_env: [("DASH_INGEST_HTTP_WORKERS".to_string(), workers.clone())]
+            .into_iter()
+            .chain(cfg.server_envs.iter().cloned())
+            .collect(),
+        extra_retrieval_env: [("DASH_RETRIEVAL_HTTP_WORKERS".to_string(), workers)]
+            .into_iter()
+            .chain(cfg.server_envs.iter().cloned())
+            .collect(),
     });
     s.start_all();
     s.wait_retrieval_ready(Duration::from_secs(60));

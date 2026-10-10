@@ -748,12 +748,20 @@ pub fn publish_claims_to_dir(
     claims: &[Claim],
     options: &SegmentPublishOptions,
 ) -> Result<SegmentPublishResult, SegmentStoreError> {
-    let config_key = format!(
+    // The storage format is part of the key: turning encryption at rest on,
+    // or rotating its key, republishes the tenant's files sealed under the
+    // active key (ADR 0005) even when its claims did not change.
+    // (Plaintext keeps the key it always had.)
+    let mut config_key = format!(
         "{}|{}|{}",
         options.max_segment_size,
         options.scheduler.max_segments_per_tier,
         options.scheduler.max_compaction_input_segments
     );
+    if let Some(keyring) = store::encryption::current() {
+        config_key.push_str("|sealed:");
+        config_key.push_str(keyring.active_key_id());
+    }
     let fingerprint = claim_set_fingerprint(claims, &config_key);
     if read_fingerprint(tenant_dir) == Some(fingerprint)
         && let Ok(Some(manifest)) = load_manifest(tenant_dir)
