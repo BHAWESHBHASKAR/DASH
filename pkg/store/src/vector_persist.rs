@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::vector_index::{TenantVectorIndex, is_indexable, vector_fingerprint};
-use crate::wal::{rename_file, sync_file, sync_parent_dir};
+use crate::wal::{VectorCatchUp, rename_file, sync_file, sync_parent_dir};
 use crate::{AnnTuningConfig, FileWal, InMemoryStore, StoreError, WalPosition};
 
 /// Version of the persisted index file layout. Bump it whenever the layout
@@ -131,7 +131,8 @@ pub enum VectorIndexRestore {
     Loaded {
         tenants: usize,
         vectors: usize,
-        /// Claims re-applied from vector records after the saved position.
+        /// Claims (and erased tenants) re-applied from the vector records and
+        /// tombstones after the saved position.
         caught_up: usize,
         saved_position: WalPosition,
     },
@@ -442,14 +443,14 @@ fn read_index_file(path: &Path, tuning: &AnnTuningConfig) -> Result<Option<Loade
 impl InMemoryStore {
     /// Restore the vector indexes from `path` (see the module docs), or
     /// build them when that is not possible. Called at the end of a WAL
-    /// replay with the vector indexes deferred. `caught_up` is the claim-id
-    /// set of the vector records after the saved position, as collected by
-    /// the replay (`None` when it could not be collected).
+    /// replay with the vector indexes deferred. `caught_up` holds the vector
+    /// records and tombstones after the saved position, as collected by the
+    /// replay (`None` when it could not be collected).
     pub(crate) fn restore_vector_indexes(
         &mut self,
         path: &Path,
         wal: &FileWal,
-        caught_up: Option<HashSet<String>>,
+        caught_up: Option<VectorCatchUp>,
     ) -> VectorIndexRestore {
         match self.try_restore_vector_indexes(path, wal, caught_up) {
             Ok(Some(restored)) => restored,
@@ -472,7 +473,7 @@ impl InMemoryStore {
         &mut self,
         path: &Path,
         wal: &FileWal,
-        caught_up: Option<HashSet<String>>,
+        caught_up: Option<VectorCatchUp>,
     ) -> Result<Option<VectorIndexRestore>, String> {
         let Some(loaded) = read_index_file(path, &self.ann_tuning)? else {
             return Ok(None);
@@ -492,9 +493,27 @@ impl InMemoryStore {
             )
         })?;
 
-        let mut indexes: HashMap<String, TenantVectorIndex> = HashMap::new();
-        for (tenant, index) in loaded.tenants {
-            match self.tenant_vector_dims.get(&tenant) {
+        // A tenant erased after the save starts from nothing: its saved
+        // index (and dimension) no longer applies. Vectors written after the
+        // erasure are in `claim_ids` and are re-added below.
+        let mut indexes: HashMap<String, TenantVectorIndex> = loaded
+            .tenants
+            .into_iter()
+            .filter(|(tenant, _)| !caught_up.erased_tenants.contains(tenant))
+            .collect();
+        // Claims deleted after the save leave the index of the tenant that
+        // owned them (the claim id may since have been reused, even by
+        // another tenant; the catch-up below re-adds it where it now lives).
+        // An index emptied this way is dropped before the dimension check:
+        // deleting a tenant's last vector releases its dimension.
+        for (tenant, claim_id) in &caught_up.deleted_claims {
+            if let Some(index) = indexes.get_mut(tenant) {
+                index.remove(claim_id);
+            }
+        }
+        indexes.retain(|_, index| !index.is_empty());
+        for (tenant, index) in &indexes {
+            match self.tenant_vector_dims.get(tenant) {
                 Some(dim) if *dim == index.dimensions() => {}
                 Some(dim) => {
                     return Err(format!(
@@ -504,13 +523,12 @@ impl InMemoryStore {
                 }
                 None => return Err(format!("tenant '{tenant}' has no stored vectors")),
             }
-            indexes.insert(tenant, index);
         }
 
         // Catch up: give every claim named after the saved position its
         // current stored vector (or none), exactly as the live apply path
         // would have left it.
-        let mut ids: Vec<&String> = caught_up.iter().collect();
+        let mut ids: Vec<&String> = caught_up.claim_ids.iter().collect();
         ids.sort_unstable();
         for claim_id in &ids {
             let Some(claim) = self.claims.get(claim_id.as_str()) else {
@@ -549,7 +567,7 @@ impl InMemoryStore {
         Ok(Some(VectorIndexRestore::Loaded {
             tenants,
             vectors,
-            caught_up: ids.len(),
+            caught_up: ids.len() + caught_up.deleted_claims.len() + caught_up.erased_tenants.len(),
             saved_position: saved,
         }))
     }

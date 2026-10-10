@@ -698,6 +698,96 @@ impl DiskBackedStore {
         Ok(claims_loaded)
     }
 
+    /// Mirror one tombstone (see `delete::DiskDeletion`) in a single write
+    /// transaction: blob rewrites first, then row removals, so a rewritten
+    /// blob of a claim the same tombstone removes is dropped with it.
+    pub(crate) fn apply_deletion(
+        &self,
+        deletion: &crate::delete::DiskDeletion,
+    ) -> Result<(), String> {
+        let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
+        {
+            let mut evidence_table = txn
+                .open_table(TABLE_EVIDENCE)
+                .map_err(|e| err("open evidence", e))?;
+            for (claim_id, evidence) in &deletion.evidence_blobs {
+                if evidence.is_empty() {
+                    evidence_table
+                        .remove(claim_id.as_str())
+                        .map_err(|e| err("remove evidence", e))?;
+                } else {
+                    let bytes = value_codec::encode(&dedupe_evidence(evidence))
+                        .map_err(|e| map_codec_err("serialize evidence", e))?;
+                    evidence_table
+                        .insert(claim_id.as_str(), bytes.as_slice())
+                        .map_err(|e| err("write evidence", e))?;
+                }
+            }
+            let mut edges_table = txn
+                .open_table(TABLE_EDGES)
+                .map_err(|e| err("open edges", e))?;
+            for (from, edges) in &deletion.edge_blobs {
+                if edges.is_empty() {
+                    edges_table
+                        .remove(from.as_str())
+                        .map_err(|e| err("remove edges", e))?;
+                } else {
+                    let bytes = value_codec::encode(&dedupe_edges(edges))
+                        .map_err(|e| map_codec_err("serialize edges", e))?;
+                    edges_table
+                        .insert(from.as_str(), bytes.as_slice())
+                        .map_err(|e| err("write edges", e))?;
+                }
+            }
+            let mut claims_table = txn
+                .open_table(TABLE_CLAIMS)
+                .map_err(|e| err("open claims", e))?;
+            let mut set_table = txn
+                .open_table(TABLE_TENANT_CLAIMS_SET)
+                .map_err(|e| err("open tenant_claims_set", e))?;
+            let mut vectors_table = txn
+                .open_table(TABLE_CLAIM_VECTORS)
+                .map_err(|e| err("open claim_vectors", e))?;
+            for (tenant_id, claim_id) in &deletion.claims {
+                let claim_id = claim_id.as_str();
+                claims_table
+                    .remove(claim_id)
+                    .map_err(|e| err("remove claim", e))?;
+                let key: (&str, &str) = (tenant_id.as_str(), claim_id);
+                set_table
+                    .remove(key)
+                    .map_err(|e| err("remove tenant_claims_set", e))?;
+                evidence_table
+                    .remove(claim_id)
+                    .map_err(|e| err("remove evidence", e))?;
+                edges_table
+                    .remove(claim_id)
+                    .map_err(|e| err("remove edges", e))?;
+                vectors_table
+                    .remove(claim_id)
+                    .map_err(|e| err("remove claim_vector", e))?;
+            }
+            let mut dims_table = txn
+                .open_table(TABLE_TENANT_DIMS)
+                .map_err(|e| err("open tenant_dims", e))?;
+            for tenant_id in &deletion.tenant_dims {
+                dims_table
+                    .remove(tenant_id.as_str())
+                    .map_err(|e| err("remove tenant_dim", e))?;
+            }
+            let mut commits_table = txn
+                .open_table(TABLE_BATCH_COMMITS)
+                .map_err(|e| err("open batch_commits", e))?;
+            for commit_id in &deletion.batch_commits {
+                commits_table
+                    .remove(commit_id.as_str())
+                    .map_err(|e| err("remove batch_commit", e))?;
+            }
+        }
+        txn.commit().map_err(|e| err("commit deletion", e))?;
+        Ok(())
+    }
+
     /// Delete every row from every data table (replication resync replaces
     /// the whole state). Done in one transaction.
     pub fn clear_all(&self) -> Result<(), String> {
