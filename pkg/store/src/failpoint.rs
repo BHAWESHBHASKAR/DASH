@@ -94,13 +94,14 @@ mod tests {
     /// Every failpoint in checkpoint order. Note the generation is bumped
     /// before the WAL is truncated so that a crash between the two only causes
     /// a spurious follower resync, never a silent skip.
-    const POINTS: [&str; 6] = [
+    const POINTS: [&str; 7] = [
         "snapshot.tmp_written",
         "snapshot.fsynced",
         "snapshot.renamed",
         "snapshot.dir_synced",
         "wal.generation_bumped",
         "wal.truncated",
+        "wal.before_transition_recorded",
     ];
 
     fn committed_store(wal: &mut FileWal, n: usize) -> InMemoryStore {
@@ -167,6 +168,11 @@ mod tests {
                 "fsync_file",
                 "fsync_dir",
                 "wal.truncated",
+                // the generation transition is recorded last, durably
+                "wal.before_transition_recorded",
+                "fsync_file",
+                "rename",
+                "fsync_dir",
             ]
         );
     }
@@ -180,6 +186,7 @@ mod tests {
             let store = committed_store(&mut wal, 4);
             let expected = lines(&store);
             let generation_before = wal.generation();
+            let (_, view_before) = wal.replication_position().unwrap();
 
             arm(point);
             let result = store.checkpoint_and_compact(&mut wal);
@@ -203,7 +210,10 @@ mod tests {
             );
             assert_eq!(recovered.claims_len(), 4, "{point}: no loss, no duplicates");
 
-            let bumped_already = matches!(point, "wal.generation_bumped" | "wal.truncated");
+            let bumped_already = matches!(
+                point,
+                "wal.generation_bumped" | "wal.truncated" | "wal.before_transition_recorded"
+            );
             if bumped_already {
                 assert_ne!(
                     recovered_wal.generation(),
@@ -232,6 +242,15 @@ mod tests {
             } else {
                 assert!(!frame.needs_resync, "{point}");
             }
+            // No transition is on disk before the checkpoint completed, so a
+            // follower at the exact old end is never switched into a WAL that
+            // may still hold the old lines.
+            assert!(recovered_wal.generation_transitions().is_empty(), "{point}");
+            let switch = recovered_wal
+                .replication_frame_with_switch(Some(generation_before), view_before, 100)
+                .unwrap();
+            assert!(switch.switched_from.is_none(), "{point}");
+            assert_eq!(switch.needs_resync, bumped_already, "{point}");
 
             // The directory must be usable again: a retried checkpoint on the
             // recovered state succeeds and keeps the same data.
