@@ -79,6 +79,13 @@ jobs:
           target/release/crash-test --cycles 200 --writers 6 --checkpoint-every 100 \
             --json-out reports/crash-checkpoint.json 2>&1 | tee reports/crash-checkpoint.log
 
+      - name: Kill -9 with encryption at rest
+        # Same oracle with DASH_ENCRYPTION_KEY_FILE set; the offline checks
+        # also require every WAL and snapshot on disk to be encrypted.
+        run: |
+          target/release/crash-test --cycles 200 --writers 6 --checkpoint-every 100 --encryption \
+            --json-out reports/crash-encryption.json 2>&1 | tee reports/crash-encryption.log
+
       - name: Harness self-check (must detect lost writes)
         # With the in-process append buffer and no flush, acknowledged writes
         # die with the process; the harness has to report that and fail.
