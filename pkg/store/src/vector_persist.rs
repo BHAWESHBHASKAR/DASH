@@ -615,7 +615,7 @@ impl InMemoryStore {
         indexes: &HashMap<String, TenantVectorIndex>,
     ) -> Result<(), String> {
         let mut expected: HashMap<&str, usize> = HashMap::new();
-        for (claim_id, vector) in &self.claim_vectors {
+        for (claim_id, vector) in self.claim_vectors.iter() {
             let Some(claim) = self.claims.get(claim_id) else {
                 continue;
             };

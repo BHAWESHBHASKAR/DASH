@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use cow_map::CowMap;
 use graph::summarize_incoming_edges;
 use ranking::{RankSignals, hybrid_relevance, lexical_relevance, prior_score, ranked_score};
 use schema::{
@@ -12,6 +13,7 @@ use schema::{
 
 #[macro_use]
 mod failpoint;
+mod cow_map;
 mod crypt;
 mod delete;
 mod disk;
@@ -298,12 +300,12 @@ struct IncomingEdge {
 /// `commit_staged`.
 #[derive(Default)]
 pub struct InMemoryStore {
-    claims: HashMap<String, Claim>,
-    evidence_by_claim: HashMap<String, Vec<Evidence>>,
-    edges_by_claim: HashMap<String, Vec<ClaimEdge>>,
+    claims: CowMap<Claim>,
+    evidence_by_claim: CowMap<Vec<Evidence>>,
+    edges_by_claim: CowMap<Vec<ClaimEdge>>,
     /// Reverse index: target claim id -> edges pointing at it.
     edges_in: HashMap<String, Vec<IncomingEdge>>,
-    claim_vectors: HashMap<String, Vec<f32>>,
+    claim_vectors: CowMap<Vec<f32>>,
     /// Per-tenant vector index (flat below the threshold, HNSW above).
     /// Holds no full-precision copy: rerank reads `claim_vectors`.
     vector_indexes: HashMap<String, TenantVectorIndex>,
@@ -317,7 +319,7 @@ pub struct InMemoryStore {
     entity_index: HashMap<String, HashMap<String, HashSet<String>>>,
     embedding_index: HashMap<String, HashMap<String, HashSet<String>>>,
     temporal_index: HashMap<String, BTreeMap<i64, HashSet<String>>>,
-    batch_commits: HashMap<String, BatchCommitMetadata>,
+    batch_commits: CowMap<BatchCommitMetadata>,
     ann_tuning: AnnTuningConfig,
     vector_backend_runtime: VectorBackendRuntime,
     wal: WalEventRing,
@@ -2451,8 +2453,7 @@ impl InMemoryStore {
         }
         let entry = self
             .evidence_by_claim
-            .entry(claim_id.to_string())
-            .or_default();
+            .get_or_default_mut(claim_id.to_string());
         for evd in evidence {
             upsert_evidence(entry, evd.clone());
         }
@@ -2464,8 +2465,7 @@ impl InMemoryStore {
         let evidence_id = evidence.evidence_id.clone();
         upsert_evidence(
             self.evidence_by_claim
-                .entry(evidence.claim_id.clone())
-                .or_default(),
+                .get_or_default_mut(evidence.claim_id.clone()),
             evidence,
         );
         self.wal.push(WalEvent::EvidenceUpsert(evidence_id));
@@ -2516,8 +2516,7 @@ impl InMemoryStore {
     fn upsert_edge_in_memory(&mut self, edge: ClaimEdge) {
         let list = self
             .edges_by_claim
-            .entry(edge.from_claim_id.clone())
-            .or_default();
+            .get_or_default_mut(edge.from_claim_id.clone());
         let existing = list
             .iter()
             .position(|e| e.to_claim_id == edge.to_claim_id && e.relation == edge.relation);
@@ -2707,7 +2706,7 @@ impl InMemoryStore {
     pub(crate) fn rebuild_vector_indexes(&mut self) {
         self.defer_vector_index = false;
         let mut by_tenant: HashMap<&str, Vec<(&str, &[f32])>> = HashMap::new();
-        for (claim_id, vector) in &self.claim_vectors {
+        for (claim_id, vector) in self.claim_vectors.iter() {
             if let Some(claim) = self.claims.get(claim_id) {
                 by_tenant
                     .entry(claim.tenant_id.as_str())

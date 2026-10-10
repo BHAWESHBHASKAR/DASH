@@ -947,14 +947,32 @@ impl Backend {
     }
 }
 
+/// Full-precision vectors by claim id (the store's vector map), read by
+/// the exact rerank of an approximate index.
+pub trait RawVectors {
+    fn raw_vector(&self, claim_id: &str) -> Option<&[f32]>;
+}
+
+impl RawVectors for HashMap<String, Vec<f32>> {
+    fn raw_vector(&self, claim_id: &str) -> Option<&[f32]> {
+        self.get(claim_id).map(Vec::as_slice)
+    }
+}
+
+impl RawVectors for crate::cow_map::CowMap<Vec<f32>> {
+    fn raw_vector(&self, claim_id: &str) -> Option<&[f32]> {
+        self.get(claim_id).map(Vec::as_slice)
+    }
+}
+
 struct InternedSource<'a> {
     ids: &'a KeyInterner,
-    raw: &'a HashMap<String, Vec<f32>>,
+    raw: &'a dyn RawVectors,
 }
 
 impl VectorSource for InternedSource<'_> {
     fn raw(&self, key: u64) -> Option<&[f32]> {
-        self.raw.get(self.ids.id_of(key)?).map(Vec::as_slice)
+        self.raw.raw_vector(self.ids.id_of(key)?)
     }
 }
 
@@ -1083,7 +1101,7 @@ impl TenantVectorIndex {
         query: &[f32],
         k: usize,
         allowed: Option<&dyn Fn(&str) -> bool>,
-        raw: &HashMap<String, Vec<f32>>,
+        raw: &dyn RawVectors,
     ) -> Vec<(String, f32)> {
         let by_key = |key: u64| {
             self.ids
