@@ -36,9 +36,12 @@ to [Semantic Versioning](https://semver.org/).
   alone (0.311 / 0.222), the store's lexical retrieve (0.863 / 0.826) and
   hybrid retrieve (0.795 / 0.682, old hybrid 0.766 / 0.642);
   `pkg/store/tests/relevance_eval.rs` fails below recorded floors.
-- **Cost** (release, 100,000 claims of 30 to 60 words, 4 vCPUs):
-  see `docs/benchmarks/performance.md` ("Full-text index") and
-  `tests/benchmarks/src/bin/fulltext_bench.rs`.
+- **Cost** (release, 100,000 claims of 30 to 60 words, 4 vCPUs,
+  `tests/benchmarks/src/bin/fulltext_bench.rs`): text-only retrieve p50
+  0.27 to 1.7 ms (the previous rule: 2 ms to 0.8 s on the same queries);
+  index build 12.6 us per claim (1.26 s per 100k, added to the WAL replay);
+  index heap 549 B per claim; delete 220 us per claim. Details in
+  `docs/benchmarks/performance.md` ("Full-text index").
 - The index is rebuilt by the WAL replay at startup and kept in step by
   ingest, re-upsert, claim and tenant tombstones, replication apply and
   resync; it is not persisted. New dependencies: `unicode-segmentation`

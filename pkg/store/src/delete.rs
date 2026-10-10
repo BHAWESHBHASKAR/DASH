@@ -432,6 +432,9 @@ impl InMemoryStore {
         deletion: &mut DiskDeletion,
         sources: &mut BTreeSet<String>,
     ) -> DeleteStats {
+        // The whole full-text index goes: dropping it first spares a
+        // posting-list removal per claim (O(claims x terms) otherwise).
+        self.text_indexes.remove(tenant_id);
         let mut ids: Vec<String> = self
             .tenant_claim_ids
             .get(tenant_id)

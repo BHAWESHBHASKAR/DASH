@@ -339,7 +339,7 @@ the host cache. The shape (throughput scales with batch size; one fsync per batc
 1. **Vector index: adopt `usearch` HNSW** (Apache-2.0, C++ via the `usearch` crate) as the segment vector index. Do not repair the in-repo ANN: the missing neighbour-diversity heuristic and the O(N) insert are the core of its design; rebuilding it equals reimplementing HNSW. Retain a pure-Rust fallback only as an exact flat scan (also needed for the memtable and small allowed sets).
 2. **Quantization default: i8 index + exact f32 rerank (rerank width 50, ef 64-128)** for segments, f32 rows kept in the row store (mmap). It matched f32 recall (0.983 at ef=128, 0.998 at ef=256 at 500k) at about one third of the f32 index memory (372 vs 1,140 MB `memory_usage` at 500k) and about 0.45-0.5 ms p50 at 500k. Plain i8 (recall 0.92-0.94) must not be the default. f16 is the fallback when rerank rows cannot be read cheaply (recall equals f32, 0.57x memory). Binary quantization was not tested.
 3. **Filtered search rule**: per segment, compute the allowed set size A from roaring bitmaps (tenant is a physical partition, so only time/entity/metadata filters remain). If A <= ~8,000 (tunable): exact scan of the allowed rows. Otherwise: `filtered_search` with predicate, ef=64, rerank 50. Allow post-filter x10 only when selectivity >= 30%.
-4. **Text index: adopt `tantivy`** (MIT), one index per tenant segment (not a tenant filter term inside a shared index), BM25 with `WithFreqs` postings and an id fast field. Replace the `HashMap<String, HashSet<String>>` inverted index and its union-everything candidate generation. Rank-fusion layer must be re-calibrated: top-10 overlap with the in-repo composite score is only 0.90-0.96.
+4. **Text index: adopt `tantivy`** (superseded by section 12: an in-tree BM25 index was built instead) (MIT), one index per tenant segment (not a tenant filter term inside a shared index), BM25 with `WithFreqs` postings and an id fast field. Replace the `HashMap<String, HashSet<String>>` inverted index and its union-everything candidate generation. Rank-fusion layer must be re-calibrated: top-10 overlap with the in-repo composite score is only 0.90-0.96.
 5. **Concurrency**: memtable (flat exact scan up to ~5k vectors, then flush) + immutable usearch segments behind `ArcSwap`, one query = parallel search of all segments + merge by score. Confirmed viable; reserve CPU for ingest/flush/compaction.
 6. **WAL**: group commit with a dedicated committer coalescing queued frames (one `sync_data` per batch, no timer needed); preallocate/overwrite segment files where possible (4 KiB x 16: 55k vs 25k records/s).
 7. **Deletes/updates**: tombstone in the live-docs bitmap and remove from usearch only as an optimisation; reclaim space by segment compaction. `remove`+`add` is the update path.
@@ -477,3 +477,95 @@ save scheduling), `TenantVectorIndex::encode`/`decode` in `pkg/store/src/vector_
   graph (the tests); at scale both are approximate with the same tuning (catch-up inserts one by one, a rebuild in bulk).
   Loading needs RAM for the file plus the index while it is copied. Not done: `view`/mmap of a read-only base plus a
   mutable delta, per-tenant salvage of an otherwise valid file (any problem rebuilds every tenant), and save metrics.
+
+## 12. Full-text index: in-tree BM25 instead of tantivy (P5, 2026-10-10)
+
+Decision 4 of section 5 recommended `tantivy`. The full-text index is instead built in-tree
+(`pkg/store/src/text_index.rs`), with BM25 and Unicode-aware analysis. This section replaces decision 4; the rest of
+section 5 stands.
+
+**Why the spike's in-repo numbers do not argue for tantivy.** The 17 ms - 1.3 s in section 3.4 came from candidate
+generation and scoring, not from the inverted index: every claim sharing a token was a candidate (up to 78k at 100k
+docs), each was scored with the composite score, and the BM25 context recomputed the tenant's average length with a
+pass over all its claims on every query. An index that keeps document lengths and term frequencies in its posting
+lists, scores term-at-a-time and keeps the top N answers the same queries in 0.27 - 1.7 ms p50 inside the store
+(table below), which is inside the hybrid budget of section 2 (p50 < 15 ms).
+
+**Reasons for in-tree.**
+
+- *Dependency weight.* tantivy 0.26 pulls 125 crates into the graph (`cargo tree` on the spike), including `zstd-sys`
+  (a second C build next to usearch's C++), `rayon`, `regex`, `tantivy-fst`, `memmap2`, `lz4_flex`, `typetag` and a
+  dozen `tantivy-*` crates. The in-tree index adds two small crates: `unicode-segmentation` (MIT or Apache-2.0) and
+  `rust-stemmers` (MIT or BSD-3-Clause, depends only on `serde`). Both pass `cargo deny check` with the existing
+  allow-list. tantivy itself is MIT; its 125-crate graph was not run through `cargo deny`, so licences are not
+  what decided it, the size of the graph to audit and build is.
+- *State model.* The store is an in-memory, deterministic replica of the WAL: a batch is staged on a detached clone
+  and committed by swapping (`commit_staged`), replication followers and resync replay the same records, and two
+  nodes must answer with identical scores (the segment and in-memory paths too, `answers_do_not_depend_on_the_segment_directory`).
+  A tantivy index is an external mutable resource with writer commits, reader reloads and merge policies: a staged
+  clone cannot be rolled back by dropping it, visibility follows reader reloads, and segment merges reorder documents.
+  The in-tree index is plain data (`Clone`), changes in the same call as the claim, and sums scores in `f64` in query
+  order, so every replica produces bit-identical scores (`pkg/store/tests/fulltext_index.rs::follower_restart_and_resync_answer_like_the_leader`).
+- *Persistence and rebuild.* Building the index is 12.6 us per claim (1.26 s per 100k claims of 30-60 words), paid
+  during the WAL replay that runs at every start anyway (about 9 s per 100k claims with 384-d vectors, section 11).
+  That is too small to justify a persisted format with versioning, digests and catch-up like the vector index, so the
+  index is rebuilt on start and never persisted. tantivy's mmap'd segments would make the text index itself free to
+  open, but the store still replays the WAL to hold the claims in memory, so the start would not get faster.
+- *Memory.* 549 B per claim of heap at 100k claims (12 B per posting plus terms and the claim-id table) against 7 MB
+  (about 70 B per doc) for tantivy's compressed postings. The difference is about 48 MB per 100k claims; the store
+  already holds the claim rows (1,286 B per claim of RSS for claims and all indexes in the same run) and the vectors
+  (1.5 KB per 384-d claim), so the index is a minority of the footprint.
+- *Multi-tenant filtering.* Section 3.4 found one index per tenant 5-10x faster than a tenant filter term and with
+  per-tenant statistics; the in-tree index is per tenant, so a query touches only its tenant's postings and BM25 uses
+  the tenant's document count, document frequencies and average length.
+- *Deletes.* tantivy deletes by term and applies them at the next commit, with space reclaimed at merge. The in-tree
+  index removes postings in place when a claim is re-upserted or tombstoned (re-analysing the old text finds exactly
+  its entries, with a full scan as a fallback), so document frequencies and lengths describe live claims only and a
+  delete is visible at once. Measured cost: 220 us per claim at 100k (head-term posting lists are shifted); a tenant
+  erasure drops the tenant's index in one step.
+
+**What tantivy would have given that this does not.** Phrase and proximity queries (positions are not stored),
+block-max WAND (head-term queries cost 1-2 ms at 100k here against 0.07-0.3 ms p50 for tantivy in section 3.4),
+compressed postings, and language analysers beyond English stemming. If phrase queries, much larger tenants or a
+segment engine with mmap'd immutable indexes become requirements, the decision should be revisited; the index sits
+behind a small interface (`insert`, `remove`, `search`, `score_many`, `max_score`) that a tantivy-backed
+implementation could provide.
+
+**What was built.**
+
+- *Analysis.* UAX #29 word segmentation, full Unicode lowercasing, typographic apostrophe folded, English Snowball
+  stemming of words made of ASCII letters (other scripts are kept whole; Han and Hiragana characters are one term each
+  because UAX #29 has no word boundaries for them), terms truncated at 64 characters. Queries drop English stop words
+  unless nothing else remains; documents keep them. Accent folding and Unicode normalisation are not done.
+- *Scoring.* BM25, `k1 = 1.2`, `b = 0.75`, idf `ln(1 + (N - df + 0.5) / (df + 0.5))` (Lucene / tantivy form), per
+  tenant; checked against a hand-computed example (`text_index.rs::bm25_matches_a_hand_computed_example`).
+- *Candidates.* The `top_k * 20` best BM25 matches (clamped to 100..5000, the vector candidate depth) after the time
+  range and allowed-claim filters, plus the vector candidates, on every retrieve path. The previous rule (every claim
+  sharing a token) is gone; a query with no word at all still puts no lexical constraint on the pool.
+- *Fusion.* Lexical relevance is BM25 divided by the query's upper bound `sum(idf * (k1 + 1))`, in `[0, 1)`, which does
+  not depend on the candidate set. Hybrid relevance is `2/3 * (cos + 1) / 2 + 1/3 * normalised BM25`: one unit of cosine
+  weighs as much as one unit of normalised BM25, which keeps the documented semantic-first guarantee strict (a claim
+  with cosine 1 and no query term outranks one with cosine 0 and any BM25, at equal priors). Reciprocal rank fusion was
+  measured (nDCG@10 0.849 on the set below with an unweighted RRF of the two candidate ranks) but breaks that
+  guarantee, since a claim first in the BM25 list and second in the vector list beats one that is first in the vector
+  list only. The prior signals keep their relative weights (`ranking::prior_score`: saturated support and
+  contradiction, 0.15 x source quality, 0.25 x confidence) and are added at half weight.
+- *Quality* (`pkg/store/tests/relevance_eval.rs`, 448 generated claims, 72 queries, graded judgements; gated in CI at
+  0.02 below these values): previous rule nDCG@10 0.769 / recall@10 0.660, previous hybrid 0.766 / 0.642, BM25 alone
+  0.874 / 0.838, hash-embedding vectors alone 0.311 / 0.222, store lexical retrieve 0.863 / 0.826, store hybrid
+  retrieve 0.795 / 0.682. Hybrid is below BM25 alone because the hash embedder is a development stand-in; with a real
+  embedding model it is not measured.
+- *Cost* at 100k claims (`tests/benchmarks/src/bin/fulltext_bench.rs`, release, 4 shared vCPUs, one run):
+
+  | Mix, terms | store retrieve p50 / p99 | previous rule p50 / p99 |
+  |---|---|---|
+  | natural, 1 | 0.44 / 1.8 ms | 8.9 / 758 ms |
+  | natural, 3 | 1.3 / 2.1 ms | 347 / 848 ms |
+  | natural, 6 | 1.7 / 2.7 ms | 792 / 943 ms |
+  | midtail, 1 | 0.27 / 0.48 ms | 1.9 / 29 ms |
+  | midtail, 3 | 0.41 / 0.65 ms | 13.7 / 46 ms |
+  | midtail, 6 | 0.50 / 0.74 ms | 26 / 83 ms |
+
+  Hybrid (3 terms, 64-d vectors, HNSW) 2.9 / 4.6 ms. Full table in `docs/benchmarks/performance.md`.
+- *Compatibility.* No new configuration, no response field added (the retrieve API has no per-result explain
+  output). Ranking changes on the compat fixtures are listed with reasons in `tests/compat/expected/`.

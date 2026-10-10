@@ -32,7 +32,7 @@ const TENANT: &str = "eval";
 const K: usize = 10;
 
 /// (system, nDCG@10 floor, recall@10 floor). Measured values are in
-/// docs/benchmarks/retrieval-quality.md; floors sit 0.02 below them.
+/// docs/benchmarks/performance.md ("Full-text index"); floors sit 0.02 below them.
 const FLOORS: &[(&str, f64, f64)] = &[
     ("bm25", 0.854, 0.817),
     ("store_lexical", 0.843, 0.806),
