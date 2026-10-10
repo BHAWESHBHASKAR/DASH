@@ -117,6 +117,15 @@ impl RecordCipher {
 
     /// Opens a record sealed by any session of this file.
     pub fn open(&self, sealed: &[u8], extra_aad: &[u8]) -> Result<Vec<u8>, EncryptionError> {
+        self.open_owned(sealed.to_vec(), extra_aad)
+    }
+
+    /// [`RecordCipher::open`] decrypting inside `sealed` (no copy).
+    pub fn open_owned(
+        &self,
+        mut sealed: Vec<u8>,
+        extra_aad: &[u8],
+    ) -> Result<Vec<u8>, EncryptionError> {
         if sealed.len() < RECORD_OVERHEAD {
             return Err(EncryptionError::Format(
                 "encrypted record is too short".to_string(),
@@ -128,8 +137,7 @@ impl RecordCipher {
         counter.copy_from_slice(&sealed[SALT_LEN..SALT_LEN + COUNTER_LEN]);
         let counter = u64::from_be_bytes(counter);
         let body_end = sealed.len() - TAG_LEN;
-        let mut body = sealed[SALT_LEN + COUNTER_LEN..body_end].to_vec();
-        let tag = aes_gcm::Tag::from_slice(&sealed[body_end..]);
+        let tag = *aes_gcm::Tag::from_slice(&sealed[body_end..]);
         let aad = self.aad(extra_aad);
         let cipher = if salt == self.salt {
             self.session.clone()
@@ -147,9 +155,16 @@ impl RecordCipher {
             }
         };
         cipher
-            .decrypt_in_place_detached(Nonce::from_slice(&nonce_for(counter)), &aad, &mut body, tag)
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_for(counter)),
+                &aad,
+                &mut sealed[SALT_LEN + COUNTER_LEN..body_end],
+                &tag,
+            )
             .map_err(|_| EncryptionError::Authentication("encrypted record".to_string()))?;
-        Ok(body)
+        sealed.truncate(body_end);
+        sealed.drain(..SALT_LEN + COUNTER_LEN);
+        Ok(sealed)
     }
 }
 

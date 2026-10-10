@@ -568,3 +568,30 @@ fn quarantined_legacy_lines_stay_encrypted() {
     });
     assert_no_marker(dir.path());
 }
+
+#[test]
+fn a_large_encrypted_wal_decodes_in_parallel_with_the_same_result() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("dash.wal");
+    with_keyring(Some(key(15)), || {
+        let mut wal = FileWal::open_with_sync_every_records(&path, 100_000).unwrap();
+        for n in 0..6_000 {
+            wal.append_claim(&claim(&format!("c{n}"), n)).unwrap();
+        }
+        wal.flush_pending_sync().unwrap();
+        drop(wal);
+        let wal = FileWal::open(&path).unwrap();
+        assert_eq!(wal.wal_record_count().unwrap(), 6_000);
+        let store = InMemoryStore::load_from_wal(&wal).unwrap();
+        assert_eq!(store.claims_for_tenant(TENANT).len(), 6_000);
+        drop(wal);
+        // Damage one line in the middle: still a hard error naming it.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (_, ends) = record_line_ends(&bytes);
+        let at = ends[3_000] - 10;
+        bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
+        std::fs::write(&path, &bytes).unwrap();
+        let err = format!("{:?}", FileWal::open(&path).err().unwrap());
+        assert!(err.contains("wal line 3002"), "{err}");
+    });
+}

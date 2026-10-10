@@ -606,6 +606,10 @@ pub struct FileWal {
     /// reached the disk (fsyncgate). Only a restart, which re-reads the log
     /// from disk, clears it.
     poisoned: Option<String>,
+    /// The lines read when the WAL was opened, with the file length then;
+    /// the first replay uses them instead of reading (and decrypting) the
+    /// file again, when the file has not changed since.
+    open_scan: std::sync::Mutex<Option<(u64, Vec<(usize, String)>)>>,
 }
 
 /// Prefix of the error returned by every write to a poisoned WAL.
@@ -704,15 +708,20 @@ impl FileWal {
                 LineCodec::Plain
             }
         };
+        // One read (and, for an encrypted file, one decryption) of the
+        // whole file serves the torn-tail repair, the commit-group check,
+        // the record count and the first replay.
+        let mut scan = scan_wal(&path, &codec)?;
         let torn_tail_dropped = torn_header
-            + repair_torn_tail(&path, &codec)?
-            + truncate_unterminated_group(&path, &codec)?;
+            + repair_torn_tail(&path, &codec, &mut scan)?
+            + truncate_unterminated_group(&path, &codec, &mut scan)?;
         if !codec.is_encrypted()
             && let Some(keyring) = keyring.as_ref()
         {
-            codec = encrypt_plain_line_file(&path, keyring)?;
+            codec = encrypt_plain_line_file(&path, keyring, &scan)?;
         }
-        let wal_records = count_non_empty_lines(&path)?;
+        let wal_records = scan.lines.len();
+        let opened_len = std::fs::metadata(&path)?.len();
         let generation = load_or_create_generation(&generation_path_for(&path))?;
         let transitions = load_transitions(&transitions_path_for(&path));
         let closed = load_closed_generation(&path, transitions.last(), keyring.as_ref())?;
@@ -737,6 +746,7 @@ impl FileWal {
             transitions,
             closed,
             poisoned: None,
+            open_scan: std::sync::Mutex::new(Some((opened_len, scan.lines))),
         })
     }
 
@@ -1007,6 +1017,7 @@ impl FileWal {
 
     pub fn rollback_to(&mut self, point: WalRollbackPoint) -> Result<(), StoreError> {
         self.ensure_writable()?;
+        self.forget_open_scan();
         let discards_records = self.wal_records > point.wal_records;
         self.append_buffer.clear();
         let file = OpenOptions::new()
@@ -1484,6 +1495,7 @@ impl FileWal {
         self.ensure_writable()?;
         self.flush_pending_sync()?;
         export.for_each_line(|_, line| check_replicated_line(line))?;
+        self.forget_open_scan();
 
         let snapshot_path = self.snapshot_path();
         let mut tmp_path = snapshot_path.clone().into_os_string();
@@ -1640,6 +1652,7 @@ impl FileWal {
     /// Writes the whole append buffer with a single `write_all` and empties
     /// it (also on error, as before).
     fn write_append_buffer(&mut self, file: &mut File) -> Result<(), StoreError> {
+        self.forget_open_scan();
         let bytes: usize = self.append_buffer.iter().map(|line| line.len() + 1).sum();
         let bytes = if self.codec.is_encrypted() {
             bytes * 4 / 3 + self.append_buffer.len() * 64
@@ -1705,7 +1718,7 @@ impl FileWal {
             }
             n
         };
-        let scan = scan_wal(&self.path, &self.codec)?;
+        let scan = self.scan_for_replay()?;
         // Vector-index changes after line `from` (see
         // `WalReplay::vector_catch_up`); impossible when the WAL is shorter
         // than `from`.
@@ -1760,6 +1773,32 @@ impl FileWal {
             quarantined_claim_ids: parser.quarantined_claim_ids,
             vector_catch_up: catch_up,
         })
+    }
+
+    /// Drops the lines cached at open (the file is about to change).
+    fn forget_open_scan(&mut self) {
+        *self.open_scan.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The WAL's lines for a replay: the ones read at open while the file is
+    /// unchanged since (taken once), otherwise a fresh scan.
+    fn scan_for_replay(&self) -> Result<WalScan, StoreError> {
+        let cached = self
+            .open_scan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((len, lines)) = cached
+            && std::fs::metadata(&self.path)?.len() == len
+        {
+            return Ok(WalScan {
+                lines,
+                valid_len: len,
+                torn_tail: false,
+                missing_newline: false,
+            });
+        }
+        scan_wal(&self.path, &self.codec)
     }
 
     fn replay_snapshot_lines_raw(&self) -> Result<Vec<String>, StoreError> {
@@ -1844,6 +1883,7 @@ impl FileWal {
     }
 
     fn write_wal_lines_raw(&mut self, lines: &[String]) -> Result<(), StoreError> {
+        self.forget_open_scan();
         let codec = LineCodec::create(self.keyring.as_ref())?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -1863,6 +1903,7 @@ impl FileWal {
     /// its remaining lines (see [`ClosedGeneration`]).
     fn truncate_wal(&mut self) -> Result<(), StoreError> {
         self.append_buffer.clear();
+        self.forget_open_scan();
         let closed_generation = self.generation;
         // New lineage first: a crash between the bump and the truncation
         // only causes a spurious resync, never a silent skip.
@@ -2076,19 +2117,6 @@ impl Drop for FileWal {
     }
 }
 
-fn count_non_empty_lines(path: &Path) -> Result<usize, StoreError> {
-    let file = OpenOptions::new().read(true).open(path)?;
-    let reader = BufReader::new(file);
-    let mut count = 0usize;
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() && !encryption::is_header_line(line.as_bytes()) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 fn with_context(err: StoreError, context: &str) -> StoreError {
     match err {
         StoreError::Parse(msg) => StoreError::Parse(format!("{context}: {msg}")),
@@ -2221,11 +2249,7 @@ fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
 
     // Decode text (decrypting an encrypted file); a line that does not
     // decode is treated as an unparseable line.
-    let decoded: Vec<Result<String, String>> = raw
-        .iter()
-        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
-        .collect();
-    let decode = |idx: usize| -> Option<String> { decoded[idx].as_ref().ok().cloned() };
+    let decoded = decode_lines(&bytes, &raw, codec);
 
     // Index of the last non-blank physical line.
     let last_content = decoded
@@ -2236,13 +2260,10 @@ fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
     let mut valid_len = bytes.len() as u64;
     let mut torn_tail = false;
     let mut missing_newline = false;
-    for (idx, &(s, _, terminated)) in raw.iter().enumerate() {
-        let text = decode(idx);
+    for (idx, (&(s, _, terminated), text)) in raw.iter().zip(decoded).enumerate() {
         let is_last = Some(idx) == last_content;
         if is_last {
-            let ok = text
-                .as_deref()
-                .is_some_and(|t| is_valid_tail(t, terminated));
+            let ok = text.as_deref().is_ok_and(|t| is_valid_tail(t, terminated));
             if !ok {
                 torn_tail = true;
                 valid_len = s as u64;
@@ -2254,10 +2275,9 @@ fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
             }
         }
         match text {
-            Some(t) if t.trim().is_empty() => {}
-            Some(t) => lines.push((idx + 1, t)),
-            None => {
-                let reason = decoded[idx].as_ref().err().cloned().unwrap_or_default();
+            Ok(t) if t.trim().is_empty() => {}
+            Ok(t) => lines.push((idx + 1, t)),
+            Err(reason) => {
                 return Err(StoreError::Parse(format!("wal line {}: {reason}", idx + 1)));
             }
         }
@@ -2267,6 +2287,42 @@ fn scan_wal(path: &Path, codec: &LineCodec) -> Result<WalScan, StoreError> {
         valid_len,
         torn_tail,
         missing_newline,
+    })
+}
+
+/// Decodes every physical line of `bytes`. Decryption of a large encrypted
+/// file runs on all cores (lines are independent), so a cold start does not
+/// pay the decryption serially.
+fn decode_lines(
+    bytes: &[u8],
+    raw: &[(usize, usize, bool)],
+    codec: &LineCodec,
+) -> Vec<Result<String, String>> {
+    const PARALLEL_MIN_LINES: usize = 4096;
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if !codec.is_encrypted() || raw.len() < PARALLEL_MIN_LINES || workers < 2 {
+        return raw
+            .iter()
+            .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+            .collect();
+    }
+    let per = raw.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = raw
+            .chunks(per)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&(s, e, _)| codec.decode(&bytes[s..e]))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("line decoder thread panicked"))
+            .collect()
     })
 }
 
@@ -2625,9 +2681,9 @@ fn filter_replication_lines(lines: Vec<String>) -> (Vec<String>, usize) {
 fn encrypt_plain_line_file(
     path: &Path,
     keyring: &std::sync::Arc<encryption::Keyring>,
+    scan: &WalScan,
 ) -> Result<LineCodec, StoreError> {
     let codec = LineCodec::create(Some(keyring))?;
-    let scan = scan_wal(path, &LineCodec::Plain)?;
     if !scan.lines.is_empty() {
         eprintln!(
             "info: encrypting the existing plaintext write-ahead log {} ({} lines) under key {}",
@@ -2657,9 +2713,13 @@ fn encrypt_plain_line_file(
 }
 
 /// Truncates a torn final WAL line (and terminates an otherwise valid
-/// unterminated one). Returns the number of dropped lines (0 or 1).
-fn repair_torn_tail(path: &Path, codec: &LineCodec) -> Result<usize, StoreError> {
-    let scan = scan_wal(path, codec)?;
+/// unterminated one), using `scan` of the file, and updates `scan` to the
+/// repaired file. Returns the number of dropped lines (0 or 1).
+fn repair_torn_tail(
+    path: &Path,
+    codec: &LineCodec,
+    scan: &mut WalScan,
+) -> Result<usize, StoreError> {
     if !scan.torn_tail && !scan.missing_newline {
         return Ok(0);
     }
@@ -2674,12 +2734,15 @@ fn repair_torn_tail(path: &Path, codec: &LineCodec) -> Result<usize, StoreError>
         );
         file.set_len(scan.valid_len)?;
         file.sync_all()?;
+        scan.torn_tail = false;
         return Ok(1);
     }
     drop(file);
     let mut file = OpenOptions::new().append(true).open(path)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    scan.missing_newline = false;
+    scan.valid_len += 1;
     Ok(0)
 }
 
@@ -2738,8 +2801,11 @@ fn save_truncated_tail(path: &Path, from: u64, codec: &LineCodec) -> Result<Path
 /// only be a crash artifact, so every line in it must be intact). The
 /// removed bytes of a genuine torn group are first saved to a
 /// `<wal>.truncated-<ts>` sidecar.
-fn truncate_unterminated_group(path: &Path, codec: &LineCodec) -> Result<usize, StoreError> {
-    let scan = scan_wal(path, codec)?;
+fn truncate_unterminated_group(
+    path: &Path,
+    codec: &LineCodec,
+    scan: &mut WalScan,
+) -> Result<usize, StoreError> {
     let mut open: Option<(usize, String)> = None;
     for (line_no, line) in &scan.lines {
         if !line.starts_with("B2\t") {
@@ -2796,6 +2862,8 @@ fn truncate_unterminated_group(path: &Path, codec: &LineCodec) -> Result<usize, 
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(offset as u64)?;
     file.sync_all()?;
+    scan.lines.retain(|(n, _)| *n < begin_line);
+    scan.valid_len = offset as u64;
     Ok(dropped)
 }
 

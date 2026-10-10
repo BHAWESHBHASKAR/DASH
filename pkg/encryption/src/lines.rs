@@ -151,7 +151,7 @@ impl LineCipher {
         })?;
         let plain = self
             .records
-            .open(&sealed, b"")
+            .open_owned(sealed, b"")
             .map_err(|_| EncryptionError::Authentication("encrypted line".to_string()))?;
         String::from_utf8(plain)
             .map(Some)
