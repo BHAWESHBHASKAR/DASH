@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 import httpx
 
 from ._version import __version__
-from .errors import DashAPIError, DashConnectionError, DashError
+from .errors import DashAPIError, DashConnectionError
 from .types import (
     EmbeddingRequest,
     EmbeddingResponse,

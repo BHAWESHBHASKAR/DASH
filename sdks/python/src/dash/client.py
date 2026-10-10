@@ -29,15 +29,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 import requests
 
 from ._version import __version__
-from .errors import DashAPIError, DashConnectionError, DashError
+from .errors import DashAPIError, DashConnectionError
 from .types import (
-    EmbeddingData,
     EmbeddingRequest,
     EmbeddingResponse,
-    EmbeddingUsage,
     RetrieveRequest,
     RetrieveResponse,
-    RetrieveResult,
     TimeRange,
 )
 
