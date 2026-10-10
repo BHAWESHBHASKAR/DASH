@@ -414,6 +414,13 @@ fn initial_and_incremental_sync_report_lag_and_ready() {
     }
     assert!(metrics.contains("dash_retrieval_replication_generation "));
     assert!(metrics.contains("dash_retrieval_replication_last_success_age_ms "));
+    // A caught-up follower reports no time lag, and the whole body (service,
+    // follower, storage and shared families) is valid exposition.
+    let report = dash_observe::validate(&metrics).unwrap_or_else(|e| panic!("{e}\n{metrics}"));
+    assert_eq!(
+        report.value("dash_retrieval_replication_lag_seconds", &[]),
+        Some(0.0)
+    );
 }
 
 #[test]
@@ -778,6 +785,14 @@ fn unreachable_leader_backs_off_and_readiness_reports_it() {
     assert!(body.contains("\"last_error\":\""), "{body}");
     let (_, metrics) = server.get("/metrics");
     assert!(metrics.contains("dash_retrieval_replication_ready 0"));
+    // Never caught up: the time lag counts from start and is positive.
+    let report = dash_observe::validate(&metrics).unwrap_or_else(|e| panic!("{e}\n{metrics}"));
+    assert!(
+        report
+            .value("dash_retrieval_replication_lag_seconds", &[])
+            .unwrap()
+            > 0.0
+    );
 }
 
 #[test]

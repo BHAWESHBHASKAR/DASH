@@ -224,6 +224,9 @@ pub struct FollowerStatus {
     leader_total: AtomicUsize,
     started_ms: u64,
     last_success_ms: AtomicU64,
+    /// Unix ms when the follower was last observed fully caught up with the
+    /// leader (0 = never).
+    caught_up_ms: AtomicU64,
     consecutive_failures: AtomicU64,
     failures_total: AtomicU64,
     resyncs_total: AtomicU64,
@@ -286,6 +289,9 @@ pub struct FollowerStatusSnapshot {
     pub lag_records: usize,
     /// Milliseconds since the last successful poll (since start if none).
     pub last_success_age_ms: u64,
+    /// Milliseconds since the follower was last observed caught up with the
+    /// leader (since start if never); 0 while it is caught up.
+    pub lag_ms: u64,
     pub consecutive_failures: u64,
     pub failures_total: u64,
     pub resyncs_total: u64,
@@ -305,6 +311,7 @@ impl FollowerStatus {
             leader_total: AtomicUsize::new(0),
             started_ms: now_ms(),
             last_success_ms: AtomicU64::new(0),
+            caught_up_ms: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
             failures_total: AtomicU64::new(0),
             resyncs_total: AtomicU64::new(0),
@@ -338,6 +345,7 @@ impl FollowerStatus {
             leader_total_records: leader_total,
             lag_records: leader_total.saturating_sub(offset),
             last_success_age_ms: now_ms().saturating_sub(reference),
+            lag_ms: self.lag_ms(offset, leader_total),
             consecutive_failures: self.consecutive_failures.load(Ordering::Relaxed),
             failures_total: self.failures_total.load(Ordering::Relaxed),
             resyncs_total: self.resyncs_total.load(Ordering::Relaxed),
@@ -411,6 +419,9 @@ dash_retrieval_replication_lag_records {}\n\
 dash_retrieval_replication_offset {}\n\
 # TYPE dash_retrieval_replication_last_success_age_ms gauge\n\
 dash_retrieval_replication_last_success_age_ms {}\n\
+# HELP dash_retrieval_replication_lag_seconds Seconds since the follower was last caught up with the leader (0 while caught up).\n\
+# TYPE dash_retrieval_replication_lag_seconds gauge\n\
+dash_retrieval_replication_lag_seconds {}\n\
 # TYPE dash_retrieval_replication_consecutive_failures gauge\n\
 dash_retrieval_replication_consecutive_failures {}\n\
 # TYPE dash_retrieval_replication_failures_total counter\n\
@@ -434,6 +445,7 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
             snap.lag_records,
             snap.offset,
             snap.last_success_age_ms,
+            snap.lag_ms as f64 / 1000.0,
             snap.consecutive_failures,
             snap.failures_total,
             snap.resyncs_total,
@@ -456,6 +468,22 @@ dash_retrieval_replication_blocked_group_too_large {}\n",
             }
             None => self.has_generation.store(false, Ordering::Relaxed),
         }
+    }
+
+    /// Time-based lag: 0 while `offset` has reached the leader's record
+    /// count (which also stamps the caught-up time), otherwise the time since
+    /// the follower was last caught up (since start if never).
+    fn lag_ms(&self, offset: usize, leader_total: usize) -> u64 {
+        let now = now_ms();
+        if self.synced_once.load(Ordering::Relaxed) && offset >= leader_total {
+            self.caught_up_ms.store(now.max(1), Ordering::Relaxed);
+            return 0;
+        }
+        let reference = match self.caught_up_ms.load(Ordering::Relaxed) {
+            0 => self.started_ms,
+            stamp => stamp,
+        };
+        now.saturating_sub(reference)
     }
 
     pub(crate) fn record_success(&self) {

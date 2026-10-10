@@ -978,6 +978,7 @@ pub fn serve_http_with_workers(
         )
         .into()
     });
+    let handler = dash_observe::http::instrument(SERVICE_NAME, http_route_label, handler);
     let mut config = server_config(worker_count, queue_capacity);
     config.tls = tls;
     dash_http::serve(
@@ -1020,6 +1021,7 @@ pub fn serve_http_once_with_listener(
         )
         .into()
     });
+    let handler = dash_observe::http::instrument(SERVICE_NAME, http_route_label, handler);
     dash_http::serve_once(
         &listener,
         &server_config(1, 1),
@@ -1177,11 +1179,39 @@ fn handle_request_with_metrics_and_reload<S: StoreAccess + ?Sized>(
         &auth_policy,
     );
     if request.method == "GET" && path_only == "/metrics" && response.status == 200 {
-        response
-            .body
-            .push_str(&dash_common::audit::render_prometheus_counters());
+        append_shared_metrics(&mut response.body);
     }
     response
+}
+
+/// Service name used for the shared HTTP metrics and `dash_build_info`.
+pub(crate) const SERVICE_NAME: &str = "retrieval";
+
+/// Families shared with the other services, appended to `/metrics`: audit
+/// counters, storage (WAL, checkpoint, vector index), embedding provider,
+/// HTTP request metrics, process metrics and build info.
+pub(crate) fn append_shared_metrics(body: &mut String) {
+    body.push_str(&dash_common::audit::render_prometheus_counters());
+    body.push_str(&store::observe::render_prometheus());
+    body.push_str(&embeddings::metrics::render_prometheus());
+    body.push_str(&dash_observe::http::render_service_metrics(
+        SERVICE_NAME,
+        env!("CARGO_PKG_VERSION"),
+    ));
+}
+
+/// Bounded route label for the shared HTTP metrics.
+pub(crate) fn http_route_label(_method: &str, path: &str) -> &'static str {
+    match path {
+        "/v1/retrieve" => "retrieve",
+        "/v1/embeddings" => "embeddings",
+        "/health" | "/v1/health" => "health",
+        "/live" | "/v1/live" => "live",
+        "/ready" | "/v1/ready" => "ready",
+        "/metrics" => "metrics",
+        p if p.starts_with("/debug/") => "debug",
+        _ => "other",
+    }
 }
 
 fn handle_request_with_policy<S: StoreAccess + ?Sized>(
