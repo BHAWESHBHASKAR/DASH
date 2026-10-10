@@ -863,7 +863,7 @@ impl IngestionRuntime {
     fn switch_replication_generation(&mut self, generation: u64) -> Result<(), StoreError> {
         if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
             // The previous switch's snapshot may still be being written.
-            self.wait_for_checkpoint();
+            self.settle_checkpoint();
             let begun = self.store.begin_checkpoint(&mut lock_wal(&wal));
             match begun {
                 Ok(job) => self.spawn_checkpoint_writer(job, "replication switch"),
@@ -913,7 +913,7 @@ impl IngestionRuntime {
             .saturating_add(skipped);
         if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
             // A local checkpoint still writing its snapshot finishes first.
-            self.wait_for_checkpoint();
+            self.settle_checkpoint();
             self.clear_replication_state()?;
             lock_wal(&wal).replace_with_replication_export(&export)?;
         }
@@ -950,7 +950,7 @@ impl IngestionRuntime {
             .saturating_add(skipped);
         if let Some(wal) = self.wal.as_ref().map(std::sync::Arc::clone) {
             // A local checkpoint still writing its snapshot finishes first.
-            self.wait_for_checkpoint();
+            self.settle_checkpoint();
             self.clear_replication_state()?;
             #[cfg(test)]
             crash_point::hit("ingest.resync.cursor_cleared")?;

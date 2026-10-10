@@ -224,6 +224,7 @@ fn a_failed_background_snapshot_write_keeps_every_write_and_the_next_checkpoint_
         max_wal_bytes: None,
     };
     let mut runtime = persistent_runtime(dir.path(), policy);
+    runtime.set_checkpoint_retry_interval_for_tests(std::time::Duration::ZERO);
     // The snapshot is written to `<wal>.snapshot.tmp` by the background
     // thread; a directory there makes that write fail after the response.
     let tmp = dir.path().join("wal.log.snapshot.tmp");
@@ -237,12 +238,27 @@ fn a_failed_background_snapshot_write_keeps_every_write_and_the_next_checkpoint_
     runtime.wait_for_checkpoint();
     {
         let wal = lock_wal(runtime.wal.as_ref().unwrap());
-        assert!(!wal.checkpoint_in_flight());
+        // Held for a retry: no new rotation while the write keeps failing.
+        assert!(wal.checkpoint_in_flight());
         assert!(
             wal.checkpoint_pending(),
             "the failed write leaves the pending state"
         );
     }
+    let generation = lock_wal(runtime.wal.as_ref().unwrap()).generation();
+    let response = runtime
+        .ingest(item(
+            "s1b",
+            "Committed while the snapshot cannot be written",
+        ))
+        .unwrap();
+    assert!(!response.checkpoint_triggered, "no second rotation");
+    runtime.wait_for_checkpoint();
+    assert_eq!(
+        lock_wal(runtime.wal.as_ref().unwrap()).generation(),
+        generation,
+        "the retry writes the same checkpoint again"
+    );
     let pending_copy = tempfile::tempdir().unwrap();
     for entry in std::fs::read_dir(dir.path()).unwrap() {
         let entry = entry.unwrap();
@@ -268,10 +284,10 @@ fn a_failed_background_snapshot_write_keeps_every_write_and_the_next_checkpoint_
     assert!(after_restart.claim_by_id("s1").is_some());
 
     std::fs::remove_dir(&tmp).unwrap();
-    let response = runtime
+    runtime
         .ingest(item("s2", "Committed after the disk recovered"))
         .unwrap();
-    assert!(response.checkpoint_triggered);
+    // That write retried the held checkpoint, which now publishes.
     runtime.wait_for_checkpoint();
     {
         let wal = lock_wal(runtime.wal.as_ref().unwrap());
@@ -281,6 +297,7 @@ fn a_failed_background_snapshot_write_keeps_every_write_and_the_next_checkpoint_
     let replayed =
         InMemoryStore::load_from_wal(&FileWal::open(dir.path().join("wal.log")).unwrap()).unwrap();
     assert!(replayed.claim_by_id("s1").is_some());
+    assert!(replayed.claim_by_id("s1b").is_some());
     assert!(replayed.claim_by_id("s2").is_some());
 }
 

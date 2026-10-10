@@ -186,11 +186,16 @@ and reopens it (`pkg/store/src/failpoint.rs`).
 **Failures.** If the snapshot write or the publication fails (disk full,
 I/O error), the files stay in the pending state, which replay reads
 correctly, and the error is logged
-(`ingestion ... background checkpoint failed`, `dash_wal_checkpoint_failures_total`).
-The next checkpoint (the WAL reaches the threshold again) adds its own
-closed generation to the marker's list, and its snapshot supersedes all of
-them. A service that starts on a pending marker (after a crash, or a failure
-before a restart) starts a checkpoint right away. While a snapshot is being
+(`ingestion ... background checkpoint failed`).
+The ingestion service keeps the failed checkpoint, with its frozen copy of
+the state, and writes the same snapshot again (at most once per second,
+while the WAL is past the threshold) instead of rotating again; meanwhile
+no new checkpoint starts, so on a disk that keeps failing the WAL grows and
+its writes fail as they did before, rather than closed generations piling
+up. Where a checkpoint is given up instead (a follower that must resync, a
+crash, a restart), the next checkpoint adds its own closed generation to the
+marker's list and its snapshot supersedes all of them. A service that
+starts on a pending marker starts a checkpoint right away. While a snapshot is being
 written no second checkpoint starts (`dash_wal_checkpoint_in_progress` is
 1); a shutdown with SIGTERM waits for it.
 

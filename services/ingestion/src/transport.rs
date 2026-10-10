@@ -174,7 +174,22 @@ pub struct IngestionRuntime {
     /// Test hook: the checkpoint thread calls it before writing the
     /// snapshot (a test holds it there to make the write slow on demand).
     checkpoint_gate: Option<CheckpointGate>,
+    /// A checkpoint whose snapshot write failed, kept (with its frozen
+    /// state) to be written again instead of rotating once more, and when
+    /// it failed. While it is held the WAL refuses new checkpoints, so a
+    /// disk that keeps failing makes the WAL grow (and its writes fail) as
+    /// before, instead of piling up closed generations.
+    failed_checkpoint: FailedCheckpoint,
+    /// Least time between two attempts to write a failed checkpoint's
+    /// snapshot ([`CHECKPOINT_RETRY_INTERVAL`]; tests lower it).
+    checkpoint_retry_interval: Duration,
 }
+
+/// See `IngestionRuntime::failed_checkpoint`.
+type FailedCheckpoint = Arc<Mutex<Option<(store::CheckpointJob, Instant)>>>;
+
+/// Least time between two attempts to write a failed checkpoint's snapshot.
+const CHECKPOINT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// See `IngestionRuntime::set_checkpoint_gate_for_tests`.
 pub type CheckpointGate = Arc<dyn Fn() + Send + Sync>;
@@ -310,6 +325,8 @@ impl IngestionRuntime {
             delete_metrics: delete_routes::DeleteMetrics::default(),
             checkpoint_worker: None,
             checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
         }
     }
 
@@ -396,6 +413,8 @@ impl IngestionRuntime {
             delete_metrics: delete_routes::DeleteMetrics::default(),
             checkpoint_worker: None,
             checkpoint_gate: None,
+            failed_checkpoint: Arc::default(),
+            checkpoint_retry_interval: CHECKPOINT_RETRY_INTERVAL,
         };
         runtime.warm_replication_index();
         runtime.resume_pending_checkpoint();
@@ -799,6 +818,21 @@ impl IngestionRuntime {
         };
         let mut wal = lock_wal(shared);
         if wal.checkpoint_in_flight() {
+            // A failed snapshot write is retried (same frozen state, no new
+            // rotation) once the WAL is past the threshold again.
+            let retry = if matches!(
+                should_checkpoint_now(&self.checkpoint_policy, &wal),
+                Ok(true)
+            ) {
+                self.take_failed_checkpoint_due()
+            } else {
+                None
+            };
+            drop(wal);
+            if let Some(job) = retry {
+                eprintln!("ingestion {label}: retrying the failed checkpoint snapshot write");
+                self.spawn_checkpoint_writer(job, label);
+            }
             return (None, false);
         }
         match should_checkpoint_now(&self.checkpoint_policy, &wal) {
@@ -846,6 +880,7 @@ impl IngestionRuntime {
         };
         let label = label.to_string();
         let gate = self.checkpoint_gate.clone();
+        let failed = Arc::clone(&self.failed_checkpoint);
         let run = move |job: store::CheckpointJob, wal: &SharedWal| {
             if let Some(gate) = gate.as_ref() {
                 gate();
@@ -853,14 +888,16 @@ impl IngestionRuntime {
             let started = std::time::Instant::now();
             let written = job.write_catching_panics();
             let write_secs = started.elapsed().as_secs_f64();
+            if let Err(err) = written {
+                // Kept for a retry; the files keep the pending state
+                // (replayed correctly at startup) meanwhile.
+                eprintln!("ingestion {label} background checkpoint failed: {err:?}");
+                *failed.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((job, std::time::Instant::now()));
+                return;
+            }
             let mut guard = lock_wal(wal);
-            let result = match written {
-                Ok(()) => job.finish(&mut guard),
-                Err(err) => {
-                    job.abort(&mut guard);
-                    Err(err)
-                }
-            };
+            let result = job.finish(&mut guard);
             drop(guard);
             // Retired files (the old snapshot, closed WAL files) are
             // deleted here, without the WAL lock.
@@ -946,6 +983,36 @@ impl IngestionRuntime {
         }
     }
 
+    /// The failed checkpoint held for a retry, if its retry is due.
+    fn take_failed_checkpoint_due(&self) -> Option<store::CheckpointJob> {
+        let mut held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match held.as_ref() {
+            Some((_, failed_at)) if failed_at.elapsed() >= self.checkpoint_retry_interval => {
+                held.take().map(|(job, _)| job)
+            }
+            _ => None,
+        }
+    }
+
+    /// Waits for a running checkpoint thread and gives up a failed
+    /// checkpoint held for a retry (its pending files stay; the next
+    /// checkpoint or a resync supersedes them). Followers call it before
+    /// they compact or replace their WAL.
+    pub(crate) fn settle_checkpoint(&mut self) {
+        self.wait_for_checkpoint();
+        let held = self
+            .failed_checkpoint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let (Some((job, _)), Some(wal)) = (held, self.wal.as_ref()) {
+            job.abort(&mut lock_wal(wal));
+        }
+    }
+
     /// Waits until the checkpoint whose snapshot is being written (if any)
     /// is published or has failed.
     pub fn wait_for_checkpoint(&mut self) {
@@ -958,6 +1025,13 @@ impl IngestionRuntime {
     /// without holding the runtime lock.
     pub(crate) fn take_checkpoint_worker(&mut self) -> Option<std::thread::JoinHandle<()>> {
         self.checkpoint_worker.take()
+    }
+
+    /// Test hook: retry a failed checkpoint snapshot write after `interval`
+    /// instead of [`CHECKPOINT_RETRY_INTERVAL`].
+    #[doc(hidden)]
+    pub fn set_checkpoint_retry_interval_for_tests(&mut self, interval: Duration) {
+        self.checkpoint_retry_interval = interval;
     }
 
     /// Test hook: `gate` runs on the checkpoint thread before it writes the
