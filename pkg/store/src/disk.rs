@@ -289,6 +289,27 @@ impl DiskBackedStore {
         Ok(Self { db, values })
     }
 
+    /// KEK id recorded in the redb file at `path` (`None`: not encrypted),
+    /// read without unwrapping anything and without creating a data key.
+    pub fn stored_encryption_key_id(path: impl AsRef<Path>) -> Result<Option<String>, String> {
+        let db = Database::open(path.as_ref()).map_err(|e| err("open", e))?;
+        let txn = db.begin_read().map_err(|e| err("begin_read", e))?;
+        let line = match txn.open_table(TABLE_CRYPTO) {
+            Ok(table) => table
+                .get(CRYPTO_DEK_KEY)
+                .map_err(|e| err("read data key", e))?
+                .map(|v| v.value().to_string()),
+            Err(TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(err("open dash_crypto", e)),
+        };
+        match line {
+            None => Ok(None),
+            Some(line) => encryption::parse_header_line(&line)
+                .map(|h| Some(h.key_id))
+                .map_err(|e| e.to_string()),
+        }
+    }
+
     /// `true` when values written by this handle are encrypted.
     pub fn encrypts_values(&self) -> bool {
         self.values.cipher.is_some()

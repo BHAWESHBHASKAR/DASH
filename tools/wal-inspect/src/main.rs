@@ -2,18 +2,127 @@
 //! write-ahead log (and `.snapshot`) files. See
 //! `docs/operations/wal-recovery.md`.
 //!
+//! Encrypted files (ADR 0005, `docs/operations/encryption.md`) are read with
+//! the keys in `DASH_ENCRYPTION_KEY_FILE` / `DASH_ENCRYPTION_PREVIOUS_KEY_FILES`.
+//! `keys` lists the key id of every file under a path and `rewrap` moves
+//! every file to the active key (offline; only file headers change).
+//!
 //! Exit codes: 0 success, 1 the file has problems (`verify`, or `repair`
 //! left invalid lines behind), 2 usage or I/O error.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use store::{WalInspection, WalRepairOptions, inspect_wal_file, repair_wal_file};
+use store::encryption::{self, FileFormat, RewrapOutcome};
+use store::{
+    DiskBackedStore, WalInspection, WalRepairOptions, inspect_wal_file, repair_wal_file,
+};
 
 const USAGE: &str = "usage:
   wal-inspect inspect <wal>
   wal-inspect verify <wal>
-  wal-inspect repair <wal> [--dry-run] [--quarantine]";
+  wal-inspect repair <wal> [--dry-run] [--quarantine]
+  wal-inspect keys <file-or-dir>
+  wal-inspect rewrap <file-or-dir>";
+
+/// Every file under `path` (or `path` itself).
+fn files_under(path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        if next.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&next) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        } else if next.is_file() {
+            out.push(next);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn is_redb(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok()
+        && &magic == b"redb"
+}
+
+/// `keys`: one line per file: path, storage format, KEK id.
+fn list_keys(path: &Path) -> Result<ExitCode, String> {
+    for file in files_under(path) {
+        let (format, key_id) = if is_redb(&file) {
+            match DiskBackedStore::stored_encryption_key_id(&file) {
+                Ok(Some(id)) => ("redb (encrypted values)", id),
+                Ok(None) => ("redb (plaintext values)", "-".to_string()),
+                Err(err) => ("redb (unreadable)", err),
+            }
+        } else {
+            match encryption::sniff_file(&file) {
+                Ok(FileFormat::Plain) => ("plaintext", "-".to_string()),
+                Ok(FileFormat::Lines(h)) => ("encrypted lines", h.key_id),
+                Ok(FileFormat::Sealed(h)) => ("sealed", h.key_id),
+                Err(err) => ("unreadable header", err.to_string()),
+            }
+        };
+        println!("{}\t{format}\t{key_id}", file.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `rewrap`: every encrypted file under `path` to the active KEK.
+fn rewrap(path: &Path) -> Result<ExitCode, String> {
+    let Some(keyring) = encryption::current() else {
+        return Err("rewrap needs DASH_ENCRYPTION_KEY_FILE (the new key) and DASH_ENCRYPTION_PREVIOUS_KEY_FILES (the old ones)".to_string());
+    };
+    let mut failed = 0usize;
+    for file in files_under(path) {
+        let name = file.to_string_lossy();
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        if is_redb(&file) {
+            match DiskBackedStore::stored_encryption_key_id(&file) {
+                Ok(None) => println!("{}\tplaintext values (rewritten encrypted by the next checkpoint)", file.display()),
+                Ok(Some(id)) if id == keyring.active_key_id() => println!("{}\tcurrent", file.display()),
+                Ok(Some(id)) => match DiskBackedStore::new_with_keyring(&file, Some(keyring.clone())) {
+                    Ok(_) => println!("{}\trewrapped ({id} -> {})", file.display(), keyring.active_key_id()),
+                    Err(err) => {
+                        failed += 1;
+                        println!("{}\tFAILED: {err}", file.display());
+                    }
+                },
+                Err(err) => {
+                    failed += 1;
+                    println!("{}\tFAILED: {err}", file.display());
+                }
+            }
+            continue;
+        }
+        match encryption::rewrap_file(&keyring, &file) {
+            Ok(RewrapOutcome::Plain) => {}
+            Ok(RewrapOutcome::Current) => println!("{}\tcurrent", file.display()),
+            Ok(RewrapOutcome::Rewrapped { from }) => println!(
+                "{}\trewrapped ({from} -> {})",
+                file.display(),
+                keyring.active_key_id()
+            ),
+            Err(err) => {
+                failed += 1;
+                println!("{}\tFAILED: {err}", file.display());
+            }
+        }
+    }
+    if failed > 0 {
+        println!("FAILED: {failed} file(s) could not be rewrapped");
+        return Ok(ExitCode::from(1));
+    }
+    Ok(ExitCode::SUCCESS)
+}
 
 fn preview(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
@@ -73,7 +182,19 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     };
     let path = PathBuf::from(path);
     let flags = &args[2..];
+    let keyring = encryption::keyring_from_env().map_err(|e| e.to_string())?;
+    encryption::install(keyring);
     match cmd.as_str() {
+        "keys" | "rewrap" => {
+            if !flags.is_empty() {
+                return Err(format!("{cmd}: unexpected argument {}", flags[0]));
+            }
+            if cmd == "keys" {
+                list_keys(&path)
+            } else {
+                rewrap(&path)
+            }
+        }
         "inspect" | "verify" => {
             if !flags.is_empty() {
                 return Err(format!("{cmd}: unexpected argument {}", flags[0]));
