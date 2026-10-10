@@ -684,7 +684,10 @@ fn write_export_header(
 ) -> std::io::Result<()> {
     write!(
         out,
-        "status=ok\ngeneration={generation}\nsnapshot_records={snapshot_records:0width$}\nwal_records={wal_records:0width$}\n",
+        "status=ok\ngeneration={}\nsnapshot_records={:0width$}\nwal_records={:0width$}\n",
+        generation,
+        snapshot_records,
+        wal_records,
         width = COUNT_WIDTH
     )
 }
