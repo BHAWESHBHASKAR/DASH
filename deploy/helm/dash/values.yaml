@@ -51,7 +51,8 @@ namespace:
 # Replica counts.
 #
 # Ingestion is the single writer and the control plane uses a file-backed
-# lease, so both are fixed at ONE replica (not configurable). Each retrieval
+# lease, so both are fixed at ONE replica (ingestion runs failover.replicas
+# pods when failover.enabled, of which one writes). Each retrieval
 # replica has its own PVC and follows the single ingestion pod via WAL
 # replication. Scale retrieval manually:
 #   kubectl -n <ns> scale statefulset dash-retrieval --replicas=N
@@ -66,6 +67,51 @@ replicas:
 controlPlane:
   # The control plane is optional. When enabled it needs secret.controlPlane.token.
   enabled: true
+
+# -----------------------------------------------------------------------------
+# Automatic failover of the ingestion leader (ADR 0006, docs/operations/
+# failover.md). Off by default: one ingestion pod, as before.
+#
+# When enabled (requires controlPlane.enabled):
+# * the ingestion StatefulSet runs `replicas` pods; the control plane names
+#   the leader (term + lease) and the others follow it over WAL replication;
+# * every ingestion pod's readiness probe is GET /v1/ready/leader, so the
+#   ingestion Service (and the ingress /v1/ingest* routes, and the retrieval
+#   followers' replication source) always point at the current leader only;
+#   followers show as not ready, which is expected;
+# * a headless Service <fullname>-ingestion-peers (publishNotReadyAddresses)
+#   gives every pod a stable DNS name for replication between ingestion pods;
+# * updateStrategy is OnDelete: a rolling update would wait forever for the
+#   followers to become ready. Roll by deleting follower pods one at a time
+#   (wait for each to report replication caught up in /v1/ready), then step
+#   the leader down (POST /v1/control-plane/ingest/step-down) and delete it;
+# * a PodDisruptionBudget lets followers be evicted and blocks evicting the
+#   leader: step it down before draining its node.
+#
+# Turning failover on for an existing release changes the StatefulSet's
+# serviceName, which Kubernetes does not allow in place: delete the
+# StatefulSet with `kubectl delete statefulset <name> --cascade=orphan`
+# first (pods and PVCs stay), then `helm upgrade`.
+#
+# With TLS, the certificate must also name the peer DNS names
+# (*.<fullname>-ingestion-peers.<ns>.svc.cluster.local).
+# -----------------------------------------------------------------------------
+failover:
+  enabled: false
+  replicas: 3
+  # Leader lease and promotion grace (control plane). Writes pause for about
+  # leaseMs + promotionGraceMs + heartbeatIntervalMs when the leader is lost.
+  leaseMs: 5000
+  promotionGraceMs: 1000
+  heartbeatIntervalMs: 1000
+  # Synchronous replication: answer a write only after this many followers
+  # durably applied it. 1 survives the loss of any single node; 0 is
+  # asynchronous (acknowledged writes not yet replicated are lost when the
+  # leader's node is lost).
+  minSyncReplicas: 1
+  syncTimeoutMs: 5000
+  # fail (503, retry) or degrade (200 with commit_status=sync_degraded).
+  syncOnTimeout: fail
 
 podLabels: {}
 podAnnotations: {}

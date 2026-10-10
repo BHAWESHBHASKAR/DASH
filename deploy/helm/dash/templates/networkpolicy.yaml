@@ -213,6 +213,42 @@ spec:
     ports:
     - port: http
       protocol: TCP
+{{- if .Values.failover.enabled }}
+---
+# Ingestion followers -> the ingestion leader (WAL replication between
+# ingestion pods; any pod can be leader).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-ingestion-peers
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          {{- include "dash.ingestionSelectorLabels" . | nindent 10 }}
+    ports:
+    - port: http
+      protocol: TCP
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          {{- include "dash.ingestionSelectorLabels" . | nindent 10 }}
+    ports:
+    - port: http
+      protocol: TCP
+{{- end }}
 {{- if .Values.controlPlane.enabled }}
 ---
 # Retrieval and ingestion <-> control plane.
