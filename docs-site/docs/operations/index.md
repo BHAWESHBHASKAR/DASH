@@ -5,7 +5,8 @@ The operations pages describe how to run DASH in production. They assume the rea
 ## Pages
 
 - [**Deploy**](deploy.md) — Docker, docker-compose, Kubernetes (raw YAML), and Helm.
-- [**Observability**](observability.md) — the `/metrics` endpoint, Prometheus scrape config, OpenTelemetry tracing (future), and structured logging.
+- [**Observability**](observability.md) — the `/metrics` endpoint, Prometheus scrape config, structured logging and request correlation.
+- [**Distributed tracing**](tracing.md) — OpenTelemetry trace export over OTLP/HTTP, W3C trace context propagation across services, what is traced and what never is.
 - [**Scaling**](scaling.md) — horizontal scaling, `redb` PR 3 replication, and ANN index sharding.
 - [**Backup**](backup.md) — `redb` snapshots, WAL archiving, and cross-region replication.
 - [**Authentication**](auth.md) — deny-by-default authentication, roles, JWT and OIDC settings, rate limiting and SIGHUP reload.

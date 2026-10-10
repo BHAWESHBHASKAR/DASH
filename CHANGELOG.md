@@ -6,6 +6,46 @@ to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (distributed tracing, OpenTelemetry)
+
+- **OTLP trace export, off by default.** `DASH_OTEL_ENABLED=1`, or setting
+  `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, makes
+  ingestion, retrieval and the control plane export OpenTelemetry spans over
+  OTLP/HTTP (protobuf) to a collector. Configuration uses the standard
+  `OTEL_*` variables (headers, timeout, CA bundle, service name, resource
+  attributes, sampler and ratio, batch settings);
+  `DASH_OTEL_BACKGROUND_SAMPLE_RATIO` thins traces started by replication
+  polls, heartbeats and background checkpoints. Spans are batched on a
+  dedicated thread and sent with a blocking client; a full queue drops spans
+  instead of slowing requests. While off, each instrumented point costs one
+  atomic load. See `docs/operations/tracing.md`.
+- **W3C Trace Context.** Incoming `traceparent` / `tracestate` are continued
+  by a server span per request (named after the bounded route label, with
+  method, status code and request id). Replication pulls, export chunks and
+  acks and every control-plane call (failover heartbeats, placement fetches)
+  send `traceparent`, so the leader's and the control plane's spans join the
+  caller's trace. With tracing on, the `http_request` log span carries
+  `trace_id`.
+- **Internal spans** for retrieval planning, candidate generation, vector
+  search, BM25, vector scoring, fusion and graph expansion; WAL append, fsync,
+  group-commit wait and batch; checkpoint begin, write and finish; replication
+  poll, resync and apply. Each request scope is capped at 64 child spans.
+  Spans never carry query text, claim text, evidence, tenant ids or
+  credentials.
+- **Exporter metrics** while tracing is on: `dash_trace_spans_started_total`,
+  `dash_trace_spans_exported_total`, `dash_trace_spans_dropped_total{reason}`
+  and `dash_trace_export_failures_total`.
+- **Deploy:** Helm `observability.tracing.*` (with a collector egress rule
+  under `networkPolicy.enabled`), commented keys and an optional OTLP egress
+  policy for the Kubernetes manifests, a `docker-compose.tracing.yml` overlay
+  with a local Jaeger profile, and commented keys in the systemd env examples.
+
+### Fixed
+
+- The retrieval planner debug tests now hold the env lock; they wrote audit
+  records into the file of a concurrently running test and made it fail most
+  runs.
+
 ### Added (automatic failover of the ingestion leader, P3 step 1, ADR 0006)
 
 - **Leader failover, off by default.** With `DASH_CONTROL_PLANE_INGEST_FAILOVER=1`

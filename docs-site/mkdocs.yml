@@ -73,6 +73,7 @@ nav:
       - Overview: operations/index.md
       - Deploy: operations/deploy.md
       - Observability: operations/observability.md
+      - Distributed tracing: operations/tracing.md
       - Scaling: operations/scaling.md
       - Backup: operations/backup.md
       - Authentication: operations/auth.md
