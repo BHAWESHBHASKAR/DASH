@@ -161,7 +161,7 @@ Six client SDKs live in `sdks/`, all at version 0.2.0 (the Go module is untagged
 | TypeScript (`dash-ts`) | `sdks/typescript` | 0.2.0 | embeddings, retrieve, OpenAI-compat, deletes. No ingest method. | 77 |
 | Java | `sdks/java` | 0.2.0 | embeddings, ingest (separate ingestion base URL), retrieve, deletes. | 37 |
 | Kotlin | `sdks/kotlin` | 0.2.0 | embeddings, ingest, retrieve, deletes (suspend API, wraps the Java client). | 14 |
-| C# | `sdks/csharp` | 0.2.0 | embeddings, ingest (`IngestionBaseUrl` option), retrieve. No delete methods yet. | 50 |
+| C# | `sdks/csharp` | 0.2.0 | embeddings, ingest (`IngestionBaseUrl` option), retrieve, deletes; sync and async. | 63 |
 
 The generic `delete` call that the Java, Kotlin and C# SDKs used to expose (it targeted a `POST /v1/delete` route that does not exist) was removed in 0.3.0; the scoped delete methods (`delete_claim` / `deleteClaim` / `DeleteClaim`, and the evidence and tenant variants) call the real delete routes on the ingestion service. The Go module path changed from `github.com/anomalyco/dash-go` to `github.com/BHAWESHBHASKAR/DASH/sdks/go`; update your imports. The Java, Kotlin and C# SDKs retry only idempotent requests (or requests with an `Idempotency-Key`). See [`sdks/LIVE_INTEGRATION_TESTS.md`](sdks/LIVE_INTEGRATION_TESTS.md) for running SDK tests against a live stack.
 
@@ -177,7 +177,7 @@ Counts are static (computed 2026-10-10: the Rust figure with `cargo test --works
 | TypeScript SDK | 77 |
 | Java SDK | 37 |
 | Kotlin SDK | 14 |
-| C# SDK | 50 |
+| C# SDK | 63 |
 
 There are also four `cargo-fuzz` targets in `fuzz/` (JWT, OpenAI embeddings parser, ranking, WAL parser) and a benchmark suite in `tests/benchmarks`.
 

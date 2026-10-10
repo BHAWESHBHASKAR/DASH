@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DeleteClaimAsync`, `DeleteEvidenceAsync` and `DeleteTenantAsync` (with
+  sync variants `DeleteClaim`, `DeleteEvidence`, `DeleteTenant`) for
+  `DELETE /v1/claims/{id}?tenant_id=...`, `DELETE /v1/evidence/{id}?tenant_id=...`
+  and `DELETE /v1/tenants/{id}` on the ingestion service, and the
+  `DeleteResponse` model. Ids are percent-encoded; blank ids throw
+  `ArgumentException`. Deletes are idempotent and retried like reads. The
+  generic `DeleteAsync` removed in 0.2.0 stays removed.
 - `DashClientOptions.IngestionBaseUrl` and `DashClient.IngestionBaseUrl`
   for the separate ingestion service (default port 8081).
 - `RequestOptions` (`IdempotencyKey`, `Retry`).

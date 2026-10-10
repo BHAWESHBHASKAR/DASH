@@ -5,7 +5,7 @@ namespace Dash;
 ///
 /// The SDK only retries a failed request (network error, HTTP 429/5xx)
 /// when it is safe to do so: the operation is naturally idempotent
-/// (embeddings, retrieve, health) or the caller supplied an
+/// (embeddings, retrieve, health, deletes) or the caller supplied an
 /// <see cref="IdempotencyKey"/> or explicitly opted in with
 /// <see cref="Retry"/>. <c>POST /v1/ingest</c> is therefore sent exactly
 /// once by default.

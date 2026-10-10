@@ -134,8 +134,8 @@ to [Semantic Versioning](https://semver.org/).
   run a checkpoint before starting an older binary on a WAL that holds
   tombstones.
 - **SDKs:** delete methods in the Python (sync and async), TypeScript, Go,
-  Java and Kotlin clients, with a configurable ingestion base URL (derived
-  from a retrieval URL on port 8080). The C# SDK has none yet.
+  Java, Kotlin and C# (sync and async) clients, with a configurable
+  ingestion base URL (derived from a retrieval URL on port 8080).
   `scripts/check_sdk_surface.sh` now guards the removed generic `/v1/delete`
   API and checks every endpoint named in SDK sources against the API
   reference.

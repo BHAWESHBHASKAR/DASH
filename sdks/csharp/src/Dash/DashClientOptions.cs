@@ -14,11 +14,13 @@ public class DashClientOptions
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Root URL of the ingestion service (<c>POST /v1/ingest</c>), e.g.
+    /// Root URL of the ingestion service (<c>POST /v1/ingest</c> and the
+    /// <c>DELETE /v1/claims</c>, <c>/v1/evidence</c>, <c>/v1/tenants</c>
+    /// routes), e.g.
     /// <c>"http://localhost:8081"</c>. Ingestion runs as a separate service
     /// from retrieval. When <c>null</c>, it is derived only for the
     /// conventional local layout (retrieval base URL on port 8080 maps to
-    /// the same host on port 8081); otherwise ingest calls throw
+    /// the same host on port 8081); otherwise ingest and delete calls throw
     /// <see cref="System.InvalidOperationException"/>. Must be an absolute
     /// http(s) URL.
     /// </summary>
