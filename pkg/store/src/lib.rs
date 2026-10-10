@@ -22,6 +22,7 @@ pub use disk::{DiskBackedStore, DiskStatus};
 mod gpu;
 mod group_commit;
 mod metrics;
+pub mod observe;
 pub mod vector_index;
 mod vector_persist;
 mod wal;
@@ -1143,8 +1144,11 @@ impl InMemoryStore {
         &self,
         wal: &mut FileWal,
     ) -> Result<WalCheckpointStats, StoreError> {
+        let started = std::time::Instant::now();
         let records = self.snapshot_records();
-        wal.compact_with_snapshot(&records)
+        let result = wal.compact_with_snapshot(&records);
+        observe::observe_checkpoint(started.elapsed(), result.is_ok());
+        result
     }
 
     pub fn observe_batch_commit(

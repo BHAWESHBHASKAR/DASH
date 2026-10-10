@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 url = "2"
+dash-observe = { path = "../observe", default-features = false }

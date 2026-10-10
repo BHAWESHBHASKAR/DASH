@@ -16,6 +16,7 @@
 //! feature and is reserved for future async wrappers.
 
 pub mod http;
+pub mod metrics;
 
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
@@ -978,24 +979,23 @@ impl ResilienceConfig {
     }
 }
 
-/// Wrap `provider` with the circuit breaker and the concurrency limit
-/// (outermost), per `config`.
+/// Wrap `provider` with the circuit breaker, the concurrency limit and
+/// (outermost) the call metrics of [`metrics`], per `config`.
 pub fn with_resilience<P: EmbeddingProvider + 'static>(
     provider: P,
     config: ResilienceConfig,
 ) -> Box<dyn EmbeddingProvider + Send + Sync + 'static> {
     let guarded: Box<dyn EmbeddingProvider + Send + Sync> = if config.breaker_threshold > 0 {
-        Box::new(CircuitBreakerProvider::new(
-            provider,
-            Arc::new(CircuitBreaker::new(
-                config.breaker_threshold,
-                config.breaker_reset,
-            )),
-        ))
+        let breaker = Arc::new(CircuitBreaker::new(
+            config.breaker_threshold,
+            config.breaker_reset,
+        ));
+        metrics::register_breaker(provider.name(), &breaker);
+        Box::new(CircuitBreakerProvider::new(provider, breaker))
     } else {
         Box::new(provider)
     };
-    if config.max_concurrency > 0 {
+    let limited: Box<dyn EmbeddingProvider + Send + Sync> = if config.max_concurrency > 0 {
         Box::new(ConcurrencyLimitedProvider::new(
             guarded,
             config.max_concurrency,
@@ -1003,7 +1003,8 @@ pub fn with_resilience<P: EmbeddingProvider + 'static>(
         ))
     } else {
         guarded
-    }
+    };
+    Box::new(metrics::InstrumentedProvider::new(limited))
 }
 
 impl EmbeddingProvider for Box<dyn EmbeddingProvider + Send + Sync> {

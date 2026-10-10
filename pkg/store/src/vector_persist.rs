@@ -212,6 +212,16 @@ impl VectorIndexSnapshot {
     /// Takes no lock on the store; safe to run on a background thread.
     pub fn save(&self, path: &Path) -> Result<VectorIndexSaveStats, StoreError> {
         let started = Instant::now();
+        let result = self.save_inner(path, started);
+        crate::observe::observe_vector_index_save(started.elapsed(), result.is_ok());
+        result
+    }
+
+    fn save_inner(
+        &self,
+        path: &Path,
+        started: Instant,
+    ) -> Result<VectorIndexSaveStats, StoreError> {
         let mut sections = Vec::with_capacity(self.tenants.len());
         let mut tenants = Vec::with_capacity(self.tenants.len());
         for (tenant_id, index) in &self.tenants {
@@ -447,6 +457,18 @@ impl InMemoryStore {
     /// records and tombstones after the saved position, as collected by the
     /// replay (`None` when it could not be collected).
     pub(crate) fn restore_vector_indexes(
+        &mut self,
+        path: &Path,
+        wal: &FileWal,
+        caught_up: Option<VectorCatchUp>,
+    ) -> VectorIndexRestore {
+        let started = Instant::now();
+        let restore = self.restore_vector_indexes_inner(path, wal, caught_up);
+        crate::observe::observe_vector_index_load(started.elapsed());
+        restore
+    }
+
+    fn restore_vector_indexes_inner(
         &mut self,
         path: &Path,
         wal: &FileWal,

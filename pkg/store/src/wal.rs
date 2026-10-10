@@ -1501,6 +1501,13 @@ impl FileWal {
         if self.background_flush_only {
             return Ok(());
         }
+        let started = Instant::now();
+        let result = self.apply_write_policy_inner();
+        crate::observe::observe_wal_append(started.elapsed());
+        result
+    }
+
+    fn apply_write_policy_inner(&mut self) -> Result<(), StoreError> {
         let interval_elapsed = self
             .sync_interval
             .is_some_and(|interval| self.last_sync_at.elapsed() >= interval);
@@ -1555,6 +1562,7 @@ impl FileWal {
             buf.push('\n');
         }
         file.write_all(buf.as_bytes())?;
+        crate::observe::observe_wal_bytes_written(buf.len());
         Ok(())
     }
 
@@ -2022,6 +2030,13 @@ pub(crate) fn sync_parent_dir(path: &Path) -> Result<(), StoreError> {
 /// `File::sync_data` for WAL appends, with a test-only failpoint (`wal.sync`)
 /// so tests can inject an fsync failure.
 fn sync_wal_data(file: &File) -> std::io::Result<()> {
+    let started = Instant::now();
+    let result = sync_wal_data_inner(file);
+    crate::observe::observe_wal_fsync(started.elapsed(), result.is_ok());
+    result
+}
+
+fn sync_wal_data_inner(file: &File) -> std::io::Result<()> {
     failpoint!("wal.sync");
     file.sync_data()
 }

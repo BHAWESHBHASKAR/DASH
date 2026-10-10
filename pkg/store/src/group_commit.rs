@@ -377,6 +377,7 @@ fn run_committer<L: GroupCommitLog>(shared: &Shared, log: &Mutex<L>) {
         counters
             .max_batch_entries
             .fetch_max(entries, Ordering::Relaxed);
+        crate::observe::observe_group_commit_batch(entries as usize);
 
         let result = match outcome {
             Ok(()) => Ok(()),
