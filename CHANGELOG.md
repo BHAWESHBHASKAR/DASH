@@ -28,9 +28,10 @@ to [Semantic Versioning](https://semver.org/).
   snapshot, the closed WAL files the marker lists and the WAL; after the
   rename, the new snapshot and the WAL. A crash at any step recovers every
   acknowledged write exactly once (failpoint tests for every step in
-  `pkg/store/src/failpoint.rs`). A failed snapshot write leaves the marker;
-  the next checkpoint supersedes it, and a service that starts on one
-  starts a checkpoint right away. `docs/operations/wal-durability.md`
+  `pkg/store/src/failpoint.rs`). A failed snapshot write leaves the marker and
+  is retried with the same frozen state (no new rotation, so a failing
+  disk still makes WAL writes fail as before); a service that starts on a
+  marker starts a checkpoint right away. `docs/operations/wal-durability.md`
   ("Checkpoints") has the full argument.
 - **Replication.** The generation transition is recorded at the rotation, so
   followers switch to the new generation while the snapshot is still being
