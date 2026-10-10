@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use store::{
-    AnnTuningConfig, CheckpointPolicy, FileWal, InMemoryStore, ReplayPolicy,
-    VectorIndexPersistence, VectorIndexRestore, WalWritePolicy,
+    AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, VectorIndexPersistence,
+    VectorIndexRestore, WalWritePolicy,
 };
 
 /// Default `DASH_INGEST_VECTOR_INDEX_SAVE_INTERVAL_MS`.
@@ -281,16 +281,27 @@ fn main() {
             wal.background_flush_only(),
             allow_unsafe_wal_durability
         );
-        let policy = CheckpointPolicy {
-            max_wal_records: parse_env_with_fallback::<usize>(
+        let policy = ingestion::transport::checkpoint_policy_from_values(
+            env_with_fallback(
                 "DASH_CHECKPOINT_MAX_WAL_RECORDS",
                 "EME_CHECKPOINT_MAX_WAL_RECORDS",
-            ),
-            max_wal_bytes: parse_env_with_fallback::<u64>(
+            )
+            .as_deref(),
+            env_with_fallback(
                 "DASH_CHECKPOINT_MAX_WAL_BYTES",
                 "EME_CHECKPOINT_MAX_WAL_BYTES",
-            ),
-        };
+            )
+            .as_deref(),
+        );
+        tracing::info!(
+            "ingestion checkpoint policy: max_wal_records={}, max_wal_bytes={}",
+            policy
+                .max_wal_records
+                .map_or_else(|| "off".to_string(), |n| n.to_string()),
+            policy
+                .max_wal_bytes
+                .map_or_else(|| "off".to_string(), |n| n.to_string())
+        );
 
         if serve_mode {
             tracing::info!("ingestion transport listening on http://{bind_addr}");

@@ -1230,18 +1230,18 @@ pub static REGISTRY: &[Entry] = &[
         "DASH_CHECKPOINT_MAX_WAL_RECORDS",
         Ingestion,
         T_WAL,
-        Kind::POSITIVE,
+        Kind::UINT,
         "unset",
-        "Trigger a checkpoint after this many WAL records.",
+        "Trigger a checkpoint after this many WAL records. `0` or unset: no record threshold.",
     )
     .eme(),
     Entry::new(
         "DASH_CHECKPOINT_MAX_WAL_BYTES",
         Ingestion,
         T_WAL,
-        Kind::POSITIVE,
-        "unset",
-        "Trigger a checkpoint after this many WAL bytes.",
+        Kind::UINT,
+        "268435456 (256 MiB)",
+        "Trigger a checkpoint once the WAL reaches this many bytes. `0` turns the size threshold off (with no record threshold either, the service never checkpoints on its own). Followers cross a checkpoint without a full resync; see docs/operations/replication-limits.md.",
     )
     .eme(),
     Entry::new(

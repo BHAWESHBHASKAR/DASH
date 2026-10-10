@@ -264,8 +264,8 @@ Read by the `ingestion` service.
 | `DASH_INGEST_WAL_GROUP_COMMIT_MAX_BATCH_BYTES` | `1048576` | integer >= 1 | A group-commit batch is closed once it holds this many bytes of encoded WAL lines. A single larger request still forms a batch of its own. | DASH only. |
 | `DASH_INGEST_WAL_GROUP_COMMIT_QUEUE_CAPACITY` | `1024` | integer >= 1 | Single ingests that may wait for the group committer. When the queue is full the request is rejected with 503 `wal_group_commit_queue_full` and `Retry-After: 1`. | DASH only. |
 | `DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY` | ``false`` | bool | Required to run with durability settings that exceed the safe limits: sync-every or append buffer above 256 records, sync interval or async flush interval above 5000 ms, batched writes without a sync interval, or background-only flushing without an async worker. Without it the service exits with code 2. |  |
-| `DASH_CHECKPOINT_MAX_WAL_RECORDS` | `unset` | integer >= 1 | Trigger a checkpoint after this many WAL records. |  |
-| `DASH_CHECKPOINT_MAX_WAL_BYTES` | `unset` | integer >= 1 | Trigger a checkpoint after this many WAL bytes. |  |
+| `DASH_CHECKPOINT_MAX_WAL_RECORDS` | `unset` | integer | Trigger a checkpoint after this many WAL records. `0` or unset: no record threshold. |  |
+| `DASH_CHECKPOINT_MAX_WAL_BYTES` | 268435456 (256 MiB) | integer | Trigger a checkpoint once the WAL reaches this many bytes. `0` turns the size threshold off (with no record threshold either, the service never checkpoints on its own). Followers cross a checkpoint without a full resync; see docs/operations/replication-limits.md. |  |
 
 ### Replication follower
 

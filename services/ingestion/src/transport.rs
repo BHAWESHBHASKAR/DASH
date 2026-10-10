@@ -51,6 +51,7 @@ use payload::{
     render_ingest_batch_response_json, render_ingest_document_response_json,
     render_ingest_raw_response_json, render_ingest_response_json,
 };
+pub use persistence::{DEFAULT_CHECKPOINT_MAX_WAL_BYTES, checkpoint_policy_from_values};
 use persistence::{append_input_to_wal, map_store_error, should_checkpoint_now};
 use placement_debug::render_placement_debug_json;
 use placement_routing::{
