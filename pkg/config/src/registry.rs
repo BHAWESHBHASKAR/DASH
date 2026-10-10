@@ -979,6 +979,16 @@ pub static REGISTRY: &[Entry] = &[
     .readers(ALL_SERVICES)
     .external(),
     Entry::new(
+        "DASH_GIT_SHA",
+        Common,
+        T_CONTAINER,
+        Kind::Str,
+        "unknown",
+        "Build-time only: the git commit compiled into the binaries and reported as the `git_sha` label of `dash_build_info`. Pass it to `cargo build` (the container build takes `--build-arg DASH_GIT_SHA=...`); setting it at runtime has no effect.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
         "DASH_HEALTHCHECK_URL",
         Common,
         T_CONTAINER,
