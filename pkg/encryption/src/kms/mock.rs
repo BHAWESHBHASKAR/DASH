@@ -258,8 +258,7 @@ pub fn write_token(dir: &Path, name: &str, token: &str) -> PathBuf {
 
 fn seal(key: &[u8; 32], aad: &[u8], plain: &[u8]) -> Vec<u8> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 12] = rand::Rng::r#gen(&mut rand::rngs::OsRng);
     let mut out = nonce.to_vec();
     out.extend(
         cipher
