@@ -2,11 +2,11 @@
 //!
 //! [`instrument`] wraps a service handler and, for every request:
 //!
-//! * counts it in `dash_http_server_requests_total{service,route,method,code}`;
+//! * counts it in `dash_http_server_requests_total{component,route,method,code}`;
 //! * records its latency in the
-//!   `dash_http_server_request_duration_seconds{service,route,method}`
+//!   `dash_http_server_request_duration_seconds{component,route,method}`
 //!   histogram;
-//! * tracks `dash_http_server_requests_in_flight{service}`;
+//! * tracks `dash_http_server_requests_in_flight{component}`;
 //! * runs the handler inside an `http_request` tracing span carrying the
 //!   service, route, method and request id (resolved by `dash-http`), so every
 //!   log event emitted while handling the request is correlated; and
@@ -134,7 +134,7 @@ impl HttpMetrics {
                 w.sample(
                     "dash_http_server_requests_total",
                     &[
-                        ("service", self.service),
+                        ("component", self.service),
                         ("route", route),
                         ("method", method),
                         ("code", &code),
@@ -152,7 +152,7 @@ impl HttpMetrics {
             w.histogram_series(
                 "dash_http_server_request_duration_seconds",
                 &[
-                    ("service", self.service),
+                    ("component", self.service),
                     ("route", route),
                     ("method", method),
                 ],
@@ -167,7 +167,7 @@ impl HttpMetrics {
         );
         w.sample(
             "dash_http_server_requests_in_flight",
-            &[("service", self.service)],
+            &[("component", self.service)],
             self.in_flight().max(0) as f64,
         );
     }
@@ -322,7 +322,11 @@ mod tests {
         let missing = |_r: Request| Response::error(404, "nope");
         handle_instrumented(&metrics, request("GET", "/a?x=1"), ok);
         handle_instrumented(&metrics, request("GET", "/a"), ok);
-        handle_instrumented(&metrics, request("BREW", "/tenant/123/claim/456"), missing);
+        handle_instrumented(
+            &metrics,
+            request("BREW", "/tenant/zz-tenant/claim/zz-claim"),
+            missing,
+        );
         assert_eq!(metrics.in_flight(), 0);
 
         let mut w = MetricsWriter::new();
@@ -331,7 +335,7 @@ mod tests {
         let report = validate(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         let labels = |route, method, code| {
             [
-                ("service", "unit"),
+                ("component", "unit"),
                 ("route", route),
                 ("method", method),
                 ("code", code),
@@ -354,18 +358,18 @@ mod tests {
         assert_eq!(
             report.value(
                 "dash_http_server_request_duration_seconds_count",
-                &[("service", "unit"), ("route", "a"), ("method", "GET")]
+                &[("component", "unit"), ("route", "a"), ("method", "GET")]
             ),
             Some(2.0)
         );
         assert!(
-            !text.contains("123"),
+            !text.contains("zz-"),
             "path segments must not become labels"
         );
         assert_eq!(
             report.value(
                 "dash_http_server_requests_in_flight",
-                &[("service", "unit")]
+                &[("component", "unit")]
             ),
             Some(0.0)
         );
@@ -386,7 +390,7 @@ mod tests {
             report.value(
                 "dash_http_server_requests_total",
                 &[
-                    ("service", "unit-panic"),
+                    ("component", "unit-panic"),
                     ("route", "boom"),
                     ("method", "POST"),
                     ("code", "500")

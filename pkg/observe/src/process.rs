@@ -121,7 +121,9 @@ pub fn proc_stats() -> ProcStats {
 
 /// Render the process families and `dash_build_info`.
 ///
-/// `service` and `version` label `dash_build_info` (one series per process).
+/// `service` (rendered as the `component` label, which does not collide with
+/// the `service` target label Kubernetes service discovery adds) and
+/// `version` label `dash_build_info` (one series per process).
 pub fn render(w: &mut MetricsWriter, service: &str, version: &str) {
     let start = start();
     let stats = proc_stats();
@@ -184,7 +186,7 @@ pub fn render(w: &mut MetricsWriter, service: &str, version: &str) {
     w.sample(
         "dash_build_info",
         &[
-            ("service", service.as_str()),
+            ("component", service.as_str()),
             ("version", version.as_str()),
             ("git_sha", git_sha.as_str()),
         ],
@@ -223,7 +225,7 @@ Max open files            1024                 524288               files\n";
             report.value(
                 "dash_build_info",
                 &[
-                    ("service", "test-svc"),
+                    ("component", "test-svc"),
                     ("version", "1.2.3\""),
                     ("git_sha", GIT_SHA)
                 ]

@@ -78,7 +78,10 @@ fn metrics_endpoint_is_valid_exposition_with_shared_families() {
         addr,
         b"GET /v1/retrieve?tenant_id=t&query=x HTTP/1.1\r\n\r\n",
     );
-    let _ = send_raw(addr, b"GET /tenants/123/claims/456 HTTP/1.1\r\n\r\n");
+    let _ = send_raw(
+        addr,
+        b"GET /tenants/zz-secret-tenant/claims/zz-secret-claim HTTP/1.1\r\n\r\n",
+    );
     let response = send_raw(addr, b"GET /metrics HTTP/1.1\r\n\r\n");
     let text = body(&response);
     let report = dash_observe::validate(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
@@ -107,7 +110,7 @@ fn metrics_endpoint_is_valid_exposition_with_shared_families() {
     }
     let retrieve = report.sum_where(
         "dash_http_server_requests_total",
-        &[("service", "retrieval"), ("route", "retrieve")],
+        &[("component", "retrieval"), ("route", "retrieve")],
     );
     assert!(retrieve >= 1.0, "{text}");
     let unknown = report.sum_where(
@@ -116,7 +119,7 @@ fn metrics_endpoint_is_valid_exposition_with_shared_families() {
     );
     assert!(unknown >= 1.0, "{text}");
     assert!(
-        !text.contains("456"),
+        !text.contains("zz-secret"),
         "a path segment leaked into a label\n{text}"
     );
     // The /metrics request itself is in flight while it renders.
@@ -124,13 +127,13 @@ fn metrics_endpoint_is_valid_exposition_with_shared_families() {
         report
             .value(
                 "dash_http_server_requests_in_flight",
-                &[("service", "retrieval")]
+                &[("component", "retrieval")]
             )
             .unwrap()
             >= 1.0
     );
     assert!(
-        text.contains("dash_build_info{service=\"retrieval\",version=\""),
+        text.contains("dash_build_info{component=\"retrieval\",version=\""),
         "{text}"
     );
 }

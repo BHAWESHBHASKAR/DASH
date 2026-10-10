@@ -122,7 +122,7 @@ fn metrics_endpoint_is_valid_exposition_with_shared_and_storage_families() {
         report.sum_where(
             "dash_http_server_requests_total",
             &[
-                ("service", "ingestion"),
+                ("component", "ingestion"),
                 ("route", "ingest"),
                 ("code", "200")
             ],
