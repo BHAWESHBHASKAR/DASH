@@ -9,8 +9,8 @@
 use schema::Claim;
 use std::path::{Path, PathBuf};
 use store::{
-    AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, StoreLoadStats, VectorIndexRestore,
-    WalPosition,
+    AnnTuningConfig, FileWal, InMemoryStore, ReplayPolicy, StoreLoadStats, Tombstone,
+    VectorIndexRestore, WalPosition,
 };
 use tempfile::TempDir;
 
@@ -117,6 +117,18 @@ impl Fixture {
             store
                 .upsert_claim_vector_persistent(&mut wal, id, rng.vector())
                 .unwrap();
+        }
+    }
+
+    /// Append tombstones through the WAL, as the ingestion service does.
+    fn delete(&self, tombstones: Vec<Tombstone>) {
+        let mut wal = self.wal();
+        let mut store = InMemoryStore::load_from_wal_with_ann_tuning(&wal, tuning()).unwrap();
+        for (i, tombstone) in tombstones.into_iter().enumerate() {
+            let outcome = store
+                .delete_persistent(&mut wal, tombstone, 1_800_000_000_000 + i as u64)
+                .unwrap();
+            assert!(outcome.deleted());
         }
     }
 
@@ -428,4 +440,102 @@ fn an_unindexable_vector_round_trips_as_unindexed() {
         loaded.index_stats().ann_vector_buckets,
         rebuilt.index_stats().ann_vector_buckets
     );
+}
+
+fn claim_tombstone(tenant: &str, claim: &str) -> Tombstone {
+    Tombstone::Claim {
+        tenant_id: tenant.to_string(),
+        claim_id: claim.to_string(),
+    }
+}
+
+fn all_candidates(store: &InMemoryStore) -> Vec<String> {
+    let mut out: Vec<String> = results(store).into_iter().flatten().collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A saved index still holds claims deleted after the save; the WAL
+/// catch-up removes them instead of serving them or rebuilding.
+#[test]
+fn claims_deleted_after_the_save_are_removed_by_catch_up() {
+    let fx = populated();
+    let position = fx.save();
+    let deleted = ["b3", "b77", "b250", "s0", "s29"];
+    fx.delete(
+        deleted
+            .iter()
+            .map(|id| {
+                let tenant = if id.starts_with('b') { "big" } else { "small" };
+                claim_tombstone(tenant, id)
+            })
+            .collect(),
+    );
+
+    let (loaded, stats) = fx.load(true);
+    match &stats.vector_index {
+        VectorIndexRestore::Loaded {
+            tenants,
+            vectors,
+            caught_up,
+            saved_position,
+        } => {
+            assert_eq!(*saved_position, position);
+            assert_eq!(*caught_up, deleted.len());
+            assert_eq!(*tenants, 2);
+            assert_eq!(*vectors, 430 - deleted.len());
+        }
+        other => panic!("expected a load, got {other:?}"),
+    }
+    let (rebuilt, _) = fx.load(false);
+    assert_eq!(results(&loaded), results(&rebuilt));
+    let served = all_candidates(&loaded);
+    for id in deleted {
+        assert!(!served.iter().any(|c| c == id), "{id} still served");
+        assert!(loaded.claim_by_id(id).is_none());
+    }
+}
+
+/// A tenant erased after the save and written again (a claim id reused)
+/// starts from an empty index, not the saved one.
+#[test]
+fn a_tenant_erased_after_the_save_is_dropped_from_the_saved_index() {
+    let fx = populated();
+    fx.save();
+    fx.delete(vec![Tombstone::Tenant {
+        tenant_id: "small".to_string(),
+    }]);
+    // Reuse an id the saved index holds for "small", now in a new claim.
+    fx.ingest("small", "s", 3, 42);
+
+    let (loaded, stats) = fx.load(true);
+    match &stats.vector_index {
+        VectorIndexRestore::Loaded { vectors, .. } => assert_eq!(*vectors, 400 + 3),
+        other => panic!("expected a load, got {other:?}"),
+    }
+    let (rebuilt, _) = fx.load(false);
+    assert_eq!(results(&loaded), results(&rebuilt));
+    assert_eq!(loaded.claim_count_for_tenant("small"), 3);
+}
+
+/// Deleting a tenant's last vector releases its dimension; the saved
+/// index of that tenant is emptied by the catch-up, not rejected.
+#[test]
+fn deleting_the_last_vector_of_a_tenant_after_the_save_still_loads() {
+    let fx = populated();
+    fx.ingest("late", "l", 2, 6);
+    fx.save();
+    fx.delete(vec![
+        claim_tombstone("late", "l0"),
+        claim_tombstone("late", "l1"),
+    ]);
+
+    let (loaded, stats) = fx.load(true);
+    match &stats.vector_index {
+        VectorIndexRestore::Loaded { tenants, .. } => assert_eq!(*tenants, 2),
+        other => panic!("expected a load, got {other:?}"),
+    }
+    assert_eq!(loaded.tenant_vector_dim("late"), None);
+    assert_eq!(results(&loaded), results(&fx.load(false).0));
 }

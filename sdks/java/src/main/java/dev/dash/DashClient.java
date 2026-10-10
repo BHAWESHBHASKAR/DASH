@@ -1,9 +1,12 @@
 package dev.dash;
 
 import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 
 import dev.dash.internal.HttpTransport;
+import dev.dash.model.DeleteResponse;
 import dev.dash.model.EmbedRequest;
 import dev.dash.model.EmbeddingResponse;
 import dev.dash.model.HealthResponse;
@@ -212,6 +215,52 @@ public class DashClient {
                             + "or call withIngestionBaseUrl(...)");
         }
         return ingestTransport.post("/v1/ingest", request, IngestResponse.class, options);
+    }
+
+    /**
+     * Call {@code DELETE /v1/claims/{claimId}?tenant_id=...} on the ingestion
+     * service: remove the claim with its vector, evidence and every edge from
+     * or to it. Needs the {@code ingest} role. Idempotent: the response has
+     * {@code deleted == false} when the claim does not exist in this tenant.
+     */
+    public DeleteResponse deleteClaim(String tenantId, String claimId) {
+        return sendDelete("/v1/claims/" + segment("claimId", claimId)
+                + "?tenant_id=" + segment("tenantId", tenantId));
+    }
+
+    /**
+     * Call {@code DELETE /v1/evidence/{evidenceId}?tenant_id=...}: remove
+     * every evidence row with this id on the tenant's claims (the claims
+     * stay). Needs the {@code ingest} role.
+     */
+    public DeleteResponse deleteEvidence(String tenantId, String evidenceId) {
+        return sendDelete("/v1/evidence/" + segment("evidenceId", evidenceId)
+                + "?tenant_id=" + segment("tenantId", tenantId));
+    }
+
+    /**
+     * Call {@code DELETE /v1/tenants/{tenantId}}: erase all of the tenant's
+     * data. Needs the {@code admin} role for that tenant.
+     */
+    public DeleteResponse deleteTenant(String tenantId) {
+        return sendDelete("/v1/tenants/" + segment("tenantId", tenantId));
+    }
+
+    private DeleteResponse sendDelete(String path) {
+        if (ingestTransport == null) {
+            throw new IllegalStateException(
+                    "ingestionBaseUrl is not configured; pass it to the constructor "
+                            + "or call withIngestionBaseUrl(...)");
+        }
+        return ingestTransport.httpDelete(path, DeleteResponse.class);
+    }
+
+    /** Percent-encodes one path segment or query value (space as %20). */
+    static String segment(String name, String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + " must not be blank");
+        }
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
     /**

@@ -29,8 +29,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 import requests
 
 from ._version import __version__
-from .errors import DashAPIError, DashConnectionError
+from ._ingestion import (
+    MISSING_INGESTION_URL,
+    claim_delete_path,
+    derive_ingestion_url,
+    evidence_delete_path,
+    tenant_delete_path,
+)
+from .errors import DashAPIError, DashConnectionError, DashError
 from .types import (
+    DeleteResponse,
     EmbeddingRequest,
     EmbeddingResponse,
     RetrieveRequest,
@@ -122,6 +130,8 @@ class Client:
         base_url: str = "http://localhost:8080",
         api_key: Optional[str] = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        *,
+        ingestion_base_url: Optional[str] = None,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required")
@@ -129,6 +139,12 @@ class Client:
             raise ValueError("timeout must be positive")
 
         self.base_url = base_url.rstrip("/")
+        # Deletes go to the ingestion service (see ``delete_claim``).
+        self.ingestion_base_url: Optional[str] = (
+            ingestion_base_url.rstrip("/")
+            if ingestion_base_url
+            else derive_ingestion_url(self.base_url)
+        )
         self.api_key = api_key
         self.timeout = timeout
         # Use a Session for connection pooling + sensible default
@@ -238,6 +254,39 @@ class Client:
         return self._request_retrieve(request, timeout=timeout)
 
     # ------------------------------------------------------------------
+    # Deletes (ingestion service)
+    # ------------------------------------------------------------------
+
+    def delete_claim(
+        self, tenant_id: str, claim_id: str, *, timeout: Optional[float] = None
+    ) -> DeleteResponse:
+        """Call ``DELETE /v1/claims/{claim_id}?tenant_id=...``.
+
+        Removes the claim with its vector, evidence and every edge from or
+        to it. Idempotent: ``deleted`` is ``False`` when the claim does not
+        exist in this tenant. Needs a credential with the ``ingest`` role.
+        """
+        return self._request_delete(claim_delete_path(tenant_id, claim_id), timeout)
+
+    def delete_evidence(
+        self, tenant_id: str, evidence_id: str, *, timeout: Optional[float] = None
+    ) -> DeleteResponse:
+        """Call ``DELETE /v1/evidence/{evidence_id}?tenant_id=...``.
+
+        Removes every evidence row with this id on the tenant's claims; the
+        claims stay. Needs the ``ingest`` role.
+        """
+        return self._request_delete(evidence_delete_path(tenant_id, evidence_id), timeout)
+
+    def delete_tenant(
+        self, tenant_id: str, *, timeout: Optional[float] = None
+    ) -> DeleteResponse:
+        """Call ``DELETE /v1/tenants/{tenant_id}``: erase all of the
+        tenant's data. Needs the ``admin`` role for that tenant.
+        """
+        return self._request_delete(tenant_delete_path(tenant_id), timeout)
+
+    # ------------------------------------------------------------------
     # Internal HTTP plumbing
     # ------------------------------------------------------------------
 
@@ -263,8 +312,9 @@ class Client:
         *,
         json_body: Optional[Mapping[str, Any]] = None,
         timeout: Optional[float] = None,
+        base_url: Optional[str] = None,
     ) -> Any:
-        url = f"{self.base_url}{path}"
+        url = f"{base_url or self.base_url}{path}"
         headers = {**self._default_headers(), **self._auth_headers()}
         effective_timeout = self.timeout if timeout is None else timeout
 
@@ -357,6 +407,20 @@ class Client:
                 body=body,
             )
         return RetrieveResponse.from_dict(body)
+
+    def _request_delete(self, path: str, timeout: Optional[float]) -> DeleteResponse:
+        if not self.ingestion_base_url:
+            raise DashError(MISSING_INGESTION_URL)
+        body = self._request(
+            "DELETE", path, timeout=timeout, base_url=self.ingestion_base_url
+        )
+        if not isinstance(body, dict):
+            raise DashAPIError(
+                "DASH returned a non-object body for a delete",
+                status_code=200,
+                body=body,
+            )
+        return DeleteResponse.from_dict(body)
 
 
 __all__ = ["Client", "EmbeddingsNamespace"]

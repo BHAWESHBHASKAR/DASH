@@ -91,8 +91,11 @@ readinessProbe:
 | ingestion | `/v1/ingest/raw` | POST | raw document extraction path |
 | ingestion | `/v1/ingest/document` | POST | document-level path |
 | ingestion | `/internal/replication/ack` | POST | inter-replica WAL ack |
+| ingestion | `/v1/claims/{claim_id}?tenant_id=` | DELETE | delete a claim with its vector, evidence and edges |
+| ingestion | `/v1/evidence/{evidence_id}?tenant_id=` | DELETE | delete evidence rows by id |
+| ingestion | `/v1/tenants/{tenant_id}` | DELETE | erase a tenant (admin) |
 
-There is no delete route: `POST /v1/delete` was documented here in error and does not exist (see [Planned API](../../docs-site/docs/reference/planned-api.md)). Routes, auth requirements and status codes are in the [HTTP API reference](../../docs-site/docs/reference/api.md).
+Deletes are `DELETE /v1/claims/{claim_id}`, `DELETE /v1/evidence/{evidence_id}` and `DELETE /v1/tenants/{tenant_id}` on ingestion (see [Data deletion](data-deletion.md)); the generic `POST /v1/delete` that was documented here in error does not exist (see [Planned API](../../docs-site/docs/reference/planned-api.md)). Routes, auth requirements and status codes are in the [HTTP API reference](../../docs-site/docs/reference/api.md).
 
 ## Graceful shutdown
 

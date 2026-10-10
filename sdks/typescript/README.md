@@ -185,6 +185,21 @@ Every error inherits from `DashError`, so a single
 `catch (err) { if (err instanceof DashError) { ... } }` is enough
 to catch "anything went wrong talking to DASH".
 
+## Deletes (0.3.0)
+
+```ts
+const client = createClient({
+  baseUrl: 'http://localhost:8080',
+  ingestionBaseUrl: 'http://localhost:8081',
+});
+await client.deleteClaim('tenant-a', 'claim-1'); // claim, vector, evidence, edges
+await client.deleteEvidence('tenant-a', 'ev-1'); // every evidence row with this id
+const result = await client.deleteTenant('tenant-a'); // erase the tenant (admin role)
+console.log(result.deleted, result.claims_deleted);
+```
+
+Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ## API surface
 
 | Symbol | Purpose |

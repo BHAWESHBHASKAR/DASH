@@ -35,6 +35,9 @@ pub enum WalEvent {
     EdgeUpsert(String),
     ClaimVectorUpsert(String),
     BatchCommit(String),
+    /// A tombstone was applied; carries the tombstone's target (claim id,
+    /// evidence id or tenant id).
+    Tombstone(String),
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,76 @@ pub(crate) enum PersistedRecord {
     Edge(ClaimEdge),
     ClaimVector(ClaimVectorRecord),
     BatchCommit(BatchCommitRecord),
+    Tombstone(TombstoneRecord),
+}
+
+/// What a delete removes. Encoded in the WAL as a checksummed `T2` record
+/// (see [`record_to_line`]); readers that predate tombstones reject the
+/// unknown kind instead of skipping it, so a deleted claim can never be
+/// resurrected by an old binary replaying a newer log.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Tombstone {
+    /// The claim, its vector, its evidence and every edge from or to it.
+    Claim { tenant_id: String, claim_id: String },
+    /// Every evidence row with this id on the tenant's claims.
+    Evidence {
+        tenant_id: String,
+        evidence_id: String,
+    },
+    /// Every claim of the tenant (with vectors, evidence and edges), the
+    /// tenant's vector dimension and index, and the batch-commit metadata
+    /// that names any of its claims.
+    Tenant { tenant_id: String },
+}
+
+impl Tombstone {
+    pub fn tenant_id(&self) -> &str {
+        match self {
+            Self::Claim { tenant_id, .. }
+            | Self::Evidence { tenant_id, .. }
+            | Self::Tenant { tenant_id } => tenant_id,
+        }
+    }
+
+    /// The deleted object's id (the tenant id for a tenant tombstone).
+    pub fn target_id(&self) -> &str {
+        match self {
+            Self::Claim { claim_id, .. } => claim_id,
+            Self::Evidence { evidence_id, .. } => evidence_id,
+            Self::Tenant { tenant_id } => tenant_id,
+        }
+    }
+
+    /// `claim`, `evidence` or `tenant`.
+    pub fn scope(&self) -> &'static str {
+        match self {
+            Self::Claim { .. } => "claim",
+            Self::Evidence { .. } => "evidence",
+            Self::Tenant { .. } => "tenant",
+        }
+    }
+
+    /// Rejects empty or whitespace-only identifiers.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.tenant_id().trim().is_empty() {
+            return Err(StoreError::Parse(
+                "tombstone tenant_id must not be empty".to_string(),
+            ));
+        }
+        if self.target_id().trim().is_empty() {
+            return Err(StoreError::Parse(format!(
+                "tombstone {}_id must not be empty",
+                self.scope()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TombstoneRecord {
+    pub(crate) tombstone: Tombstone,
+    pub(crate) ts_unix_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +369,19 @@ pub fn batch_commit_id_from_wal_line(line: &str) -> Option<String> {
     }
 }
 
+/// The tombstone carried by a WAL line, or `None` for any other (or an
+/// unreadable) line. Lets a replica see which tenants a replicated batch
+/// deleted from, e.g. to refresh derived per-tenant files.
+pub fn tombstone_from_wal_line(line: &str) -> Option<Tombstone> {
+    if !line.starts_with("T2\t") {
+        return None;
+    }
+    match line_to_record(line).ok()? {
+        PersistedRecord::Tombstone(record) => Some(record.tombstone),
+        _ => None,
+    }
+}
+
 pub fn is_group_marker_commit_id(commit_id: &str) -> bool {
     commit_id.starts_with(GROUP_BEGIN_PREFIX) || commit_id.starts_with(SINGLE_TX_PREFIX)
 }
@@ -516,6 +602,21 @@ impl FileWal {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// `true` when the WAL (not the snapshot, which never holds one) contains
+    /// a tombstone record. Used by the redb cold-start path: a redb file
+    /// reflects a later state than the start of the log, and replaying writes
+    /// that a later tombstone undid over that state is only safe from an
+    /// empty store (a released vector dimension may have been re-established
+    /// with a different size).
+    pub fn contains_tombstones(&self) -> Result<bool, StoreError> {
+        let is_tombstone = |line: &str| line.starts_with("T2\t");
+        if self.append_buffer.iter().any(|line| is_tombstone(line)) {
+            return Ok(true);
+        }
+        let scan = scan_wal(&self.path)?;
+        Ok(scan.lines.iter().any(|(_, line)| is_tombstone(line)))
     }
 
     /// Persistent identifier of the current WAL lineage. It changes every
@@ -984,30 +1085,29 @@ impl FileWal {
             n
         };
         let scan = scan_wal(&self.path)?;
-        // Claim ids of the vector records after line `from` (see
-        // `WalReplay::vector_claim_ids_after`); impossible when the WAL is
-        // shorter than `from`.
-        let mut vector_ids = collect_vectors_from
+        // Vector-index changes after line `from` (see
+        // `WalReplay::vector_catch_up`); impossible when the WAL is shorter
+        // than `from`.
+        let mut catch_up = collect_vectors_from
             .filter(|from| *from <= scan.lines.len())
-            .map(|_| HashSet::new());
+            .map(|_| VectorCatchUp::default());
         let collect_from = collect_vectors_from.unwrap_or(usize::MAX);
         let mut wal_items = Vec::new();
         for (index, (line_no, line)) in scan.lines.into_iter().enumerate() {
             let origin = format!("wal line {line_no}");
             if let Some(item) = parser.parse(line, origin, &mut sink)? {
                 if index >= collect_from
-                    && let (Some(ids), PersistedRecord::ClaimVector(v)) =
-                        (vector_ids.as_mut(), &item.record)
+                    && let Some(catch_up) = catch_up.as_mut()
                 {
-                    ids.insert(v.claim_id.clone());
+                    catch_up.observe(&item.record);
                 }
                 wal_items.push(item);
             }
         }
         for line in &self.append_buffer {
             let record = line_to_record(line)?;
-            if let (Some(ids), PersistedRecord::ClaimVector(v)) = (vector_ids.as_mut(), &record) {
-                ids.insert(v.claim_id.clone());
+            if let Some(catch_up) = catch_up.as_mut() {
+                catch_up.observe(&record);
             }
             wal_items.push(ReplayItem {
                 record,
@@ -1037,7 +1137,7 @@ impl FileWal {
             stats,
             sink,
             quarantined_claim_ids: parser.quarantined_claim_ids,
-            vector_claim_ids_after: vector_ids,
+            vector_catch_up: catch_up,
         })
     }
 
@@ -1397,7 +1497,14 @@ fn is_valid_tail(text: &str, terminated: bool) -> bool {
     if terminated && is_legacy_kind(record_kind(text)) {
         return true;
     }
-    line_to_record(text).is_ok() && (terminated || split_and_verify_crc(text).is_ok_and(|(_, c)| c))
+    let checksummed = split_and_verify_crc(text).is_ok_and(|(_, c)| c);
+    // A terminated line with a verified checksum was written whole: if this
+    // reader cannot parse it (a record kind from a newer binary), replay must
+    // fail on it rather than truncate it away as a torn write.
+    if terminated && checksummed {
+        return true;
+    }
+    line_to_record(text).is_ok() && (terminated || checksummed)
 }
 
 fn quarantine_path_for(wal_path: &Path) -> PathBuf {
@@ -1415,8 +1522,15 @@ fn is_legacy_kind(kind: &str) -> bool {
     matches!(kind, "C" | "E" | "G" | "V" | "B")
 }
 
+/// Every checksummed record kind this reader understands. `T2` (tombstone)
+/// is the newest; a reader that predates it fails replay on the unknown kind
+/// (see `ReplayParser::parse`) rather than skipping a delete.
+fn is_versioned_kind(kind: &str) -> bool {
+    matches!(kind, "C2" | "E2" | "G2" | "V2" | "B2" | "T2")
+}
+
 fn is_known_kind(kind: &str) -> bool {
-    is_legacy_kind(kind) || matches!(kind, "C2" | "E2" | "G2" | "V2" | "B2")
+    is_legacy_kind(kind) || is_versioned_kind(kind)
 }
 
 /// One parsed replay record plus the metadata the replay policy needs.
@@ -1448,7 +1562,46 @@ impl ReplayItem {
                 ids.contains(&e.from_claim_id) || ids.contains(&e.to_claim_id)
             }
             PersistedRecord::ClaimVector(v) => ids.contains(&v.claim_id),
-            PersistedRecord::Claim(_) | PersistedRecord::BatchCommit(_) => false,
+            PersistedRecord::Claim(_)
+            | PersistedRecord::BatchCommit(_)
+            | PersistedRecord::Tombstone(_) => false,
+        }
+    }
+}
+
+/// What changed in the vector indexes after the WAL position a persisted
+/// vector index was saved at, so a restore can bring the saved index up to
+/// date instead of rebuilding it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct VectorCatchUp {
+    /// Claims with a vector record after the saved position.
+    pub(crate) claim_ids: HashSet<String>,
+    /// `(tenant, claim)` of every claim tombstone after the saved position.
+    pub(crate) deleted_claims: Vec<(String, String)>,
+    /// Tenants erased after the saved position.
+    pub(crate) erased_tenants: HashSet<String>,
+}
+
+impl VectorCatchUp {
+    fn observe(&mut self, record: &PersistedRecord) {
+        match record {
+            PersistedRecord::ClaimVector(v) => {
+                self.claim_ids.insert(v.claim_id.clone());
+            }
+            PersistedRecord::Tombstone(t) => match &t.tombstone {
+                Tombstone::Claim {
+                    tenant_id,
+                    claim_id,
+                } => {
+                    self.deleted_claims
+                        .push((tenant_id.clone(), claim_id.clone()));
+                }
+                Tombstone::Tenant { tenant_id } => {
+                    self.erased_tenants.insert(tenant_id.clone());
+                }
+                Tombstone::Evidence { .. } => {}
+            },
+            _ => {}
         }
     }
 }
@@ -1459,9 +1612,9 @@ pub(crate) struct WalReplay {
     pub(crate) sink: QuarantineSink,
     /// Claim ids of legacy claim lines quarantined at parse time.
     pub(crate) quarantined_claim_ids: HashSet<String>,
-    /// Claim ids of the vector records after the requested WAL line; `None`
-    /// when none was requested or the WAL is shorter than that line.
-    pub(crate) vector_claim_ids_after: Option<HashSet<String>>,
+    /// Vector-index changes after the requested WAL line; `None` when none
+    /// was requested or the WAL is shorter than that line.
+    pub(crate) vector_catch_up: Option<VectorCatchUp>,
 }
 
 /// Collects quarantined raw lines and appends them (fsynced) to
@@ -1570,7 +1723,12 @@ impl ReplayParser {
             Err(err) => {
                 let kind = record_kind(&line);
                 let legacy = is_legacy_kind(kind);
-                let continuation = self.prev_failed && !is_known_kind(kind);
+                // A line carrying a verified checksum is a whole record of a
+                // kind this reader does not know (written by a newer binary,
+                // e.g. a tombstone), never a fragment of a broken legacy line:
+                // it must fail the replay rather than be quarantined.
+                let checksummed = matches!(split_and_verify_crc(&line), Ok((_, true)));
+                let continuation = self.prev_failed && !is_known_kind(kind) && !checksummed;
                 if self.policy == ReplayPolicy::Strict || !(legacy || continuation) {
                     return Err(with_context(err, &origin));
                 }
@@ -1838,6 +1996,21 @@ pub(crate) fn record_to_line(record: &PersistedRecord) -> String {
             record.ts_unix_ms,
             escape_field(&pack_string_list(&record.claim_ids))
         ),
+        // `T2 <scope> <tenant> <target> <ts>`; the target of a tenant
+        // tombstone is empty (the tenant id is already the second field).
+        PersistedRecord::Tombstone(record) => {
+            let target = match &record.tombstone {
+                Tombstone::Tenant { .. } => "",
+                other => other.target_id(),
+            };
+            format!(
+                "T2\t{}\t{}\t{}\t{}",
+                record.tombstone.scope(),
+                escape_field(record.tombstone.tenant_id()),
+                escape_field(target),
+                record.ts_unix_ms
+            )
+        }
     };
     format!("{body}\t{CRC_PREFIX}{:08x}", crc32(body.as_bytes()))
 }
@@ -1916,7 +2089,7 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
     if parts.is_empty() {
         return Err(StoreError::Parse("empty wal record".to_string()));
     }
-    if matches!(parts[0], "C2" | "E2" | "G2" | "V2" | "B2") && !has_crc {
+    if is_versioned_kind(parts[0]) && !has_crc {
         return Err(StoreError::Parse(
             "wal record is missing its checksum".to_string(),
         ));
@@ -2011,6 +2184,44 @@ pub(crate) fn line_to_record(line: &str) -> Result<PersistedRecord, StoreError> 
             Ok(PersistedRecord::ClaimVector(ClaimVectorRecord {
                 claim_id: unescape_field(parts[1])?,
                 values: unpack_f32_list(parts[2])?,
+            }))
+        }
+        "T2" => {
+            if parts.len() != 5 {
+                return Err(StoreError::Parse(
+                    "tombstone record has invalid field count".to_string(),
+                ));
+            }
+            let tenant_id = unescape_field(parts[2])?;
+            let target = unescape_field(parts[3])?;
+            let tombstone = match parts[1] {
+                "claim" => Tombstone::Claim {
+                    tenant_id,
+                    claim_id: target,
+                },
+                "evidence" => Tombstone::Evidence {
+                    tenant_id,
+                    evidence_id: target,
+                },
+                "tenant" if target.is_empty() => Tombstone::Tenant { tenant_id },
+                "tenant" => {
+                    return Err(StoreError::Parse(
+                        "tenant tombstone must not name a target".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(StoreError::Parse(
+                        "tombstone record has unknown scope".to_string(),
+                    ));
+                }
+            };
+            tombstone.validate()?;
+            let ts_unix_ms = parts[4].parse::<u64>().map_err(|_| {
+                StoreError::Parse("tombstone record has invalid ts_unix_ms".to_string())
+            })?;
+            Ok(PersistedRecord::Tombstone(TombstoneRecord {
+                tombstone,
+                ts_unix_ms,
             }))
         }
         "C" => {

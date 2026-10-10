@@ -33,7 +33,7 @@ Authorization is per tenant. The tenant is taken from the **request** (`claim.te
 | Role | Allows |
 |---|---|
 | `admin` | every route |
-| `ingest` | `/v1/ingest*` |
+| `ingest` | `/v1/ingest*`, `DELETE /v1/claims/{claim_id}`, `DELETE /v1/evidence/{evidence_id}` |
 | `retrieve` | `/v1/retrieve`, `/v1/embeddings` |
 | `read_only` | everything `retrieve` allows, plus `/metrics` and `/debug/*` (which additionally need `admin` or an unscoped credential, see below) |
 
@@ -44,6 +44,8 @@ Authorization is per tenant. The tenant is taken from the **request** (`claim.te
 | retrieval `POST`/`GET /v1/retrieve`, `POST /v1/embeddings` | `retrieve` |
 | retrieval `/metrics`, `/debug/*`; ingestion `/metrics`, `/debug/*` | `read_only` and (`admin` or an unscoped credential); tenant-scoped keys get 403 |
 | ingestion `POST /v1/ingest`, `/v1/ingest/raw`, `/v1/ingest/document`, `/v1/ingest/batch` | `ingest` |
+| ingestion `DELETE /v1/claims/{claim_id}`, `DELETE /v1/evidence/{evidence_id}` | `ingest` on the `tenant_id` query parameter |
+| ingestion `DELETE /v1/tenants/{tenant_id}` | `admin` for that tenant (an admin of another tenant gets 403) |
 | ingestion `/internal/replication/*` | not a role: `x-replication-token` header |
 | control plane `/v1/control-plane/*` except health and ready | not a role: `Authorization: Bearer <control-plane token>` |
 
@@ -264,6 +266,42 @@ Requires role `ingest`. Extracts sentence claims from text: `{ "tenant_id", "doc
 ### `POST /v1/ingest/document`
 
 Requires role `ingest`. Like `/raw` but takes `mime_type` and either `text` or `content_base64`. Only UTF-8 text is parsed by the built-in parser; other MIME types need `DASH_INGEST_DOCUMENT_PARSER_PROVIDER=adapter_command`. Response adds `mime_type` and `parser_provider`.
+
+### Deletes
+
+| Route | Role | Removes |
+|---|---|---|
+| `DELETE /v1/claims/{claim_id}?tenant_id=...` | `ingest` | The claim, its vector, its evidence and every edge from or to it. |
+| `DELETE /v1/evidence/{evidence_id}?tenant_id=...` | `ingest` | Every evidence row with this id on the tenant's claims. The claims stay. |
+| `DELETE /v1/tenants/{tenant_id}` | `admin` | All of the tenant's claims with their vectors, evidence and edges, the tenant's vector dimension and index, and batch-commit metadata naming its claims. |
+
+- Path ids are percent-decoded (`+` is a literal plus in the path). `tenant_id` is required in the query for claim and evidence deletes and must not be sent for a tenant delete (400). An empty id is a 400, an extra path segment a 404, any other method on these paths a 405. `write_consistency` is accepted as on every write.
+- **Idempotent.** Every delete answers `200`. `deleted` is `false` when there was nothing to remove: an unknown id, an id already deleted, or a claim that belongs to another tenant (the answer does not reveal that it exists). A delete of nothing writes nothing to the WAL.
+- **Durable before visible.** A delete that removes something is one checksummed WAL tombstone record (`T2`), framed as a commit group, appended with the same write policy as an ingest before memory, redb, the vector index and the tenant's segments change. Deletes wait for in-flight pipelined ingests to be applied first, so the result equals serial execution in WAL order. Tombstones replicate to followers like any other record; a checkpoint drops the deleted rows for good. Backups and WAL archives taken before the delete still contain the data; see `docs/operations/data-deletion.md`.
+- Deleting a tenant's last vector releases its vector dimension, so the tenant may later write vectors of another size.
+- A delete does not block later writes: re-sending an ingest (or a batch with the same `commit_id`) after a delete writes the data again, as an update. Deleted ids can be reused.
+- With placement routing, a claim delete is routed like an ingest of the stored claim; an evidence or tenant delete must be sent to the leader of every shard of the tenant (a follower answers with the usual wrong-node error).
+- Every delete is audit-logged (`delete_claim`, `delete_evidence`, `delete_tenant`) with the counts, including denied requests, and is refused with 503 by the audit fail-closed gate like an ingest.
+
+Response `200`:
+
+```json
+{
+  "deleted": true,
+  "scope": "claim",
+  "tenant_id": "t1",
+  "claim_id": "c1",
+  "claims_deleted": 1,
+  "evidence_deleted": 2,
+  "edges_deleted": 1,
+  "vectors_deleted": 1,
+  "claims_total": 41,
+  "checkpoint_triggered": false,
+  "checkpoint_deferred": false
+}
+```
+
+`claim_id` appears only for a claim delete and `evidence_id` only for an evidence delete. `claims_total` counts the claims left on the node.
 
 ### Health, metrics, debug (ingestion)
 

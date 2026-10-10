@@ -133,6 +133,17 @@ automatic retries); pass
 allow retries. `delete` was removed in 0.2.0 because the server has
 no `/v1/delete` endpoint.
 
+### Deletes (0.3.0)
+
+```kotlin
+val client = DashClientAsync(DashClient("http://localhost:8080", "http://localhost:8081", "sk-live-..."))
+client.deleteClaim("tenant-a", "claim-1")     // claim, vector, evidence, edges
+client.deleteEvidence("tenant-a", "ev-1")     // every evidence row with this id
+val r = client.deleteTenant("tenant-a")       // erase the tenant (admin role)
+```
+
+Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ### 5. Error handling
 
 ```kotlin

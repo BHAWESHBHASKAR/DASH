@@ -12,8 +12,10 @@ use schema::{
 
 #[macro_use]
 mod failpoint;
+mod delete;
 mod disk;
 mod value_codec;
+pub use delete::{DeleteOutcome, DeleteStats, PreparedDelete};
 pub use disk::{DiskBackedStore, DiskStatus};
 
 #[cfg(feature = "gpu-backend")]
@@ -57,6 +59,7 @@ pub use wal::{
     GROUP_BEGIN_PREFIX, REPLICATION_GROUP_EXTENSION_MAX, SINGLE_TX_PREFIX,
     batch_commit_id_from_wal_line, complete_group_prefix_len, is_group_marker_commit_id,
 };
+pub use wal::{Tombstone, tombstone_from_wal_line};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BatchCommitMetadata {
@@ -215,6 +218,8 @@ enum StagedDiskOp {
         new_dim: Option<usize>,
     },
     BatchCommit(BatchCommitMetadata),
+    /// Everything one tombstone removes, applied in one redb transaction.
+    Delete(delete::DiskDeletion),
 }
 
 /// Reverse edge index entry: `from` points at the indexed claim.
@@ -571,6 +576,16 @@ impl InMemoryStore {
         // the disk was an owned `DiskBackedStore` (not Clone-able
         // because it wraps a `redb::Database`).
         let disk = Arc::clone(store.disk.as_ref().expect("disk was just attached"));
+        // With a tombstone in the WAL the redb state cannot serve as the
+        // base of the replay (see `FileWal::contains_tombstones`): rebuild
+        // redb from the WAL instead, which is the source of truth anyway.
+        let reset = wal
+            .contains_tombstones()
+            .map_err(|e| format!("wal scan: {e:?}"))?;
+        if reset {
+            disk.clear_all()
+                .map_err(|e| format!("disk reset before tombstone replay: {e}"))?;
+        }
         let claims_loaded = disk
             .bulk_load_claims_into(&mut store)
             .map_err(|e| format!("disk bulk load: {e}"))?;
@@ -580,7 +595,9 @@ impl InMemoryStore {
         // with the WAL tail counts (claims loaded by the bulk
         // path will be overwritten in `claims_loaded` by the WAL
         // tail counter, so we explicitly prefer the bulk count).
-        stats.claims_loaded = claims_loaded;
+        if !reset {
+            stats.claims_loaded = claims_loaded;
+        }
         store.disk_status = disk::DiskStatus::Available;
         Ok((store, stats))
     }
@@ -695,7 +712,7 @@ impl InMemoryStore {
         wal: &FileWal,
         policy: ReplayPolicy,
         collect_vectors_from: Option<usize>,
-    ) -> Result<(StoreLoadStats, Option<HashSet<String>>), StoreError> {
+    ) -> Result<(StoreLoadStats, Option<wal::VectorCatchUp>), StoreError> {
         fn hard(err: StoreError, origin: &str) -> StoreError {
             match err {
                 StoreError::Validation(_)
@@ -706,7 +723,7 @@ impl InMemoryStore {
         }
         let lenient = policy == ReplayPolicy::Lenient;
         let replay = wal.replay_with_policy(policy, collect_vectors_from)?;
-        let caught_up = replay.vector_claim_ids_after;
+        let caught_up = replay.vector_catch_up;
         let mut stats = replay.stats;
         let mut sink = replay.sink;
         let mut bad_claims = replay.quarantined_claim_ids;
@@ -755,7 +772,7 @@ impl InMemoryStore {
                 PersistedRecord::Evidence(_) => Some(1),
                 PersistedRecord::Edge(_) => Some(2),
                 PersistedRecord::ClaimVector(_) => Some(3),
-                PersistedRecord::BatchCommit(_) => None,
+                PersistedRecord::BatchCommit(_) | PersistedRecord::Tombstone(_) => None,
             };
             let known_claim = claim_id
                 .as_ref()
@@ -1149,7 +1166,9 @@ impl InMemoryStore {
                     || self.replica_skipped_claims.contains(&e.to_claim_id)
             }
             PersistedRecord::ClaimVector(v) => self.replica_skipped_claims.contains(&v.claim_id),
-            PersistedRecord::Claim(_) | PersistedRecord::BatchCommit(_) => false,
+            PersistedRecord::Claim(_)
+            | PersistedRecord::BatchCommit(_)
+            | PersistedRecord::Tombstone(_) => false,
         };
         if depends {
             return Ok(false);
@@ -1570,6 +1589,14 @@ impl InMemoryStore {
 
     pub fn edges_for_claim(&self, claim_id: &str) -> Vec<ClaimEdge> {
         self.edges_by_claim
+            .get(claim_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Evidence rows attached to `claim_id`, in stored order.
+    pub fn evidence_for_claim(&self, claim_id: &str) -> Vec<Evidence> {
+        self.evidence_by_claim
             .get(claim_id)
             .cloned()
             .unwrap_or_default()
@@ -2241,6 +2268,9 @@ impl InMemoryStore {
                 self.apply_claim_vector(&record.claim_id, record.values)
             }
             PersistedRecord::BatchCommit(record) => self.apply_batch_commit_record(record),
+            PersistedRecord::Tombstone(record) => {
+                self.apply_tombstone(&record.tombstone).map(|_| ())
+            }
         }
     }
 
@@ -2959,6 +2989,7 @@ fn write_disk_op(disk: &disk::DiskBackedStore, op: &StagedDiskOp) -> Result<(), 
             Ok(())
         }
         StagedDiskOp::BatchCommit(metadata) => disk.put_batch_commit(metadata),
+        StagedDiskOp::Delete(deletion) => disk.apply_deletion(deletion),
     }
 }
 
