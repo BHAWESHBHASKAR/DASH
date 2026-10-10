@@ -114,17 +114,20 @@ pub fn lexical_relevance(bm25_fraction: f32) -> f32 {
     }
 }
 
-/// Weight of vector similarity in hybrid relevance.
-pub const HYBRID_DENSE_WEIGHT: f32 = 0.7;
+/// Weight of vector similarity (mapped to `[0, 1]`) in hybrid relevance.
+/// Twice [`HYBRID_TEXT_WEIGHT`] because the mapping halves the cosine
+/// range: one unit of cosine and one unit of normalised BM25 weigh the
+/// same, and a claim with cosine 1 and no query term still outranks a claim
+/// with cosine 0 and any BM25 (normalised BM25 is always below 1).
+pub const HYBRID_DENSE_WEIGHT: f32 = 2.0 / 3.0;
 /// Weight of normalised BM25 in hybrid relevance.
-pub const HYBRID_TEXT_WEIGHT: f32 = 0.3;
+pub const HYBRID_TEXT_WEIGHT: f32 = 1.0 / 3.0;
 
 /// Relevance of a hybrid retrieve (a query vector is present): a
 /// calibrated blend of vector similarity (cosine in `[-1, 1]` mapped to
 /// `[0, 1]`; a claim without a vector counts as orthogonal, 0.5) and
-/// normalised BM25 ([`lexical_relevance`]). In `[0, 1]`. Vector
-/// similarity carries the larger weight, so a claim aligned with the
-/// query vector outranks one that only shares words with the query text.
+/// normalised BM25 ([`lexical_relevance`]). In `[0, 1]`. See
+/// [`HYBRID_DENSE_WEIGHT`] for the calibration.
 pub fn hybrid_relevance(cosine: Option<f32>, bm25_fraction: f32) -> f32 {
     let cosine = cosine.filter(|c| c.is_finite()).unwrap_or(0.0).clamp(-1.0, 1.0);
     let dense = (cosine + 1.0) * 0.5;
