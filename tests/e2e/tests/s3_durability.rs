@@ -8,7 +8,10 @@ use dash_e2e::*;
 use serde_json::{Value, json};
 
 const T: &str = "tenant-a";
-const ALL: &str = "zzqx-matches-nothing";
+/// One word from every text this file ingests (claim bundles, the batch,
+/// both documents), so a retrieve with it lists every claim through lexical
+/// matching. A query that matches nothing returns nothing.
+const ALL: &str = "claim turbines blades bridge tolls";
 const N: usize = 25;
 
 fn edge(id: &str, from: &str, to: &str) -> Value {

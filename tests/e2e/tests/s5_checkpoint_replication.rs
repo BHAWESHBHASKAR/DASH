@@ -9,7 +9,10 @@ use dash_e2e::*;
 use serde_json::{Value, json};
 
 const T: &str = "tenant-a";
-const ALL: &str = "zzqx-matches-nothing";
+/// A word every claim text in this file contains, so a retrieve with it lists
+/// every claim through lexical matching (a query that matches nothing returns
+/// nothing).
+const ALL: &str = "claim";
 const CHECKPOINT_EVERY: usize = 30;
 
 struct Oracle {

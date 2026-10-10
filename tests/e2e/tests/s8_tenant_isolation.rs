@@ -5,7 +5,10 @@ use std::time::Duration;
 use dash_e2e::*;
 use serde_json::{Value, json};
 
-const ALL: &str = "zzqx-matches-nothing";
+/// A word every claim text in this file contains, so a retrieve with it lists
+/// every claim through lexical matching (a query that matches nothing returns
+/// nothing).
+const ALL: &str = "statement";
 
 fn edge(id: &str, from: &str, to: &str, rel: &str) -> Value {
     json!({"edge_id": id, "from_claim_id": from, "to_claim_id": to, "relation": rel, "strength": 0.9})
