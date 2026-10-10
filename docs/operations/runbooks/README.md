@@ -17,6 +17,10 @@ Every runbook has the same sections: meaning, impact, diagnosis (queries and com
 | `DashFileDescriptorsExhausted` | warning | [dash-file-descriptors-exhausted.md](dash-file-descriptors-exhausted.md) |
 | `DashHighErrorRate` | critical | [dash-high-error-rate.md](dash-high-error-rate.md) |
 | `DashHighLatencyP99` | warning | [dash-high-latency-p99.md](dash-high-latency-p99.md) |
+| `DashIngestFailoverBlocked` | critical | [dash-ingest-failover-blocked.md](dash-ingest-failover-blocked.md) |
+| `DashIngestFailoverHappened` | info | [dash-ingest-failover-happened.md](dash-ingest-failover-happened.md) |
+| `DashIngestNoLeader` | critical | [dash-ingest-no-leader.md](dash-ingest-no-leader.md) |
+| `DashIngestSyncReplicationTimeouts` | warning | [dash-ingest-sync-replication-timeouts.md](dash-ingest-sync-replication-timeouts.md) |
 | `DashIngestToVisibleLagHigh` | warning | [dash-ingest-to-visible-lag-high.md](dash-ingest-to-visible-lag-high.md) |
 | `DashReplicationFollowerLagging` | warning | [dash-replication-follower-lagging.md](dash-replication-follower-lagging.md) |
 | `DashReplicationFollowerNotReady` | critical | [dash-replication-follower-not-ready.md](dash-replication-follower-not-ready.md) |

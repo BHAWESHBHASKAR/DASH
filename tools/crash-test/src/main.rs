@@ -30,6 +30,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dash_e2e::{Client, Stack, StackOpts, bin_path, bundle};
+
+mod failover;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::{Value, json};
@@ -52,6 +54,13 @@ const USAGE: &str = "usage: crash-test [options]
                            DASH_ENCRYPTION_KEY_FILE; the offline checks
                            also require every WAL and snapshot to be
                            encrypted
+  --failover               leader-failover scenario: a control plane and three
+                           ingestion nodes with synchronous replication; every
+                           cycle kills the current leader and checks that no
+                           acknowledged write is lost, exactly one node accepts
+                           writes and the killed node rejoins as a follower
+                           (with --env DASH_INGEST_MIN_SYNC_REPLICAS=0 lost
+                           acknowledged writes are counted instead)
   --json-out PATH          write the summary as JSON
   --keep-state             keep the state directory even when the run passes
 
@@ -72,6 +81,7 @@ struct Config {
     json_out: Option<PathBuf>,
     keep_state: bool,
     encryption: bool,
+    failover: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Config, String> {
@@ -88,6 +98,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
         json_out: None,
         keep_state: false,
         encryption: false,
+        failover: false,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -119,6 +130,7 @@ fn parse_args(args: &[String]) -> Result<Config, String> {
             "--json-out" => cfg.json_out = Some(PathBuf::from(value()?)),
             "--keep-state" => cfg.keep_state = true,
             "--encryption" => cfg.encryption = true,
+            "--failover" => cfg.failover = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -618,6 +630,45 @@ fn main() -> ExitCode {
         cfg.encryption
     );
     let t0 = Instant::now();
+    if cfg.failover {
+        let (result, totals, cycles_done) = failover::run(&cfg);
+        let summary = failover::summary(&cfg, &result, &totals, cycles_done, t0.elapsed());
+        println!(
+            "crash-test --failover {}: synchronous={} cycles={}/{} acked_requests={} acked_claims={} acked_lost={} unknown={} (applied {}) failover_ms={} rejoin_ms={} duration={:.1}s",
+            if result.is_ok() { "PASSED" } else { "FAILED" },
+            failover::synchronous(&cfg),
+            cycles_done,
+            cfg.cycles,
+            totals.acked_requests,
+            totals.acked_claims,
+            totals.acked_lost,
+            totals.unknown_requests,
+            totals.unknown_applied,
+            summary["failover_ms"],
+            summary["rejoin_ms"],
+            t0.elapsed().as_secs_f64()
+        );
+        if let Some(path) = &cfg.json_out
+            && let Err(e) = std::fs::write(path, format!("{summary:#}\n"))
+        {
+            eprintln!("crash-test: cannot write {}: {e}", path.display());
+        }
+        return match result {
+            Ok(()) if totals.acked_claims == 0 => {
+                eprintln!("crash-test: no write was ever acknowledged; nothing was tested");
+                ExitCode::from(1)
+            }
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("crash-test --failover FAILED: {e}");
+                eprintln!(
+                    "reproduce with: crash-test --failover --seed {} --cycles {} --writers {}",
+                    cfg.seed, cfg.cycles, cfg.writers
+                );
+                ExitCode::from(1)
+            }
+        };
+    }
     let (result, totals, kept, cycles_done) = run(&cfg);
     let mut rec = totals.recovery_ms.clone();
     rec.sort_unstable();
@@ -733,6 +784,21 @@ mod tests {
         assert!(cfg.keep_state);
         assert!(cfg.encryption);
         assert!(!parse_args(&args(&[])).unwrap().encryption);
+    }
+
+    #[test]
+    fn failover_mode_and_its_replication_mode_are_parsed() {
+        let cfg = parse_args(&args(&["--failover"])).unwrap();
+        assert!(cfg.failover);
+        assert!(failover::synchronous(&cfg), "synchronous by default");
+        let cfg = parse_args(&args(&[
+            "--failover",
+            "--env",
+            "DASH_INGEST_MIN_SYNC_REPLICAS=0",
+        ]))
+        .unwrap();
+        assert!(!failover::synchronous(&cfg));
+        assert!(!parse_args(&args(&[])).unwrap().failover);
     }
 
     #[test]

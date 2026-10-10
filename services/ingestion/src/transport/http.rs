@@ -5,6 +5,19 @@ use super::json::json_escape;
 pub(super) const SOCKET_TIMEOUT_SECS: u64 = 5;
 /// Workers reserved for health-class requests (`/health`, `/live`, ...).
 const HEALTH_WORKERS: usize = 2;
+/// Extra reserved workers for followers' WAL polls, which share the
+/// reserved lane: a caught-up follower's poll is held open (long poll), and
+/// with synchronous replication every general worker can be busy waiting
+/// for exactly those polls, so they must never queue behind writes.
+const REPLICATION_POLL_WORKERS: usize = 4;
+
+/// Reserved lane: the standard health paths plus followers' WAL polls and
+/// commit acks (a follower's poll loop waits for its acks).
+pub(super) fn reserved_lane_classifier(method: &str, path: &str) -> bool {
+    dash_http::default_health_classifier(method, path)
+        || (method == "GET" && path == "/internal/replication/wal")
+        || (method == "POST" && path == "/internal/replication/ack")
+}
 const HEALTH_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +35,8 @@ pub(crate) struct HttpResponse {
     pub(crate) body: String,
     /// Emitted as a `Retry-After` header (429 responses).
     pub(crate) retry_after_secs: Option<u64>,
+    /// Extra response headers (leader hints on a non-leader's 503).
+    pub(crate) headers: Vec<(&'static str, String)>,
 }
 
 impl HttpResponse {
@@ -31,6 +46,7 @@ impl HttpResponse {
             content_type: "application/json",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -40,6 +56,7 @@ impl HttpResponse {
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -49,6 +66,7 @@ impl HttpResponse {
             content_type: "text/plain; charset=utf-8",
             body,
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -58,6 +76,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -67,6 +86,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -76,6 +96,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -85,6 +106,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -94,6 +116,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -103,6 +126,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -112,6 +136,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -121,6 +146,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -130,6 +156,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: Some(retry_after_secs),
+            headers: Vec::new(),
         }
     }
 
@@ -145,6 +172,7 @@ impl HttpResponse {
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
             retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -165,11 +193,15 @@ impl From<dash_http::Request> for HttpRequest {
 
 impl From<HttpResponse> for dash_http::Response {
     fn from(response: HttpResponse) -> Self {
-        let out = dash_http::Response::new(response.status, response.content_type, response.body);
-        match response.retry_after_secs {
-            Some(secs) => out.with_header("Retry-After", secs.to_string()),
-            None => out,
+        let mut out =
+            dash_http::Response::new(response.status, response.content_type, response.body);
+        if let Some(secs) = response.retry_after_secs {
+            out = out.with_header("Retry-After", secs.to_string());
         }
+        for (name, value) in response.headers {
+            out = out.with_header(name, value);
+        }
+        out
     }
 }
 
@@ -178,7 +210,7 @@ impl From<HttpResponse> for dash_http::Response {
 pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_http::ServerConfig {
     let env = dash_common::conn::ConnConfig::from_env();
     let mut config = dash_http::ServerConfig::new("ingestion", worker_count, queue_capacity);
-    config.health_workers = HEALTH_WORKERS;
+    config.health_workers = HEALTH_WORKERS + REPLICATION_POLL_WORKERS;
     config.health_queue_capacity = HEALTH_QUEUE_CAPACITY;
     config.write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
     config.reject_write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);

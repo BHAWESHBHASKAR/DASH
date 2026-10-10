@@ -189,6 +189,23 @@ jobs:
             echo "helm template with encryption.enabled succeeded without encryption.secretName" >&2
             exit 1
           fi
+          # Ingestion leader failover (docs/operations/failover.md): several
+          # ingestion pods, leader-only readiness, peers Service, PDB.
+          helm lint deploy/helm/dash --strict "${args[@]}" --set failover.enabled=true
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true > helm-failover.yaml
+          grep -q 'path: /v1/ready/leader' helm-failover.yaml
+          grep -q 'DASH_CONTROL_PLANE_INGEST_FAILOVER: "1"' helm-failover.yaml
+          helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true --set tls.enabled=true \
+            --set tls.secretName=dash-internal-tls > helm-failover-tls.yaml
+          if helm template dash deploy/helm/dash --namespace dash-system "${args[@]}" \
+            --set failover.enabled=true --set controlPlane.enabled=false >/dev/null 2>&1; then
+            echo "helm template with failover.enabled succeeded without the control plane" >&2
+            exit 1
+          fi
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            helm-failover.yaml helm-failover-tls.yaml
           # Monitoring: ServiceMonitors, PrometheusRule, Grafana dashboards and
           # the scrape NetworkPolicy (deploy/observability/).
           monitoring=(

@@ -1,8 +1,29 @@
 {{- /*
-Disruption budget for retrieval only. Ingestion and the control plane run a
-single replica; a minAvailable budget there would block node drains forever.
+Disruption budget for retrieval, and for ingestion when failover is on.
+Single-replica ingestion and the control plane get none: a minAvailable
+budget there would block node drains forever.
 */ -}}
-{{- if .Values.pdb.enabled -}}
+{{- if and .Values.pdb.enabled .Values.failover.enabled }}
+---
+# Ingestion with failover: followers (not ready by design) may always be
+# evicted; the leader may not (step it down first, see failover.md), because
+# evicting it pauses writes for a lease.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dash.componentName" (list . "ingestion") }}
+  namespace: {{ include "dash.namespace" . }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if .Values.pdb.enabled }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -1,7 +1,11 @@
 {{- /*
-Ingestion workload: the single writer (WAL + redb). Fixed at one replica;
-retrieval pods replicate from it. Do not scale or autoscale it.
+Ingestion workload: the single writer (WAL + redb). One replica, or with
+failover.enabled failover.replicas pods of which the control plane names
+one leader; the Service routes to the leader only (readiness
+/v1/ready/leader). Do not scale it by hand or autoscale it.
 */ -}}
+{{- $failover := .Values.failover.enabled -}}
+{{- $peers := printf "%s-peers" (include "dash.componentName" (list . "ingestion")) -}}
 ---
 apiVersion: v1
 kind: Service
@@ -21,6 +25,30 @@ spec:
     targetPort: http
     protocol: TCP
     appProtocol: {{ ternary "https" "http" .Values.tls.enabled }}
+{{- if $failover }}
+---
+# Stable per-pod DNS names for replication between ingestion pods and for the
+# failover heartbeat's advertised URL. Lists followers too (they are not ready
+# by design: only the leader passes /v1/ready/leader).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $peers }}
+  namespace: {{ include "dash.namespace" . }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "dash.ingestionSelectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: 8081
+    targetPort: http
+    protocol: TCP
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -31,9 +59,19 @@ metadata:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: ingestion
 spec:
+  {{- if $failover }}
+  serviceName: {{ $peers }}
+  replicas: {{ .Values.failover.replicas | int }}
+  # Followers never become ready (only the leader passes the probe), so pods
+  # start in parallel and are updated by deleting them (see values.yaml).
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  {{- else }}
   serviceName: {{ include "dash.componentName" (list . "ingestion") }}
   replicas: 1
   podManagementPolicy: OrderedReady
+  {{- end }}
   selector:
     matchLabels:
       {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
@@ -88,6 +126,21 @@ spec:
         env:
         - name: DASH_BIN
           value: "ingestion"
+        {{- if $failover }}
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: DASH_NODE_ID
+          value: "$(POD_NAME)"
+        - name: DASH_INGEST_FAILOVER_ADVERTISE_URL
+          value: {{ printf "%s://$(POD_NAME).%s.%s.svc.cluster.local:8081" (ternary "https" "http" .Values.tls.enabled) $peers (include "dash.namespace" .) | quote }}
+        - name: DASH_CONTROL_PLANE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "dash.controlPlaneSecretName" . }}
+              key: DASH_CONTROL_PLANE_TOKEN
+        {{- end }}
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config
@@ -120,13 +173,23 @@ spec:
           failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
         readinessProbe:
           httpGet:
-            path: {{ .Values.probes.readiness.path }}
+            # With failover only the leader is ready: the Service follows it.
+            path: {{ ternary "/v1/ready/leader" .Values.probes.readiness.path $failover }}
             port: http
             scheme: {{ include "dash.probeScheme" . }}
+          {{- if $failover }}
+          # Probe often: the Service must move to a new leader (and away from
+          # a deposed one) within seconds, not tens of seconds.
+          periodSeconds: {{ .Values.failover.readinessPeriodSeconds }}
+          timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          successThreshold: 1
+          failureThreshold: 1
+          {{- else }}
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
         securityContext:
           {{- toYaml .Values.containerSecurityContext | nindent 12 }}
         volumeMounts:

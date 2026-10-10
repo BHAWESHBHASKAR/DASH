@@ -103,6 +103,30 @@ data:
   {{- end }}
   {{- end }}
 
+  {{- if .Values.failover.enabled }}
+  {{- if not .Values.controlPlane.enabled }}
+  {{- fail "failover.enabled requires controlPlane.enabled" }}
+  {{- end }}
+  # ----- automatic failover of the ingestion leader (docs/operations/failover.md) -----
+  {{- $f := .Values.failover }}
+  DASH_CONTROL_PLANE_INGEST_FAILOVER: "1"
+  DASH_CONTROL_PLANE_INGEST_LEASE_MS: {{ $f.leaseMs | int64 | quote }}
+  DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS: {{ $f.promotionGraceMs | int64 | quote }}
+  DASH_INGEST_FAILOVER_CONTROL_PLANE_URL: {{ printf "%s://%s.%s.svc.cluster.local:%v" (ternary "https" "http" .Values.tls.enabled) (include "dash.componentName" (list . "control-plane")) $ns .Values.service.ports.controlPlane | quote }}
+  DASH_INGEST_FAILOVER_HEARTBEAT_INTERVAL_MS: {{ $f.heartbeatIntervalMs | int64 | quote }}
+  DASH_INGEST_MIN_SYNC_REPLICAS: {{ $f.minSyncReplicas | int64 | quote }}
+  DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS: {{ $f.syncTimeoutMs | int64 | quote }}
+  DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT: {{ $f.syncOnTimeout | quote }}
+  DASH_INGEST_REPLICATION_POLL_INTERVAL_MS: {{ .Values.config.replication.pollIntervalMs | int64 | quote }}
+  {{- if .Values.tls.enabled }}
+  DASH_ROUTER_CONTROL_PLANE_CA_FILE: {{ printf "%s/ca.crt" .Values.tls.mountPath | quote }}
+  {{- else }}
+  # TLS is off: the heartbeat's control-plane token crosses the pod network
+  # unencrypted (as the replication token does). Prefer tls.enabled=true.
+  DASH_ROUTER_ALLOW_INSECURE_HTTP: "1"
+  {{- end }}
+  {{- end }}
+
   # ----- control plane -----
   DASH_CONTROL_PLANE_STATE_PATH: {{ printf "%s/state/control-plane.csv" $p | quote }}
   DASH_CONTROL_PLANE_STATE_SHA256_PATH: {{ printf "%s/state/control-plane.csv.sha256" $p | quote }}

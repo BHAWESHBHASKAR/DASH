@@ -29,6 +29,7 @@ use schema::{Claim, ClaimEdge, ClaimType, Evidence, Relation, Stance};
 use crate::StoreError;
 use crate::crypt::{self, Detected, KeyringRef, LineCodec};
 
+mod failover;
 mod replication_export;
 mod replication_index;
 #[cfg(test)]

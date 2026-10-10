@@ -159,16 +159,18 @@ What it does:
 
 | Event | Effect |
 |---|---|
-| Ingestion pod killed or rescheduled | Writes fail until the pod is back (single writer). Acknowledged writes are on the PVC (with the default `config.wal.ingestSyncEveryRecords: 1`, fsynced before the 200) and are replayed at start. Followers retry and catch up. |
+| Ingestion pod killed or rescheduled | Writes fail until the pod is back (single writer). Acknowledged writes are on the PVC (with the default `config.wal.ingestSyncEveryRecords: 1`, fsynced before the 200) and are replayed at start. Followers retry and catch up. With `failover.enabled`, a follower pod is promoted instead after about `failover.leaseMs + failover.promotionGraceMs + failover.heartbeatIntervalMs` (see [Leader failover](#leader-failover)). |
 | Retrieval pod killed | The StatefulSet restarts it on the same PVC; it resumes from its saved offset. Other replicas keep serving. |
 | Retrieval PVC lost | A fresh pod starts empty and resyncs everything from ingestion. |
-| Node lost with ingestion's volume on it | With node-local storage (local-path, hostPath) ingestion stays down until the node or volume returns, or until you restore a backup onto a new PVC. Use network-attached storage for ingestion. |
-| Control plane down | Placement updates and lease renewals stop; ingest and retrieve keep working in the default single-shard setup. |
+| Node lost with ingestion's volume on it | With node-local storage (local-path, hostPath) ingestion stays down until the node or volume returns, or until you restore a backup onto a new PVC. Use network-attached storage for ingestion, or enable `failover` with the ingestion pods on different nodes (each has its own PVC). |
+| Control plane down | Placement updates and lease renewals stop; ingest and retrieve keep working in the default single-shard setup. With `failover.enabled`, writes pause once the ingestion leader's lease lapses (it cannot renew); reads continue. |
 
 ## Scaling and current limits
 
-* **One ingestion pod.** There is no leader election or failover for the
-  writer; it is a single point of failure for writes. Never scale it above 1.
+* **One ingestion pod by default.** Without `failover.enabled` the writer
+  is a single point of failure for writes; never scale it above 1 by hand.
+  With `failover.enabled` the chart runs `failover.replicas` ingestion pods
+  and the control plane fails over between them (next section).
 * **Manual retrieval scaling, no autoscaler.** Use `helm upgrade --set
   replicas.retrieval=N` (a plain `kubectl scale` is undone by the next
   upgrade). A new replica starts empty and copies the full state from
@@ -184,6 +186,54 @@ What it does:
   on single-replica workloads would block node drains.
 * **Ingress** assumes ingress-nginx annotations; replication and `/metrics`
   are never routed.
+
+## Leader failover
+
+`--set failover.enabled=true` (requires the control plane) turns on automatic
+failover of the ingestion leader ([failover.md](failover.md),
+[ADR 0006](../adr/0006-leader-failover.md)):
+
+* `failover.replicas` ingestion pods (default 3), each with its own PVC. The
+  control plane names one leader; the others replicate from it over the
+  headless `<fullname>-ingestion-peers` Service (stable pod DNS names; it
+  publishes not-ready pods).
+* Every ingestion pod's readiness probe is `GET /v1/ready/leader`: only the
+  leader is ready, so the `<fullname>-ingestion` Service, the ingress
+  `/v1/ingest*` routes and the retrieval pods' replication source always reach
+  the current leader. **Follower pods show `0/1 READY`; that is expected.**
+  Check them with `GET /v1/ready` (replication caught up) instead.
+* `failover.minSyncReplicas: 1` (default): a write is answered once one
+  follower holds it, so no acknowledged write is lost when any single pod or
+  node is. Set 0 for asynchronous replication.
+* Writes pause for about `leaseMs + promotionGraceMs + heartbeatIntervalMs`
+  (7 s with the defaults) when the leader's pod or node is lost, and for as
+  long as the control plane is unreachable once the lease lapses.
+* **Updates.** The StatefulSet uses `updateStrategy: OnDelete` (a rolling
+  update would wait forever for the followers to become ready). After `helm
+  upgrade`, delete the follower pods one at a time and wait for each to report
+  `replication.lag_records: 0` in `/v1/ready`; then step the leader down and
+  delete it:
+
+  ```bash
+  curl -fsS -X POST -H "Authorization: Bearer $CP_TOKEN" \
+    "http://127.0.0.1:8090/v1/control-plane/ingest/step-down?prefer=dash-ingestion-1"
+  kubectl -n dash-system delete pod dash-ingestion-0
+  ```
+* **Drains.** The ingestion PodDisruptionBudget allows evicting followers
+  (they are unhealthy by design) and blocks evicting the leader: step it down
+  first, then drain.
+* **Enabling it on an existing release** changes the StatefulSet's
+  `serviceName`, which Kubernetes refuses to update in place. Run `kubectl -n
+  dash-system delete statefulset dash-ingestion --cascade=orphan` (the pod and
+  its PVC stay), then `helm upgrade --set failover.enabled=true`. The existing
+  pod has the most data and wins the first election; new pods resync from it.
+* With TLS, the certificate must also name the peer DNS names
+  (`*.<fullname>-ingestion-peers.<ns>.svc.cluster.local`).
+
+`scripts/kind_e2e.sh` does not exercise failover yet; it is covered by the
+end-to-end scenario with the real binaries (`tests/e2e/tests/s14_leader_failover.rs`)
+and `crash-test --failover`. The chart rendering is checked with `helm lint`
+and `helm template` for both settings.
 
 ## Testing on kind
 

@@ -53,6 +53,20 @@ pub(crate) struct ReplicationPullConfig {
     /// Bytes requested per chunk of a full resync (chunked export), capped
     /// so a chunk response fits in `max_response_bytes`.
     pub(crate) export_chunk_bytes: usize,
+    /// The leader term this follower knows (`term=`). The leader answers
+    /// with its own term (a `term=` line); frames from an older term are
+    /// refused, and a leader that sees a newer term stops accepting writes.
+    pub(crate) term: Option<u64>,
+    /// Send `replica_id` and `durable=1`: this follower's poll position
+    /// proves what it has durably applied (synchronous replication).
+    pub(crate) durable_replica: bool,
+    /// Ask a caught-up leader to hold the poll open (`wait_ms`).
+    pub(crate) long_poll: Option<Duration>,
+    /// Per-read timeout of WAL delta polls (frames are bounded, unlike an
+    /// export being built). A failover follower uses a short one so a poll
+    /// stuck on a dead or paused leader does not outlive a failover by
+    /// long: the next poll goes to the new leader.
+    pub(crate) delta_io_timeout: Option<Duration>,
 }
 
 impl ReplicationPullConfig {
@@ -73,6 +87,10 @@ impl ReplicationPullConfig {
             max_lag_records: DEFAULT_MAX_LAG_RECORDS,
             max_staleness_ms: DEFAULT_MAX_STALENESS_MS,
             export_chunk_bytes: store::EXPORT_CHUNK_DEFAULT_BYTES,
+            term: None,
+            durable_replica: false,
+            long_poll: None,
+            delta_io_timeout: None,
         }
     }
 
@@ -81,10 +99,18 @@ impl ReplicationPullConfig {
             "DASH_INGEST_REPLICATION_SOURCE_URL",
             "EME_INGEST_REPLICATION_SOURCE_URL",
         )?;
-        let mut config = Self::new(source_base_url);
+        let config = Self::from_env_with_source(source_base_url);
         if config.source_base_url.is_empty() {
             return None;
         }
+        Some(config)
+    }
+
+    /// The follower settings from the environment with `source_base_url`
+    /// as the leader (a failover member re-points it at every leader
+    /// change, see `failover.rs`).
+    pub(crate) fn from_env_with_source(source_base_url: String) -> Self {
+        let mut config = Self::new(source_base_url);
         if let Some(ms) = env_u64(
             "DASH_INGEST_REPLICATION_POLL_INTERVAL_MS",
             "EME_INGEST_REPLICATION_POLL_INTERVAL_MS",
@@ -138,7 +164,16 @@ impl ReplicationPullConfig {
                 .or_else(|| env_with_fallback("DASH_NODE_ID", "EME_NODE_ID"))
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty());
-        Some(config)
+        // An ingestion follower can take over as leader: its polls report
+        // what it holds, and it long-polls a caught-up leader so that a
+        // synchronous write waits for a round trip, not a poll interval.
+        config.durable_replica = config.local_replica_id.is_some();
+        config.term = Some(0);
+        config.long_poll = Some(Duration::from_millis(
+            super::failover::MAX_LONG_POLL_MS
+                .min(config.poll_interval.as_millis().max(1) as u64 * 2),
+        ));
+        config
     }
 
     pub(crate) fn wal_pull_url(&self, from_offset: usize, from_generation: Option<u64>) -> String {
@@ -150,6 +185,20 @@ impl ReplicationPullConfig {
         );
         if let Some(generation) = from_generation {
             url.push_str(&format!("&from_generation={generation}"));
+        }
+        if let Some(term) = self.term {
+            url.push_str(&format!("&term={term}"));
+        }
+        if self.durable_replica
+            && let Some(replica_id) = self.local_replica_id.as_deref()
+        {
+            url.push_str(&format!(
+                "&replica_id={}&durable=1",
+                url_encode_component(replica_id)
+            ));
+        }
+        if let Some(wait) = self.long_poll {
+            url.push_str(&format!("&wait_ms={}", wait.as_millis()));
         }
         url
     }
@@ -209,6 +258,9 @@ pub(crate) struct ReplicationDeltaFrame {
     pub(crate) next_offset: usize,
     pub(crate) total_records: usize,
     pub(crate) wal_lines: Vec<String>,
+    /// The leader's term (`term=` line; leaders answer it to followers
+    /// that sent `term=`).
+    pub(crate) term: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +276,38 @@ pub(crate) fn request_replication_source(
     max_body_bytes: usize,
 ) -> Result<ReplicationSourceResponse, String> {
     request_replication_source_with_method(url, token, "GET", max_body_bytes)
+}
+
+fn request_replication_source_with_io_timeout(
+    url: &str,
+    token: Option<&str>,
+    max_body_bytes: usize,
+    io_timeout: Option<Duration>,
+) -> Result<ReplicationSourceResponse, String> {
+    request_replication_source_with_io_timeout_method(url, token, "GET", max_body_bytes, io_timeout)
+}
+
+fn request_replication_source_with_io_timeout_method(
+    url: &str,
+    token: Option<&str>,
+    method: &str,
+    max_body_bytes: usize,
+    io_timeout: Option<Duration>,
+) -> Result<ReplicationSourceResponse, String> {
+    let mut options = dash_common::replication_client::ClientOptions::from_env();
+    if let Some(timeout) = io_timeout {
+        // Per-read timeout only: a leader that stops answering (dead,
+        // paused, partitioned) is given up on quickly, a large frame that
+        // keeps arriving is not cut off.
+        options.io_timeout = timeout;
+        options.request_deadline = Duration::ZERO;
+    }
+    let response =
+        dash_common::replication_client::request(method, url, token, max_body_bytes, &options)?;
+    Ok(ReplicationSourceResponse {
+        status: response.status,
+        body: response.body,
+    })
 }
 
 fn request_replication_ack(
@@ -257,9 +341,20 @@ fn request_replication_source_with_method(
 /// `<generation>:<offset>` when the frame moves the follower from the end
 /// of that generation to offset 0 of the current one. Without it the layout
 /// is the one older followers parse.
+#[cfg(test)]
 pub(crate) fn render_replication_delta_frame(
     frame: &WalReplicationFrame,
     with_switch: bool,
+) -> String {
+    render_replication_delta_frame_with_term(frame, with_switch, None)
+}
+
+/// [`render_replication_delta_frame`] plus a `term=` line after the
+/// `switch_from=` line, for followers that sent `term=` (and `gen_switch=1`).
+pub(crate) fn render_replication_delta_frame_with_term(
+    frame: &WalReplicationFrame,
+    with_switch: bool,
+    term: Option<u64>,
 ) -> String {
     let switch_line = if with_switch {
         match frame.switched_from {
@@ -269,8 +364,12 @@ pub(crate) fn render_replication_delta_frame(
     } else {
         String::new()
     };
+    let term_line = match term {
+        Some(term) if with_switch => format!("term={term}\n"),
+        _ => String::new(),
+    };
     let mut out = format!(
-        "status=ok\ngeneration={}\nneeds_resync={}\n{switch_line}from_offset={}\nnext_offset={}\ntotal_records={}\nrecords={}\n",
+        "status=ok\ngeneration={}\nneeds_resync={}\n{switch_line}{term_line}from_offset={}\nnext_offset={}\ntotal_records={}\nrecords={}\n",
         frame.generation,
         if frame.needs_resync { 1 } else { 0 },
         frame.from_offset,
@@ -294,6 +393,18 @@ pub(crate) fn parse_replication_delta_frame(
     let generation = parse_generation(&mut lines)?;
     let needs_resync = parse_kv_bool01(&mut lines, "needs_resync")?;
     let switch_from = parse_switch_from(&mut lines)?;
+    let term = match lines.peek() {
+        Some(line) if line.starts_with("term=") => {
+            let line = lines.next().unwrap_or_default();
+            let (_, value) = parse_kv_line(line, "term")?;
+            Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "replication payload has invalid term".to_string())?,
+            )
+        }
+        _ => None,
+    };
     let from_offset = parse_kv_usize(&mut lines, "from_offset")?;
     let next_offset = parse_kv_usize(&mut lines, "next_offset")?;
     let total_records = parse_kv_usize(&mut lines, "total_records")?;
@@ -325,6 +436,7 @@ pub(crate) fn parse_replication_delta_frame(
         next_offset,
         total_records,
         wal_lines,
+        term,
     })
 }
 
@@ -616,6 +728,11 @@ pub(crate) struct ReplicationFollowerState {
     /// will not fix (oversized response / commit group); reported by
     /// `/ready` and `/metrics`.
     pub(crate) blocked_reason: Option<&'static str>,
+    /// Records in the last applied delta frame (the pull loop polls again
+    /// at once while frames carry records).
+    pub(crate) last_frame_records: usize,
+    /// The leader answered with a `term=` line: it understands `wait_ms`.
+    pub(crate) leader_long_polls: bool,
 }
 
 impl Default for ReplicationFollowerState {
@@ -637,6 +754,8 @@ impl Default for ReplicationFollowerState {
             generation_switches_total: 0,
             export_bytes_total: 0,
             blocked_reason: None,
+            last_frame_records: 0,
+            leader_long_polls: false,
         }
     }
 }
@@ -679,7 +798,10 @@ impl IngestionRuntime {
 
     /// `(from_offset, from_generation, force_resync)` for the next pull.
     /// Loads the persisted state the first time it is called.
-    fn replication_cursor(&mut self, config: &ReplicationPullConfig) -> (usize, Option<u64>, bool) {
+    pub(super) fn replication_cursor(
+        &mut self,
+        config: &ReplicationPullConfig,
+    ) -> (usize, Option<u64>, bool) {
         if !self.replication_follower.state_loaded {
             self.replication_follower.state_loaded = true;
             let path = config.offset_path.clone().or_else(|| {
@@ -781,9 +903,16 @@ impl IngestionRuntime {
         &mut self,
         frame: &ReplicationDeltaFrame,
     ) -> Result<(), StoreError> {
-        if frame.switch_from.is_some() {
+        if let Some(from) = frame.switch_from {
             self.switch_replication_generation(frame.generation)?;
+            self.failover
+                .record_switch(super::failover::RecordedSwitch {
+                    from,
+                    to: frame.generation,
+                    term: frame.term.unwrap_or(0),
+                });
         }
+        self.replication_follower.last_frame_records = frame.wal_lines.len();
         if !frame.wal_lines.is_empty() {
             for line in &frame.wal_lines {
                 store::check_replicated_line(line)?;
@@ -967,6 +1096,8 @@ impl IngestionRuntime {
         offset: usize,
         applied: u64,
     ) {
+        // The crossings made before the resync belong to the replaced state.
+        self.failover.recent_switches.clear();
         // Tenants the export no longer holds (erased on the leader) get their
         // segments refreshed to an empty claim set as well.
         let mut tenants: std::collections::BTreeSet<String> =
@@ -994,7 +1125,7 @@ impl IngestionRuntime {
 
     /// Removes the persisted cursor (directory synced) before the local
     /// files are replaced.
-    fn clear_replication_state(&self) -> Result<(), StoreError> {
+    pub(super) fn clear_replication_state(&self) -> Result<(), StoreError> {
         let Some(path) = self.replication_follower.state_path.clone() else {
             return Ok(());
         };
@@ -1287,6 +1418,13 @@ fn apply_guarded<T>(
     // single ingests to finish first.
     let mut guard = group_commit::lock_drained(runtime)
         .map_err(|_| StoreError::Io("replication runtime lock unavailable".to_string()))?;
+    // Promoted while this frame was in flight: the leader's own WAL must
+    // never take records from another node.
+    if guard.failover.is_leader() {
+        return Err(StoreError::Io(
+            "this node is the leader now; replication frame discarded".to_string(),
+        ));
+    }
     match catch_unwind(AssertUnwindSafe(|| apply(&mut guard))) {
         Ok(result) => result,
         Err(panic) => {
@@ -1317,10 +1455,11 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
     if force_resync {
         return resync_from_export(runtime, config);
     }
-    let delta_response = request_replication_source(
+    let delta_response = request_replication_source_with_io_timeout(
         &config.wal_pull_url(from_offset, from_generation),
         config.token.as_deref(),
         config.max_response_bytes,
+        config.delta_io_timeout,
     )?;
     if delta_response.status != 200 {
         return Err(format!(
@@ -1330,6 +1469,23 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
         ));
     }
     let delta_frame = parse_replication_delta_frame(&delta_response.body, config.max_records)?;
+    if let (Some(ours), Some(theirs)) = (config.term, delta_frame.term)
+        && theirs < ours
+    {
+        if let Ok(mut guard) = runtime.lock() {
+            guard.failover.stale_term_frames_total =
+                guard.failover.stale_term_frames_total.saturating_add(1);
+        }
+        return Err(format!(
+            "replication frame from a deposed leader (term {theirs}, this follower knows term {ours}); refused"
+        ));
+    }
+    if let Ok(mut guard) = runtime.lock() {
+        guard.replication_follower.leader_long_polls = delta_frame.term.is_some();
+        if delta_frame.wal_lines.is_empty() {
+            guard.replication_follower.last_frame_records = 0;
+        }
+    }
     if let Some(from) = delta_frame.switch_from {
         // The leader checkpointed exactly at our position: continue in the
         // new generation from offset 0. Only accepted for our own position.
@@ -1464,7 +1620,16 @@ fn acknowledge_replication_commits(
         let Some(url) = config.ack_url(commit_id) else {
             continue;
         };
-        let response = request_replication_ack(&url, config.token.as_deref())?;
+        let response = match config.delta_io_timeout {
+            Some(timeout) => request_replication_source_with_io_timeout_method(
+                &url,
+                config.token.as_deref(),
+                "POST",
+                ACK_MAX_RESPONSE_BYTES,
+                Some(timeout),
+            )?,
+            None => request_replication_ack(&url, config.token.as_deref())?,
+        };
         // 404: the leader no longer tracks this commit (evicted by its
         // retention policy or restarted). The data is already applied, so a
         // forgotten commit must not fail the pull.

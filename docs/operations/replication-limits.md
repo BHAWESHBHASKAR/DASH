@@ -241,6 +241,48 @@ without a cursor means "resync"), and a generation switch compacts the
 local WAL before it moves the cursor to offset 0 (a crash in between leaves
 an offset that no longer matches the WAL).
 
+## Leader failover and synchronous replication
+
+With automatic failover ([failover.md](failover.md), ADR 0006) the leader can
+change, and every follower must notice it without mixing the two histories:
+
+* **Terms on the wire.** A failover follower adds `term=<T>` to every poll;
+  the leader answers with a `term=` line after `switch_from=` (only to
+  followers that sent `term=` and `gen_switch=1`, so older followers get the
+  old layout). A follower refuses a frame from an older term
+  (`replication frame from a deposed leader`,
+  `dash_ingest_failover_stale_term_frames_total`), and a leader that receives
+  a newer term answers `409 stale_leader_term` and stops accepting writes.
+* **The fencing checkpoint.** A promoted follower names its WAL after the old
+  leader's generation (`FileWal::adopt_generation`, its WAL holds exactly the
+  first `n` lines of it) and checkpoints at once. The recorded transition
+  `(old generation, n, new generation)` lets the old leader's other followers
+  continue exactly as across any checkpoint: behind `n`, they finish the closed
+  generation from its retained file; at `n`, they switch; ahead of `n` (they
+  hold records the new leader never received), they no longer match and get a
+  full resync, which discards those records.
+* **Deposed leaders** have no follower cursor: they copy their WAL to
+  `<wal>.deposed-t<term>-<unix ms>` and resync from the new leader.
+* **Long polls.** Followers send `wait_ms` (at most 1000); a leader that has
+  nothing new holds the poll until a write commits or the wait ends. A
+  follower polls again at once while frames carry records. Followers' WAL
+  polls and commit acks are served by a reserved worker lane (the health
+  lane, enlarged by four workers), so they never queue behind writes that
+  hold every general worker while they wait for confirmations.
+* **Per-read timeouts.** A failover follower's WAL polls and acks use a
+  per-read timeout of `wait_ms + 2 s` and no overall deadline: a dead, paused
+  or partitioned leader is given up on within that, and the next poll goes to
+  the leader the control plane names, while a large frame that keeps arriving
+  is never cut off. (The shared replication client otherwise applies an
+  overall request deadline, which in the HTTP client used takes precedence
+  over the per-read timeout.)
+* **Synchronous replication** (`DASH_INGEST_MIN_SYNC_REPLICAS`): a follower's
+  poll from offset `p` in generation `g` (with `replica_id` and `durable=1`)
+  proves it fsynced its WAL and cursor up to `p`. The leader answers a write
+  once enough followers of the current term proved a position at or after the
+  write (a follower in a later generation of the leader's checkpoint chain
+  counts as past it).
+
 ## What `/ready` reports about a failure
 
 `/ready` embeds the follower state as one JSON object under `replication`.

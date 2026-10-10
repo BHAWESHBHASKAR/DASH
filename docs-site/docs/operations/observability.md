@@ -113,7 +113,7 @@ The control plane is scraped with its own token by default. With `networkPolicy.
 
 Everything lives in `deploy/observability/`:
 
-* `prometheus/dash-alerts.rules.yml`: 21 alerts (availability, latency, error-budget burn, WAL, disk, checkpoints, replication, audit, embedding breaker, load shedding, file descriptors). Each has `annotations.runbook_url` pointing at its runbook in [`docs/operations/runbooks/`](https://github.com/bhaweshbhaskar/dash/tree/main/docs/operations/runbooks).
+* `prometheus/dash-alerts.rules.yml`: 25 alerts (availability, latency, error-budget burn, WAL, disk, checkpoints, replication, leader failover, audit, embedding breaker, load shedding, file descriptors). Each has `annotations.runbook_url` pointing at its runbook in [`docs/operations/runbooks/`](https://github.com/bhaweshbhaskar/dash/tree/main/docs/operations/runbooks).
 * `prometheus/dash-recording.rules.yml`: request rates, latency quantiles and the SLIs of [`docs/operations/slos.md`](https://github.com/bhaweshbhaskar/dash/blob/main/docs/operations/slos.md).
 * `prometheus/tests/`: `promtool test rules` unit tests; every alert has a firing and a quiet case.
 * `grafana/`: *DASH / Overview*, *DASH / Ingestion and WAL* and *DASH / Retrieval, embeddings and replication* (Grafana 10+, Prometheus data source chosen through the `datasource` variable).

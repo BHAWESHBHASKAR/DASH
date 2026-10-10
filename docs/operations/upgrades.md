@@ -158,6 +158,32 @@ features available during the window:
   threshold the first write after the upgrade checkpoints: expect one
   snapshot write (proportional to the data set) right after the upgrade.
 
+### Leader failover (ADR 0006)
+
+Failover is off until `DASH_CONTROL_PLANE_INGEST_FAILOVER=1` and
+`DASH_INGEST_FAILOVER_CONTROL_PLANE_URL` are set, so upgrading changes
+nothing by itself. The wire additions are opt-in and backwards compatible:
+
+* **Current follower, earlier leader.** The follower adds `term=`,
+  `replica_id=`, `durable=1` and `wait_ms=` to its polls; an earlier leader
+  ignores them and answers without a `term=` line, and the follower then
+  polls at its normal interval instead of long-polling. Synchronous
+  replication and failover need every ingestion node on the current build.
+* **Earlier follower, current leader.** It sends none of them and gets the
+  frame layout it parses. It is not counted for synchronous replication.
+* **Clients.** A non-leader answers writes `503` (as a placement-routed
+  non-leader already did) with `Retry-After` and the leader hint headers;
+  clients that retry 503 keep working unchanged.
+
+Enabling failover on a running deployment: upgrade every node, start the
+control plane with failover on, then restart the current writer with
+`DASH_INGEST_FAILOVER_CONTROL_PLANE_URL` (and without a replication source)
+and the followers with it (they may keep their source URL). The writer has
+the most data and is elected first, about one lease after the control plane
+started; until then writes are refused with `503 not_leader`. Rolling back:
+see "Turning failover off" in [failover.md](failover.md#runbook); the
+`<wal>.failover` and `<state>.ingest-failover` files can be deleted.
+
 ### Control plane replicas
 
 0.2 cannot read the lease file 0.3 writes, and 0.2 does not take the

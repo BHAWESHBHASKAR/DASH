@@ -30,6 +30,33 @@ pub(super) fn handle_get_request(
         // check that the SharedRuntime mutex is reachable and that
         // disk persistence is healthy when a persistence path was
         // configured.
+        // Ready AND the node that accepts writes right now: the probe of a
+        // leader-only Service (Kubernetes) or load balancer health check.
+        "/ready/leader" | "/v1/ready/leader" => {
+            let ready = handle_get_request(runtime, request, "/ready", query, auth_policy);
+            if ready.status != 200 {
+                return ready;
+            }
+            let Ok(rt) = runtime.lock() else {
+                return HttpResponse::internal_server_error("runtime_unavailable");
+            };
+            if rt.failover.enabled {
+                if let Err(not_leader) = rt.failover.check_write(Instant::now()) {
+                    let mut response = not_leader.response();
+                    response.body = format!(
+                        "{{\"status\":\"not_leader\",\"reason\":\"{}\",\"failover\":{}}}",
+                        not_leader.reason,
+                        rt.failover.ready_json(Instant::now())
+                    );
+                    return response;
+                }
+            } else if rt.replication_follower.enabled {
+                let mut response = HttpResponse::service_unavailable("not_leader");
+                response.body = "{\"status\":\"not_leader\",\"reason\":\"follower\"}".to_string();
+                return response;
+            }
+            ready
+        }
         "/ready" | "/v1/ready" => match runtime.lock() {
             Ok(mut rt) => {
                 // After a failed fsync the WAL refuses writes until a restart
@@ -41,6 +68,7 @@ pub(super) fn handle_get_request(
                         content_type: "application/json",
                         body: "{\"status\":\"not_ready\",\"reason\":\"wal_poisoned\"}".to_string(),
                         retry_after_secs: None,
+                        headers: Vec::new(),
                     };
                 }
                 // Writes are failing (full or broken WAL volume): leave the
@@ -51,6 +79,7 @@ pub(super) fn handle_get_request(
                         content_type: "application/json",
                         body: format!("{{\"status\":\"not_ready\",\"reason\":\"{reason}\"}}"),
                         retry_after_secs: None,
+                        headers: Vec::new(),
                     };
                 }
                 // A follower that is lagging, stale or never synced serves
@@ -65,11 +94,19 @@ pub(super) fn handle_get_request(
                                 .unwrap_or_else(|| "null".to_string())
                         ),
                         retry_after_secs: None,
+                        headers: Vec::new(),
                     };
                 }
+                let failover_json = if rt.failover.enabled {
+                    format!(",\"failover\":{}", rt.failover.ready_json(Instant::now()))
+                } else {
+                    String::new()
+                };
                 let ready_body = match rt.replication_ready_json() {
-                    Some(json) => format!("{{\"status\":\"ready\",\"replication\":{json}}}"),
-                    None => "{\"status\":\"ready\"}".to_string(),
+                    Some(json) => {
+                        format!("{{\"status\":\"ready\",\"replication\":{json}{failover_json}}}")
+                    }
+                    None => format!("{{\"status\":\"ready\"{failover_json}}}"),
                 };
                 match rt.disk_status() {
                     DiskStatus::Available | DiskStatus::Recovering => {
@@ -84,6 +121,7 @@ pub(super) fn handle_get_request(
                                 body: "{\"status\":\"not_ready\",\"reason\":\"disk_unavailable\"}"
                                     .to_string(),
                                 retry_after_secs: None,
+                                headers: Vec::new(),
                             }
                         } else {
                             HttpResponse::ok_json(ready_body)
@@ -110,6 +148,8 @@ pub(super) fn handle_get_request(
                     text.push_str(&rt.replication_follower_metrics_text());
                     text.push_str(&rt.replication_leader_metrics_text());
                     text.push_str(&rt.replication_commit_status_metrics_text());
+                    text.push_str(&rt.failover.metrics_text(Instant::now()));
+                    text.push_str(&rt.sync_replication_metrics_text());
                     text
                 }
                 Err(_) => "dash_ingest_metrics_unavailable 1\n".to_string(),
@@ -232,24 +272,96 @@ fn handle_replication_wal_get(
     // Followers that understand generation switches say so; the frame then
     // carries a `switch_from=` line (older followers get the old layout).
     let allow_switch = query.get("gen_switch").is_some_and(|v| v == "1");
-    match runtime.lock() {
-        Ok(mut rt) => {
-            match rt.replication_delta_for_followers(
-                from_generation,
-                from_offset,
-                max_records,
-                allow_switch,
-            ) {
-                Ok(delta) => {
-                    HttpResponse::ok_plain(render_replication_delta_frame(&delta, allow_switch))
-                }
-                Err(err) => {
-                    let (status, message) = map_store_error(&err);
-                    HttpResponse::error_with_status(status, &message)
-                }
-            }
+    // Failover-aware followers send the term they know (and get ours back),
+    // their replica id when their position proves what they hold, and how
+    // long a caught-up poll may be held open.
+    let follower_term = match query.get("term").map(|v| v.parse::<u64>()) {
+        None => None,
+        Some(Ok(term)) => Some(term),
+        Some(Err(_)) => {
+            return HttpResponse::bad_request("query parameter 'term' must be a valid u64");
         }
-        Err(_) => HttpResponse::internal_server_error("failed to acquire ingestion runtime lock"),
+    };
+    let durable_replica = query
+        .get("replica_id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .filter(|_| query.get("durable").is_some_and(|v| v == "1"))
+        .map(str::to_string);
+    let wait = match parse_query_usize(query, "wait_ms") {
+        Ok(value) => std::time::Duration::from_millis(
+            (value.unwrap_or(0) as u64).min(failover::MAX_LONG_POLL_MS),
+        ),
+        Err(err) => return HttpResponse::bad_request(&err),
+    };
+    let progress = match runtime.lock() {
+        Ok(rt) => Arc::clone(&rt.replica_progress),
+        Err(_) => {
+            return HttpResponse::internal_server_error("failed to acquire ingestion runtime lock");
+        }
+    };
+    let mut waited = false;
+    loop {
+        // Read before the frame: a write that lands in between wakes the
+        // wait below at once instead of being missed.
+        let seen = progress.wal_seq();
+        let mut rt = match runtime.lock() {
+            Ok(rt) => rt,
+            Err(_) => {
+                return HttpResponse::internal_server_error(
+                    "failed to acquire ingestion runtime lock",
+                );
+            }
+        };
+        let our_term = rt.failover.enabled.then_some(rt.failover.term);
+        if let Some(term) = follower_term
+            && rt.failover.observe_newer_term(term)
+        {
+            return HttpResponse::error_with_status(
+                409,
+                &format!(
+                    "stale_leader_term: this node's term {} is older than the follower's term {term}",
+                    rt.failover.term
+                ),
+            );
+        }
+        if let (Some(replica_id), Some(generation)) = (durable_replica.as_deref(), from_generation)
+        {
+            progress.record(
+                replica_id,
+                generation,
+                from_offset,
+                follower_term.unwrap_or(0),
+            );
+        }
+        let delta = match rt.replication_delta_for_followers(
+            from_generation,
+            from_offset,
+            max_records,
+            allow_switch,
+        ) {
+            Ok(delta) => delta,
+            Err(err) => {
+                let (status, message) = map_store_error(&err);
+                return HttpResponse::error_with_status(status, &message);
+            }
+        };
+        drop(rt);
+        let caught_up = delta.wal_lines.is_empty()
+            && !delta.needs_resync
+            && delta.switched_from.is_none()
+            && from_generation == Some(delta.generation);
+        if caught_up && !waited && !wait.is_zero() {
+            waited = true;
+            progress.wait_wal_advanced(seen, wait);
+            continue;
+        }
+        let term = follower_term.map(|_| our_term.unwrap_or(0));
+        return HttpResponse::ok_plain(render_replication_delta_frame_with_term(
+            &delta,
+            allow_switch,
+            term,
+        ));
     }
 }
 

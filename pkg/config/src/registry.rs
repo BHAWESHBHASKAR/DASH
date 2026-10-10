@@ -34,6 +34,7 @@ pub const T_EMBEDDING: &str = "Embedding providers";
 pub const T_EXTRACTION: &str = "Extraction and parsing";
 pub const T_SERVER: &str = "HTTP server";
 pub const T_LEASE: &str = "State and leader lease";
+pub const T_FAILOVER: &str = "Leader failover and synchronous replication";
 pub const T_ENCRYPTION: &str = "Encryption at rest";
 pub const T_CONTAINER: &str = "Container and compose variables";
 pub const T_BENCH: &str = "Benchmarks";
@@ -76,6 +77,9 @@ const SEG_TIER: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENTS_PER_TIER")
 const SEG_COMPACT: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS")];
 const OLLAMA_ALIAS: &[Alias] = &[Alias::deprecated("DASH_OLLAMA_BASE_URL")];
 
+const SYNC_TIMEOUT_POLICY: Kind = Kind::Enum {
+    values: &["fail", "degrade"],
+};
 const READ_PREFERENCE: Kind = Kind::Enum {
     values: &["any_healthy", "leader_only", "prefer_follower"],
 };
@@ -1272,6 +1276,55 @@ pub static REGISTRY: &[Entry] = &[
     )
     .readers(INGEST)
     .eme(),
+    // ---- leader failover and synchronous replication (ADR 0006)
+    Entry::new(
+        "DASH_INGEST_FAILOVER_CONTROL_PLANE_URL",
+        Ingestion,
+        T_FAILOVER,
+        Kind::Url,
+        "unset (off)",
+        "Base URL of the control plane that coordinates automatic failover of the ingestion leader. When set, this node heartbeats it, accepts writes only while the control plane names it leader (and its lease is valid), and otherwise follows the leader it names. Requires `DASH_NODE_ID` (unique per node), `DASH_INGEST_FAILOVER_ADVERTISE_URL` and the control-plane token (`DASH_ROUTER_CONTROL_PLANE_TOKEN` or `DASH_CONTROL_PLANE_TOKEN`). See docs/operations/failover.md.",
+    ),
+    Entry::new(
+        "DASH_INGEST_FAILOVER_ADVERTISE_URL",
+        Ingestion,
+        T_FAILOVER,
+        Kind::Url,
+        "unset (required with failover)",
+        "Base URL (`http://host:port` or `https://...`) at which the other nodes reach this ingestion node; followers pull from it when it is leader and clients get it in `X-Dash-Leader-Url`.",
+    ),
+    Entry::new(
+        "DASH_INGEST_FAILOVER_HEARTBEAT_INTERVAL_MS",
+        Ingestion,
+        T_FAILOVER,
+        Kind::POSITIVE_MILLIS,
+        "1000",
+        "Interval between heartbeats to the control plane. Keep it well below `DASH_CONTROL_PLANE_INGEST_LEASE_MS` (a fifth or less): the leader's lease is renewed only by a successful heartbeat.",
+    ),
+    Entry::new(
+        "DASH_INGEST_MIN_SYNC_REPLICAS",
+        Ingestion,
+        T_FAILOVER,
+        Kind::UINT,
+        "0 (asynchronous)",
+        "Synchronous replication: a write is answered only after at least this many ingestion followers (of the current term) have durably applied it. With 1 and at least one follower an acknowledged write survives the loss of any single node. 0 answers as soon as the leader's WAL holds the write.",
+    ),
+    Entry::new(
+        "DASH_INGEST_SYNC_REPLICATION_TIMEOUT_MS",
+        Ingestion,
+        T_FAILOVER,
+        Kind::POSITIVE_MILLIS,
+        "5000",
+        "How long a synchronous write waits for its follower confirmations before `DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT` applies.",
+    ),
+    Entry::new(
+        "DASH_INGEST_SYNC_REPLICATION_ON_TIMEOUT",
+        Ingestion,
+        T_FAILOVER,
+        SYNC_TIMEOUT_POLICY,
+        "fail",
+        "`fail`: answer 503 `sync_replication_timeout` (the write is on the leader and may still replicate; clients retry, writes are idempotent). `degrade`: answer 200 with `commit_status: sync_degraded` and `X-Dash-Sync-Replication: degraded`, waiving the guarantee for that write.",
+    ),
     Entry::new(
         "DASH_INGEST_REPLICATION_COMMIT_STATUS_MAX",
         Ingestion,
@@ -1969,6 +2022,38 @@ pub static REGISTRY: &[Entry] = &[
         "Clock-skew margin: a leader stops reporting leadership this long before the lease expires, and other nodes wait this long after expiry before taking over (capped at half the lease duration).",
     )
     .eme(),
+    Entry::new(
+        "DASH_CONTROL_PLANE_INGEST_FAILOVER",
+        ControlPlane,
+        T_FAILOVER,
+        Kind::Bool(Honors::OneTrueYes),
+        "off",
+        "Coordinate automatic failover of the ingestion leader: serve `POST /v1/control-plane/ingest/heartbeat`, `GET /v1/control-plane/ingest` and `POST /v1/control-plane/ingest/step-down`, and promote the most up-to-date follower when the leader's lease lapses.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_INGEST_LEASE_MS",
+        ControlPlane,
+        T_FAILOVER,
+        Kind::POSITIVE_MILLIS,
+        "5000",
+        "Lease of the ingestion leader. The leader stops accepting writes this long after the heartbeat that last renewed it was sent; failover starts this long plus the promotion grace after the control plane processed it. A control-plane outage longer than this pauses writes.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_INGEST_PROMOTION_GRACE_MS",
+        ControlPlane,
+        T_FAILOVER,
+        Kind::POSITIVE_MILLIS,
+        "1000",
+        "Extra wait after the leader's lease before a promotion. Covers clock-rate drift between the leader and the control plane and the time between a write's lease check and its WAL append.",
+    ),
+    Entry::new(
+        "DASH_CONTROL_PLANE_INGEST_STATE_PATH",
+        ControlPlane,
+        T_FAILOVER,
+        Kind::Path,
+        "`<DASH_CONTROL_PLANE_STATE_PATH>.ingest-failover`",
+        "Durable record of the ingestion term, leader and WAL lineage (written before any node learns a new term). Put it on the volume the control-plane replicas share. Without it and without `DASH_CONTROL_PLANE_STATE_PATH` the term is kept in memory only.",
+    ),
     // =====================================================================
     // Tools
     // =====================================================================

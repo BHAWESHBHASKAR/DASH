@@ -5,7 +5,7 @@ Helm chart for the DASH evidence-first vector store. It deploys three
 
 | Workload | Replicas | Role |
 |----------|----------|------|
-| `ingestion` | 1 (fixed) | Single writer: owns the WAL and redb store, serves `/v1/ingest*` and the replication endpoint. |
+| `ingestion` | 1 (fixed), or `failover.replicas` with `failover.enabled` | Single writer: owns the WAL and redb store, serves `/v1/ingest*` and the replication endpoint. With failover, the control plane names one pod leader; the others follow it and take over automatically (see "Leader failover"). |
 | `retrieval` | `replicas.retrieval` (default 2) | Serves `/v1/retrieve` and `/v1/embeddings`. Every replica has its own PVC and follows the single ingestion pod over WAL replication. |
 | `control-plane` | 1 (fixed, optional) | Shard placement metadata and file-backed leader lease. |
 
@@ -68,6 +68,23 @@ Set `controlPlane.enabled=false` to skip the control plane and its token.
 | Helm          | >= 3.10 | chart features |
 | cert-manager  | >= 1.13 | TLS for the ingress (optional) |
 | nginx-ingress | >= 1.9  | annotations target ingress-nginx |
+
+## Leader failover
+
+`--set failover.enabled=true` runs `failover.replicas` ingestion pods. The
+control plane names one leader (with a fenced, time-bounded lease) and
+promotes the most up-to-date follower when the leader is lost; with
+`failover.minSyncReplicas=1` (the default) no acknowledged write is lost when
+any single node is. Ingestion pods use `GET /v1/ready/leader` as readiness, so
+the ingestion Service, the ingress `/v1/ingest*` routes and the retrieval
+followers always reach the current leader; follower pods are not ready by
+design. A headless `<fullname>-ingestion-peers` Service gives every pod a
+stable name for replication between ingestion pods. The StatefulSet uses
+`updateStrategy: OnDelete`: roll followers first by deleting them one at a
+time, then step the leader down (`POST /v1/control-plane/ingest/step-down`)
+and delete it. Enabling failover on an existing release changes the
+StatefulSet's `serviceName`: delete the StatefulSet with `--cascade=orphan`
+first. Details and guarantees: `docs/operations/failover.md`.
 
 ## Data path
 
@@ -157,7 +174,12 @@ container creates the data directories on a fresh PVC.
 | `ingress.*` | nginx, `dash.example.com` | `/v1/ingest` to ingestion, `/v1` and `/health` to retrieval |
 | `networkPolicy.enabled` | `true` | Default deny plus allow rules |
 | `networkPolicy.ollama.enabled` | `false` | Egress to in-cluster Ollama on private CIDRs (port 11434) |
-| `pdb.enabled` | `true` | PodDisruptionBudget for retrieval only |
+| `pdb.enabled` | `true` | PodDisruptionBudget for retrieval (and for ingestion with failover: followers evictable, leader not) |
+| `failover.enabled` | `false` | Automatic failover of the ingestion leader (needs `controlPlane.enabled`) |
+| `failover.replicas` | `3` | Ingestion pods with failover |
+| `failover.leaseMs` / `failover.promotionGraceMs` / `failover.heartbeatIntervalMs` | `5000` / `1000` / `1000` | Leader lease, promotion grace, heartbeat interval |
+| `failover.minSyncReplicas` | `1` | Synchronous replication (0: asynchronous) |
+| `failover.syncTimeoutMs` / `failover.syncOnTimeout` | `5000` / `fail` | Synchronous replication timeout and policy (`fail` or `degrade`) |
 | `secret.*` | none | See "Secrets are required" |
 | `metrics.public` | `false` | `DASH_METRICS_PUBLIC`: `/metrics` without credentials |
 | `metrics.serviceMonitor.enabled` | `false` | One Prometheus Operator ServiceMonitor per component |

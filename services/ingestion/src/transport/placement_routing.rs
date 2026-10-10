@@ -97,6 +97,9 @@ pub(super) enum WriteRouteError {
         age_ms: u64,
         grace_ms: u64,
     },
+    /// Leader failover is enabled and this node is not the leader (or its
+    /// lease lapsed); see `failover.rs`.
+    NotLeader(super::failover::NotLeader),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +303,13 @@ impl PlacementRoutingState {
         }
     }
 
+    /// Reload on the next opportunity instead of waiting for the interval.
+    pub(super) fn request_reload(&mut self) {
+        if let Some(reload) = self.reload.as_mut() {
+            reload.next_reload_at = Instant::now();
+        }
+    }
+
     /// Writes are refused once reloads have been failing for longer than the
     /// stale grace: a node that cannot reach the placement source can no
     /// longer prove it is still the leader (REP-08).
@@ -461,6 +471,7 @@ pub(super) fn map_write_route_error(error: &WriteRouteError) -> (u16, String) {
                 total_replicas
             ),
         ),
+        WriteRouteError::NotLeader(not_leader) => (503, not_leader.message()),
         WriteRouteError::PlacementStale { age_ms, grace_ms } => (
             503,
             format!(
