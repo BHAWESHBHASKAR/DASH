@@ -123,9 +123,12 @@ spec:
             cpu: 1000m
             memory: 512Mi
             ephemeral-storage: 512Mi
+        # Startup gates only "the process is up" (/v1/live). /v1/ready also
+        # requires a reachable, caught-up replication leader on retrieval, so
+        # using it here restarted followers in a loop while ingestion was down.
         startupProbe:
           httpGet:
-            path: /v1/ready
+            path: /v1/live
             port: http
           initialDelaySeconds: 5
           periodSeconds: 5

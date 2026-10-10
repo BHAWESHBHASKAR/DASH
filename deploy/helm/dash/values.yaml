@@ -226,8 +226,11 @@ nodeSelector: {}
 tolerations: []
 
 # -----------------------------------------------------------------------------
-# Probes (HTTP). Liveness is /v1/live (process only); readiness and startup
-# use /v1/ready (also checks disk persistence). The control plane uses
+# Probes (HTTP). Liveness and startup use /v1/live (process only); readiness
+# uses /v1/ready (also checks disk persistence and, on retrieval, that the
+# replication leader is reachable and the follower caught up). Startup must
+# not use /v1/ready: a follower started while ingestion is down would be
+# restarted in a loop instead of waiting. The control plane uses
 # /v1/control-plane/health and /v1/control-plane/ready.
 # -----------------------------------------------------------------------------
 probes:
@@ -243,7 +246,7 @@ probes:
     timeoutSeconds: 3
     failureThreshold: 3
   startup:
-    path: /v1/ready
+    path: /v1/live
     initialDelaySeconds: 5
     periodSeconds: 5
     timeoutSeconds: 3
