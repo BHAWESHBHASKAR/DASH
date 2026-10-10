@@ -1,22 +1,138 @@
 # Replication limits and failure modes
 
 This page lists the hard limits of WAL replication (ingestion leader to
-ingestion or retrieval followers) and how each one shows up. All of them are
-reported loudly: the follower's `/ready` answers 503 with a `reason`, and a
-metric flips to 1.
+ingestion or retrieval followers), how a follower crosses a checkpoint and
+rebuilds its state, and how each failure shows up. Failures are reported
+loudly: the follower's `/ready` answers 503 with a `reason`, and a metric
+flips to 1.
+
+## Checkpoints: switching generations instead of resyncing
+
+A checkpoint writes the leader's state to `<wal>.snapshot`, starts a new,
+empty WAL and a new WAL generation. Offsets of the old generation mean
+nothing in the new one, so before this release every checkpoint sent every
+follower through a full resync. Now:
+
+* The leader records each checkpoint as a transition `(closed generation,
+  replication view length at the checkpoint, new generation)` in
+  `<wal>.gen.transitions` (the newest 16), and keeps the closed generation's
+  WAL file as `<wal>.closed.<generation>` until the next checkpoint.
+* A follower inside the closed generation (offset below its end) keeps
+  receiving frames of that generation, read from the closed file. A
+  checkpoint runs right after the write that triggered it, under the same
+  lock, so a live follower is practically always a few records behind when
+  it happens: this is the common case.
+* A follower at the exact end of the closed generation receives a frame
+  that starts at offset 0 of the current generation and names the position
+  it switches from (`switch_from=<generation>:<offset>`). The follower
+  compacts its own WAL the same way (a snapshot of its state, an empty WAL)
+  and continues; `generation_switches_total` in `/ready` and
+  `dash_*_replication_generation_switches_total` count these.
+* Transitions are followed in a chain, so several checkpoints in a row with
+  nothing written between them are crossed at once.
+* Everything else resyncs, as before: a follower in an older generation than
+  the retained one (it missed a whole generation), a follower ahead of the
+  closed generation's end, a generation that a rollback, reset or resync
+  replaced (no transition leads to it), a leader that lost its transitions
+  file, and followers that do not send `gen_switch=1` (earlier builds).
+
+**Why the switch is safe.** The snapshot a checkpoint writes is the leader's
+in-memory state at that moment, and that state is exactly the result of
+applying the replication view of the closed generation, in order, on top of
+the generation's starting snapshot (the WAL is the source of truth: a write
+is validated before it is appended and applied after; replay and followers
+apply the same lines with the same lenient rules; a commit group is never
+open at a checkpoint because groups are appended in one unit under the WAL
+lock). A follower that applied every line of the closed generation up to
+its end (`offset == from_records`, generation equal) therefore holds the new
+snapshot's state; the new generation starts with an empty WAL, so offset 0
+of it is the next record. No record is skipped (the follower is at the end
+of the old view and at the start of the new one) and none is applied twice
+(the new WAL holds only records written after the checkpoint). The leader
+checks the follower's position against the recorded transition and the
+follower checks the leader's `switch_from` against its own cursor; both
+must match exactly. The transition is recorded only after the new WAL is
+durable (snapshot fsynced and renamed, generation file written, old WAL
+renamed to the closed file, new WAL fsynced): a crash anywhere before that
+leaves no transition, and the follower resyncs. A crash during the
+follower's own compaction leaves a local WAL whose length no longer matches
+the saved offset, which the follower detects at startup and answers with a
+resync. Tests: `pkg/store/src/wal/replication_tests.rs` (exact end, behind,
+ahead, chained checkpoints, rollback, damaged transitions file, crash
+points), `pkg/store/src/failpoint.rs` (crash at every checkpoint step), and
+the follower tests in `services/*/tests` and `tests/e2e/tests/s12_chunked_resync.rs`.
+
+Cost: the closed file is one extra WAL's worth of disk on the leader (and
+on an ingestion follower, which may itself be followed). Retrieval followers
+delete theirs right away.
+
+## Full resync: chunked export
+
+A follower that must rebuild (fresh follower of a leader that has
+checkpointed, missed generation, stale cursor) downloads the leader's export
+in chunks:
+
+1. `GET /internal/replication/export/begin` freezes the leader's state under
+   the WAL lock (opens the snapshot, copies the WAL's replication lines) and
+   writes `<wal>.exports/<id>.export` from the frozen inputs without the
+   lock, streaming. The answer is a manifest: export id, generation, record
+   counts, size and SHA-256. A leader whose generation and WAL are unchanged
+   hands out the export it already has.
+2. `GET /internal/replication/export/chunk?export_id=&offset=&max_bytes=`
+   returns up to `max_bytes` of the file, cut back to the last complete
+   line, read straight from the file (no lock, no copy of the export in
+   memory). The leader serves at most 32 MiB per chunk.
+3. The follower appends each chunk to `<wal>.resync.part` (fsync per chunk;
+   the manifest is kept next to it as `<wal>.resync.manifest`), verifies the
+   SHA-256 of the complete file, removes its cursor, replaces its snapshot
+   and WAL from the file (streaming), swaps in a store built from it, writes
+   the cursor `(generation, wal_records)` from the manifest and deletes the
+   download. It then continues with delta frames, generation switches
+   included (an export frozen just before a checkpoint is crossed without a
+   second resync).
+
+Interruptions: a network error or a restart resumes the download from the
+part file's length with the same export id. An export the leader no longer
+has (404: pruned or leader restarted with other data) restarts the download
+with a new export. A checksum mismatch discards the download and asks for a
+different export (`begin?avoid=<id>`); after four failed attempts the error
+is reported. A crash between removing the cursor and writing the new one
+restarts into a resync that applies the already verified download again,
+without downloading it.
+
+Memory: the leader holds one chunk per request; the follower holds one
+chunk plus the store it builds (the store is in memory by design; the
+export text is not). Disk: the leader keeps the newest 2 exports, deletes
+older ones and any export not read for 15 minutes (checked every minute);
+`dash_ingest_replication_exports_retained_bytes` shows the space used. Each
+export is about the size of `<wal>.snapshot` plus `<wal>`. The follower
+needs room for one export next to its WAL.
+
+Chunk size: `DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES` /
+`DASH_RETRIEVAL_REPLICATION_EXPORT_CHUNK_BYTES` (default 4 MiB), capped so a
+chunk and its header fit in the follower's response limit. Leaders without
+chunked export (earlier 0.3 builds) answer `begin` with 404; the follower
+then falls back to the single-response `/internal/replication/export`, which
+is still served for them.
+
+Metrics: `dash_*_replication_export_bytes_total` (follower, downloaded),
+`dash_ingest_replication_exports_built_total`, `_exports_reused_total`,
+`_export_chunks_served_total`, `_export_bytes_served_total`,
+`_exports_retained`, `_exports_retained_bytes` (leader).
 
 ## Response size
 
-A full resync (`/internal/replication/export`) is a single HTTP response that
-carries the snapshot and the whole WAL. The follower rejects any response
-larger than its `max_response_bytes` (default 64 MiB):
+The follower rejects any response larger than its `max_response_bytes`
+(default 64 MiB):
 
 * ingestion follower: `DASH_INGEST_REPLICATION_MAX_RESPONSE_BYTES`
 * retrieval follower: `DASH_RETRIEVAL_REPLICATION_MAX_RESPONSE_BYTES`
 
-If the export (or a single delta frame) is larger than the limit, the
-follower can never finish a resync. It keeps retrying with backoff and
-reports:
+This bounds a delta frame and one export chunk, not the data set: the
+export is downloaded in chunks below the limit, so any data set can be
+replicated. A delta frame larger than the limit (a frame of
+`max_records` very large records, or a single line longer than the limit)
+cannot be applied; the follower keeps retrying with backoff and reports:
 
 * `/ready`: status 503, `"reason":"replication_response_too_large"`, and the
   same value in `replication.blocked_reason`;
@@ -24,13 +140,28 @@ reports:
   follower) or `dash_retrieval_replication_blocked_response_too_large 1`
   (retrieval follower).
 
-The condition clears on the next successful pull. Remedy: raise the
-follower's `MAX_RESPONSE_BYTES` above the leader's export size (the size of
-`<wal>.snapshot` plus `<wal>`; a checkpoint on the leader does not shrink
-the export, it moves records from the WAL into the snapshot). There is no
-chunked export: the export is not paginated, so the limit is a hard ceiling
-on the dataset size a follower can bootstrap from. Followers also hold the
-whole export in memory while applying it.
+The condition clears on the next successful pull. Remedy: lower the
+follower's `MAX_RECORDS` or raise `MAX_RESPONSE_BYTES`. Against a leader
+without chunked export the single-response export is still bounded by the
+limit, as before.
+
+## Applying frames
+
+A follower applies a frame in place: the frame is mirrored to its WAL with
+one write and one fsync, then applied to the live store whole commit groups
+at a time (readers never see part of a group; the retrieval follower holds
+its write lock for at most about 64 records), with the redb writes of the
+whole frame in one transaction. Before, every frame was staged on a full
+copy of the store (time and memory proportional to the data set, per
+frame), every record was fsynced on its own in the follower WAL, and every
+redb write was its own durable transaction: under an update-heavy soak the
+retrieval follower trailed the leader by about half of the leader's WAL
+(see `docs/operations/testing-durability.md` for the measurements). Every
+line is parsed before anything is written, so a frame with an unreadable
+record changes nothing. A record that parses but cannot be applied means
+the follower diverged from the leader: the WAL append is rolled back and
+the follower rebuilds from a full resync (earlier it retried the same frame
+forever).
 
 ## Leader cost of a poll
 
@@ -39,9 +170,28 @@ since the previous poll plus the lines of the frame itself (and fewer than 64
 lines before it): the leader indexes each line once as it is appended and
 keeps one byte offset per 64 lines. A caught-up follower costs no file reads,
 and the leader's memory per poll is bounded by the frame size, not by the WAL
-length. A full export is different: the leader reads the snapshot and the
-whole WAL into memory to build it, and every checkpoint (a new WAL
-generation) sends each follower through one.
+length. Frames of the closed generation are read the same way from the
+closed file (its index is kept from before the checkpoint, or built once
+after a restart). An export is built once per leader state and served in
+chunks from its file.
+
+## Automatic checkpoints
+
+The ingestion service checkpoints once its WAL reaches 256 MiB unless
+`DASH_CHECKPOINT_MAX_WAL_BYTES` says otherwise (`0` turns the size threshold
+off; `DASH_CHECKPOINT_MAX_WAL_RECORDS` adds a record threshold, off by
+default). Earlier releases had no default because each checkpoint forced
+every follower through a full resync whose export had to fit in one
+response. Neither holds any more: followers that keep up cross a checkpoint
+with a generation switch, and a resync is chunked. What a checkpoint still
+costs is writing the snapshot (proportional to the data set, under the
+ingestion lock, so writes wait for it) and, on followers, the same local
+compaction. 256 MiB bounds the WAL on disk (plus one closed generation of the
+same size), the replay time at restart, and the replication index, while a
+data set well below that size is rewritten at most about once per 256 MiB of
+writes. Deployments with a data set much larger than 256 MiB should raise
+the threshold (a checkpoint rewrites the whole data set) or accept the
+write pauses; the deployment templates in `deploy/` set 50 MiB.
 
 ## Commit group size
 
@@ -84,7 +234,12 @@ A follower persists `(generation, offset)` next to its WAL
 (`<wal>.replication`). At startup it compares the saved offset with the
 number of records in its local WAL; if they differ (a restored or truncated
 WAL, or a stale state file) it discards the cursor and performs a full
-resync, instead of resuming and silently missing records.
+resync, instead of resuming and silently missing records. The same check
+catches the two crash windows this release adds: a resync removes the
+cursor before it replaces the local snapshot and WAL (a populated WAL
+without a cursor means "resync"), and a generation switch compacts the
+local WAL before it moves the cursor to offset 0 (a crash in between leaves
+an offset that no longer matches the WAL).
 
 ## What `/ready` reports about a failure
 
