@@ -1843,8 +1843,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("source should receive WAL pull request");
         assert!(
-            pull_request
-                .starts_with("GET /internal/replication/wal?from_offset=0&max_records=64 HTTP/1.1"),
+            pull_request.starts_with(
+                "GET /internal/replication/wal?from_offset=0&max_records=64&gen_switch=1 HTTP/1.1"
+            ),
             "unexpected pull request line: {pull_request}"
         );
         let ack_request = requests
@@ -1917,8 +1918,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("source should receive WAL pull request");
         assert!(
-            pull_request
-                .starts_with("GET /internal/replication/wal?from_offset=0&max_records=64 HTTP/1.1"),
+            pull_request.starts_with(
+                "GET /internal/replication/wal?from_offset=0&max_records=64&gen_switch=1 HTTP/1.1"
+            ),
             "unexpected pull request line: {pull_request}"
         );
         assert!(
@@ -2164,8 +2166,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("source should receive WAL pull request");
         assert!(
-            pull_request
-                .starts_with("GET /internal/replication/wal?from_offset=0&max_records=64 HTTP/1.1"),
+            pull_request.starts_with(
+                "GET /internal/replication/wal?from_offset=0&max_records=64&gen_switch=1 HTTP/1.1"
+            ),
             "unexpected pull request line: {pull_request}"
         );
         assert!(
