@@ -2,6 +2,12 @@
 
 All notable changes to `dash-java` are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `deleteClaim`, `deleteEvidence` and `deleteTenant` (`DELETE /v1/claims/{id}`, `/v1/evidence/{id}`, `/v1/tenants/{id}` on the ingestion service) and the `DeleteResponse` model. The generic `delete()` removed in 0.2.0 stays removed.
+
 ## [0.2.0]
 
 ### Fixed

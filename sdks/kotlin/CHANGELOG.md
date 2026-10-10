@@ -2,6 +2,12 @@
 
 All notable changes to `dash-kotlin` are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Suspend `deleteClaim`, `deleteEvidence` and `deleteTenant` wrappers over the Java client (`DELETE /v1/claims/{id}`, `/v1/evidence/{id}`, `/v1/tenants/{id}`).
+
 ## [0.2.0]
 
 ### Fixed

@@ -185,6 +185,18 @@ type DashError interface {
 also check the underlying network error (for example to test
 `net.Error.Timeout()`).
 
+## Deletes (0.3.0)
+
+```go
+c := dash.New("http://localhost:8080", dash.WithIngestionBaseURL("http://localhost:8081"))
+_, err := c.DeleteClaim(ctx, "tenant-a", "claim-1")   // claim, vector, evidence, edges
+_, err = c.DeleteEvidence(ctx, "tenant-a", "ev-1")    // every evidence row with this id
+res, err := c.DeleteTenant(ctx, "tenant-a")           // erase the tenant (admin role)
+fmt.Println(res.Deleted, res.ClaimsDeleted)
+```
+
+Without an ingestion URL the delete methods return `dash.ErrNoIngestionURL`. Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ## Why a Go SDK for DASH?
 
 DASH already speaks the OpenAI wire format, so most users can use

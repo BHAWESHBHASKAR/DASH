@@ -131,6 +131,20 @@ except DashAPIError as exc:
 Both clients support `with` / `async with` for safe connection-pool
 cleanup.
 
+## Deletes (0.3.0)
+
+```python
+from dash import Client
+
+client = Client(base_url="http://localhost:8080", ingestion_base_url="http://localhost:8081")
+client.delete_claim("tenant-a", "claim-1")      # claim, vector, evidence, edges
+client.delete_evidence("tenant-a", "ev-1")      # every evidence row with this id
+result = client.delete_tenant("tenant-a")       # erase the tenant (admin role)
+print(result.deleted, result.claims_deleted)
+```
+
+`AsyncClient` has the same methods as coroutines. Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ## Why a Python SDK for DASH?
 
 DASH already speaks the OpenAI wire format, so most users can use the
