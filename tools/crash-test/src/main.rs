@@ -263,7 +263,9 @@ fn verify_files(cfg: &Config, state: &Path) -> Result<(), String> {
             .envs(
                 cfg.envs
                     .iter()
-                    .filter(|(k, _)| k.starts_with("DASH_ENCRYPTION_"))
+                    .filter(|(k, _)| {
+                        k == "DASH_ENCRYPTION_KEY_FILE" || k == "DASH_ENCRYPTION_PREVIOUS_KEY_FILES"
+                    })
                     .cloned(),
             )
             .output()
