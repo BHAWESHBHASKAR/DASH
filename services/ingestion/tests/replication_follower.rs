@@ -913,3 +913,90 @@ fn deletes_replicate_to_an_ingestion_follower_wal_redb_and_segments() {
         .collect();
     assert_eq!(ids, vec!["x9"]);
 }
+
+/// Every write makes the leader checkpoint. A follower that is caught up
+/// before each write finishes the closed generation from the leader's
+/// retained file and switches to the new one: no resync, every record
+/// exactly once in its WAL.
+#[test]
+fn checkpoints_on_the_leader_are_crossed_without_a_resync() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(
+        &dir.path().join("leader.wal"),
+        None,
+        checkpoint_every_record(),
+        None,
+    );
+    let follower_wal = dir.path().join("follower.wal");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    let mut expected = Vec::new();
+    for i in 0..5u64 {
+        let id = format!("s{i}");
+        leader.ingest(&id);
+        expected.push(id);
+        let (generation, total) = leader.frame();
+        wait_until("follower switched", Duration::from_secs(10), || {
+            follower.metric("dash_ingest_replication_generation") == Some(generation)
+                && follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+                && follower.metric("dash_ingest_replication_generation_switches_total")
+                    == Some(i + 1)
+        });
+    }
+    assert_eq!(
+        follower.metric("dash_ingest_replication_resync_total"),
+        Some(0),
+        "no resync for checkpoints the follower was inside of"
+    );
+    follower.stop();
+    assert_eq!(claim_ids_in_wal(&follower_wal), expected);
+}
+
+/// A fresh follower of a leader with a snapshot downloads the export in
+/// chunks smaller than the data set.
+#[test]
+fn fresh_follower_resyncs_through_a_chunked_export() {
+    let _guard = serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let leader = Server::start(
+        &dir.path().join("leader.wal"),
+        None,
+        CheckpointPolicy {
+            max_wal_records: Some(30),
+            max_wal_bytes: None,
+        },
+        None,
+    );
+    let mut expected = Vec::new();
+    for i in 0..20 {
+        let id = format!("x{i:02}");
+        leader.ingest(&id);
+        expected.push(id);
+    }
+    let follower_wal = dir.path().join("follower.wal");
+    set_env("DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES", "1024");
+    let mut follower = Server::start_follower(&leader.addr, &follower_wal, None, no_checkpoint());
+    unset_env("DASH_INGEST_REPLICATION_EXPORT_CHUNK_BYTES");
+    let (generation, total) = leader.frame();
+    wait_until("resynced", Duration::from_secs(15), || {
+        follower.metric("dash_ingest_replication_generation") == Some(generation)
+            && follower.metric("dash_ingest_replication_last_offset") == Some(total as u64)
+    });
+    assert_eq!(
+        follower.metric("dash_ingest_replication_resync_total"),
+        Some(1)
+    );
+    assert!(
+        follower
+            .metric("dash_ingest_replication_export_bytes_total")
+            .is_some_and(|bytes| bytes > 4 * 1024),
+        "several chunks were downloaded"
+    );
+    follower.stop();
+    expected.sort();
+    assert_eq!(claim_ids_in_wal(&follower_wal), expected);
+    assert!(
+        !dir.path().join("follower.wal.resync.part").exists(),
+        "the download is removed after the swap"
+    );
+}

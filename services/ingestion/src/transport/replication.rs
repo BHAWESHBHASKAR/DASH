@@ -2019,6 +2019,99 @@ mod tests {
         }
     }
 
+    /// A crash in the middle of a resync's swap restarts into a resync that
+    /// applies the verified download again (no network), with nothing lost
+    /// or duplicated and a cursor that matches the WAL.
+    #[test]
+    fn a_crash_during_the_resync_swap_recovers_from_the_downloaded_export() {
+        use schema::claim_builder;
+        for point in ["ingest.resync.cursor_cleared", "ingest.resync.wal_replaced"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let leader_path = dir.path().join("leader.wal");
+            let mut leader_wal = store::FileWal::open(&leader_path).expect("leader wal");
+            let mut leader = store::InMemoryStore::new();
+            for i in 0..10 {
+                let claim = claim_builder(&format!("l{i}"), "tenant-r", "leader claim", 0.9);
+                leader
+                    .ingest_bundle_persistent(&mut leader_wal, claim, vec![], vec![])
+                    .expect("leader write");
+                if i == 6 {
+                    leader
+                        .checkpoint_and_compact(&mut leader_wal)
+                        .expect("checkpoint");
+                }
+            }
+            let exports = store::ReplicationExportStore::for_wal(&leader_path);
+            let leader_wal = Mutex::new(leader_wal);
+
+            let follower_path = dir.path().join("follower.wal");
+            {
+                let mut wal = store::FileWal::open(&follower_path).expect("follower wal");
+                let claim = claim_builder("stale", "tenant-r", "stale claim", 0.9);
+                store::InMemoryStore::new()
+                    .ingest_bundle_persistent(&mut wal, claim, vec![], vec![])
+                    .expect("stale write");
+            }
+            let paths = store::DownloadPaths::for_wal(&follower_path);
+            let mut source = store::LocalExportSource {
+                store: &exports,
+                wal: &leader_wal,
+            };
+            let store::DownloadOutcome::Complete(download) =
+                store::download_export(&mut source, &paths, 256).expect("download")
+            else {
+                panic!("complete");
+            };
+            // Unreachable leader: a resync must come from the download.
+            let config = ReplicationPullConfig::new("http://127.0.0.1:9");
+            let start = || -> SharedRuntime {
+                let wal = store::FileWal::open(&follower_path).expect("follower wal");
+                let store = store::InMemoryStore::load_from_wal(&wal).expect("load");
+                let runtime = super::super::IngestionRuntime::persistent(
+                    store,
+                    wal,
+                    store::CheckpointPolicy::default(),
+                );
+                Arc::new(Mutex::new(runtime))
+            };
+
+            let runtime = start();
+            let (_, _, force_resync) = runtime.lock().unwrap().replication_cursor(&config);
+            assert!(force_resync, "{point}: populated WAL without a cursor");
+            crash_point::arm(point);
+            let err = resync_from_export(&runtime, &config).expect_err("crash point");
+            assert!(err.contains("crash point"), "{point}: {err}");
+            assert!(
+                !dir.path().join("follower.wal.replication").exists(),
+                "{point}: the cursor is gone before the files change"
+            );
+            drop(runtime);
+
+            let runtime = start();
+            let (_, _, force_resync) = runtime.lock().unwrap().replication_cursor(&config);
+            assert!(force_resync, "{point}: the restart resyncs");
+            resync_from_export(&runtime, &config).expect("resync from the download");
+            let saved = read_state(&format!("{}.replication", follower_path.display()))
+                .expect("cursor written");
+            assert_eq!(saved.generation, Some(download.manifest.generation));
+            assert_eq!(saved.offset, download.manifest.wal_records);
+            assert!(!paths.part.exists(), "{point}: download removed");
+            drop(runtime);
+            let wal = store::FileWal::open(&follower_path).expect("reopen");
+            assert_eq!(wal.wal_record_count().unwrap(), saved.offset);
+            let replayed = store::InMemoryStore::load_from_wal(&wal).expect("replay");
+            let mut ids: Vec<String> = replayed
+                .claims_for_tenant("tenant-r")
+                .into_iter()
+                .map(|c| c.claim_id)
+                .collect();
+            ids.sort();
+            let mut want: Vec<String> = (0..10).map(|i| format!("l{i}")).collect();
+            want.sort();
+            assert_eq!(ids, want, "{point}: exactly the leader's claims");
+        }
+    }
+
     #[test]
     fn mutated_frames_never_panic_the_frame_parsers() {
         let delta = render_replication_delta_frame(
