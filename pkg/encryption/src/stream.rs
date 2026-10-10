@@ -424,6 +424,29 @@ impl SealedFile {
     }
 }
 
+/// Plaintext length of the sealed file at `path`, from its header and size
+/// (nothing is decrypted; a damaged file still fails when read).
+pub fn sealed_plain_len(path: &Path) -> Result<u64, EncryptionError> {
+    let mut file = File::open(path)?;
+    let (_, chunk_size, data_start) =
+        read_seal_header(&mut file).map_err(|e| e.context(&path.display().to_string()))?;
+    let total = file.metadata()?.len();
+    let body = total.saturating_sub(data_start);
+    let stride = (chunk_size + TAG_LEN) as u64;
+    let rem = body % stride;
+    let full = body / stride;
+    if rem == 0 && full > 0 {
+        Ok(full * chunk_size as u64)
+    } else if rem >= TAG_LEN as u64 {
+        Ok(full * chunk_size as u64 + rem - TAG_LEN as u64)
+    } else {
+        Err(EncryptionError::Format(format!(
+            "{}: sealed file has a truncated chunk",
+            path.display()
+        )))
+    }
+}
+
 /// Seals `plain` into the bytes of a sealed file.
 pub fn seal_bytes(keyring: &Keyring, plain: &[u8]) -> Result<Vec<u8>, EncryptionError> {
     let mut writer = SealedWriter::new(Vec::with_capacity(plain.len() + 256), keyring)?;

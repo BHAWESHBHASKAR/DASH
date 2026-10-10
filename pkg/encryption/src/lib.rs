@@ -50,7 +50,7 @@ pub use reader::{
 pub use record::{LINE_LABEL, RECORD_OVERHEAD, REDB_LABEL, RecordCipher};
 pub use stream::{
     DEFAULT_CHUNK_SIZE, SEAL_MAGIC, SealedFile, SealedReader, SealedWriter, open_sealed_bytes,
-    read_seal_header, rewrap_sealed_header, seal_bytes,
+    read_seal_header, rewrap_sealed_header, seal_bytes, sealed_plain_len,
 };
 
 use std::sync::Arc;

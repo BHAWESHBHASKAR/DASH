@@ -111,7 +111,6 @@ fn dedupe_edges(edges: &[ClaimEdge]) -> Vec<ClaimEdge> {
     out
 }
 
-
 const TABLE_CRYPTO: TableDefinition<&str, &str> = TableDefinition::new("dash_crypto");
 const CRYPTO_DEK_KEY: &str = "dek";
 /// Value-codec style marker of an encrypted value: `DASH` + `e1` + `\0\xff`.
@@ -173,10 +172,10 @@ impl ValueCrypt {
                 key
             }
             (Some(line), keyring) => {
-                let header = encryption::parse_header_line(&line)
-                    .map_err(|e| format!("{what}: {e}"))?;
-                let mut key = encryption::open_file_key(keyring, &header, what)
-                    .map_err(|e| e.to_string())?;
+                let header =
+                    encryption::parse_header_line(&line).map_err(|e| format!("{what}: {e}"))?;
+                let mut key =
+                    encryption::open_file_key(keyring, &header, what).map_err(|e| e.to_string())?;
                 if let Some(keyring) = keyring
                     && header.key_id != keyring.active_key_id()
                 {
@@ -192,10 +191,7 @@ impl ValueCrypt {
         };
         Ok(Self {
             key_id: Some(key.key_id().to_string()),
-            cipher: Some(encryption::RecordCipher::new(
-                &key,
-                encryption::REDB_LABEL,
-            )),
+            cipher: Some(encryption::RecordCipher::new(&key, encryption::REDB_LABEL)),
             what: what.to_string(),
         })
     }
@@ -348,7 +344,12 @@ impl DiskBackedStore {
     /// `claim_id`) and record its tenant membership in the SAME write
     /// transaction, so the claim row and the tenant set cannot diverge.
     pub fn put_claim(&self, claim: &Claim) -> Result<(), String> {
-        let bytes = self.values.encode(TABLE_CLAIMS.name(), &claim.claim_id, claim, "serialize claim")?;
+        let bytes = self.values.encode(
+            TABLE_CLAIMS.name(),
+            &claim.claim_id,
+            claim,
+            "serialize claim",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -379,7 +380,9 @@ impl DiskBackedStore {
         match table.get(id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let claim: Claim = self.values.decode(TABLE_CLAIMS.name(), id, &value, "deserialize claim")?;
+                let claim: Claim =
+                    self.values
+                        .decode(TABLE_CLAIMS.name(), id, &value, "deserialize claim")?;
                 Ok(Some(claim))
             }
             Ok(None) => Ok(None),
@@ -392,8 +395,12 @@ impl DiskBackedStore {
     /// Duplicate `evidence_id`s inside the blob are collapsed (last wins).
     pub fn put_evidence_blob(&self, claim_id: &str, evidence: &[Evidence]) -> Result<(), String> {
         let evidence = dedupe_evidence(evidence);
-        let bytes =
-            self.values.encode(TABLE_EVIDENCE.name(), claim_id, &evidence, "serialize evidence")?;
+        let bytes = self.values.encode(
+            TABLE_EVIDENCE.name(),
+            claim_id,
+            &evidence,
+            "serialize evidence",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -420,12 +427,22 @@ impl DiskBackedStore {
                 .get(evidence.claim_id.as_str())
                 .map_err(|e| err("read evidence", e))?
             {
-                Some(v) => self.values.decode(TABLE_EVIDENCE.name(), &evidence.claim_id, &v.value().to_vec(), "deserialize evidence")?,
+                Some(v) => self.values.decode(
+                    TABLE_EVIDENCE.name(),
+                    &evidence.claim_id,
+                    &v.value().to_vec(),
+                    "deserialize evidence",
+                )?,
                 None => Vec::new(),
             };
             current.push(evidence.clone());
             let current = dedupe_evidence(&current);
-            let bytes = self.values.encode(TABLE_EVIDENCE.name(), &evidence.claim_id, &current, "serialize evidence")?;
+            let bytes = self.values.encode(
+                TABLE_EVIDENCE.name(),
+                &evidence.claim_id,
+                &current,
+                "serialize evidence",
+            )?;
             table
                 .insert(evidence.claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -446,13 +463,22 @@ impl DiskBackedStore {
                 .get(edge.from_claim_id.as_str())
                 .map_err(|e| err("read edges", e))?
             {
-                Some(v) => self.values.decode(TABLE_EDGES.name(), &edge.from_claim_id, &v.value().to_vec(), "deserialize edges")?,
+                Some(v) => self.values.decode(
+                    TABLE_EDGES.name(),
+                    &edge.from_claim_id,
+                    &v.value().to_vec(),
+                    "deserialize edges",
+                )?,
                 None => Vec::new(),
             };
             current.push(edge.clone());
             let current = dedupe_edges(&current);
-            let bytes =
-                self.values.encode(TABLE_EDGES.name(), &edge.from_claim_id, &current, "serialize edges")?;
+            let bytes = self.values.encode(
+                TABLE_EDGES.name(),
+                &edge.from_claim_id,
+                &current,
+                "serialize edges",
+            )?;
             table
                 .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;
@@ -473,7 +499,12 @@ impl DiskBackedStore {
         match table.get(claim_id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let evidence: Vec<Evidence> = self.values.decode(TABLE_EVIDENCE.name(), claim_id, &value, "deserialize evidence")?;
+                let evidence: Vec<Evidence> = self.values.decode(
+                    TABLE_EVIDENCE.name(),
+                    claim_id,
+                    &value,
+                    "deserialize evidence",
+                )?;
                 Ok(Some(evidence))
             }
             Ok(None) => Ok(None),
@@ -487,7 +518,9 @@ impl DiskBackedStore {
     /// collapsed (last wins).
     pub fn put_edge_blob(&self, from: &str, edges: &[ClaimEdge]) -> Result<(), String> {
         let edges = dedupe_edges(edges);
-        let bytes = self.values.encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
+        let bytes = self
+            .values
+            .encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -513,7 +546,9 @@ impl DiskBackedStore {
         match table.get(from) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let edges: Vec<ClaimEdge> = self.values.decode(TABLE_EDGES.name(), from, &value, "deserialize edges")?;
+                let edges: Vec<ClaimEdge> =
+                    self.values
+                        .decode(TABLE_EDGES.name(), from, &value, "deserialize edges")?;
                 Ok(Some(edges))
             }
             Ok(None) => Ok(None),
@@ -524,8 +559,12 @@ impl DiskBackedStore {
     /// Persist an embedding vector for a claim. Replaces any prior
     /// vector for the same `claim_id` atomically.
     pub fn put_vector(&self, claim_id: &str, vector: &[f32]) -> Result<(), String> {
-        let bytes =
-            self.values.encode(TABLE_CLAIM_VECTORS.name(), claim_id, vector, "serialize vector")?;
+        let bytes = self.values.encode(
+            TABLE_CLAIM_VECTORS.name(),
+            claim_id,
+            vector,
+            "serialize vector",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -551,7 +590,12 @@ impl DiskBackedStore {
         match table.get(claim_id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let vector: Vec<f32> = self.values.decode(TABLE_CLAIM_VECTORS.name(), claim_id, &value, "deserialize vector")?;
+                let vector: Vec<f32> = self.values.decode(
+                    TABLE_CLAIM_VECTORS.name(),
+                    claim_id,
+                    &value,
+                    "deserialize vector",
+                )?;
                 Ok(Some(vector))
             }
             Ok(None) => Ok(None),
@@ -562,8 +606,12 @@ impl DiskBackedStore {
     /// Persist batch-commit metadata. Replaces any prior entry with
     /// the same `commit_id` atomically.
     pub fn put_batch_commit(&self, commit: &BatchCommitMetadata) -> Result<(), String> {
-        let bytes =
-            self.values.encode(TABLE_BATCH_COMMITS.name(), &commit.commit_id, commit, "serialize batch_commit")?;
+        let bytes = self.values.encode(
+            TABLE_BATCH_COMMITS.name(),
+            &commit.commit_id,
+            commit,
+            "serialize batch_commit",
+        )?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -588,7 +636,12 @@ impl DiskBackedStore {
         match table.get(id) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let commit: BatchCommitMetadata = self.values.decode(TABLE_BATCH_COMMITS.name(), id, &value, "deserialize batch_commit")?;
+                let commit: BatchCommitMetadata = self.values.decode(
+                    TABLE_BATCH_COMMITS.name(),
+                    id,
+                    &value,
+                    "deserialize batch_commit",
+                )?;
                 Ok(Some(commit))
             }
             Ok(None) => Ok(None),
@@ -691,7 +744,9 @@ impl DiskBackedStore {
 
     /// Persist the index stats singleton.
     pub fn set_stats(&self, stats: &StoreIndexStats) -> Result<(), String> {
-        let bytes = self.values.encode(TABLE_STATS.name(), STATS_KEY, stats, "serialize stats")?;
+        let bytes = self
+            .values
+            .encode(TABLE_STATS.name(), STATS_KEY, stats, "serialize stats")?;
         let txn = self.db.begin_write().map_err(|e| err("begin_write", e))?;
         {
             let mut table = txn
@@ -717,7 +772,12 @@ impl DiskBackedStore {
         match table.get(STATS_KEY) {
             Ok(Some(v)) => {
                 let value = v.value().to_vec();
-                let stats: StoreIndexStats = self.values.decode(TABLE_STATS.name(), STATS_KEY, &value, "deserialize stats")?;
+                let stats: StoreIndexStats = self.values.decode(
+                    TABLE_STATS.name(),
+                    STATS_KEY,
+                    &value,
+                    "deserialize stats",
+                )?;
                 Ok(stats)
             }
             Ok(None) => Ok(StoreIndexStats::default()),
@@ -751,7 +811,9 @@ impl DiskBackedStore {
                 let entry = entry.map_err(|e| err("scan claims", e))?;
                 let key = entry.0.value().to_string();
                 let value = entry.1.value().to_vec();
-                let claim: Claim = self.values.decode(TABLE_CLAIMS.name(), &key, &value, "deserialize claim")?;
+                let claim: Claim =
+                    self.values
+                        .decode(TABLE_CLAIMS.name(), &key, &value, "deserialize claim")?;
                 dest.apply_claim_for_load(claim)
                     .map_err(|e| format!("apply_claim_for_load: {e:?}"))?;
                 claims_loaded += 1;
@@ -769,7 +831,12 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan evidence", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let evidence: Vec<Evidence> = self.values.decode(TABLE_EVIDENCE.name(), &key, &value, "deserialize evidence")?;
+                    let evidence: Vec<Evidence> = self.values.decode(
+                        TABLE_EVIDENCE.name(),
+                        &key,
+                        &value,
+                        "deserialize evidence",
+                    )?;
                     let evidence = dedupe_evidence(&evidence);
                     dest.apply_evidence_blob_for_load(&key, &evidence)
                         .map_err(|e| format!("apply_evidence_blob_for_load: {e:?}"))?;
@@ -786,7 +853,12 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan edges", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let edges: Vec<ClaimEdge> = self.values.decode(TABLE_EDGES.name(), &key, &value, "deserialize edges")?;
+                    let edges: Vec<ClaimEdge> = self.values.decode(
+                        TABLE_EDGES.name(),
+                        &key,
+                        &value,
+                        "deserialize edges",
+                    )?;
                     let edges = dedupe_edges(&edges);
                     dest.apply_edge_blob_for_load(&key, &edges)
                         .map_err(|e| format!("apply_edge_blob_for_load: {e:?}"))?;
@@ -805,7 +877,12 @@ impl DiskBackedStore {
                         let entry = entry.map_err(|e| err("scan claim_vectors", e))?;
                         let key = entry.0.value().to_string();
                         let value = entry.1.value().to_vec();
-                        let vector: Vec<f32> = self.values.decode(TABLE_CLAIM_VECTORS.name(), &key, &value, "deserialize vector")?;
+                        let vector: Vec<f32> = self.values.decode(
+                            TABLE_CLAIM_VECTORS.name(),
+                            &key,
+                            &value,
+                            "deserialize vector",
+                        )?;
                         dest.apply_claim_vector_blob_for_load(&key, vector)
                             .map_err(|e| format!("apply_claim_vector_blob_for_load: {e:?}"))?;
                     }
@@ -826,7 +903,12 @@ impl DiskBackedStore {
                     let entry = entry.map_err(|e| err("scan batch_commits", e))?;
                     let key = entry.0.value().to_string();
                     let value = entry.1.value().to_vec();
-                    let commit: BatchCommitMetadata = self.values.decode(TABLE_BATCH_COMMITS.name(), &key, &value, "deserialize batch_commit")?;
+                    let commit: BatchCommitMetadata = self.values.decode(
+                        TABLE_BATCH_COMMITS.name(),
+                        &key,
+                        &value,
+                        "deserialize batch_commit",
+                    )?;
                     dest.apply_batch_commit_for_load(&commit)
                         .map_err(|e| format!("apply_batch_commit_for_load: {e:?}"))?;
                 }
@@ -877,7 +959,12 @@ impl DiskBackedStore {
         for op in ops {
             match op {
                 StagedDiskOp::Claim(claim) => {
-                    let bytes = self.values.encode(TABLE_CLAIMS.name(), &claim.claim_id, claim, "serialize claim")?;
+                    let bytes = self.values.encode(
+                        TABLE_CLAIMS.name(),
+                        &claim.claim_id,
+                        claim,
+                        "serialize claim",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_CLAIMS)
                         .map_err(|e| err("open claims", e))?;
@@ -899,11 +986,21 @@ impl DiskBackedStore {
                         .get(evidence.claim_id.as_str())
                         .map_err(|e| err("read evidence", e))?
                     {
-                        Some(v) => self.values.decode(TABLE_EVIDENCE.name(), &evidence.claim_id, &v.value().to_vec(), "deserialize evidence")?,
+                        Some(v) => self.values.decode(
+                            TABLE_EVIDENCE.name(),
+                            &evidence.claim_id,
+                            &v.value().to_vec(),
+                            "deserialize evidence",
+                        )?,
                         None => Vec::new(),
                     };
                     crate::upsert_evidence(&mut current, evidence.clone());
-                    let bytes = self.values.encode(TABLE_EVIDENCE.name(), &evidence.claim_id, &dedupe_evidence(&current), "serialize evidence")?;
+                    let bytes = self.values.encode(
+                        TABLE_EVIDENCE.name(),
+                        &evidence.claim_id,
+                        &dedupe_evidence(&current),
+                        "serialize evidence",
+                    )?;
                     table
                         .insert(evidence.claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write evidence", e))?;
@@ -916,11 +1013,21 @@ impl DiskBackedStore {
                         .get(edge.from_claim_id.as_str())
                         .map_err(|e| err("read edges", e))?
                     {
-                        Some(v) => self.values.decode(TABLE_EDGES.name(), &edge.from_claim_id, &v.value().to_vec(), "deserialize edges")?,
+                        Some(v) => self.values.decode(
+                            TABLE_EDGES.name(),
+                            &edge.from_claim_id,
+                            &v.value().to_vec(),
+                            "deserialize edges",
+                        )?,
                         None => Vec::new(),
                     };
                     crate::upsert_edge(&mut current, edge.clone());
-                    let bytes = self.values.encode(TABLE_EDGES.name(), &edge.from_claim_id, &dedupe_edges(&current), "serialize edges")?;
+                    let bytes = self.values.encode(
+                        TABLE_EDGES.name(),
+                        &edge.from_claim_id,
+                        &dedupe_edges(&current),
+                        "serialize edges",
+                    )?;
                     table
                         .insert(edge.from_claim_id.as_str(), bytes.as_slice())
                         .map_err(|e| err("write edges", e))?;
@@ -931,7 +1038,12 @@ impl DiskBackedStore {
                     vector,
                     new_dim,
                 } => {
-                    let bytes = self.values.encode(TABLE_CLAIM_VECTORS.name(), claim_id, vector, "serialize vector")?;
+                    let bytes = self.values.encode(
+                        TABLE_CLAIM_VECTORS.name(),
+                        claim_id,
+                        vector,
+                        "serialize vector",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_CLAIM_VECTORS)
                         .map_err(|e| err("open claim_vectors", e))?;
@@ -947,7 +1059,12 @@ impl DiskBackedStore {
                     }
                 }
                 StagedDiskOp::BatchCommit(commit) => {
-                    let bytes = self.values.encode(TABLE_BATCH_COMMITS.name(), &commit.commit_id, commit, "serialize batch_commit")?;
+                    let bytes = self.values.encode(
+                        TABLE_BATCH_COMMITS.name(),
+                        &commit.commit_id,
+                        commit,
+                        "serialize batch_commit",
+                    )?;
                     let mut table = txn
                         .open_table(TABLE_BATCH_COMMITS)
                         .map_err(|e| err("open batch_commits", e))?;
@@ -1001,8 +1118,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIMS)
                 .map_err(|e| err("open claims", e))?;
             for claim in store.claims_iter() {
-                let bytes =
-                    self.values.encode(TABLE_CLAIMS.name(), &claim.claim_id, claim, "serialize claim")?;
+                let bytes = self.values.encode(
+                    TABLE_CLAIMS.name(),
+                    &claim.claim_id,
+                    claim,
+                    "serialize claim",
+                )?;
                 claims_table
                     .insert(claim.claim_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write claim", e))?;
@@ -1013,7 +1134,12 @@ impl DiskBackedStore {
                 .map_err(|e| err("open evidence", e))?;
             for (claim_id, evidence) in store.evidence_iter() {
                 let evidence = dedupe_evidence(evidence);
-                let bytes = self.values.encode(TABLE_EVIDENCE.name(), claim_id, &evidence, "serialize evidence")?;
+                let bytes = self.values.encode(
+                    TABLE_EVIDENCE.name(),
+                    claim_id,
+                    &evidence,
+                    "serialize evidence",
+                )?;
                 evidence_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write evidence", e))?;
@@ -1025,7 +1151,8 @@ impl DiskBackedStore {
             for (from, edges) in store.edges_iter() {
                 let edges = dedupe_edges(edges);
                 let bytes =
-                    self.values.encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
+                    self.values
+                        .encode(TABLE_EDGES.name(), from, &edges, "serialize edges")?;
                 edges_table
                     .insert(from, bytes.as_slice())
                     .map_err(|e| err("write edges", e))?;
@@ -1035,7 +1162,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_CLAIM_VECTORS)
                 .map_err(|e| err("open claim_vectors", e))?;
             for (claim_id, vector) in store.claim_vectors_iter() {
-                let bytes = self.values.encode(TABLE_CLAIM_VECTORS.name(), claim_id, vector, "serialize vector")?;
+                let bytes = self.values.encode(
+                    TABLE_CLAIM_VECTORS.name(),
+                    claim_id,
+                    vector,
+                    "serialize vector",
+                )?;
                 vectors_table
                     .insert(claim_id, bytes.as_slice())
                     .map_err(|e| err("write claim_vector", e))?;
@@ -1045,7 +1177,12 @@ impl DiskBackedStore {
                 .open_table(TABLE_BATCH_COMMITS)
                 .map_err(|e| err("open batch_commits", e))?;
             for commit in store.batch_commits_iter() {
-                let bytes = self.values.encode(TABLE_BATCH_COMMITS.name(), &commit.commit_id, commit, "serialize batch_commit")?;
+                let bytes = self.values.encode(
+                    TABLE_BATCH_COMMITS.name(),
+                    &commit.commit_id,
+                    commit,
+                    "serialize batch_commit",
+                )?;
                 batch_commits_table
                     .insert(commit.commit_id.as_str(), bytes.as_slice())
                     .map_err(|e| err("write batch_commit", e))?;
@@ -1108,7 +1245,12 @@ fn apply_deletion_in(
                 .remove(claim_id.as_str())
                 .map_err(|e| err("remove evidence", e))?;
         } else {
-            let bytes = values.encode(TABLE_EVIDENCE.name(), claim_id, &dedupe_evidence(evidence), "serialize evidence")?;
+            let bytes = values.encode(
+                TABLE_EVIDENCE.name(),
+                claim_id,
+                &dedupe_evidence(evidence),
+                "serialize evidence",
+            )?;
             evidence_table
                 .insert(claim_id.as_str(), bytes.as_slice())
                 .map_err(|e| err("write evidence", e))?;
@@ -1123,7 +1265,12 @@ fn apply_deletion_in(
                 .remove(from.as_str())
                 .map_err(|e| err("remove edges", e))?;
         } else {
-            let bytes = values.encode(TABLE_EDGES.name(), from, &dedupe_edges(edges), "serialize edges")?;
+            let bytes = values.encode(
+                TABLE_EDGES.name(),
+                from,
+                &dedupe_edges(edges),
+                "serialize edges",
+            )?;
             edges_table
                 .insert(from.as_str(), bytes.as_slice())
                 .map_err(|e| err("write edges", e))?;

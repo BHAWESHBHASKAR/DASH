@@ -430,7 +430,8 @@ impl ReplicationExportStore {
                 self.reused_total.fetch_add(1, Ordering::Relaxed);
                 return Ok(latest);
             }
-            let mut out = SealSink::new(BufWriter::new(File::create(&wal_tmp)?), self.keyring.get())?;
+            let mut out =
+                SealSink::new(BufWriter::new(File::create(&wal_tmp)?), self.keyring.get())?;
             let frozen = match wal.freeze_for_export(&mut out) {
                 Ok(frozen) => out
                     .finish()
@@ -486,11 +487,13 @@ impl ReplicationExportStore {
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        let mut out = HashWriter::new(SealSink::new(
-            BufWriter::new(file),
-            self.keyring.get(),
-        )?);
-        write_export_header(&mut out, frozen.generation, snapshot_records, frozen.wal_records)?;
+        let mut out = HashWriter::new(SealSink::new(BufWriter::new(file), self.keyring.get())?);
+        write_export_header(
+            &mut out,
+            frozen.generation,
+            snapshot_records,
+            frozen.wal_records,
+        )?;
         out.write_all(b"SNAPSHOT\n")?;
         if let Some((file, codec)) = frozen.snapshot.as_mut() {
             let written = for_each_snapshot_line(file, codec, |text| {
@@ -1208,7 +1211,10 @@ fn part_state(
             file.set_len(0).map_err(|e| e.to_string())?;
             return Ok((LineCodec::create(keyring).map_err(fail)?, 0));
         }
-        Detected::Encrypted(codec) => codec,
+        Detected::Encrypted(codec) => {
+            crypt::terminate_lone_header(path).map_err(fail)?;
+            codec
+        }
     };
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
     let mut have = 0u64;
@@ -1216,7 +1222,11 @@ fn part_state(
     let mut chunks = bytes.split_inclusive(|b| *b == b'\n').peekable();
     while let Some(raw) = chunks.next() {
         let terminated = raw.last() == Some(&b'\n');
-        let body = if terminated { &raw[..raw.len() - 1] } else { raw };
+        let body = if terminated {
+            &raw[..raw.len() - 1]
+        } else {
+            raw
+        };
         match codec.decode(body) {
             Ok(text) => {
                 if !encryption::is_header_line(body) {

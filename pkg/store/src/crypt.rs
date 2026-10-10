@@ -14,7 +14,6 @@ use encryption::{EncryptionError, Keyring, LineCipher};
 
 use crate::StoreError;
 
-
 /// The keyring a store handle captured (`None`: encryption off).
 pub(crate) type KeyringRef = Option<Arc<Keyring>>;
 
@@ -138,9 +137,8 @@ fn detect_from_first_line(
     if !encryption::is_header_line(line) {
         return Ok(Detected::Plain);
     }
-    let text = std::str::from_utf8(line).map_err(|_| {
-        StoreError::Parse(format!("{what}: encryption header line is not UTF-8"))
-    })?;
+    let text = std::str::from_utf8(line)
+        .map_err(|_| StoreError::Parse(format!("{what}: encryption header line is not UTF-8")))?;
     if !terminated && encryption::parse_header_line(text).is_err() {
         return Ok(Detected::TornHeader);
     }
@@ -187,6 +185,19 @@ pub(crate) fn line_codec_for(
     }
 }
 
+/// Appends the newline of an encryption header that is the whole file (a
+/// crash right before the newline was written), so appended lines do not
+/// run into it. Call after [`detect_line_file`] returned `Encrypted`.
+pub(crate) fn terminate_lone_header(path: &Path) -> Result<(), StoreError> {
+    let bytes = std::fs::read(path)?;
+    if !bytes.is_empty() && !bytes.contains(&b'\n') {
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Writes `lines` as a complete line file through `file` (header line
 /// first when encrypted). Does not sync.
 pub(crate) fn write_line_file<'a>(
@@ -209,7 +220,10 @@ pub(crate) fn write_line_file<'a>(
 
 /// Opens `path` for appending lines with `codec`, writing the header line
 /// first when the file is empty. Returns the handle.
-pub(crate) fn open_line_file_for_append(path: &Path, codec: &LineCodec) -> Result<File, StoreError> {
+pub(crate) fn open_line_file_for_append(
+    path: &Path,
+    codec: &LineCodec,
+) -> Result<File, StoreError> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     if let Some(header) = codec.header_line()
         && file.metadata()?.len() == 0

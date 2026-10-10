@@ -684,7 +684,10 @@ impl FileWal {
         let mut torn_header = 0usize;
         let mut codec = match crypt::detect_line_file(&path, keyring.as_ref())? {
             Detected::Plain => LineCodec::Plain,
-            Detected::Encrypted(codec) => codec,
+            Detected::Encrypted(codec) => {
+                crypt::terminate_lone_header(&path)?;
+                codec
+            }
             Detected::TornHeader => {
                 // A crash while the file was being created: nothing but a
                 // partial header was written.
@@ -2438,11 +2441,7 @@ impl QuarantineSink {
                         .trim_end_matches('\r')
                         .to_string(),
                     encrypted => encrypted.decode(raw).map_err(|reason| {
-                        StoreError::Parse(format!(
-                            "{} line {}: {reason}",
-                            path.display(),
-                            idx + 1
-                        ))
+                        StoreError::Parse(format!("{} line {}: {reason}", path.display(), idx + 1))
                     })?,
                 };
                 if !line.is_empty() {
@@ -2645,7 +2644,11 @@ fn encrypt_plain_line_file(
         .write(true)
         .truncate(true)
         .open(&tmp)?;
-    crypt::write_line_file(&mut file, &codec, scan.lines.iter().map(|(_, l)| l.as_str()))?;
+    crypt::write_line_file(
+        &mut file,
+        &codec,
+        scan.lines.iter().map(|(_, l)| l.as_str()),
+    )?;
     sync_file(&file)?;
     drop(file);
     rename_file(&tmp, path)?;

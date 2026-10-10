@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::{
     QuarantineSink, ReplayParser, ReplayPolicy, is_legacy_kind, is_valid_tail, record_kind,
 };
-use crate::crypt::LineCodec;
 use crate::StoreError;
+use crate::crypt::LineCodec;
 
 /// One anchor (byte offset of a replication line) every this many lines.
 /// Serving a frame reads at most `ANCHOR_STRIDE - 1` lines before its start.
@@ -339,7 +339,6 @@ impl Iterator for ViewLines<'_> {
         self.read_next().transpose()
     }
 }
-
 
 #[cfg(test)]
 mod tests {
