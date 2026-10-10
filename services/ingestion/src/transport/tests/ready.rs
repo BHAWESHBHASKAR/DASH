@@ -175,15 +175,28 @@ fn post_ingest(runtime: &SharedRuntime, claim_id: &str) -> u16 {
 
 #[test]
 fn ready_reports_failed_wal_writes_until_the_volume_is_writable_again() {
+    // Single ingests go through the group committer by default.
+    failed_wal_writes_flip_ready_and_recover(true);
+}
+
+#[test]
+fn ready_reports_failed_wal_writes_with_group_commit_disabled() {
+    failed_wal_writes_flip_ready_and_recover(false);
+}
+
+fn failed_wal_writes_flip_ready_and_recover(group_commit: bool) {
     let _env = env_lock().lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
     let volume = dir.path().join("volume");
     let wal = FileWal::open(volume.join("ingest.wal")).expect("wal");
-    let runtime: SharedRuntime = Arc::new(Mutex::new(IngestionRuntime::persistent(
-        InMemoryStore::new(),
-        wal,
-        CheckpointPolicy::default(),
-    )));
+    if !group_commit {
+        super::set_env_var_for_tests("DASH_INGEST_WAL_GROUP_COMMIT", "false");
+    }
+    let runtime =
+        IngestionRuntime::persistent(InMemoryStore::new(), wal, CheckpointPolicy::default());
+    super::restore_env_var_for_tests("DASH_INGEST_WAL_GROUP_COMMIT", None);
+    assert_eq!(runtime.group_commit_active(), group_commit);
+    let runtime: SharedRuntime = Arc::new(Mutex::new(runtime));
     assert_eq!(post_ingest(&runtime, "before"), 200);
     assert_eq!(ready(&runtime).0, 200);
 
