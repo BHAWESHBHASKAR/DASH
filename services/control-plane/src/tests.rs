@@ -1082,3 +1082,50 @@ fn duplicate_authorization_headers_are_rejected_with_400() {
         "unexpected status line: {status_line}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn metrics_require_the_token_and_render_valid_exposition() {
+    let state = authed_state(7);
+    let denied = call(&state, "GET", "/metrics", None, "");
+    assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+    let wrong = call(&state, "GET", "/metrics", Some("wrong-token"), "");
+    assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+
+    let response = call(&state, "GET", "/metrics", Some(TOKEN), "");
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let body = response.split_once("\r\n\r\n").expect("body").1;
+    let report = dash_observe::validate(body).unwrap_or_else(|e| panic!("{e}\n{body}"));
+    assert_eq!(report.value("dash_control_plane_is_leader", &[]), Some(1.0));
+    assert_eq!(
+        report.value("dash_control_plane_state_error", &[]),
+        Some(0.0)
+    );
+    assert_eq!(
+        report.value("dash_control_plane_placement_epoch", &[]),
+        Some(7.0)
+    );
+    assert_eq!(
+        report.value("dash_control_plane_placements", &[]),
+        Some(1.0)
+    );
+    assert!(report.has_family("dash_build_info"), "{body}");
+    assert!(report.has_family("process_start_time_seconds"), "{body}");
+
+    let post = call(&state, "POST", "/metrics", Some(TOKEN), "");
+    assert!(post.starts_with("HTTP/1.1 405"), "{post}");
+}
+
+#[test]
+fn route_labels_are_bounded() {
+    assert_eq!(
+        http_route_label("GET", "/v1/control-plane/placement"),
+        "placement"
+    );
+    assert_eq!(http_route_label("GET", "/metrics"), "metrics");
+    assert_eq!(http_route_label("GET", "/v1/control-plane/x/123"), "other");
+    assert_eq!(http_route_label("GET", "/anything"), "other");
+}

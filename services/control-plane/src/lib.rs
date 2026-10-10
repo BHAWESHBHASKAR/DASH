@@ -867,6 +867,7 @@ pub fn serve_listener(
         let peer = request.peer.map(|addr| addr.ip());
         handle_request(&state, request, peer).into()
     });
+    let handler = dash_observe::http::instrument(SERVICE_NAME, http_route_label, handler);
     let mut http = config.to_http();
     http.tls = dash_common::tls::listener_tls_from_env(&dash_common::tls::CONTROL_PLANE_TLS_ENV)
         .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidInput, reason))?;
@@ -1007,8 +1008,101 @@ fn require_leader(
 }
 
 fn requires_auth(path: &str) -> bool {
-    path.starts_with("/v1/control-plane/")
-        && !matches!(path, "/v1/control-plane/health" | "/v1/control-plane/ready")
+    (path.starts_with("/v1/control-plane/")
+        && !matches!(path, "/v1/control-plane/health" | "/v1/control-plane/ready"))
+        || (path == "/metrics" && !metrics_public_from_env())
+}
+
+/// Service name used for the shared HTTP metrics and `dash_build_info`.
+pub const SERVICE_NAME: &str = "control-plane";
+
+/// `DASH_METRICS_PUBLIC=1` serves `/metrics` without the bearer token (as on
+/// ingestion and retrieval). Otherwise `/metrics` needs the control-plane
+/// token like every other protected route.
+fn metrics_public_from_env() -> bool {
+    matches!(
+        std::env::var("DASH_METRICS_PUBLIC")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Bounded route label for the shared HTTP metrics.
+pub fn http_route_label(_method: &str, path: &str) -> &'static str {
+    match path {
+        "/health" | "/v1/control-plane/health" => "health",
+        "/ready" | "/v1/control-plane/ready" => "ready",
+        "/metrics" => "metrics",
+        "/v1/control-plane/leader" => "leader",
+        "/v1/control-plane/leader/acquire" => "leader_acquire",
+        "/v1/control-plane/placement" => "placement",
+        "/v1/control-plane/replica-lag" => "replica_lag",
+        "/v1/control-plane/failover/promote" => "failover_promote",
+        _ => "other",
+    }
+}
+
+/// `/metrics` body: leadership and placement gauges, then the shared HTTP,
+/// process and build families.
+fn render_metrics(guard: &ControlPlanePlacementState) -> String {
+    let mut w = dash_observe::MetricsWriter::new();
+    match guard.is_leader() {
+        Ok(is_leader) => {
+            w.gauge(
+                "dash_control_plane_is_leader",
+                "1 when this node holds the leader lease.",
+                f64::from(u8::from(is_leader)),
+            );
+            w.gauge(
+                "dash_control_plane_state_error",
+                "1 when the leader lease could not be read.",
+                0.0,
+            );
+        }
+        Err(_) => w.gauge(
+            "dash_control_plane_state_error",
+            "1 when the leader lease could not be read.",
+            1.0,
+        ),
+    }
+    if let Ok(Some(record)) = guard.current_leader_info() {
+        w.gauge(
+            "dash_control_plane_leader_epoch",
+            "Epoch (fencing token) of the current leader lease.",
+            record.epoch as f64,
+        );
+        if record.expires_at_ms != u64::MAX {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i128)
+                .unwrap_or(0);
+            let remaining = (i128::from(record.expires_at_ms) - now_ms) as f64 / 1000.0;
+            w.gauge(
+                "dash_control_plane_leader_lease_remaining_seconds",
+                "Seconds until the current leader lease expires (negative when expired).",
+                remaining,
+            );
+        }
+    }
+    w.gauge(
+        "dash_control_plane_placement_epoch",
+        "Highest placement epoch known to this node.",
+        guard.highest_epoch() as f64,
+    );
+    w.gauge(
+        "dash_control_plane_placements",
+        "Shard placements known to this node.",
+        guard.placements().len() as f64,
+    );
+    let mut body = w.finish();
+    body.push_str(&dash_observe::http::render_service_metrics(
+        SERVICE_NAME,
+        env!("CARGO_PKG_VERSION"),
+    ));
+    body
 }
 
 fn handle_request(
@@ -1043,6 +1137,11 @@ fn handle_request(
     }
 
     match (request.method.as_str(), path.as_str()) {
+        ("GET", "/metrics") => match lock_state(state) {
+            Ok(guard) => HttpResponse::ok_text(render_metrics(&guard)),
+            Err(response) => response,
+        },
+        (_, "/metrics") => HttpResponse::method_not_allowed("only GET is supported"),
         ("GET", "/health") | ("GET", "/v1/control-plane/health") => {
             HttpResponse::ok_json("{\"status\":\"ok\"}".to_string())
         }

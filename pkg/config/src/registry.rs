@@ -466,8 +466,9 @@ pub static REGISTRY: &[Entry] = &[
         T_REPL_AUTH,
         Kind::BOOL,
         "off",
-        "Expose `/metrics` without credentials. Without it `/metrics` and `/debug/*` need a credential holding `read_only` or `admin`.",
-    ),
+        "Expose `/metrics` without credentials. Without it `/metrics` and `/debug/*` need a credential holding `read_only` or `admin` on ingestion and retrieval, and `/metrics` needs `DASH_CONTROL_PLANE_TOKEN` on the control plane.",
+    )
+    .readers(ALL_SERVICES),
     Entry::new(
         "DASH_INGEST_REPLICATION_TOKEN",
         Ingestion,

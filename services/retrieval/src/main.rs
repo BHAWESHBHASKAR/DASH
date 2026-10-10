@@ -15,6 +15,7 @@ const DEFAULT_VECTOR_INDEX_SAVE_INTERVAL_MS: u64 = 300_000;
 
 fn main() {
     dash_common::init_logging();
+    dash_observe::process::mark_start();
     dash_config::startup_check(dash_config::Service::Retrieval);
     // Default to serve mode (this is a server binary; the CLI
     // mode is for smoke tests and one-shot benchmarks). Pass

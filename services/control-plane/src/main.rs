@@ -9,6 +9,8 @@ use control_plane::{
 use metadata_router::load_shard_placements_csv;
 
 fn main() {
+    dash_common::init_logging();
+    dash_observe::process::mark_start();
     dash_config::startup_check(dash_config::Service::ControlPlane);
     let requested_bind = env_with_fallback("DASH_CONTROL_PLANE_BIND", "EME_CONTROL_PLANE_BIND")
         .unwrap_or_else(|| "127.0.0.1:8090".to_string());

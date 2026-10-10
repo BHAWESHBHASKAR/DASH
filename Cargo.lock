@@ -489,6 +489,7 @@ dependencies = [
  "dash-common",
  "dash-config",
  "dash-http",
+ "dash-observe",
  "libc",
  "metadata-router",
  "serde",
