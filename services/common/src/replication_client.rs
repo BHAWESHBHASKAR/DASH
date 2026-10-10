@@ -28,6 +28,16 @@ use std::time::Duration;
 
 use url::{Host, Url};
 
+/// Error a follower reports for a WAL frame or export without a `generation`
+/// line: the leader runs a release older than 0.3.0. Its offset-only
+/// protocol serves a fresh follower only the WAL tail (never the snapshot)
+/// and cannot signal a compaction reliably, so following it could silently
+/// skip records. Both followers refuse such frames and apply nothing; see the
+/// upgrade order in `docs/operations/upgrades.md`.
+pub const LEGACY_LEADER_ERROR: &str = "replication source sent a frame without a WAL generation: \
+     the leader runs a release older than 0.3.0, which this follower cannot follow safely; \
+     upgrade the leader (docs/operations/upgrades.md)";
+
 /// Set to exactly `1` to allow sending the replication token over plaintext
 /// `http://` to a non-loopback host.
 pub const ALLOW_INSECURE_HTTP_ENV: &str = "DASH_REPLICATION_ALLOW_INSECURE_HTTP";

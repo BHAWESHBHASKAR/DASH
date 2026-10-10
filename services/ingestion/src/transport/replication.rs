@@ -177,7 +177,7 @@ pub(crate) struct ReplicationSourceResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplicationDeltaFrame {
-    pub(crate) generation: Option<u64>,
+    pub(crate) generation: u64,
     pub(crate) needs_resync: bool,
     pub(crate) from_offset: usize,
     pub(crate) next_offset: usize,
@@ -187,7 +187,7 @@ pub(crate) struct ReplicationDeltaFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplicationExportFrame {
-    pub(crate) generation: Option<u64>,
+    pub(crate) generation: u64,
     pub(crate) snapshot_lines: Vec<String>,
     pub(crate) wal_lines: Vec<String>,
 }
@@ -249,7 +249,7 @@ pub(crate) fn parse_replication_delta_frame(
 ) -> Result<ReplicationDeltaFrame, String> {
     let mut lines = body.lines().peekable();
     expect_kv(&mut lines, "status", "ok")?;
-    let generation = parse_optional_generation(&mut lines)?;
+    let generation = parse_generation(&mut lines)?;
     let needs_resync = parse_kv_bool01(&mut lines, "needs_resync")?;
     let from_offset = parse_kv_usize(&mut lines, "from_offset")?;
     let next_offset = parse_kv_usize(&mut lines, "next_offset")?;
@@ -308,7 +308,7 @@ pub(crate) fn render_replication_export_frame(
 pub(crate) fn parse_replication_export_frame(body: &str) -> Result<ReplicationExportFrame, String> {
     let mut lines = body.lines().peekable();
     expect_kv(&mut lines, "status", "ok")?;
-    let generation = parse_optional_generation(&mut lines)?;
+    let generation = parse_generation(&mut lines)?;
     let snapshot_records = parse_kv_usize(&mut lines, "snapshot_records")?;
     let wal_records = parse_kv_usize(&mut lines, "wal_records")?;
     if snapshot_records > body.len() || wal_records > body.len() {
@@ -347,9 +347,12 @@ pub(crate) fn parse_replication_export_frame(body: &str) -> Result<ReplicationEx
     })
 }
 
-fn parse_optional_generation<'a, I>(
-    lines: &mut std::iter::Peekable<I>,
-) -> Result<Option<u64>, String>
+/// The WAL generation line every frame of a 0.3.0+ leader carries. A frame
+/// without it comes from an older leader whose offset-only protocol cannot
+/// tell a follower that the WAL was compacted (and serves a fresh follower
+/// only the WAL tail, never the snapshot), so following it could silently
+/// skip records: refuse it.
+fn parse_generation<'a, I>(lines: &mut std::iter::Peekable<I>) -> Result<u64, String>
 where
     I: Iterator<Item = &'a str>,
 {
@@ -359,10 +362,9 @@ where
             let (_, value) = parse_kv_line(line, "generation")?;
             value
                 .parse::<u64>()
-                .map(Some)
                 .map_err(|_| "replication payload has invalid generation".to_string())
         }
-        _ => Ok(None),
+        _ => Err(dash_common::replication_client::LEGACY_LEADER_ERROR.to_string()),
     }
 }
 
@@ -566,6 +568,9 @@ impl Default for ReplicationFollowerState {
 
 const BLOCKED_RESPONSE_TOO_LARGE: &str = "replication_response_too_large";
 const BLOCKED_GROUP_TOO_LARGE: &str = "replication_group_too_large";
+/// The leader runs a release older than 0.3.0 (see
+/// [`dash_common::replication_client::LEGACY_LEADER_ERROR`]).
+const BLOCKED_LEADER_TOO_OLD: &str = "replication_leader_too_old";
 const RESPONSE_TOO_LARGE_MARKER: &str = "byte limit";
 
 /// Failures that retrying cannot fix: the leader's answer is permanently
@@ -573,6 +578,8 @@ const RESPONSE_TOO_LARGE_MARKER: &str = "byte limit";
 fn classify_blocking_error(error: &str) -> Option<&'static str> {
     if error.contains(BLOCKED_GROUP_TOO_LARGE) {
         Some(BLOCKED_GROUP_TOO_LARGE)
+    } else if error.contains(dash_common::replication_client::LEGACY_LEADER_ERROR) {
+        Some(BLOCKED_LEADER_TOO_OLD)
     } else if error.contains(RESPONSE_TOO_LARGE_MARKER) {
         Some(BLOCKED_RESPONSE_TOO_LARGE)
     } else {
@@ -752,8 +759,7 @@ impl IngestionRuntime {
         }
         self.replication_pull_success_total = self.replication_pull_success_total.saturating_add(1);
         self.replication_last_offset = frame.next_offset;
-        self.replication_follower.generation =
-            frame.generation.or(self.replication_follower.generation);
+        self.replication_follower.generation = Some(frame.generation);
         self.replication_last_error = None;
         self.persist_replication_state();
         Ok(())
@@ -801,7 +807,7 @@ impl IngestionRuntime {
         self.replication_resync_total = self.replication_resync_total.saturating_add(1);
         // Offsets count WAL lines only, the unit the leader reports.
         self.replication_last_offset = export.wal_lines.len();
-        self.replication_follower.generation = frame.generation;
+        self.replication_follower.generation = Some(frame.generation);
         self.replication_follower.force_resync = false;
         self.replication_follower.leader_total_records = export.wal_lines.len();
         self.replication_last_error = None;
@@ -1066,10 +1072,7 @@ fn pull_tick(runtime: &SharedRuntime, config: &ReplicationPullConfig) -> Result<
         .lock()
         .map_err(|_| "replication runtime lock unavailable".to_string())?
         .note_leader_total(delta_frame.total_records);
-    let generation_changed = matches!(
-        (from_generation, delta_frame.generation),
-        (Some(ours), Some(theirs)) if ours != theirs
-    );
+    let generation_changed = from_generation.is_some_and(|ours| ours != delta_frame.generation);
     if delta_frame.needs_resync || generation_changed {
         return resync_from_export(runtime, config);
     }
@@ -1446,7 +1449,7 @@ mod tests {
             ],
         });
         let frame = parse_replication_delta_frame(&body, 512).expect("delta frame should parse");
-        assert_eq!(frame.generation, Some(9));
+        assert_eq!(frame.generation, 9);
         assert!(!frame.needs_resync);
         assert_eq!(frame.next_offset, 4);
         assert_eq!(frame.wal_lines.len(), 2);
@@ -1464,9 +1467,21 @@ mod tests {
             11,
         );
         let frame = parse_replication_export_frame(&body).expect("export frame should parse");
-        assert_eq!(frame.generation, Some(11));
+        assert_eq!(frame.generation, 11);
         assert_eq!(frame.snapshot_lines.len(), 1);
         assert_eq!(frame.wal_lines.len(), 1);
+    }
+
+    /// Frames of a pre-0.3.0 leader carry no generation. Following such a
+    /// leader could silently skip records, so both frame kinds are refused.
+    #[test]
+    fn frames_without_a_generation_from_a_pre_0_3_leader_are_refused() {
+        let delta = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=1\ntotal_records=1\nrecords=1\nC\tc1\ttenant-a\ttext\t0.9\tnull\t\t\n";
+        let err = parse_replication_delta_frame(delta, 512).expect_err("legacy delta");
+        assert_eq!(err, dash_common::replication_client::LEGACY_LEADER_ERROR);
+        let export = "status=ok\nsnapshot_records=0\nwal_records=0\nSNAPSHOT\nWAL\n";
+        let err = parse_replication_export_frame(export).expect_err("legacy export");
+        assert_eq!(err, dash_common::replication_client::LEGACY_LEADER_ERROR);
     }
 
     #[test]
@@ -1508,7 +1523,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
             store::InMemoryStore::new(),
         )));
-        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-1\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-1\t1\t1700000000000\t7:claim-1\n".to_string();
+        let delta_body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-1\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-1\t1\t1700000000000\t7:claim-1\n".to_string();
         let (source_base_url, requests, source_handle) =
             spawn_mock_replication_source(delta_body, 2);
         let config = ReplicationPullConfig {
@@ -1557,7 +1572,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
             store::InMemoryStore::new(),
         )));
-        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-1\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-1\t1\t1700000000000\t7:claim-1\n".to_string();
+        let delta_body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-1\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-1\t1\t1700000000000\t7:claim-1\n".to_string();
         let (source_base_url, requests, source_handle) =
             spawn_mock_replication_source_with_ack(delta_body, 2, "HTTP/1.1 404 Not Found");
         let config = ReplicationPullConfig {
@@ -1582,7 +1597,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
             store::InMemoryStore::new(),
         )));
-        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-2\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-2\t1\t1700000000000\t7:claim-2\n".to_string();
+        let delta_body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-2\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-2\t1\t1700000000000\t7:claim-2\n".to_string();
         let (source_base_url, requests, source_handle) =
             spawn_mock_replication_source(delta_body, 1);
         let config = ReplicationPullConfig {
@@ -1768,7 +1783,7 @@ mod tests {
         let runtime = Arc::new(Mutex::new(super::super::IngestionRuntime::in_memory(
             store::InMemoryStore::new(),
         )));
-        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-p\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-p\t1\t1700000000000\t7:claim-p\n".to_string();
+        let delta_body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=2\ntotal_records=2\nrecords=2\nC\tclaim-p\ttenant-a\ttext\t0.9\tnull\t\t\nB\tcommit-p\t1\t1700000000000\t7:claim-p\n".to_string();
         let (source_base_url, _requests, source_handle) =
             spawn_mock_replication_source(delta_body, 1);
         let config = ReplicationPullConfig {
@@ -1825,7 +1840,7 @@ mod tests {
                 )
                 .expect("initial batch commit metadata should seed runtime");
         }
-        let delta_body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=1\ntotal_records=1\nrecords=1\nB\tcommit-diverge-1\t1\t1700000000001\t5:c-new\n".to_string();
+        let delta_body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=1\ntotal_records=1\nrecords=1\nB\tcommit-diverge-1\t1\t1700000000001\t5:c-new\n".to_string();
         let (source_base_url, requests, source_handle) =
             spawn_mock_replication_source(delta_body, 1);
         let config = ReplicationPullConfig {

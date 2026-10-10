@@ -214,11 +214,15 @@ pub struct FollowerStatus {
 const BLOCKED_NONE: u8 = 0;
 const BLOCKED_RESPONSE_TOO_LARGE: u8 = 1;
 const BLOCKED_GROUP_TOO_LARGE: u8 = 2;
+/// The leader runs a release older than 0.3.0 (see
+/// [`dash_common::replication_client::LEGACY_LEADER_ERROR`]).
+const BLOCKED_LEADER_TOO_OLD: u8 = 3;
 
 fn blocked_reason_name(code: u8) -> Option<&'static str> {
     match code {
         BLOCKED_RESPONSE_TOO_LARGE => Some("replication_response_too_large"),
         BLOCKED_GROUP_TOO_LARGE => Some("replication_group_too_large"),
+        BLOCKED_LEADER_TOO_OLD => Some("replication_leader_too_old"),
         _ => None,
     }
 }
@@ -228,6 +232,8 @@ fn blocked_reason_name(code: u8) -> Option<&'static str> {
 fn classify_blocking_error(error: &str) -> u8 {
     if error.contains("replication_group_too_large") {
         BLOCKED_GROUP_TOO_LARGE
+    } else if error.contains(dash_common::replication_client::LEGACY_LEADER_ERROR) {
+        BLOCKED_LEADER_TOO_OLD
     } else if error.contains("byte limit") {
         BLOCKED_RESPONSE_TOO_LARGE
     } else {
@@ -742,10 +748,10 @@ impl Follower {
         self.status
             .leader_total
             .store(frame.total_records, Ordering::Relaxed);
-        let generation_changed = matches!(
-            (self.state.generation, frame.generation),
-            (Some(ours), Some(theirs)) if ours != theirs
-        );
+        let generation_changed = self
+            .state
+            .generation
+            .is_some_and(|ours| ours != frame.generation);
         if frame.needs_resync || generation_changed {
             return self.resync();
         }
@@ -764,7 +770,7 @@ impl Follower {
             self.apply_delta(&frame.wal_lines)?;
         }
         self.state = FollowerState {
-            generation: frame.generation.or(self.state.generation),
+            generation: Some(frame.generation),
             offset: frame.next_offset,
         };
         self.persist_state();
@@ -881,7 +887,7 @@ impl Follower {
         }
         let wal_len = export.export.wal_lines.len();
         self.state = FollowerState {
-            generation: export.generation,
+            generation: Some(export.generation),
             offset: wal_len,
         };
         self.force_resync = false;
@@ -965,7 +971,7 @@ fn http_get(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeltaFrame {
-    generation: Option<u64>,
+    generation: u64,
     needs_resync: bool,
     from_offset: usize,
     next_offset: usize,
@@ -975,14 +981,14 @@ struct DeltaFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportFrame {
-    generation: Option<u64>,
+    generation: u64,
     export: WalReplicationExport,
 }
 
 fn parse_delta_frame(body: &str, max_records: usize) -> Result<DeltaFrame, String> {
     let mut lines = body.lines().peekable();
     expect_kv(&mut lines, "status", "ok")?;
-    let generation = parse_optional_generation(&mut lines)?;
+    let generation = parse_generation(&mut lines)?;
     let needs_resync = parse_kv_bool01(&mut lines, "needs_resync")?;
     let from_offset = parse_kv_usize(&mut lines, "from_offset")?;
     let next_offset = parse_kv_usize(&mut lines, "next_offset")?;
@@ -1022,7 +1028,7 @@ fn parse_delta_frame(body: &str, max_records: usize) -> Result<DeltaFrame, Strin
 fn parse_export_frame(body: &str) -> Result<ExportFrame, String> {
     let mut lines = body.lines().peekable();
     expect_kv(&mut lines, "status", "ok")?;
-    let generation = parse_optional_generation(&mut lines)?;
+    let generation = parse_generation(&mut lines)?;
     let snapshot_records = parse_kv_usize(&mut lines, "snapshot_records")?;
     let wal_records = parse_kv_usize(&mut lines, "wal_records")?;
     if snapshot_records > body.len() || wal_records > body.len() {
@@ -1063,9 +1069,10 @@ fn parse_export_frame(body: &str) -> Result<ExportFrame, String> {
     })
 }
 
-fn parse_optional_generation<'a, I>(
-    lines: &mut std::iter::Peekable<I>,
-) -> Result<Option<u64>, String>
+/// The WAL generation line every frame of a 0.3.0+ leader carries; a frame
+/// without it comes from an older leader that cannot be followed safely (see
+/// [`dash_common::replication_client::LEGACY_LEADER_ERROR`]).
+fn parse_generation<'a, I>(lines: &mut std::iter::Peekable<I>) -> Result<u64, String>
 where
     I: Iterator<Item = &'a str>,
 {
@@ -1075,10 +1082,9 @@ where
             let (_, value) = parse_kv_line(line, "generation")?;
             value
                 .parse::<u64>()
-                .map(Some)
                 .map_err(|_| "replication payload has invalid generation".to_string())
         }
-        _ => Ok(None),
+        _ => Err(dash_common::replication_client::LEGACY_LEADER_ERROR.to_string()),
     }
 }
 
@@ -1244,10 +1250,25 @@ mod tests {
 
     #[test]
     fn delta_frame_rejects_absurd_record_counts_without_allocating() {
-        let body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=0\ntotal_records=0\nrecords=18446744073709551615\n";
-        assert!(parse_delta_frame(body, 512).is_err());
-        let body = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=1000000\ntotal_records=0\nrecords=1000000\n";
-        assert!(parse_delta_frame(body, 512).is_err());
+        let body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=0\ntotal_records=0\nrecords=18446744073709551615\n";
+        let err = parse_delta_frame(body, 512).expect_err("absurd count");
+        assert!(err.contains("advertises"), "{err}");
+        let body = "status=ok\ngeneration=1\nneeds_resync=0\nfrom_offset=0\nnext_offset=1000000\ntotal_records=0\nrecords=1000000\n";
+        let err = parse_delta_frame(body, 512).expect_err("absurd count");
+        assert!(err.contains("advertises"), "{err}");
+    }
+
+    /// A pre-0.3.0 leader sends no generation; following it could silently
+    /// skip records (it serves a fresh follower only its WAL tail), so both
+    /// frame kinds are refused with an error that names the cause.
+    #[test]
+    fn frames_without_a_generation_from_a_pre_0_3_leader_are_refused() {
+        let delta = "status=ok\nneeds_resync=0\nfrom_offset=0\nnext_offset=1\ntotal_records=1\nrecords=1\nline\n";
+        let err = parse_delta_frame(delta, 512).expect_err("legacy delta");
+        assert_eq!(err, dash_common::replication_client::LEGACY_LEADER_ERROR);
+        let export = "status=ok\nsnapshot_records=1\nwal_records=0\nSNAPSHOT\na\nWAL\n";
+        let err = parse_export_frame(export).expect_err("legacy export");
+        assert_eq!(err, dash_common::replication_client::LEGACY_LEADER_ERROR);
     }
 
     #[test]
@@ -1256,7 +1277,7 @@ mod tests {
         assert!(parse_delta_frame(body, 512).is_err());
         let ok = "status=ok\ngeneration=7\nneeds_resync=0\nfrom_offset=2\nnext_offset=3\ntotal_records=9\nrecords=1\nline\n";
         let frame = parse_delta_frame(ok, 512).expect("valid frame");
-        assert_eq!(frame.generation, Some(7));
+        assert_eq!(frame.generation, 7);
         assert_eq!(frame.wal_lines, vec!["line".to_string()]);
     }
 
@@ -1265,10 +1286,12 @@ mod tests {
         let body =
             "status=ok\ngeneration=3\nsnapshot_records=1\nwal_records=1\nSNAPSHOT\na\nWAL\nb\n";
         let frame = parse_export_frame(body).expect("valid export");
-        assert_eq!(frame.generation, Some(3));
+        assert_eq!(frame.generation, 3);
         assert_eq!(frame.export.snapshot_lines, vec!["a".to_string()]);
-        let inflated = "status=ok\nsnapshot_records=99999999999\nwal_records=0\nSNAPSHOT\nWAL\n";
-        assert!(parse_export_frame(inflated).is_err());
+        let inflated =
+            "status=ok\ngeneration=3\nsnapshot_records=99999999999\nwal_records=0\nSNAPSHOT\nWAL\n";
+        let err = parse_export_frame(inflated).expect_err("inflated export");
+        assert!(err.contains("advertises"), "{err}");
     }
 
     #[test]
