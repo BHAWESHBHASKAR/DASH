@@ -13,6 +13,7 @@ deploy/container/
 ├── Dockerfile                  # multi-stage build (builder / dev / runtime)
 ├── docker-compose.yml          # ingestion, retrieval, segment-maintenance (+ control-plane profile)
 ├── docker-compose.dev.yml      # local dev overlay (hot-reload via cargo-watch)
+├── docker-compose.tracing.yml  # OpenTelemetry trace export overlay (+ local Jaeger profile)
 ├── .env.example                # secrets template; copying it as-is fails startup on purpose
 ├── .dockerignore
 ├── README.md
@@ -257,3 +258,20 @@ against `DASH_HEALTHCHECK_CA_FILE` when given). The
 `segment-maintenance` daemon has no HTTP endpoint, so its check is
 process presence. `depends_on` uses `condition: service_healthy` so
 retrieval starts only after ingestion is ready.
+
+## Distributed tracing
+
+`docker-compose.tracing.yml` turns on OpenTelemetry trace export
+(OTLP/HTTP protobuf) for ingestion, retrieval and the control plane. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to your collector's OTLP/HTTP base URL, or add
+`--profile tracing-backend` to start a local Jaeger whose UI listens on
+`http://127.0.0.1:16686`:
+
+```bash
+docker compose -f deploy/container/docker-compose.yml \
+               -f deploy/container/docker-compose.tracing.yml \
+               --profile tracing-backend up -d
+```
+
+Send a `traceparent` header with a request to join your own trace; see
+`docs/operations/tracing.md`.

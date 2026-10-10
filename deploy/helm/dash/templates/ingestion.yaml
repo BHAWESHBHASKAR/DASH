@@ -141,6 +141,7 @@ spec:
               name: {{ include "dash.controlPlaneSecretName" . }}
               key: DASH_CONTROL_PLANE_TOKEN
         {{- end }}
+        {{- include "dash.tracingEnv" . | nindent 8 }}
         envFrom:
         - configMapRef:
             name: {{ include "dash.fullname" . }}-config

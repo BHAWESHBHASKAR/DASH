@@ -230,3 +230,27 @@ Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
     defaultMode: 0400
 {{- end }}
 {{- end -}}
+
+{{/*
+Per-pod tracing environment: resource attributes naming the pod and, when
+configured, the collector headers from a Secret. Rendered only when
+observability.tracing.enabled.
+*/}}
+{{- define "dash.tracingEnv" -}}
+{{- $tr := .Values.observability.tracing -}}
+{{- if $tr.enabled }}
+- name: K8S_POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+- name: OTEL_RESOURCE_ATTRIBUTES
+  value: {{ printf "k8s.namespace.name=%s,k8s.pod.name=$(K8S_POD_NAME)%s" (include "dash.namespace" .) (ternary "" (printf ",%s" $tr.resourceAttributes) (empty $tr.resourceAttributes)) | quote }}
+{{- if $tr.headersSecret.name }}
+- name: OTEL_EXPORTER_OTLP_HEADERS
+  valueFrom:
+    secretKeyRef:
+      name: {{ $tr.headersSecret.name }}
+      key: {{ required "observability.tracing.headersSecret.key is required with headersSecret.name" $tr.headersSecret.key }}
+{{- end }}
+{{- end }}
+{{- end -}}

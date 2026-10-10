@@ -103,6 +103,17 @@ data:
   {{- end }}
   {{- end }}
 
+  {{- if .Values.observability.tracing.enabled }}
+  # ----- distributed tracing (docs/operations/tracing.md) -----
+  {{- $tr := .Values.observability.tracing }}
+  DASH_OTEL_ENABLED: "1"
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ required "observability.tracing.endpoint is required when tracing is enabled" $tr.endpoint | quote }}
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+  OTEL_TRACES_SAMPLER: {{ $tr.sampler | quote }}
+  OTEL_TRACES_SAMPLER_ARG: {{ $tr.samplerArg | toString | quote }}
+  DASH_OTEL_BACKGROUND_SAMPLE_RATIO: {{ $tr.backgroundSampleRatio | toString | quote }}
+  {{- end }}
+
   {{- if .Values.failover.enabled }}
   {{- if not .Values.controlPlane.enabled }}
   {{- fail "failover.enabled requires controlPlane.enabled" }}

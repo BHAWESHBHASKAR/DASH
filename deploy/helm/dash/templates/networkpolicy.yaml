@@ -137,6 +137,32 @@ spec:
     - port: {{ .Values.networkPolicy.ollama.port }}
       protocol: TCP
 {{- end }}
+{{- if .Values.observability.tracing.enabled }}
+---
+# Every DASH pod -> the OpenTelemetry collector (OTLP/HTTP).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dash.fullname" . }}-otlp-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dash.selectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    {{- range (default $cidrs .Values.observability.tracing.networkPolicy.cidrs) }}
+    - ipBlock:
+        cidr: {{ . }}
+    {{- end }}
+    ports:
+    - port: {{ .Values.observability.tracing.networkPolicy.port }}
+      protocol: TCP
+{{- end }}
 ---
 # Ingress controller -> retrieval and ingestion HTTP ports.
 apiVersion: networking.k8s.io/v1

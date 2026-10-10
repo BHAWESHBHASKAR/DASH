@@ -36,6 +36,7 @@ pub const T_SERVER: &str = "HTTP server";
 pub const T_LEASE: &str = "State and leader lease";
 pub const T_FAILOVER: &str = "Leader failover and synchronous replication";
 pub const T_ENCRYPTION: &str = "Encryption at rest";
+pub const T_TRACING: &str = "Distributed tracing (OpenTelemetry)";
 pub const T_CONTAINER: &str = "Container and compose variables";
 pub const T_BENCH: &str = "Benchmarks";
 pub const T_LOAD: &str = "Load test";
@@ -76,6 +77,21 @@ const SEG_SIZE: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENT_SIZE")];
 const SEG_TIER: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_SEGMENTS_PER_TIER")];
 const SEG_COMPACT: &[Alias] = &[Alias::shared("DASH_SEGMENT_MAX_COMPACTION_INPUT_SEGMENTS")];
 const OLLAMA_ALIAS: &[Alias] = &[Alias::deprecated("DASH_OLLAMA_BASE_URL")];
+
+const OTLP_PROTOCOL: Kind = Kind::Enum {
+    values: &["http/protobuf"],
+};
+const OTEL_SAMPLER: Kind = Kind::Enum {
+    values: &[
+        "always_on",
+        "always_off",
+        "traceidratio",
+        "parentbased_always_on",
+        "parentbased_always_off",
+        "parentbased_traceidratio",
+    ],
+};
+const UNIT_FRACTION: Kind = Kind::Float { min: 0.0, max: 1.0 };
 
 const SYNC_TIMEOUT_POLICY: Kind = Kind::Enum {
     values: &["fail", "degrade"],
@@ -951,6 +967,217 @@ pub static REGISTRY: &[Entry] = &[
     )
     .readers(DATA | TOOLS)
     .blank_ok(),
+    // ---- distributed tracing (OpenTelemetry, OTLP/HTTP protobuf)
+    Entry::new(
+        "DASH_OTEL_ENABLED",
+        Common,
+        T_TRACING,
+        Kind::BOOL,
+        "off; on when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set",
+        "Turns OpenTelemetry trace export on (`1`) or off (`0`). Unset, tracing is on exactly when an OTLP endpoint variable is set. `OTEL_SDK_DISABLED=true` and `OTEL_TRACES_EXPORTER=none` turn it off in every case. Off costs one atomic load per instrumented point. See [Distributed tracing](../operations/tracing.md).",
+    )
+    .readers(ALL_SERVICES),
+    Entry::new(
+        "DASH_OTEL_BACKGROUND_SAMPLE_RATIO",
+        Common,
+        T_TRACING,
+        UNIT_FRACTION,
+        "1",
+        "Extra fraction applied to new traces started by background work (replication polls, failover heartbeats, checkpoints outside a request) on top of `OTEL_TRACES_SAMPLER`. Lower it to thin the traces of idle replication loops without lowering request sampling.",
+    )
+    .readers(ALL_SERVICES),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        Common,
+        T_TRACING,
+        Kind::Url,
+        "",
+        "Base URL of the OTLP/HTTP collector (`http://collector:4318`); spans go to `<endpoint>/v1/traces`. Setting it enables tracing unless `DASH_OTEL_ENABLED=0`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        Common,
+        T_TRACING,
+        Kind::Url,
+        "`http://localhost:4318/v1/traces` when tracing is enabled without an endpoint",
+        "Full URL spans are POSTed to (used as is, no path appended). Wins over `OTEL_EXPORTER_OTLP_ENDPOINT`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        Common,
+        T_TRACING,
+        Kind::Secret,
+        "",
+        "Extra request headers for the collector as `name=value` pairs separated by commas (values may be `%`-encoded), for example the collector's credentials. Never logged; a malformed entry is skipped with a warning that names only its position. `OTEL_EXPORTER_OTLP_TRACES_HEADERS` wins when set.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        Common,
+        T_TRACING,
+        Kind::Secret,
+        "",
+        "Traces-only form of `OTEL_EXPORTER_OTLP_HEADERS`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        Common,
+        T_TRACING,
+        OTLP_PROTOCOL,
+        "http/protobuf",
+        "Only `http/protobuf` is supported. Any other value (`grpc`, `http/json`) keeps tracing off and logs why. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins when set.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        Common,
+        T_TRACING,
+        OTLP_PROTOCOL,
+        "http/protobuf",
+        "Traces-only form of `OTEL_EXPORTER_OTLP_PROTOCOL`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        Common,
+        T_TRACING,
+        Kind::POSITIVE_MILLIS,
+        "10000",
+        "Timeout of one export request. `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` wins when set.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        Common,
+        T_TRACING,
+        Kind::POSITIVE_MILLIS,
+        "10000",
+        "Traces-only form of `OTEL_EXPORTER_OTLP_TIMEOUT`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        Common,
+        T_TRACING,
+        Kind::Path,
+        "",
+        "PEM bundle of CA certificates trusted for an `https://` collector, in addition to the public web roots. `OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE` wins when set. Client certificates are not supported; use a local collector for mutual TLS.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        Common,
+        T_TRACING,
+        Kind::Path,
+        "",
+        "Traces-only form of `OTEL_EXPORTER_OTLP_CERTIFICATE`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_SERVICE_NAME",
+        Common,
+        T_TRACING,
+        Kind::Str,
+        "`dash-ingestion`, `dash-retrieval` or `dash-control-plane`",
+        "The `service.name` resource attribute. Wins over `service.name` in `OTEL_RESOURCE_ATTRIBUTES`.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        Common,
+        T_TRACING,
+        Kind::Str,
+        "",
+        "Extra resource attributes as `key=value` pairs separated by commas (for example `deployment.environment=prod,k8s.pod.name=...`).",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_TRACES_SAMPLER",
+        Common,
+        T_TRACING,
+        OTEL_SAMPLER,
+        "parentbased_always_on",
+        "Head sampler. `parentbased_*` samplers follow the caller's `traceparent` decision and apply the named sampler to new traces. An unsupported value falls back to the default with a warning.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_TRACES_SAMPLER_ARG",
+        Common,
+        T_TRACING,
+        UNIT_FRACTION,
+        "1",
+        "Sampling ratio for `traceidratio` and `parentbased_traceidratio`. The decision is derived from the trace id, so every service samples the same traces.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_TRACES_EXPORTER",
+        Common,
+        T_TRACING,
+        Kind::Enum {
+            values: &["otlp", "none"],
+        },
+        "otlp",
+        "`none` turns tracing off.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_SDK_DISABLED",
+        Common,
+        T_TRACING,
+        Kind::BOOL,
+        "false",
+        "`true` turns tracing off, whatever else is set.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_BSP_SCHEDULE_DELAY",
+        Common,
+        T_TRACING,
+        Kind::POSITIVE_MILLIS,
+        "5000",
+        "Longest time a finished span waits in the export queue before a batch is sent.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_BSP_MAX_QUEUE_SIZE",
+        Common,
+        T_TRACING,
+        Kind::POSITIVE,
+        "2048",
+        "Spans buffered for export. When the queue is full new spans are dropped (counted in `dash_trace_spans_dropped_total{reason=\"queue_full\"}`); request threads never wait for the exporter.",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
+    Entry::new(
+        "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
+        Common,
+        T_TRACING,
+        Kind::POSITIVE,
+        "512",
+        "Spans per export request (capped at the queue size).",
+    )
+    .readers(ALL_SERVICES)
+    .external(),
     // ---- container / compose (not read by Rust)
     Entry::new(
         "DASH_BIN",
