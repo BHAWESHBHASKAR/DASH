@@ -177,10 +177,19 @@ spec:
             path: {{ ternary "/v1/ready/leader" .Values.probes.readiness.path $failover }}
             port: http
             scheme: {{ include "dash.probeScheme" . }}
+          {{- if $failover }}
+          # Probe often: the Service must move to a new leader (and away from
+          # a deposed one) within seconds, not tens of seconds.
+          periodSeconds: {{ .Values.failover.readinessPeriodSeconds }}
+          timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          successThreshold: 1
+          failureThreshold: 1
+          {{- else }}
           periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
           successThreshold: 1
           failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
         securityContext:
           {{- toYaml .Values.containerSecurityContext | nindent 12 }}
         volumeMounts:

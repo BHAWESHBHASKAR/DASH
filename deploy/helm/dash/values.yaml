@@ -112,6 +112,9 @@ failover:
   syncTimeoutMs: 5000
   # fail (503, retry) or degrade (200 with commit_status=sync_degraded).
   syncOnTimeout: fail
+  # Readiness period of the ingestion pods (failure threshold 1): how fast
+  # the ingestion Service follows a leader change.
+  readinessPeriodSeconds: 2
 
 podLabels: {}
 podAnnotations: {}
