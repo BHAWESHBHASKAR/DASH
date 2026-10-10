@@ -40,7 +40,12 @@ rollback without restoring a backup would face.
 | Audit log (`DASH_*_AUDIT_LOG_PATH`) | JSON lines without `v` (ingestion: sorted keys; retrieval: insertion order) | record version 2 (`"v":2`, canonical field order) | Yes; the verifier accepts both, the writer continues the chain (`seq`, `prev_hash`) | The 0.2 writer continues from the last `seq`/`hash`; verify the mixed chain with 0.3's `audit-verify` |
 | Control-plane lease (`DASH_CONTROL_PLANE_LEASE_PATH`) | `node_id,epoch,expires_at_ms` | `node_id,epoch,expires_at_ms,instance_id`, plus `leader.lease.epoch` (fencing floor) and `leader.lease.lock` (flock) | Yes; the first acquisition issues a fencing token above the old one | No: 0.2 requires exactly three fields and never becomes leader |
 | Placement state (`DASH_CONTROL_PLANE_STATE_PATH`) | CSV `tenant_id,shard_id,epoch,node_id,role,health` | same | Yes | Yes |
-| Replication frames (`/internal/replication/wal`, `/export`) | no `generation=` line | `generation=<lineage>` as the second line | Refused: both followers apply nothing and report `replication_leader_too_old` | Refused: the 0.2 follower expects `needs_resync=` on the second line and fails every poll |
+| Replication frames (`/internal/replication/wal`, `/export`) | no `generation=` line | `generation=<lineage>` as the second line; to a follower that sends `gen_switch=1`, also `switch_from=none` or `switch_from=<generation>:<offset>` after `needs_resync=` (see [Within 0.3.0](#within-030-chunked-export-and-generation-switches)) | Refused: both followers apply nothing and report `replication_leader_too_old` | Refused: the 0.2 follower expects `needs_resync=` on the second line and fails every poll |
+| Chunked export (`/internal/replication/export/begin`, `/chunk`) | not served (404) | manifest (`export_id`, `generation`, `snapshot_records`, `wal_records`, `total_bytes`, `sha256`) and chunks (`DATA` + whole lines) | n/a: followers fall back to the single-response export on 404 (and then refuse the 0.2 frame) | n/a |
+| Generation transitions `<wal>.gen.transitions` | not written | one `<from:16 hex> <records> <to:16 hex>` line per checkpoint, newest 16 | n/a | Ignored |
+| Closed generation `<wal>.closed.<16 hex>` | not written | the WAL file of the generation the last checkpoint closed (same records as the WAL), replaced at the next checkpoint | n/a | Ignored (delete it after a rollback) |
+| Exports `<wal>.exports/` | not written | `<id>.export` (single-response export layout, zero-padded counts) and `<id>.manifest`, newest 2, deleted after 15 idle minutes | n/a | Ignored (delete it after a rollback) |
+| Follower download `<wal>.resync.part`, `<wal>.resync.manifest` | not written | a partial or complete export download and its manifest, deleted after the swap | n/a | Ignored |
 | Follower cursor (`<wal>.replication`, `DASH_RETRIEVAL_REPLICATION_OFFSET_PATH`) | bare offset (retrieval only) | `generation=…` and `offset=…` | A bare offset is read as a cursor without a generation, which the leader answers with a resync (the parser is unit-tested in `services/retrieval`, not in `tests/compat`) | n/a |
 | HTTP API `/v1` | | | Request bodies and the API key header of 0.2 clients are accepted; every response field 0.2 returned is still returned. Authentication and role defaults changed (CHANGELOG checklist, steps 2 to 5) | n/a |
 
@@ -126,6 +131,33 @@ Upgrading followers first also works, but they report not ready (`/ready`
 rotation until the leader is upgraded. Prefer leader first so readers keep a
 (stale) answer during the window.
 
+### Within 0.3.0: chunked export and generation switches
+
+Builds of the 0.3.0 line before chunked export (the `v0.3.0-dev` fixture)
+and current builds replicate in both directions; nothing has to be
+upgraded in a particular order, though leader first keeps the most
+features available during the window:
+
+* **Earlier follower, current leader.** The follower does not send
+  `gen_switch=1`, so the leader answers with the frame layout it parses (no
+  `switch_from=` line) and serves it the single-response export. It resyncs
+  after every checkpoint, as before, and its export must still fit in its
+  `MAX_RESPONSE_BYTES`.
+* **Current follower, earlier leader.** The leader ignores `gen_switch=1` and
+  answers `/export/begin` with 404; the follower falls back to the
+  single-response export. Checkpoints still force a resync (the leader
+  records no transitions).
+* **Rollback of a leader to an earlier 0.3 build.** The WAL, snapshot and
+  frame formats are unchanged, so it starts normally; it ignores
+  `<wal>.gen.transitions`, `<wal>.closed.*` and `<wal>.exports/` (delete them
+  to reclaim the space). Current followers fall back as above.
+* **Checkpoint default.** A leader upgraded without
+  `DASH_CHECKPOINT_MAX_WAL_BYTES` in its environment now checkpoints once
+  its WAL reaches 256 MiB (it never checkpointed on its own before). Set the
+  variable to `0` to keep the old behaviour. With an existing WAL above the
+  threshold the first write after the upgrade checkpoints: expect one
+  snapshot write (proportional to the data set) right after the upgrade.
+
 ### Control plane replicas
 
 0.2 cannot read the lease file 0.3 writes, and 0.2 does not take the
@@ -201,9 +233,11 @@ a scratch copy of each fixture and must:
   (`vector_index_file.rs`), verify the segment directories (`segments.rs`),
   continue the audit chain (`audit_chain.rs`), take over the lease and read
   the placement state (`control_plane.rs`);
-- refuse 0.2 replication frames, follow recorded 0.3 frames, and serve
-  followers from an upgraded leader whose WAL still holds 0.2 records
-  (`replication_wire.rs`);
+- refuse 0.2 replication frames, follow recorded 0.3 frames (falling back to
+  the single-response export of a leader without chunked export), serve
+  followers from an upgraded leader whose WAL still holds 0.2 records, and
+  serve both the earlier 0.3 frame layout and the chunked export from a
+  current leader (`replication_wire.rs`);
 - accept the old releases' ingest requests with compatible responses
   (`http_api.rs`).
 
