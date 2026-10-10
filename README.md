@@ -149,7 +149,7 @@ DASH is a Rust workspace (edition 2024).
 | `tools/loadgen` | Closed-loop load and soak generator (throughput, latency percentiles, server RSS) |
 | `tests/benchmarks` | Benchmark and load-test binaries |
 
-Ingested claims are written to a WAL, replayed into an in-memory Claim + Evidence + Edge store, and indexed for ANN candidate generation. The retrieval path combines ANN and lexical candidates with tenant, time-range and stance filters and optional graph expansion, then projects citation-bearing results. Design detail: [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) (the design document predates several renames; where it disagrees with the code, the code and this README win).
+Ingested claims are written to a WAL, replayed into an in-memory Claim + Evidence + Edge store, and indexed for ANN candidate generation. The retrieval path combines ANN and lexical candidates with tenant, time-range and stance filters and optional graph expansion, then projects citation-bearing results. A claim that shares no term with the query and is not a vector candidate is never returned, even when fewer than `top_k` claims match, and the answer is the same with or without a segment directory. Design detail: [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) (the design document predates several renames; where it disagrees with the code, the code and this README win).
 
 ## SDKs
 
