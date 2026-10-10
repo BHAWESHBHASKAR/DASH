@@ -8,6 +8,7 @@ its load numbers: what each tool checks, how to run it, what it does
 |---|---|---|---|
 | `tools/crash-test` | Acknowledged ingests survive `kill -9` at random moments; no duplicates, no partial bundles or batches, clean WAL, service ready after restart | 25 cycles (`rust.yml`, job `crash-test`) | 1000 cycles, 200 cycles with checkpoint pressure, plus a self-check (`durability-nightly.yml`) |
 | `tests/e2e/tests/s4_crash_consistency.rs` | The same oracle across the leader **and** the retrieval follower | 100 cycles (job `e2e`) | 500 cycles |
+| `tools/crash-test --failover` | Leader failover: SIGKILL of the ingestion leader at random moments in a three-node cluster with synchronous replication; no acknowledged write lost, one leader at a time, the killed node rejoins and converges | no (run by hand; e2e `s14_leader_failover` runs in job `e2e`) | no |
 | `tests/e2e/tests/s10_disk_full.rs` | Writes on a full volume fail with a 5xx, `/ready` goes not-ready, nothing acknowledged is lost, recovery in place (WAL) or on restart (redb mirror) | yes (job `e2e`) | yes |
 | `tools/loadgen` | Throughput and latency (p50/p95/p99/max) of an ingest/retrieve mix; soak with server memory sampling | no | 30-minute soak + 2-minute load report, uploaded as artifacts |
 
@@ -113,7 +114,43 @@ Not covered:
   then be lost, as the self-check shows.
 * `/v1/ingest/document` is not exercised by crash-test (it is covered by the
   e2e durability scenario s3).
-* Replicated (quorum) writes; there is no quorum write path yet.
+* Replicated (quorum) writes; there is no quorum write path yet. Synchronous
+  replication across a leader failover is covered by `crash-test --failover`
+  (below).
+
+## Leader failover: `crash-test --failover`
+
+```bash
+cargo build --release -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
+DASH_E2E_BIN_DIR=$PWD/target/release target/release/crash-test --failover --cycles 25 --checkpoint-every 30
+```
+
+A control plane and three ingestion nodes (`n1` the first writer, `n2` and
+`n3` its followers) run with `DASH_INGEST_MIN_SYNC_REPLICAS=1`, a 2 s lease,
+0.5 s grace and 200 ms heartbeats. Each cycle runs the same writers as above
+against the current leader, SIGKILLs it after a random delay, waits for a
+follower to be promoted (exactly one node may answer `/v1/ready/leader`),
+checks that every acknowledged request is on the new leader with all its
+evidence and that the request in flight is there completely or not at all,
+restarts the killed node and waits until it and the other follower hold the
+new leader's data. `--checkpoint-every` adds checkpoints, so failovers happen
+across generation changes. With `--env DASH_INGEST_MIN_SYNC_REPLICAS=0` the
+same run measures asynchronous replication: lost acknowledged writes are
+counted (`acked_lost`) instead of failing the run.
+
+Measured on a 4-vCPU development VM with debug builds:
+
+| Run | Cycles | Acknowledged requests | Lost | Failover (p50 / max) | Rejoin (p50 / max) |
+|---|---|---|---|---|---|
+| synchronous, `--checkpoint-every 30` | 25 | 413 | 0 | 2.68 s / 2.89 s | 3.6 s / 5.8 s |
+| asynchronous (`MIN_SYNC_REPLICAS=0`) | 3 | 337 | 4 | 2.59 s / 2.59 s | 2.4 s / 4.3 s |
+
+Failover time is measured from the SIGKILL to the first `/v1/ready/leader`
+200 on a follower; with these settings the floor is lease + grace = 2.5 s.
+
+Not covered: network partitions (the e2e scenario approximates an isolated
+leader with SIGSTOP/SIGCONT), control-plane failures during a failover, and
+two simultaneous node losses (outside the single-node-loss guarantee).
 
 ## Disk full: `s10_disk_full`
 

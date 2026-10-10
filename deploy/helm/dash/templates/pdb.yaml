@@ -23,7 +23,7 @@ spec:
     matchLabels:
       {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
 {{- end }}
-{{- if .Values.pdb.enabled -}}
+{{- if .Values.pdb.enabled }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
