@@ -137,12 +137,14 @@ spec:
         - name: tmp
           mountPath: /tmp
         {{- include "dash.tlsVolumeMount" . | nindent 8 }}
+        {{- include "dash.encryptionVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir:
           medium: Memory
           sizeLimit: 64Mi
       {{- include "dash.tlsVolume" . | nindent 6 }}
+      {{- include "dash.encryptionVolume" . | nindent 6 }}
       {{- if not .Values.persistence.enabled }}
       - name: data
         emptyDir: {}

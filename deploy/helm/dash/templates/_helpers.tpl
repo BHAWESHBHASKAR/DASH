@@ -212,3 +212,21 @@ Usage: include "dash.initDataDirs" (list . "<image>" "<dir> <dir> ...")
     defaultMode: 0440
 {{- end }}
 {{- end -}}
+
+{{/* Read-only mount of the encryption key Secret (docs/operations/encryption.md). */}}
+{{- define "dash.encryptionVolumeMount" -}}
+{{- if .Values.encryption.enabled }}
+- name: encryption-key
+  mountPath: {{ .Values.encryption.mountPath }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "dash.encryptionVolume" -}}
+{{- if .Values.encryption.enabled }}
+- name: encryption-key
+  secret:
+    secretName: {{ required "encryption.secretName is required when encryption.enabled=true (a Secret holding the key under encryption.keyName)" .Values.encryption.secretName }}
+    defaultMode: 0400
+{{- end }}
+{{- end -}}

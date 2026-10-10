@@ -184,6 +184,27 @@ tls:
   mutual: true
 
 # -----------------------------------------------------------------------------
+# Encryption at rest (ADR 0005, docs/operations/encryption.md). Off by default.
+#
+# secretName names an existing Secret that holds the 32-byte key-encryption
+# key as 64 hex characters under `keyName`, for example:
+#   openssl rand -hex 32 > dash.key
+#   kubectl -n dash-system create secret generic dash-encryption-key \
+#     --from-file=active.key=dash.key
+# The Secret is mounted read-only (mode 0400) into ingestion and retrieval and
+# DASH_ENCRYPTION_KEY_FILE points at it. For a rotation add the new key to the
+# Secret, make it `keyName` and list the old one in `previousKeyNames`.
+# Keep a copy of every key outside the cluster: backups of the volumes hold
+# ciphertext only and are useless without the key.
+# -----------------------------------------------------------------------------
+encryption:
+  enabled: false
+  secretName: ""
+  keyName: active.key
+  previousKeyNames: []
+  mountPath: /etc/dash/encryption
+
+# -----------------------------------------------------------------------------
 # Persistent storage. Per-pod PVCs via StatefulSet volumeClaimTemplates.
 # -----------------------------------------------------------------------------
 persistence:
