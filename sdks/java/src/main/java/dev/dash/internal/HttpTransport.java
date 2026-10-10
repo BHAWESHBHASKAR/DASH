@@ -130,6 +130,16 @@ public class HttpTransport {
         return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
     }
 
+    /**
+     * DELETE {@code path} (no body) and return the deserialised response.
+     * The DASH delete routes are idempotent, so the request is retried on
+     * 429/5xx and I/O errors like a GET.
+     */
+    public <T> T delete(String path, Class<T> responseType) {
+        RawResponse raw = execute("DELETE", path, null, RequestOptions.IDEMPOTENT);
+        return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
+    }
+
     public ObjectMapper mapper() {
         return mapper;
     }
@@ -166,6 +176,11 @@ public class HttpTransport {
     }
 
     private RawResponse execute(String rawPath, String jsonBody, RequestOptions options) {
+        return execute(jsonBody != null ? "POST" : "GET", rawPath, jsonBody, options);
+    }
+
+    private RawResponse execute(String method, String rawPath, String jsonBody,
+                                RequestOptions options) {
         String path = "/" + rawPath.replaceFirst("^/+", "");
         String url = baseUrl + path;
         int attempts = options.canRetry() ? maxAttempts : 1;
@@ -173,6 +188,8 @@ public class HttpTransport {
             Request.Builder builder = new Request.Builder().url(url);
             if (jsonBody != null) {
                 builder.post(RequestBody.create(jsonBody, JSON));
+            } else if ("DELETE".equals(method)) {
+                builder.delete();
             } else {
                 builder.get();
             }
