@@ -29,6 +29,8 @@ pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_SYNC_TIMEOUT_MS: u64 = 5_000;
 /// Longest a caught-up follower's poll is held open (`wait_ms`).
 pub(crate) const MAX_LONG_POLL_MS: u64 = 1_000;
+/// Checkpoint transitions a node reports with its own WAL position.
+const HEARTBEAT_CHAIN_MAX: usize = 8;
 
 // ---------------------------------------------------------------------
 // Configuration
@@ -265,7 +267,7 @@ pub(crate) struct FailoverState {
     /// The checkpoint transition this follower crossed last
     /// (`switch_from`), reported so the control plane can order a
     /// generation the leader had no time to report.
-    pub(crate) last_switch: Option<store::WalPosition>,
+    pub(crate) last_switch: Option<(store::WalPosition, u64)>,
     pub(crate) promotions_total: u64,
     pub(crate) demotions_total: u64,
     pub(crate) promotion_failures_total: u64,
@@ -553,12 +555,16 @@ impl IngestionRuntime {
         // the one this node would continue from.
         let _ = self.replication_cursor(pull);
         let follower = &self.replication_follower;
+        // A follower reports its cursor and the crossing it made last (with
+        // the term of the leader that served it); a node on its own WAL
+        // reports that WAL and its recent checkpoint chain.
+        let mut chain = Vec::new();
         let (position, prev, synced) = match follower.generation {
             Some(generation) if self.failover.role != NodeRole::Leader => (
                 Some((generation, self.replication_last_offset as u64)),
                 self.failover
                     .last_switch
-                    .map(|p| (p.generation, p.records as u64)),
+                    .map(|(p, term)| (p.generation, p.records as u64, term)),
                 follower.synced_once && !follower.force_resync && follower.blocked_reason.is_none(),
             ),
             _ => match self.wal.as_ref() {
@@ -566,12 +572,13 @@ impl IngestionRuntime {
                     let mut wal = lock_wal(wal);
                     match wal.replication_position() {
                         Ok((generation, records)) => {
-                            let prev = wal
-                                .generation_transitions()
-                                .last()
-                                .filter(|t| t.to_generation == generation)
-                                .map(|t| (t.from_generation, t.from_records as u64));
-                            (Some((generation, records as u64)), prev, true)
+                            let transitions = wal.generation_transitions();
+                            let skip = transitions.len().saturating_sub(HEARTBEAT_CHAIN_MAX);
+                            chain = transitions[skip..]
+                                .iter()
+                                .map(|t| (t.from_generation, t.from_records, t.to_generation))
+                                .collect();
+                            (Some((generation, records as u64)), None, true)
                         }
                         Err(_) => (None, None, false),
                     }
@@ -594,10 +601,18 @@ impl IngestionRuntime {
         if let Some((generation, records)) = position {
             query.push_str(&format!("&generation={generation}&records={records}"));
         }
-        if let Some((generation, records)) = prev {
+        if let Some((generation, records, term)) = prev {
             query.push_str(&format!(
-                "&prev_generation={generation}&prev_records={records}"
+                "&prev_generation={generation}&prev_records={records}&prev_term={term}"
             ));
+        }
+        if !chain.is_empty() {
+            let chain = chain
+                .iter()
+                .map(|(from, records, to)| format!("{from}:{records}:{to}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            query.push_str(&format!("&chain={}", url_encode(&chain)));
         }
         query
     }

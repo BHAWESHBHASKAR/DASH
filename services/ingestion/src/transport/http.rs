@@ -11,10 +11,12 @@ const HEALTH_WORKERS: usize = 2;
 /// for exactly those polls, so they must never queue behind writes.
 const REPLICATION_POLL_WORKERS: usize = 4;
 
-/// Reserved lane: the standard health paths plus followers' WAL polls.
+/// Reserved lane: the standard health paths plus followers' WAL polls and
+/// commit acks (a follower's poll loop waits for its acks).
 pub(super) fn reserved_lane_classifier(method: &str, path: &str) -> bool {
     dash_http::default_health_classifier(method, path)
         || (method == "GET" && path == "/internal/replication/wal")
+        || (method == "POST" && path == "/internal/replication/ack")
 }
 const HEALTH_QUEUE_CAPACITY: usize = 64;
 

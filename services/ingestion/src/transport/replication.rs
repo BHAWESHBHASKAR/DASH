@@ -905,7 +905,7 @@ impl IngestionRuntime {
     ) -> Result<(), StoreError> {
         if let Some(from) = frame.switch_from {
             self.switch_replication_generation(frame.generation)?;
-            self.failover.last_switch = Some(from);
+            self.failover.last_switch = Some((from, frame.term.unwrap_or(0)));
         }
         self.replication_follower.last_frame_records = frame.wal_lines.len();
         if !frame.wal_lines.is_empty() {

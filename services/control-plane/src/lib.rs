@@ -384,7 +384,17 @@ impl ControlPlanePlacementState {
             .as_mut()
             .ok_or_else(|| "ingest failover is disabled".to_string())?;
         let now = failover.now_ms();
+        let blocked_before = failover.blocked();
         let (reply, promotion) = failover.heartbeat(report, now)?;
+        let blocked_after = failover.blocked();
+        if blocked_after != blocked_before
+            && let Some(blocked) = blocked_after
+        {
+            eprintln!(
+                "control-plane: the ingestion leader's lease lapsed and no member can be promoted yet ({})",
+                blocked.as_str()
+            );
+        }
         if let Some(promotion) = promotion {
             eprintln!(
                 "control-plane: ingestion leader {} promoted at term {} (previous leader: {}{})",

@@ -91,6 +91,14 @@ impl ReportedRole {
     }
 }
 
+/// A checkpoint closed `from` at `records` and opened `to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Transition {
+    pub from: u64,
+    pub records: u64,
+    pub to: u64,
+}
+
 /// What a member reports in a heartbeat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatReport {
@@ -104,9 +112,17 @@ pub struct HeartbeatReport {
     pub role: ReportedRole,
     /// Replication position (a follower's cursor, or the node's own WAL).
     pub position: Option<Position>,
-    /// The checkpoint transition into `position.generation`:
+    /// A follower's last checkpoint crossing into `position.generation`:
     /// `(previous generation, records at which it was closed)`.
     pub prev: Option<Position>,
+    /// Term of the leader that served that crossing. Only a crossing served
+    /// by the current term's leader may extend the lineage: an old leader's
+    /// checkpoint that the new leader never saw is a divergent history.
+    pub prev_term: Option<u64>,
+    /// The node's own recent checkpoint transitions, oldest first (reported
+    /// for its own WAL: by the leader and by a node without a follower
+    /// cursor). The current leader's chain is authoritative.
+    pub chain: Vec<Transition>,
     /// Initial sync done, no resync pending, not blocked.
     pub synced: bool,
     /// Configured as a writer (no replication source): may be chosen when
@@ -195,6 +211,9 @@ struct LineageEntry {
     /// Records at which this generation was closed, when known. An offset
     /// beyond it is a history the current leader does not share.
     end: Option<u64>,
+    /// `end` is only a lower bound: set at a promotion to the new leader's
+    /// position; its own fencing checkpoint (at or after it) makes it final.
+    provisional: bool,
 }
 
 /// Why no promotion happened although the leader's lease lapsed.
@@ -403,12 +422,12 @@ impl IngestFailover {
             }
             self.leader_seen_ms = now_ms;
             self.blocked = None;
-            if self.observe_lineage(&report, true) || url_changed {
+            if self.observe_leader_lineage(&report) || url_changed {
                 self.persist()?;
             }
             return Ok((self.reply_for(&report), None));
         }
-        if report.term == self.term && self.observe_lineage(&report, false) {
+        if report.term == self.term && self.observe_follower_lineage(&report) {
             self.persist()?;
         }
 
@@ -487,45 +506,96 @@ impl IngestFailover {
         }
     }
 
-    /// Learn generations of the current lineage from a report of the
-    /// current term. The leader is authoritative for its own lineage; a
-    /// follower extends it only through a transition from its last entry.
-    /// Returns `true` when the lineage changed (it is persisted then).
-    fn observe_lineage(&mut self, report: &HeartbeatReport, from_leader: bool) -> bool {
-        let Some(position) = report.position else {
-            return false;
-        };
-        if let Some(index) = self
-            .lineage
+    fn lineage_index(&self, generation: u64) -> Option<usize> {
+        self.lineage
             .iter()
-            .position(|entry| entry.generation == position.generation)
-        {
-            // The leader appends to its current generation: it is open.
-            let last = index + 1 == self.lineage.len();
-            if from_leader && last && self.lineage[index].end.is_some() {
-                self.lineage[index].end = None;
-                return true;
-            }
-            return false;
-        }
-        let linked = match (self.lineage.last(), report.prev) {
-            (Some(last), Some(prev)) => prev.generation == last.generation,
-            _ => false,
-        };
-        if !from_leader && !linked {
-            return false;
-        }
-        if linked && let (Some(entry), Some(prev)) = (self.lineage.last_mut(), report.prev) {
-            entry.end = Some(prev.records);
-        }
+            .position(|entry| entry.generation == generation)
+    }
+
+    fn push_lineage(&mut self, generation: u64) {
         self.lineage.push(LineageEntry {
-            generation: position.generation,
+            generation,
             end: None,
+            provisional: false,
         });
         if self.lineage.len() > MAX_LINEAGE {
             let excess = self.lineage.len() - MAX_LINEAGE;
             self.lineage.drain(..excess);
         }
+    }
+
+    /// Learn generations from the current leader's report: its checkpoint
+    /// chain is authoritative (an entry after a transition's source that is
+    /// not its target is dropped), and its current generation is open.
+    /// Returns `true` when the lineage changed (it is persisted then).
+    fn observe_leader_lineage(&mut self, report: &HeartbeatReport) -> bool {
+        let mut changed = false;
+        for transition in &report.chain {
+            let Some(from) = self.lineage_index(transition.from) else {
+                continue;
+            };
+            let entry = self.lineage[from];
+            if entry.end != Some(transition.records) || entry.provisional {
+                self.lineage[from].end = Some(transition.records);
+                self.lineage[from].provisional = false;
+                changed = true;
+            }
+            if self.lineage.get(from + 1).map(|e| e.generation) == Some(transition.to) {
+                continue;
+            }
+            self.lineage.truncate(from + 1);
+            self.push_lineage(transition.to);
+            changed = true;
+        }
+        if let Some(position) = report.position {
+            match self.lineage_index(position.generation) {
+                Some(index) if index + 1 == self.lineage.len() => {
+                    if self.lineage[index].end.is_some() {
+                        self.lineage[index].end = None;
+                        self.lineage[index].provisional = false;
+                        changed = true;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.push_lineage(position.generation);
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// A follower of the current term crossed a checkpoint the leader has
+    /// not reported (it may have died right after it): extend the lineage
+    /// if the crossing was served by the current leader and fits.
+    fn observe_follower_lineage(&mut self, report: &HeartbeatReport) -> bool {
+        let (Some(position), Some(prev)) = (report.position, report.prev) else {
+            return false;
+        };
+        if report.prev_term != Some(self.term) || self.lineage_index(position.generation).is_some()
+        {
+            return false;
+        }
+        let Some(from) = self.lineage_index(prev.generation) else {
+            return false;
+        };
+        if from + 1 < self.lineage.len() {
+            // The successor is known and it is not this generation.
+            return false;
+        }
+        let entry = self.lineage[from];
+        let fits = match entry.end {
+            None => true,
+            Some(end) if entry.provisional => prev.records >= end,
+            Some(end) => prev.records == end,
+        };
+        if !fits {
+            return false;
+        }
+        self.lineage[from].end = Some(prev.records);
+        self.lineage[from].provisional = false;
+        self.push_lineage(position.generation);
         true
     }
 
@@ -641,14 +711,12 @@ impl IngestFailover {
                 self.lineage = vec![LineageEntry {
                     generation: position.generation,
                     end: None,
+                    provisional: false,
                 }];
-            } else if let Some(index) = self
-                .lineage
-                .iter()
-                .position(|entry| entry.generation == position.generation)
-            {
+            } else if let Some(index) = self.lineage_index(position.generation) {
                 self.lineage.truncate(index + 1);
                 self.lineage[index].end = Some(position.records);
+                self.lineage[index].provisional = true;
             }
         }
         // Persist before anyone learns the new term.
@@ -683,9 +751,10 @@ impl IngestFailover {
         let lineage = self
             .lineage
             .iter()
-            .map(|entry| match entry.end {
-                Some(end) => format!("{:016x}:{end}", entry.generation),
-                None => format!("{:016x}:-", entry.generation),
+            .map(|entry| match (entry.end, entry.provisional) {
+                (Some(end), true) => format!("{:016x}:~{end}", entry.generation),
+                (Some(end), false) => format!("{:016x}:{end}", entry.generation),
+                (None, _) => format!("{:016x}:-", entry.generation),
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -810,11 +879,16 @@ fn read_state(path: &Path) -> Result<Option<PersistedState>, String> {
                 for item in value.split(',').filter(|item| !item.trim().is_empty()) {
                     let (generation, end) = item.trim().split_once(':').ok_or_else(invalid)?;
                     let generation = u64::from_str_radix(generation, 16).map_err(|_| invalid())?;
-                    let end = match end {
+                    let provisional = end.starts_with('~');
+                    let end = match end.trim_start_matches('~') {
                         "-" => None,
                         raw => Some(raw.parse::<u64>().map_err(|_| invalid())?),
                     };
-                    lineage.push(LineageEntry { generation, end });
+                    lineage.push(LineageEntry {
+                        generation,
+                        end,
+                        provisional,
+                    });
                 }
             }
             _ => {}
@@ -919,6 +993,24 @@ pub fn parse_heartbeat_query(
         }),
         _ => None,
     };
+    let mut chain = Vec::new();
+    if let Some(raw) = get("chain").filter(|raw| !raw.is_empty()) {
+        for item in raw.split(',') {
+            let parts: Vec<&str> = item.split(':').collect();
+            let invalid = || "chain must list from:records:to transitions".to_string();
+            let [from, records, to] = parts[..] else {
+                return Err(invalid());
+            };
+            chain.push(Transition {
+                from: from.parse().map_err(|_| invalid())?,
+                records: records.parse().map_err(|_| invalid())?,
+                to: to.parse().map_err(|_| invalid())?,
+            });
+            if chain.len() > MAX_LINEAGE {
+                return Err("chain is too long".to_string());
+            }
+        }
+    }
     Ok(HeartbeatReport {
         node_id: required("node_id")?,
         url: required("url")?,
@@ -927,6 +1019,8 @@ pub fn parse_heartbeat_query(
         role,
         position,
         prev,
+        prev_term: parse_u64("prev_term")?,
+        chain,
         synced: flag("synced"),
         bootstrap: flag("bootstrap"),
     })

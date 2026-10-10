@@ -46,6 +46,8 @@ fn report(
             records,
         }),
         prev: None,
+        prev_term: None,
+        chain: Vec::new(),
         synced: true,
         bootstrap: false,
     }
@@ -377,10 +379,11 @@ fn a_follower_ahead_of_the_new_leader_holds_a_divergent_history() {
     assert_eq!(promotion.unwrap().new_leader, "b");
     // The new leader fenced G1 at 10 with a checkpoint into G2.
     let mut b = report("b", 2, ReportedRole::Leader, Some((G2, 0)));
-    b.prev = Some(Position {
-        generation: G1,
+    b.chain = vec![Transition {
+        from: G1,
         records: 10,
-    });
+        to: G2,
+    }];
     f.heartbeat(b, after + 500).unwrap();
     assert!(
         f.rank(Position {
@@ -420,6 +423,7 @@ fn a_follower_extends_the_lineage_through_a_checkpoint_the_leader_never_reported
         generation: G1,
         records: 15,
     });
+    c.prev_term = Some(1);
     f.heartbeat(c, after).unwrap();
     let (_, promotion) = f
         .heartbeat(
@@ -773,4 +777,129 @@ fn a_named_leader_that_never_takes_over_is_replaced_after_its_lease() {
     assert_eq!(promotion.new_leader, "c");
     assert_eq!(promotion.term, 3);
     assert!(at > after + LEASE + GRACE, "not before b's lease lapsed");
+}
+
+#[test]
+fn checkpoints_between_two_leader_reports_are_learned_from_its_chain() {
+    let mut f = running_cluster();
+    // The leader checkpointed twice (G1 at 30 -> G2, G2 at 30 -> G3) since
+    // its last report; c is still inside G2.
+    let mut a = report("a", 1, ReportedRole::Leader, Some((G3, 5)));
+    a.chain = vec![
+        Transition {
+            from: G1,
+            records: 30,
+            to: G2,
+        },
+        Transition {
+            from: G2,
+            records: 30,
+            to: G3,
+        },
+    ];
+    f.heartbeat(a, 6_000).unwrap();
+    let g1 = f.rank(Position {
+        generation: G1,
+        records: 30,
+    });
+    let g2 = f.rank(Position {
+        generation: G2,
+        records: 20,
+    });
+    let g3 = f.rank(Position {
+        generation: G3,
+        records: 1,
+    });
+    assert!(g1.is_some() && g1 < g2 && g2 < g3, "{g1:?} {g2:?} {g3:?}");
+    assert!(
+        f.rank(Position {
+            generation: G1,
+            records: 31
+        })
+        .is_none()
+    );
+    beat_followers(&mut f, 11_500, &[("b", 30)]);
+    f.heartbeat(
+        report("c", 1, ReportedRole::Follower, Some((G2, 20))),
+        11_500,
+    )
+    .unwrap();
+    let after = 6_000 + LEASE + GRACE + 1;
+    f.heartbeat(
+        report("b", 1, ReportedRole::Follower, Some((G1, 30))),
+        after,
+    )
+    .unwrap();
+    let (_, promotion) = f
+        .heartbeat(
+            report("c", 1, ReportedRole::Follower, Some((G2, 20))),
+            after,
+        )
+        .unwrap();
+    assert_eq!(promotion.unwrap().new_leader, "c", "G2 is ahead of G1");
+}
+
+#[test]
+fn an_old_leaders_checkpoint_never_extends_the_new_leaders_lineage() {
+    let mut f = running_cluster();
+    leader_beat(&mut f, "a", 10, 6_000);
+    beat_followers(&mut f, 11_500, &[("b", 10), ("c", 8)]);
+    let after = 6_000 + LEASE + GRACE + 1;
+    f.heartbeat(report("c", 1, ReportedRole::Follower, Some((G1, 8))), after)
+        .unwrap();
+    let (_, promotion) = f
+        .heartbeat(
+            report("b", 1, ReportedRole::Follower, Some((G1, 10))),
+            after,
+        )
+        .unwrap();
+    assert_eq!(promotion.unwrap().new_leader, "b");
+    // c kept pulling from the old leader, crossed its checkpoint at 12 into
+    // GX and only then learned term 2.
+    const GX: u64 = 0x9999;
+    let mut c = report("c", 2, ReportedRole::Follower, Some((GX, 3)));
+    c.prev = Some(Position {
+        generation: G1,
+        records: 12,
+    });
+    c.prev_term = Some(1);
+    f.heartbeat(c, after + 100).unwrap();
+    assert!(
+        f.rank(Position {
+            generation: GX,
+            records: 3
+        })
+        .is_none(),
+        "a crossing served by the old leader is a divergent history"
+    );
+    // A crossing served by the new leader extends it, even before the new
+    // leader reported (its fencing checkpoint at 12 >= its position 10).
+    let mut c = report("c", 2, ReportedRole::Follower, Some((G2, 0)));
+    c.prev = Some(Position {
+        generation: G1,
+        records: 12,
+    });
+    c.prev_term = Some(2);
+    f.heartbeat(c, after + 200).unwrap();
+    assert!(
+        f.rank(Position {
+            generation: G2,
+            records: 0
+        })
+        .is_some()
+    );
+    assert!(
+        f.rank(Position {
+            generation: G1,
+            records: 12
+        })
+        .is_some()
+    );
+    assert!(
+        f.rank(Position {
+            generation: G1,
+            records: 13
+        })
+        .is_none()
+    );
 }

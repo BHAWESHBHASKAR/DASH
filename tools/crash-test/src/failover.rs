@@ -204,7 +204,10 @@ pub(crate) fn run(cfg: &Config) -> (Result<(), String>, FailoverTotals, usize) {
                 eprintln!("{}", cluster.logs());
                 return (Err(err), totals, n);
             }
-            Err(panic) => return (Err(panic_text(&panic)), totals, n),
+            Err(panic) => {
+                eprintln!("{}", cluster.logs());
+                return (Err(panic_text(&panic)), totals, n);
+            }
         }
     }
     (Ok(()), totals, cfg.cycles)
