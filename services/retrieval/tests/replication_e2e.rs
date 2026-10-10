@@ -418,6 +418,16 @@ fn initial_and_incremental_sync_report_lag_and_ready() {
 
 #[test]
 fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
+    // The follower's generation is still retained by the leader (one
+    // checkpoint): it finishes it from the closed file and switches. Its
+    // generation is gone (two checkpoints with writes between): it resyncs.
+    // Either way, the new WAL reaching the old offset never makes it skip.
+    for missed_a_generation in [false, true] {
+        checkpoint_then_more_writes(missed_a_generation);
+    }
+}
+
+fn checkpoint_then_more_writes(missed_a_generation: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut leader = Leader::start(&dir.path().join("leader.wal"), None, no_checkpoint());
     leader.ingest("a", None);
@@ -435,7 +445,12 @@ fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
 
     // The leader compacts its WAL...
     leader.restart(checkpoint_every_record());
+    let mut expected = vec!["a", "b", "c"];
     leader.ingest("c", Some("anchor"));
+    if missed_a_generation {
+        leader.ingest("c2", Some("anchor"));
+        expected.push("c2");
+    }
     let (generation_after, _) = leader.frame();
     assert_ne!(
         generation_before, generation_after,
@@ -446,10 +461,10 @@ fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
     // follower would continue from `follower_offset` and silently skip the
     // first records of the new WAL.
     leader.restart(no_checkpoint());
-    leader.ingest("d", Some("anchor"));
-    leader.ingest("e", Some("anchor"));
-    leader.ingest("f", Some("anchor"));
-    leader.ingest("g", Some("anchor"));
+    for id in ["d", "e", "f", "g"] {
+        leader.ingest(id, Some("anchor"));
+        expected.push(id);
+    }
     let (_, total_after) = leader.frame();
     assert!(
         total_after >= follower_offset,
@@ -458,16 +473,25 @@ fn leader_checkpoint_then_more_writes_is_never_silently_skipped() {
 
     node.handle().resume();
     wait_until("follower converges", Duration::from_secs(10), || {
-        node.claim_ids().len() == 7
+        node.claim_ids().len() == expected.len()
     });
-    assert_eq!(node.claim_ids(), vec!["a", "b", "c", "d", "e", "f", "g"]);
-    for id in ["a", "b", "c", "d", "e", "f", "g"] {
+    expected.sort();
+    assert_eq!(node.claim_ids(), expected);
+    for id in &expected {
         assert_eq!(supports_for(&node.store, id), 1, "evidence for {id}");
     }
-    wait_until("resync counted", Duration::from_secs(10), || {
-        node.status().resyncs_total >= 1
+    let (generation, total) = leader.frame();
+    wait_until("caught up again", Duration::from_secs(10), || {
+        let status = node.status();
+        status.generation == Some(generation) && status.offset == total
     });
-    assert_eq!(node.status().resyncs_total, 1, "exactly one resync");
+    let status = node.status();
+    if missed_a_generation {
+        assert_eq!(status.resyncs_total, 1, "exactly one resync: {status:?}");
+    } else {
+        assert_eq!(status.resyncs_total, 0, "no resync: {status:?}");
+        assert_eq!(status.generation_switches_total, 1, "{status:?}");
+    }
 }
 
 #[test]
