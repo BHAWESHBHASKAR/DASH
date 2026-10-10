@@ -102,6 +102,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 **Beta (works, with known gaps listed in the register or below):**
 - HTTP services on a hand-written thread-per-connection transport (ingestion, retrieval, control-plane) with bounded headers, bodies and whole-request deadlines. Since 0.3.0 the services refuse to start without credentials unless `DASH_INSECURE_DEV_MODE=1`; strict secret validation (>= 16 characters for keys and tokens, >= 32 for JWT secrets, placeholders rejected) is on by default; `/v1/embeddings`, `/debug/*` and `/metrics` require auth; replication requires `DASH_INGEST_REPLICATION_TOKEN`; the control plane requires `DASH_CONTROL_PLANE_TOKEN`. Optional native TLS on every listener (rustls, TLS 1.2/1.3, ALPN `http/1.1`), client-certificate verification, replication over mutual TLS with per-follower certificate pinning, and certificate reload without restart; off by default ([`docs/operations/tls.md`](docs/operations/tls.md)).
 - Evidence and edge writes are idempotent upserts (evidence by `evidence_id`, edges by endpoints and relation), so retries, restarts and replication re-apply do not duplicate citations.
+- Deletes: `DELETE /v1/claims/{claim_id}` (the claim with its vector, evidence and edges), `DELETE /v1/evidence/{evidence_id}` and `DELETE /v1/tenants/{tenant_id}` (admin only) on ingestion. Each is idempotent (200 with `deleted: true|false`), audit-logged, written to the WAL as a checksummed tombstone before it takes effect, and replicated to followers; a checkpoint drops the deleted data from the log. Backups and WAL archives taken earlier still hold it ([`docs/operations/data-deletion.md`](docs/operations/data-deletion.md)).
 - Single-writer ingestion plus polling read replicas that follow the WAL generation-aware (resync on checkpoint, `/ready` reflects lag), a file-lease control plane with fenced leases and lag-guarded promotion, and CSV placement files. This is not consensus replication.
 - `redb` on-disk persistence is **on by default** when a WAL path is configured (default `./data/dash-ingestion.redb` and `./data/dash-retrieval.redb`; opt out with `DASH_INGEST_PERSISTENCE_DISABLE=1` / `DASH_RETRIEVAL_PERSISTENCE_DISABLE=1`). If the file cannot be opened the service logs an error and continues in memory. Snapshot values are written by an in-tree versioned codec; snapshots written by earlier releases (the `bincode` 1.x layout) still load.
 - Embedding providers: `hash` (default, dev only), `ollama`, `openai` (HTTPS). `/v1/embeddings` rejects token-id array inputs unless `DASH_EMBEDDING_ALLOW_TOKEN_IDS=1`, and `usage.prompt_tokens` is an estimate. The Ollama endpoint variable is `DASH_OLLAMA_ENDPOINT`. Live Ollama and OpenAI calls are not exercised by CI.
@@ -118,7 +119,7 @@ This is the honest state of the 0.3.0 (unreleased) tree. The authoritative plan,
 - An external penetration test and published SOC 2 evidence. TLS on by default in the shipped deployment artifacts (today it is one setting away; see above).
 - GPU vector backend. `pkg/store/src/gpu.rs` is a placeholder that never returns a GPU engine; scoring runs on CPU.
 - Consensus replication (Raft), automatic failover, sharded cluster mode.
-- Delete, tenant management and reindex APIs (`/v1/delete`, `/v1/tenants`, `/v1/admin/reindex` do not exist; see [Planned API](docs-site/docs/reference/planned-api.md)).
+- Tenant management (creating or listing tenants) and reindex APIs (`POST /v1/tenants`, `/v1/admin/reindex` do not exist; see [Planned API](docs-site/docs/reference/planned-api.md)). Per-tenant write parallelism is deferred ([ADR 0004](docs/adr/0004-per-tenant-write-partitioning.md)).
 - Published release artifacts. The release workflow builds CycloneDX/SPDX SBOMs, keyless cosign signatures and build-provenance attestations for every binary and image ([`docs/operations/supply-chain.md`](docs/operations/supply-chain.md)), but no release has been tagged with it yet. CI actions are pinned by commit SHA, base images by digest, and `cargo deny` gates licenses, sources and advisories.
 
 ## Architecture
@@ -152,14 +153,14 @@ Six client SDKs live in `sdks/`, all at version 0.2.0 (the Go module is untagged
 
 | SDK | Path | Version | Coverage | Tests |
 |---|---|---|---|---|
-| Python (`dash-py`) | `sdks/python` | 0.2.0 | embeddings, retrieve (full request and response contract); sync and async; OpenAI-compat helper. No ingest method. | 69 |
-| Go | `sdks/go` (module `github.com/BHAWESHBHASKAR/DASH/sdks/go`) | untagged | embeddings, retrieve, OpenAI-compat. No ingest method. | 92 |
-| TypeScript (`dash-ts`) | `sdks/typescript` | 0.2.0 | embeddings, retrieve, OpenAI-compat. No ingest method. | 71 |
-| Java | `sdks/java` | 0.2.0 | embeddings, ingest (separate ingestion base URL), retrieve. | 32 |
-| Kotlin | `sdks/kotlin` | 0.2.0 | embeddings, ingest, retrieve (suspend API, wraps the Java client). | 12 |
-| C# | `sdks/csharp` | 0.2.0 | embeddings, ingest (`IngestionBaseUrl` option), retrieve. | 50 |
+| Python (`dash-py`) | `sdks/python` | 0.2.0 | embeddings, retrieve (full request and response contract); sync and async; OpenAI-compat helper; claim, evidence and tenant deletes. No ingest method. | 77 |
+| Go | `sdks/go` (module `github.com/BHAWESHBHASKAR/DASH/sdks/go`) | untagged | embeddings, retrieve, OpenAI-compat, deletes. No ingest method. | 98 |
+| TypeScript (`dash-ts`) | `sdks/typescript` | 0.2.0 | embeddings, retrieve, OpenAI-compat, deletes. No ingest method. | 77 |
+| Java | `sdks/java` | 0.2.0 | embeddings, ingest (separate ingestion base URL), retrieve, deletes. | 37 |
+| Kotlin | `sdks/kotlin` | 0.2.0 | embeddings, ingest, retrieve, deletes (suspend API, wraps the Java client). | 14 |
+| C# | `sdks/csharp` | 0.2.0 | embeddings, ingest (`IngestionBaseUrl` option), retrieve. No delete methods yet. | 50 |
 
-The `delete` call that the Java, Kotlin and C# SDKs used to expose (it targeted a `POST /v1/delete` route that does not exist) was removed in 0.3.0. The Go module path changed from `github.com/anomalyco/dash-go` to `github.com/BHAWESHBHASKAR/DASH/sdks/go`; update your imports. The Java, Kotlin and C# SDKs retry only idempotent requests (or requests with an `Idempotency-Key`). See [`sdks/LIVE_INTEGRATION_TESTS.md`](sdks/LIVE_INTEGRATION_TESTS.md) for running SDK tests against a live stack.
+The generic `delete` call that the Java, Kotlin and C# SDKs used to expose (it targeted a `POST /v1/delete` route that does not exist) was removed in 0.3.0; the scoped delete methods (`delete_claim` / `deleteClaim` / `DeleteClaim`, and the evidence and tenant variants) call the real delete routes on the ingestion service. The Go module path changed from `github.com/anomalyco/dash-go` to `github.com/BHAWESHBHASKAR/DASH/sdks/go`; update your imports. The Java, Kotlin and C# SDKs retry only idempotent requests (or requests with an `Idempotency-Key`). See [`sdks/LIVE_INTEGRATION_TESTS.md`](sdks/LIVE_INTEGRATION_TESTS.md) for running SDK tests against a live stack.
 
 ## Tests
 
@@ -168,11 +169,11 @@ Counts are static (computed 2026-10-09: the Rust figure with `cargo test --works
 | Suite | Declared tests |
 |---|---|
 | Rust workspace (`#[test]` and `#[tokio::test]`) | 1264 |
-| Python SDK | 69 |
-| Go SDK | 92 |
-| TypeScript SDK | 71 |
-| Java SDK | 32 |
-| Kotlin SDK | 12 |
+| Python SDK | 77 |
+| Go SDK | 98 |
+| TypeScript SDK | 77 |
+| Java SDK | 37 |
+| Kotlin SDK | 14 |
 | C# SDK | 50 |
 
 There are also four `cargo-fuzz` targets in `fuzz/` (JWT, OpenAI embeddings parser, ranking, WAL parser) and a benchmark suite in `tests/benchmarks`.

@@ -4,8 +4,8 @@ Everything on this page is **not implemented**. None of these routes, headers or
 
 | Planned capability | Earlier doc said | Reality today | Tracking |
 |---|---|---|---|
-| Delete / tombstone claims, evidence, edges (`POST /v1/delete`) | `{ tenant_id, claim_ids }` | No delete path of any kind. The Java, Kotlin and C# SDKs used to expose a `delete` call that targeted this missing route; it was removed in 0.3.0. | register DATA-14 (P2) |
-| Tenant management (`POST /v1/tenants`) | Operators create tenants with a scoped JWT | There is no tenant registry. A tenant exists implicitly once a claim with that `tenant_id` is ingested, subject to the service tenant allowlist. There is no "unknown tenant" error path in the code, so a tenant with no data simply yields no results. | P4 |
+| Generic delete (`POST /v1/delete`) | `{ tenant_id, claim_ids }` | This route does not exist and will not be built. Deletes are the scoped routes `DELETE /v1/claims/{claim_id}`, `DELETE /v1/evidence/{evidence_id}` and `DELETE /v1/tenants/{tenant_id}` (see the [HTTP API](api.md#deletes)). The generic `delete` call the Java, Kotlin and C# SDKs used to expose was removed in 0.3.0. | register DATA-14 |
+| Tenant management (`POST /v1/tenants`) | Operators create tenants with a scoped JWT | There is no tenant registry (only erasure exists: `DELETE /v1/tenants/{tenant_id}`). A tenant exists implicitly once a claim with that `tenant_id` is ingested, subject to the service tenant allowlist. There is no "unknown tenant" error path in the code, so a tenant with no data simply yields no results. | P4 |
 | Source registration (`POST /v1/sources`) | Register a source before use | `source_id` is a free-form string on evidence. | design doc only |
 | Claim upsert by key (`POST /v1/claims:upsert`) | Upsert API | `POST /v1/ingest` writes claims, and as of 0.3.0 re-sending a claim, evidence or edge is an idempotent upsert (see the [HTTP API](api.md#post-v1ingest)). There is no separate upsert route. | design doc only |
 | Admin reindex (`POST /v1/admin/reindex`) | Rebuild an index | No admin API. The ANN graph is rebuilt in memory from the WAL / redb on startup. | design doc only |

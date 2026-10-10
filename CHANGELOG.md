@@ -59,6 +59,42 @@ to [Semantic Versioning](https://semver.org/).
   Verification steps: `docs/operations/supply-chain.md`. Not yet exercised:
   no tag has been pushed since.
 
+### Added (deletes and tenant erasure; register DATA-14)
+
+- **`DELETE /v1/claims/{claim_id}?tenant_id=...`** removes a claim with its
+  vector, its evidence and every edge from or to it; **`DELETE
+  /v1/evidence/{evidence_id}?tenant_id=...`** removes evidence rows by id;
+  **`DELETE /v1/tenants/{tenant_id}`** erases all of a tenant's data. Claim
+  and evidence deletes need the `ingest` role, tenant erasure `admin` for that
+  tenant. Every delete is idempotent (200 with `deleted: true|false`; a claim
+  of another tenant is reported as not found), audit-logged
+  (`delete_claim`, `delete_evidence`, `delete_tenant`) and gated by the audit
+  fail-closed check. New counters: `dash_ingest_delete_total{scope}`,
+  `dash_ingest_delete_noop_total`, `dash_ingest_delete_removed_total{kind}`.
+- **WAL tombstones.** A delete is one checksummed `T2` record framed as a
+  commit group, appended before memory, redb, the vector index and the
+  tenant's segments change; deletes drain the group-commit pipeline first.
+  Replay, replication followers (retrieval and ingestion) and resync apply
+  the same record; a persisted vector index saved before a delete is
+  corrected by the WAL catch-up; a checkpoint drops the deleted rows and the
+  tombstone. Deleting a tenant's last vector releases its vector dimension.
+  See `docs/operations/data-deletion.md` (backups taken before a delete still
+  hold the data).
+- **Readers fail closed on unknown record kinds.** A whole, checksummed WAL
+  record of a kind the reader does not know now fails replay under both
+  policies instead of being quarantined as a fragment after a broken legacy
+  line, or truncated as a torn write when it is the last line. *Downgrade:*
+  run a checkpoint before starting an older binary on a WAL that holds
+  tombstones.
+- **SDKs:** delete methods in the Python (sync and async), TypeScript, Go,
+  Java and Kotlin clients, with a configurable ingestion base URL (derived
+  from a retrieval URL on port 8080). The C# SDK has none yet.
+  `scripts/check_sdk_surface.sh` now guards the removed generic `/v1/delete`
+  API and checks every endpoint named in SDK sources against the API
+  reference.
+- ADR 0004 records why per-tenant write partitioning of the ingestion lock is
+  deferred.
+
 ### Added (vector index persistence; P2 engine step 2)
 
 - **Restarts no longer rebuild the vector index.** Each service with a WAL
