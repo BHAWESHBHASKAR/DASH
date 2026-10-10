@@ -117,7 +117,7 @@ Every ingestion node:
 
 | Setting | |
 |---|---|
-| `DASH_INGEST_FAILOVER_CONTROL_PLANE_URL` | Turns failover on for this node. |
+| `DASH_INGEST_FAILOVER_CONTROL_PLANE_URL` | Turns failover on for this node. With several control-plane replicas it must reach the control-plane leader (a Service whose readiness is `/v1/control-plane/ready`, which only the leader passes): followers answer heartbeats `503`, and a leader that cannot renew for a lease stops writing. |
 | `DASH_NODE_ID` | Unique per node (also the placement node id). |
 | `DASH_INGEST_FAILOVER_ADVERTISE_URL` | This node's base URL as the others reach it. |
 | `DASH_CONTROL_PLANE_TOKEN` or `DASH_ROUTER_CONTROL_PLANE_TOKEN` | Heartbeat credential (same TLS options as the placement fetch, `DASH_ROUTER_CONTROL_PLANE_*`). |
@@ -223,7 +223,13 @@ followers keep their cursors (they resync only if they were ahead).
 the highest term the nodes report and re-recognises the leader of that term
 when it reports. Lineage knowledge is rebuilt from the leader's reports; a
 promotion before that is refused (`no_eligible_candidate`) until the leader
-or a follower crossing a checkpoint reports it.
+or a follower crossing a checkpoint reports it. Keep the state on durable
+storage: if it is lost **and** the leader is gone too, no node reports as
+leader and the control plane falls back to the bootstrap election (most
+records among nodes without a replication source), which compares positions
+across WAL generations and can pick a node that is behind. In that case stop
+the nodes, find the most up-to-date one by hand (`GET /v1/ready` replication
+offsets, `wal-inspect`), and start it alone first.
 
 ## Metrics and alerts
 
