@@ -157,8 +157,12 @@ fn health_stays_fast_while_embedding_calls_are_slow() {
             status_line(&response).contains("200"),
             "{path}: {response:?}"
         );
+        // Every worker is held by an ingest whose embedding call stalls for
+        // 3 s. A probe queued behind them would take about 2.5 s more; one
+        // served by the health lane answers at request speed. The bound sits
+        // well between the two so a slow CI runner does not decide it.
         assert!(
-            started.elapsed() < Duration::from_millis(200),
+            started.elapsed() < Duration::from_millis(1_000),
             "{path} took {:?} while embeddings were slow",
             started.elapsed()
         );
