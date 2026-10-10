@@ -15,8 +15,10 @@ to [Semantic Versioning](https://semver.org/).
   present with every evidence item and edge, nothing never sent, no evidence
   written twice within the snapshot or within the WAL, unacknowledged
   requests all-or-nothing). Seed printed, state directory kept on failure,
-  JSON summary. 25 cycles run on every PR (job
-  `crash-test`), 1000 nightly.
+  JSON summary. Runs with WAL group commit on (the default) and reads the
+  group-commit counters from `/metrics` before every kill, so the summary
+  shows that acknowledged writes shared fsyncs. 25 cycles run on every PR
+  (job `crash-test`), 1000 nightly.
 - **Disk-full scenarios** (`tests/e2e/tests/s10_disk_full.rs`): the real
   ingestion binary under `RLIMIT_FSIZE` (writes fail with `EFBIG`) with the WAL
   alone, during checkpoints and with the redb mirror. The e2e harness gained

@@ -29,7 +29,11 @@ DASH_E2E_BIN_DIR=$PWD/target/release target/release/crash-test --cycles 200 --wr
 Each cycle:
 
 1. `ingestion` runs on a persistent state directory (WAL, snapshot, redb
-   mirror) with the default, strict WAL durability settings.
+   mirror) with the default, strict WAL durability settings, including WAL
+   group commit for single ingests (on by default; see
+   [`wal-durability.md`](wal-durability.md)). Concurrent single ingests
+   therefore share fsyncs, which is exactly the path the oracle has to hold
+   for: a request is acknowledged only after its group is durable.
 2. `--writers` threads send valid writes as fast as the server answers: single
    bundles (1-4 evidence items, half of them with an edge to the writer's
    previous claim) and, for `--batch-percent` of requests, 3-item atomic
@@ -65,6 +69,14 @@ the cycle and the claim, and the reproduce command is printed. `--json-out`
 writes a summary (`acked_requests`, `acked_claims`, `unknown_requests`,
 `unknown_applied`, recovery time p50/p95/max, duration).
 
+Just before each kill the harness scrapes `/metrics` and records whether
+group commit was enabled and how many entries shared an fsync; the summary
+line `group commit before the kills: enabled in N/N scrapes, E entries in B
+batches, largest batch M` (and the `group_commit` object in the JSON) shows
+that the run really exercised group commit. Pass
+`--env DASH_INGEST_WAL_GROUP_COMMIT=false` to test the direct write path
+instead.
+
 Other options: `--checkpoint-every N` (sets `DASH_CHECKPOINT_MAX_WAL_RECORDS`
 so kills land during snapshot/compaction too), `--fresh-every N` (start from an
 empty directory every N cycles to bound replay time on long runs),
@@ -79,8 +91,8 @@ nightly workflow runs this and fails if the harness does **not** fail.
 
 ### What this guarantees, and what it does not
 
-Guaranteed under the default WAL settings (sync every record, no append
-buffer) and tested as above:
+Guaranteed under the default WAL settings (every acknowledged write synced,
+no append buffer, group commit on) and tested as above:
 
 * A write acknowledged with a 2xx by `/v1/ingest` or `/v1/ingest/batch`
   survives a crash of the ingestion process at any moment.
@@ -125,9 +137,16 @@ model "space came back". Scenarios:
 
 Behavior on a full volume (the guarantee):
 
-* A write that cannot be appended to and synced in the WAL is answered with
-  **500** (`internal persistence error`) and is rolled back: the WAL is
-  truncated to the last committed group, memory and redb are untouched.
+* A write that cannot be appended to the WAL is answered with **500**
+  (`internal persistence error`) and is rolled back: the WAL is truncated to
+  the last committed group, memory and redb are untouched. With group commit
+  every request of the failed group gets the 500; other groups are
+  unaffected.
+* A failed **fsync** is different: the WAL is poisoned (an fsync error can
+  drop dirty pages, so retrying it could acknowledge lost data). Every later
+  write answers **503** `wal_poisoned` and `/ready` reports `wal_poisoned`
+  until the process restarts and re-reads the WAL from disk. The space probe
+  below does not clear that state.
 * `/ready` answers **503** with `{"status":"not_ready","reason":"wal_write_failed"}`
   as soon as a write could not be persisted, so the load balancer stops
   sending writes. While in that state each `/ready` call writes, syncs and
@@ -142,8 +161,11 @@ Behavior on a full volume (the guarantee):
   `disk_unavailable` until the process restarts. Restart is the recovery for
   that case.
 
-Not covered: real `ENOSPC` on a small filesystem (the `EFBIG` path is the
-same code), and `EIO`/fsync errors from failing hardware.
+Not covered here: real `ENOSPC` on a small filesystem (the `EFBIG` path is
+the same code), and `EIO`/fsync errors from failing hardware (the fsync
+poisoning is tested in the store and ingestion unit tests with a failpoint
+and a test hook, not end to end). `RLIMIT_FSIZE` fails `write(2)`, never
+`fsync(2)`, so s10 exercises the append path only.
 
 ## Load and soak: `loadgen`
 
@@ -176,28 +198,41 @@ p50/p99, errors, server RSS from `/proc/<pid>/status`). With `--id-space N`
 ingests update a fixed set of `N` claims, so after `--preload N` the data
 size is constant and memory should plateau; `--max-rss-growth-mib` then
 catches a leak. The nightly soak runs 30 minutes with
-`--preload 20000 --id-space 20000 --max-rss-growth-mib 256`.
+`--preload 20000 --id-space 20000 --checkpoint-every 20000
+--max-rss-growth-mib 256`.
+
+Keep checkpoints on in a soak. Without them the WAL only grows and the
+ingestion RSS grows with it: in a 3-minute update-only run on 2,000 claims
+with no checkpoint, RSS went from 118 MiB to 712 MiB over 33,000 updates,
+while the same workload with a checkpoint every 5,000 or 20,000 WAL records
+levelled off at about 200 MiB. This was seen once and has not been traced to
+its source yet; that work is still open.
 
 ### Reference numbers
 
-Measured 2026-10-09 on a shared 4-vCPU development VM (other jobs running),
-release build, default settings (strict WAL durability: one `fsync` per WAL
-record, so an ingest with 2 evidence items and a vector costs six fsyncs), loopback, 384-d
-vectors, `top_k` 10, 2 evidence items per claim. They are a baseline for
-regressions, not a capacity statement; run loadgen on your own hardware.
+Measured 2026-10-10 on a shared 4-vCPU development VM (other builds running
+at the same time), release build, default settings (strict WAL durability
+with group commit), loopback, 384-d vectors, `top_k` 10, 2 evidence items
+per claim, 30 s (mix) and 15 s (ingest only) measured after a warm-up. They
+are a baseline for regressions, not a capacity statement; run loadgen on your
+own hardware.
 
 | Workload | Concurrency | Throughput | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|---|
-| 50/50 mix, 5,000 preloaded claims: ingest | 16 | 61.8/s | 64.5 ms | 230.5 ms | 343.0 ms | 1881 ms |
-| 50/50 mix, 5,000 preloaded claims: retrieve | 16 | 60.5/s | 138.0 ms | 347.1 ms | 416.3 ms | 604 ms |
-| ingest only, 2,000 preloaded | 16 | 189.8/s | 71.0 ms | 136.3 ms | 202.6 ms | 1510 ms |
-| retrieve only, 2,000 preloaded | 16 | 262.8/s | 58.7 ms | 100.0 ms | 134.8 ms | 204 ms |
-| ingest only, batches of 16 claims | 8 | 6.0 req/s (96 claims/s) | 762 ms | 4411 ms | 5612 ms | 6222 ms |
+| 50/50 mix, 1,000 preloaded claims: ingest | 16 | 164.8/s | 34.9 ms | 73.3 ms | 107.7 ms | 179 ms |
+| 50/50 mix, 1,000 preloaded claims: retrieve | 16 | 163.3/s | 54.4 ms | 127.0 ms | 149.4 ms | 169 ms |
+| ingest only, new claims | 16 | 430.8/s | 29.4 ms | 80.7 ms | 118.3 ms | 211 ms |
 
-Errors were zero in every run. Batches are slower per claim than single
-ingests because a batch stages its writes on a full copy of the in-memory
-store (`clone_detached`), which grows with the data set; removing that copy
-is part of the P2 storage engine work (master plan P2 item 3).
+Errors were zero in every run. The previous round (2026-10-09, before group
+commit, one fsync per WAL record) measured 61.8 ingests/s in the 50/50 mix
+with 5,000 preloaded claims and 189.8/s ingest only; batches of 16 claims ran
+at 6.0 requests/s (96 claims/s) because a batch stages its writes on a full
+copy of the in-memory store (`clone_detached`), which grows with the data
+set. Removing that copy is part of the P2 storage engine work (master plan P2
+item 3). On this shared VM, throughput of both services sometimes dropped
+for tens of seconds while other jobs were building on the same disk; treat
+single intervals with a collapsed rate as host noise unless they repeat on
+a quiet machine.
 
 ## Where it runs
 
