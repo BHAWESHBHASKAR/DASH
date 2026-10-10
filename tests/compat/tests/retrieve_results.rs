@@ -23,11 +23,10 @@ fn upgraded_node_serves_the_answers_the_old_release_recorded() {
 }
 
 /// The segment directory the old release published is still usable as the
-/// retrieval prefilter: vector queries answer exactly as without it.
-/// Text-only queries keep the lexical matches first, in the same order; the
-/// segment candidate path then fills `top_k` with low-scored claims of the
-/// tenant, which the index path does not (current behaviour on any data,
-/// not an upgrade effect).
+/// retrieval prefilter: every query, vector or text-only, answers exactly as
+/// without it (same claims, same order, same scores, same graph edges). A
+/// text-only query in particular returns only claims that match a query term
+/// on both paths, never claims of the tenant that only fill `top_k`.
 #[test]
 fn answers_are_unchanged_with_the_old_segment_directory_configured() {
     let requests = dash_compat::retrieve_requests();
@@ -37,47 +36,35 @@ fn answers_are_unchanged_with_the_old_segment_directory_configured() {
         let segments = state.segments();
         let with = run_retrieves(&store, Some(&segments));
         let without = run_retrieves(&store, None);
-        for (index, request) in requests.iter().enumerate() {
+        for index in 0..requests.len() {
             let (status, body) = &with[index];
             assert_eq!(
                 *status, without[index].0,
                 "{} request {index}",
                 fixture.label
             );
-            if request["body"].get("query_embedding").is_some() {
-                assert_eq!(
-                    body["results"], without[index].1["results"],
-                    "{} request {index}",
-                    fixture.label
-                );
-                // The graph lists the same edges (its order is not defined).
-                let edges = |v: &serde_json::Value| -> Vec<String> {
-                    let mut out: Vec<String> = v["graph"]["edges"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|e| e.to_string())
-                        .collect();
-                    out.sort();
-                    out
-                };
-                assert_eq!(edges(body), edges(&without[index].1), "{}", fixture.label);
-            } else {
-                let ids = |v: &serde_json::Value| -> Vec<String> {
-                    v["results"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|r| r["claim_id"].as_str().unwrap_or("").to_string())
-                        .collect()
-                };
-                let (seg, idx) = (ids(body), ids(&without[index].1));
-                assert!(
-                    seg.starts_with(&idx),
-                    "{} request {index}: {seg:?} does not start with {idx:?}",
-                    fixture.label
-                );
-            }
+            assert_eq!(
+                body["results"], without[index].1["results"],
+                "{} request {index}",
+                fixture.label
+            );
+            // The graph lists the same edges (its order is not defined).
+            let edges = |v: &serde_json::Value| -> Vec<String> {
+                let mut out: Vec<String> = v["graph"]["edges"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.to_string())
+                    .collect();
+                out.sort();
+                out
+            };
+            assert_eq!(
+                edges(body),
+                edges(&without[index].1),
+                "{} request {index}",
+                fixture.label
+            );
         }
     }
 }

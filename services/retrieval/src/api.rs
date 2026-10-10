@@ -1813,6 +1813,159 @@ mod tests {
         clear_segment_cache_for_tests();
     }
 
+    /// Same data, same query, with and without a segment directory: the
+    /// answer must not depend on the storage execution mode. A text-only
+    /// query returns only claims that match a query term (no padding of
+    /// `top_k` with non-matching claims scored by their priors); vector and
+    /// hybrid queries rank the same claims in the same order.
+    #[test]
+    fn answers_do_not_depend_on_the_segment_directory() {
+        let _env_lock = env_lock().lock().expect("env lock should be available");
+        let _lock = segment_cache_test_lock()
+            .lock()
+            .expect("segment cache test lock should be available");
+        clear_segment_cache_for_tests();
+        let tenant = "tenant-relevance";
+        let claims = [
+            (
+                "c-helios-1",
+                "Project Helios acquired Startup Nova",
+                0.6,
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "c-helios-2",
+                "Helios board approved the merger",
+                0.5,
+                [0.9, 0.1, 0.0, 0.0],
+            ),
+            (
+                "c-weather",
+                "Heavy rain expected in Lisbon",
+                0.99,
+                [0.0, 1.0, 0.0, 0.0],
+            ),
+            (
+                "c-sports",
+                "The local team won the final",
+                0.98,
+                [0.0, 0.0, 1.0, 0.0],
+            ),
+            (
+                "c-market",
+                "Bond yields fell on Tuesday",
+                0.97,
+                [0.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "c-food",
+                "The bakery opened a second shop",
+                0.96,
+                [0.1, 0.0, 0.9, 0.1],
+            ),
+        ];
+        let mut store = InMemoryStore::new();
+        for (claim_id, text, confidence, _) in &claims {
+            store
+                .ingest_bundle(
+                    schema::claim_builder(claim_id, tenant, text, *confidence),
+                    vec![],
+                    vec![],
+                )
+                .expect("ingest should succeed");
+        }
+        for (claim_id, _, _, vector) in &claims {
+            store
+                .upsert_claim_vector(claim_id, vector.to_vec())
+                .expect("vector upsert should succeed");
+        }
+        let root = temp_dir("relevance-parity");
+        persist_segments_atomic(
+            &root.join(tenant),
+            &[Segment {
+                segment_id: "hot-0".into(),
+                tier: Tier::Hot,
+                claim_ids: claims.iter().map(|(id, ..)| id.to_string()).collect(),
+            }],
+        )
+        .expect("segment persist should succeed");
+
+        let request = |query: &str, query_embedding: Option<Vec<f32>>| RetrieveApiRequest {
+            tenant_id: tenant.into(),
+            query: query.into(),
+            query_embedding,
+            entity_filters: vec![],
+            embedding_id_filters: vec![],
+            top_k: 5,
+            stance_mode: StanceMode::Balanced,
+            return_graph: false,
+            time_range: None,
+        };
+        let ids = |response: &RetrieveApiResponse| -> Vec<String> {
+            response
+                .results
+                .iter()
+                .map(|node| node.claim_id.clone())
+                .collect()
+        };
+        let cases = [
+            ("helios merger", None),
+            ("zebra quantum", None),
+            ("helios", Some(vec![1.0, 0.0, 0.0, 0.0])),
+            ("unrelated words", Some(vec![0.0, 0.0, 1.0, 0.0])),
+        ];
+
+        let mut without = Vec::new();
+        for (query, vector) in &cases {
+            let (response, snapshot) = execute_api_query_with_segment_prefilter(
+                &store,
+                request(query, vector.clone()),
+                None,
+            );
+            assert_eq!(snapshot.execution_mode, STORAGE_EXECUTION_MODE_MEMORY_INDEX);
+            without.push(response);
+        }
+        let mut with = Vec::new();
+        {
+            let _segment_dir_env = EnvVarGuard::set("DASH_RETRIEVAL_SEGMENT_DIR", root.as_os_str());
+            for (query, vector) in &cases {
+                let (response, snapshot) =
+                    execute_api_query_with_storage_snapshot(&store, request(query, vector.clone()));
+                assert_eq!(
+                    snapshot.execution_mode,
+                    STORAGE_EXECUTION_MODE_SEGMENT_DISK_BASE
+                );
+                with.push(response);
+            }
+        }
+
+        // Text-only: the lexical matches only, whatever the storage mode.
+        for (mode, responses) in [("segments", &with), ("memory index", &without)] {
+            assert_eq!(
+                ids(&responses[0]),
+                vec!["c-helios-2", "c-helios-1"],
+                "{mode}"
+            );
+            assert!(
+                ids(&responses[1]).is_empty(),
+                "{mode}: {:?}",
+                ids(&responses[1])
+            );
+        }
+        // Vector and hybrid: the nearest claims, same answer in both modes.
+        assert_eq!(ids(&without[2])[..2], ["c-helios-1", "c-helios-2"]);
+        assert_eq!(ids(&without[3])[0], "c-sports");
+        for (index, (a, b)) in without.iter().zip(&with).enumerate() {
+            assert_eq!(ids(a), ids(b), "case {index}");
+            for (x, y) in a.results.iter().zip(&b.results) {
+                assert!((x.score - y.score).abs() < 1e-6, "case {index}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+        clear_segment_cache_for_tests();
+    }
+
     #[test]
     fn execute_api_query_storage_merge_snapshot_tracks_result_sources() {
         let _env_lock = env_lock().lock().expect("env lock should be available");

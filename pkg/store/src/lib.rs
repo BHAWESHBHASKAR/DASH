@@ -1442,25 +1442,23 @@ impl InMemoryStore {
         candidate_claim_ids: &HashSet<String>,
         allowed_claim_ids: Option<&HashSet<String>>,
     ) -> Vec<RetrievalResult> {
-        let mut candidates: Vec<String> = candidate_claim_ids
-            .iter()
-            .filter_map(|claim_id| {
-                let claim = self.claims.get(claim_id)?;
-                if claim.tenant_id != req.tenant_id {
-                    return None;
-                }
-                if !claim_matches_time_range(claim, from_unix, to_unix) {
-                    return None;
-                }
-                if let Some(allowed_ids) = allowed_claim_ids
-                    && !allowed_ids.contains(claim_id.as_str())
-                {
-                    return None;
-                }
-                Some(claim_id.clone())
-            })
-            .collect();
-        candidates.sort_unstable();
+        // The explicit set (the segment base plus the WAL delta) only
+        // narrows the pool; which claims of the pool are candidates follows
+        // the same relevance rule as every other retrieve path (see
+        // `candidate_claim_ids`), so an answer never depends on whether a
+        // segment directory is configured.
+        let pool: HashSet<String> = match allowed_claim_ids {
+            Some(allowed) => candidate_claim_ids.intersection(allowed).cloned().collect(),
+            None => candidate_claim_ids.clone(),
+        };
+        let candidates = self.candidate_claim_ids(
+            &req.tenant_id,
+            &req.query,
+            (from_unix, to_unix),
+            query_vector,
+            req.top_k,
+            Some(&pool),
+        );
         self.score_and_rank_candidate_claim_ids(req, query_vector, candidates)
     }
 
@@ -1993,6 +1991,23 @@ impl InMemoryStore {
         Ok(record_threshold_met || byte_threshold_met)
     }
 
+    /// The claims of `tenant_id` a retrieve scores, sorted by claim id. This
+    /// is the single relevance rule of every retrieve path:
+    ///
+    /// - a claim sharing at least one token with `query` (the tenant's
+    ///   inverted index) is a lexical candidate;
+    /// - with a valid `query_vector`, the `top_k * 20` (clamped to
+    ///   100..=5000) nearest claims are vector candidates;
+    /// - nothing else is: a claim with no query term and no vector
+    ///   similarity is never returned, even when fewer than `top_k` claims
+    ///   match. Recency, confidence, source quality and graph signals only
+    ///   rank candidates, they never make a claim one.
+    ///
+    /// A query without any token (empty or punctuation only) puts no lexical
+    /// constraint on the pool: every claim passing the filters is a
+    /// candidate (the HTTP API rejects an empty query).
+    ///
+    /// Time range and `allowed_claim_ids` then restrict the candidates.
     fn candidate_claim_ids(
         &self,
         tenant_id: &str,
@@ -2015,11 +2030,6 @@ impl InMemoryStore {
                 if let Some(ids) = tenant_index.get(&token) {
                     candidates.extend(ids.iter().cloned());
                 }
-            }
-            if candidates.is_empty()
-                && let Some(ids) = self.tenant_claim_ids.get(tenant_id)
-            {
-                candidates.extend(ids.iter().cloned());
             }
         }
 

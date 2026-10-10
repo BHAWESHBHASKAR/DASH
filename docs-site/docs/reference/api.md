@@ -154,6 +154,8 @@ Response `200`:
 }
 ```
 
+**Which claims are returned.** `results` holds at most `top_k` claims, and fewer when fewer qualify; it is never filled up to `top_k`. A claim qualifies when it passes the filters (tenant, `time_range`, `entity_filters`, `embedding_id_filters`, `stance_mode`) and either shares at least one term with `query` or is among the nearest neighbours of the query vector (the one sent as `query_embedding` or the one generated from `query`; the `top_k * 20` nearest, clamped to 100..5000). Confidence, source quality, support and contradiction only rank qualifying claims; they never make a claim qualify. When the query is answered from the lexical signals only (see `query` above), a claim with no query term is never returned, and a query whose terms match no claim returns an empty `results`. The answer is the same with or without a segment directory (`DASH_RETRIEVAL_SEGMENT_DIR`).
+
 Each result also carries `graph_score`, `support_path_count`, `contradiction_chain_depth`, `temporal_match_mode` and `temporal_in_range` (null when not applicable). Numbers shown are illustrative; scores are formatted with six decimals. With `return_graph: true`, `graph` is `{ "nodes": [...], "edges": [{ "from_claim_id", "to_claim_id", "relation", "strength" }] }`.
 
 ### `POST /v1/embeddings`

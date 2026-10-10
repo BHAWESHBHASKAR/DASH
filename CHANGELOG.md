@@ -222,6 +222,18 @@ to [Semantic Versioning](https://semver.org/).
   the client sent no vector; 0.2 answered it. The generated vector is now
   dropped and the query answered from the lexical signals. An explicit
   `query_embedding` of the wrong dimension is still a 400.
+- **Text-only retrieve returned claims that do not match the query when a
+  segment directory was configured.** The segment candidate path scored
+  every claim of the segment base and WAL delta and filled `top_k` with
+  claims that share no term with the query, ranked only by confidence,
+  source quality and graph signals; without a segment directory the same
+  query returned only the lexical matches. Both paths now apply one rule: a
+  claim is a candidate when it shares a term with the query or is a vector
+  candidate of the query vector; other signals only rank candidates.
+  Answers no longer depend on whether a segment directory is configured.
+  The index path's fallback to every claim of the tenant when no query term
+  matched anything is gone too: such a query now returns no results. The
+  rule is documented in the API reference (`POST /v1/retrieve`).
 - **Upgrade notes corrected.** "Mixed-version replication is not tested"
   and "0.2.x is not expected to read 0.3.0 records (not tested)" are now
   tested facts (refused both ways; rollback only by restoring the backup),

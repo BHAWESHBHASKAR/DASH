@@ -22,19 +22,15 @@
     },
     "8": {
       "claims": [
-        "a-c09",
-        "a-c04",
-        "a-c10"
+        "a-c09"
       ],
-      "why": "text-only query on a tenant whose vectors have another dimension than the provider's: 0.2 scanned every vector with the mismatched query vector; 0.3 drops that vector and ranks the lexical match first (a-c09), then the segment candidates by their remaining signals, so a-c10 replaces a-c06"
+      "why": "text-only query on a tenant whose vectors have another dimension than the provider's: 0.2 scanned every vector with the mismatched query vector and filled top_k with claims that match no query term; 0.3 drops that vector, so the query is lexical only and returns only the claim that matches a query term (a-c09). A claim with no query term and no vector similarity is never a candidate, with or without a segment directory"
     },
     "9": {
       "claims": [
-        "a-c04",
-        "a-c10",
-        "a-c12"
+        "a-c04"
       ],
-      "why": "same as request 8: the lexical match a-c04 first, then segment candidates ranked by the 0.3 signals instead of 0.2's mismatched-vector scan"
+      "why": "same as request 8: only the lexical match a-c04; 0.2's other results match no query term and came from the mismatched-vector scan"
     }
   }
 }

@@ -1,0 +1,18 @@
+{
+  "comment": "Retrieve answers of the current code on the 0.3.0-dev fixture that differ BY DESIGN from what that build answered (http/retrieve-responses.jsonl). The fixture was recorded with a segment directory configured, and that build's segment candidate path filled top_k of a text-only query with claims that match no query term (scored only by confidence, source quality and graph signals). Retrieval now applies one relevance rule on every path: a claim with no query term and no vector similarity is never returned. Scores of the remaining results are unchanged. Delete this file when the fixture is replaced by the one of the tagged 0.3.0 release.",
+  "scores_comparable": true,
+  "requests": {
+    "8": {
+      "claims": [
+        "a-c09"
+      ],
+      "why": "text-only query whose generated vector does not fit the tenant (dropped): only the lexical match a-c09 is returned; a-c04 and a-c10 match no query term and were segment padding"
+    },
+    "9": {
+      "claims": [
+        "a-c04"
+      ],
+      "why": "same as request 8: only the lexical match a-c04; a-c10 and a-c12 were segment padding"
+    }
+  }
+}
