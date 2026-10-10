@@ -277,10 +277,27 @@ jobs:
           path: release/*
           if-no-files-found: error
 
+  # Release checklist item (docs/operations/upgrades.md): the tagged release
+  # ships its upgrade-compatibility fixture, so later releases are tested
+  # against the state it writes.
+  upgrade-fixture:
+    name: Upgrade fixture present
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Check the fixture for this tag
+        run: scripts/compat/check_release_fixture.sh "${GITHUB_REF_NAME}"
+
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [sign-artifacts]
+    needs: [sign-artifacts, upgrade-fixture]
     permissions:
       contents: write
     steps:

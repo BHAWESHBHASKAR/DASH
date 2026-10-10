@@ -22,9 +22,11 @@
 # share a target directory with the working tree), and both are deleted when
 # the script exits. Needs: git, cargo, python3, gzip.
 #
-# Release checklist: run this for every release against the release tag,
-# commit the new fixture directory, and add it to FIXTURES in
-# tests/compat/tests/common/mod.rs (see docs/operations/upgrades.md).
+# Release checklist: run this for every release against the release
+# candidate commit with the tag as label, add the label to FIXTURES in
+# tests/compat/src/lib.rs, commit, then tag (see the release checklist in
+# docs/operations/upgrades.md; scripts/compat/check_release_fixture.sh is
+# the release workflow's gate).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,7 +43,7 @@ while [[ $# -gt 0 ]]; do
     --bin-dir) BIN_DIR="$2"; shift 2 ;;
     --scratch) SCRATCH="$2"; shift 2 ;;
     --keep-scratch) KEEP=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

@@ -214,22 +214,27 @@ that 0.3 output fails them (and that the procedures above are in this page).
 
 ## Release checklist
 
-For every release (and before tagging):
+For every release, before tagging:
 
-1. Capture its fixture from the release commit:
-   `scripts/compat/generate_fixtures.sh --ref <tag> --label <tag>`. The script
-   builds the release in a temporary git worktree with its own target
-   directory, runs `scripts/compat/run_scenario.py` against the binaries, and
-   deletes the worktree and build output afterwards. It needs `git`, `cargo`,
-   `python3` and `gzip`; the fixture is a few hundred KB.
+1. Capture its fixture from the release candidate commit, labelled with the
+   tag it will get:
+   `scripts/compat/generate_fixtures.sh --ref <release commit> --label <tag>`.
+   The script builds that commit in a temporary git worktree with its own
+   target directory, runs `scripts/compat/run_scenario.py` against the
+   binaries, and deletes the worktree and build output afterwards. It needs
+   `git`, `cargo`, `python3` and `gzip`; the fixture is a few hundred KB.
 2. Add the label to `FIXTURES` in `tests/compat/src/lib.rs` (the
    `every_fixture_directory_is_registered` test fails until you do) and set
-   its `Era` and `has_deletes`.
+   its `Era` and `has_deletes`. Once the release is tagged, its fixture
+   replaces the `v0.3.0-dev`-style pre-release fixture of the same line.
 3. If the release changes ranking on purpose, add
    `tests/compat/expected/<older label>.json` entries with the reason for each
    changed answer; any unexplained difference fails the tests.
 4. If the release introduces a format, add a row to the table above, a
    downgrade rule if older releases cannot read it, and an oracle in
    `dash_compat::old_readers` for the previous release's reader.
-5. Run `cargo test -p dash-compat`; it is also part of
-   `cargo test --workspace`.
+5. Run `cargo test -p dash-compat` (it is also part of
+   `cargo test --workspace` in CI), commit, then tag. The release workflow's
+   `upgrade-fixture` job runs `scripts/compat/check_release_fixture.sh <tag>`
+   and blocks the GitHub release when the tag has no registered fixture
+   generated from the tagged commit or an ancestor of it.
