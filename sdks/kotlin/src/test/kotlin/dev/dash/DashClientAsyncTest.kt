@@ -1,10 +1,8 @@
 package dev.dash
 
-import dev.dash.model.DeleteRequest
 import dev.dash.model.EmbedRequest
 import dev.dash.model.EmbeddingResponse
 import dev.dash.model.HealthResponse
-import dev.dash.model.IngestBundle
 import dev.dash.model.IngestClaim
 import dev.dash.model.IngestRequest
 import dev.dash.model.IngestResponse
@@ -24,18 +22,24 @@ import java.util.concurrent.TimeUnit
 class DashClientAsyncTest {
 
     private lateinit var server: MockWebServer
+    private lateinit var ingestServer: MockWebServer
     private lateinit var client: DashClientAsync
 
     @BeforeEach
     fun setUp() {
         server = MockWebServer()
         server.start()
-        client = DashClientAsync(DashClient(server.url("/").toString(), "kt-key"))
+        ingestServer = MockWebServer()
+        ingestServer.start()
+        client = DashClientAsync(
+            DashClient(server.url("/").toString(), ingestServer.url("/").toString(), "kt-key")
+        )
     }
 
     @AfterEach
     fun tearDown() {
         server.shutdown()
+        ingestServer.shutdown()
     }
 
     // ------------------------------------------------------------------
@@ -92,9 +96,9 @@ class DashClientAsyncTest {
     }
 
     @Test
-    @DisplayName("ingest_sendsBundlesAndDecodesResults")
-    fun ingest_sendsBundlesAndDecodesResults() = runTest {
-        server.enqueue(
+    @DisplayName("ingest_sendsServerShapedBodyToIngestionHost")
+    fun ingest_sendsServerShapedBodyToIngestionHost() = runTest {
+        ingestServer.enqueue(
             MockResponse()
                 .setResponseCode(200)
                 .setHeader("Content-Type", "application/json")
@@ -102,42 +106,33 @@ class DashClientAsyncTest {
         )
 
         val resp: IngestResponse = client.ingest(
-            IngestRequest(
-                "acme",
-                IngestBundle(
-                    claim = IngestClaim("c-1", "acme", "hi", 0.9, null),
-                    evidence = emptyList(),
-                )
-            )
+            IngestRequest(IngestClaim("c-1", "acme", "hi", 0.9))
         )
 
-        assertThat(resp.accepted).isEqualTo(1)
-        assertThat(resp.rejected).isZero()
-        assertThat(resp.results).hasSize(1)
-        assertThat(resp.results[0].claimId).isEqualTo("c-1")
-        val sent = server.takeRequest(1, TimeUnit.SECONDS)!!
+        assertThat(resp.ingestedClaimId).isEqualTo("c-1")
+        assertThat(resp.claimsTotal).isEqualTo(3)
+        assertThat(resp.commitStatus).isEqualTo("committed")
+        assertThat(server.requestCount).isZero()
+        val sent = ingestServer.takeRequest(1, TimeUnit.SECONDS)!!
         assertThat(sent.path).isEqualTo("/v1/ingest")
+        val body = sent.body.readUtf8()
+        assertThat(body).contains("\"claim\"").contains("\"canonical_text\":\"hi\"")
+        assertThat(body).doesNotContain("bundles")
     }
 
     @Test
-    @DisplayName("delete_sendsClaimIdsAndDecodesResults")
-    fun delete_sendsClaimIdsAndDecodesResults() = runTest {
-        server.enqueue(
-            MockResponse()
-                .setResponseCode(200)
-                .setHeader("Content-Type", "application/json")
-                .setBody(DELETE_BODY)
-        )
+    @DisplayName("ingest_5xx_isNotRetriedByDefault")
+    fun ingest_5xx_isNotRetriedByDefault() = runTest {
+        for (i in 0 until 3) {
+            ingestServer.enqueue(MockResponse().setResponseCode(503).setBody("{}"))
+        }
 
-        val resp = client.delete(DeleteRequest("acme", listOf("c-1", "c-2"), true))
-
-        assertThat(resp.deleted).isEqualTo(1)
-        assertThat(resp.missing).isEqualTo(1)
-        assertThat(resp.results).hasSize(2)
-        assertThat(resp.results[0].claimId).isEqualTo("c-1")
-        assertThat(resp.results[0].status).isEqualTo("deleted")
-        val sent = server.takeRequest(1, TimeUnit.SECONDS)!!
-        assertThat(sent.path).isEqualTo("/v1/delete")
+        assertThatThrownBy {
+            kotlinx.coroutines.runBlocking {
+                client.ingest(IngestRequest(IngestClaim("c-1", "acme", "hi", 0.9)))
+            }
+        }.isInstanceOf(DashException::class.java)
+        assertThat(ingestServer.requestCount).isEqualTo(1)
     }
 
     @Test
@@ -185,7 +180,7 @@ class DashClientAsyncTest {
             .satisfies({ err ->
                 val de = err as DashException
                 assertThat(de.statusCode).isEqualTo(401)
-                assertThat(de.errorCode).isEqualTo("unauthorized")
+                assertThat(de.errorCode).isEqualTo("invalid_request_error")
             })
     }
 
@@ -198,8 +193,11 @@ class DashClientAsyncTest {
                 .setBody("""{"error": {"message": "rate limited", "type": "rate_limit_error"}}""")
         )
 
+        // Single attempt so the one canned response is enough.
+        val once = DashClientAsync(client.sync().withMaxRetries(1))
+
         assertThatThrownBy {
-            kotlinx.coroutines.runBlocking { client.embed(EmbedRequest.of("hi")) }
+            kotlinx.coroutines.runBlocking { once.embed(EmbedRequest.of("hi")) }
         }
             .isInstanceOf(DashException::class.java)
             .hasMessageContaining("429")
@@ -305,20 +303,13 @@ class DashClientAsyncTest {
 
         private val INGEST_BODY = """
             {
-              "results": [{"claim_id": "c-1", "tenant_id": "acme", "canonical_text": "hi", "status": "accepted"}],
-              "accepted": 1,
-              "rejected": 0
-            }
-        """.trimIndent()
-
-        private val DELETE_BODY = """
-            {
-              "deleted": 1,
-              "missing": 1,
-              "results": [
-                {"claim_id": "c-1", "status": "deleted"},
-                {"claim_id": "c-2", "status": "missing"}
-              ]
+              "ingested_claim_id": "c-1",
+              "claims_total": 3,
+              "commit_epoch": 5,
+              "ack_count": 1,
+              "required_acks": 1,
+              "commit_status": "committed",
+              "checkpoint_triggered": false
             }
         """.trimIndent()
 

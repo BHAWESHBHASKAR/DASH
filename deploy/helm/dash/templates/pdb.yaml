@@ -1,10 +1,35 @@
-{{- if .Values.pdb.enabled -}}
+{{- /*
+Disruption budget for retrieval, and for ingestion when failover is on.
+Single-replica ingestion and the control plane get none: a minAvailable
+budget there would block node drains forever.
+*/ -}}
+{{- if and .Values.pdb.enabled .Values.failover.enabled }}
+---
+# Ingestion with failover: followers (not ready by design) may always be
+# evicted; the leader may not (step it down first, see failover.md), because
+# evicting it pauses writes for a lease.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dash.componentName" (list . "ingestion") }}
+  namespace: {{ include "dash.namespace" . }}
+  labels:
+    {{- include "dash.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingestion
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if .Values.pdb.enabled }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: {{ include "dash.componentName" (list . "retrieval") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
+  namespace: {{ include "dash.namespace" . }}
   labels:
     {{- include "dash.labels" . | nindent 4 }}
     app.kubernetes.io/component: retrieval
@@ -17,22 +42,4 @@ spec:
   selector:
     matchLabels:
       {{- include "dash.retrievalSelectorLabels" . | nindent 6 }}
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: {{ include "dash.componentName" (list . "ingestion") }}
-  namespace: {{ .Values.namespace.name | default "dash-system" }}
-  labels:
-    {{- include "dash.labels" . | nindent 4 }}
-    app.kubernetes.io/component: ingestion
-spec:
-  {{- if .Values.pdb.maxUnavailable }}
-  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
-  {{- else }}
-  minAvailable: {{ .Values.pdb.minAvailable }}
-  {{- end }}
-  selector:
-    matchLabels:
-      {{- include "dash.ingestionSelectorLabels" . | nindent 6 }}
 {{- end }}

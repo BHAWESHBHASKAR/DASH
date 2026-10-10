@@ -1,0 +1,17 @@
+[package]
+name = "crash-test"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish.workspace = true
+description = "Randomized kill -9 crash-consistency harness for the DASH ingestion service"
+
+[[bin]]
+name = "crash-test"
+path = "src/main.rs"
+
+[dependencies]
+dash-e2e = { path = "../../tests/e2e" }
+rand = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"

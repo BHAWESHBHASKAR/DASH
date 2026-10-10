@@ -12,6 +12,10 @@ edition = "2024"
 path = "src/lib.rs"
 
 [[bin]]
+name = "fuzz_http_request"
+path = "fuzz_targets/fuzz_http_request.rs"
+
+[[bin]]
 name = "fuzz_jwt"
 path = "fuzz_targets/fuzz_jwt.rs"
 
@@ -31,6 +35,7 @@ path = "fuzz_targets/fuzz_wal_parse.rs"
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 auth = { path = "../pkg/auth" }
+dash-http = { path = "../pkg/http" }
 ranking = { path = "../pkg/ranking" }
 store = { path = "../pkg/store" }
 embeddings = { path = "../pkg/embeddings" }

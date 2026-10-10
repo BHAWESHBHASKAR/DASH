@@ -1,6 +1,6 @@
 # dash-ts
 
-A thin, idiomatic TypeScript client for the [DASH](https://github.com/dash-retrieval/dash)
+A thin, idiomatic TypeScript client for the [DASH](https://github.com/BHAWESHBHASKAR/DASH)
 retrieval engine. DASH serves an OpenAI-compatible `/v1/embeddings`
 endpoint and a native `/v1/retrieve` endpoint that returns structured
 **Claim + Evidence + Contradiction** results — the differentiator
@@ -185,6 +185,21 @@ Every error inherits from `DashError`, so a single
 `catch (err) { if (err instanceof DashError) { ... } }` is enough
 to catch "anything went wrong talking to DASH".
 
+## Deletes (0.3.0)
+
+```ts
+const client = createClient({
+  baseUrl: 'http://localhost:8080',
+  ingestionBaseUrl: 'http://localhost:8081',
+});
+await client.deleteClaim('tenant-a', 'claim-1'); // claim, vector, evidence, edges
+await client.deleteEvidence('tenant-a', 'ev-1'); // every evidence row with this id
+const result = await client.deleteTenant('tenant-a'); // erase the tenant (admin role)
+console.log(result.deleted, result.claims_deleted);
+```
+
+Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
+
 ## API surface
 
 | Symbol | Purpose |
@@ -240,6 +255,15 @@ need a typed, first-class client:
 - A consistent exception hierarchy (`DashConnectionError` vs
   `DashAPIError`) instead of inspecting `fetch` rejections by hand.
 - Zero runtime dependencies — pure ESM, native `fetch`, Node 18+.
+
+## Retrieve options (0.2.0)
+
+`retrieve` now sends and decodes the full server contract
+(`services/retrieval/src/transport/payload.rs`): `query_embedding`, `entity_filters`, `embedding_id_filters`, `time_range` (`{ from_unix, to_unix }`), `read_consistency`, `return_graph` and `stance_mode`.
+Responses expose the optional `claim_confidence`, `contradiction_risk`,
+`graph`, `read_policy`, `read_quorum_met` and `serving_replica` fields
+(absent or `null` values decode as `null`/`undefined`). The default `top_k` is now
+5 (the server default) instead of 10.
 
 ## License
 

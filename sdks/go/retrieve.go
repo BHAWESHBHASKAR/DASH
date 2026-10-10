@@ -13,7 +13,7 @@ type RetrieveService struct {
 }
 
 // Query issues a retrieve call. TenantID and Query are required;
-// TopK defaults to 10 and StanceMode defaults to "balanced" on the
+// TopK defaults to 5 and StanceMode defaults to "balanced" on the
 // server when zero / empty.
 //
 // The ReturnGraph flag is optional on the wire. The struct's public
@@ -28,13 +28,20 @@ func (s *RetrieveService) Query(ctx context.Context, req RetrieveRequest) (*Retr
 		StanceMode: req.StanceMode,
 	}
 	if body.TopK == 0 {
-		body.TopK = 10
+		body.TopK = 5
 	}
 	if body.StanceMode == "" {
 		body.StanceMode = "balanced"
 	}
 	if req.ReturnGraph {
 		body.ReturnGraph = &req.ReturnGraph
+	}
+	body.QueryEmbedding = req.QueryEmbedding
+	body.EntityFilters = req.EntityFilters
+	body.EmbeddingIDFilters = req.EmbeddingIDFilters
+	body.ReadConsistency = req.ReadConsistency
+	if req.TimeRange != nil && (req.TimeRange.FromUnix != nil || req.TimeRange.ToUnix != nil) {
+		body.TimeRange = req.TimeRange
 	}
 	var out RetrieveResponse
 	if err := s.client.post(ctx, "/v1/retrieve", body, &out); err != nil {
@@ -48,9 +55,14 @@ func (s *RetrieveService) Query(ctx context.Context, req RetrieveRequest) (*Retr
 // from the wire when the caller did not set it, matching the
 // Python SDK's Optional[bool] behaviour.
 type retrieveRequestBody struct {
-	TenantID    string `json:"tenant_id"`
-	Query       string `json:"query"`
-	TopK        int    `json:"top_k"`
-	StanceMode  string `json:"stance_mode"`
-	ReturnGraph *bool  `json:"return_graph,omitempty"`
+	TenantID           string     `json:"tenant_id"`
+	Query              string     `json:"query"`
+	TopK               int        `json:"top_k"`
+	StanceMode         string     `json:"stance_mode"`
+	ReturnGraph        *bool      `json:"return_graph,omitempty"`
+	QueryEmbedding     []float32  `json:"query_embedding,omitempty"`
+	EntityFilters      []string   `json:"entity_filters,omitempty"`
+	EmbeddingIDFilters []string   `json:"embedding_id_filters,omitempty"`
+	TimeRange          *TimeRange `json:"time_range,omitempty"`
+	ReadConsistency    string     `json:"read_consistency,omitempty"`
 }

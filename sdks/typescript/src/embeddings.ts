@@ -26,10 +26,15 @@ import type { DashClient } from './client.js';
 export interface CreateEmbeddingsOptions {
   /** Override the model. Default is `"text-embedding-3-small"`. */
   model?: string;
-  /** Encoding format — DASH currently only supports `"float"`. */
+  /**
+   * Encoding format: `"float"` (default) or `"base64"`. Base64 payloads
+   * are decoded for you, so `embedding` is always a `number[]`.
+   */
   encoding_format?: EmbeddingRequest['encoding_format'];
   /** OpenAI-style opaque user identifier. */
   user?: string;
+  /** Expected embedding size; rejected by the server when it differs. */
+  dimensions?: number;
   /** Per-request timeout in milliseconds. Overrides the client default. */
   timeoutMs?: number;
   /** AbortSignal to chain for cancellation. */
@@ -66,6 +71,8 @@ export class EmbeddingsService {
     if (options.encoding_format !== undefined)
       requestBody.encoding_format = options.encoding_format;
     if (options.user !== undefined) requestBody.user = options.user;
+    if (options.dimensions !== undefined)
+      requestBody.dimensions = options.dimensions;
     return this.createRaw(requestBody, {
       timeoutMs: options.timeoutMs,
       signal: options.signal,

@@ -1,6 +1,6 @@
 # About
 
-DASH is a production-grade vector database that stores atomic **claims** with their supporting **evidence** and recorded **contradictions**. It is built to be deployed in environments that are subject to audit — legal, medical, financial, enterprise knowledge workflows — where "we found a similar chunk" is not an acceptable answer to "where did the model get that from?"
+DASH is a pre-1.0 evidence-first vector database (not yet production-ready) that stores atomic **claims** with their supporting **evidence** and recorded **contradictions**. It is built to be deployed in environments that are subject to audit — legal, medical, financial, enterprise knowledge workflows — where "we found a similar chunk" is not an acceptable answer to "where did the model get that from?"
 
 ## Pages
 
@@ -17,12 +17,12 @@ DASH is a production-grade vector database that stores atomic **claims** with th
 | **Language** | Rust (services), Python / Go / TypeScript / Java / C# (SDKs) |
 | **Source** | <https://github.com/BHAWESHBHASKAR/DASH> |
 | **Issues** | <https://github.com/BHAWESHBHASKAR/DASH/issues> |
-| **Test count** | 379 Rust + 86 Go + 65 TypeScript + 59 Python = **589** |
+| **Test count** | 807 Rust (`cargo test --workspace -- --list`) plus SDK test declarations: Python 69, Go 92, TypeScript 71, Java 32, Kotlin 12, C# 63 (static counts; see the README) |
 | **First release** | 2026-06-15 |
 
 ## Why we built it
 
-Naive RAG ranks documents by vector similarity and returns the top *k* chunks. That works for "summarize this article" but fails in three common enterprise cases: (1) two sources say opposite things and there is no way to demote the contradicted one, (2) a fact has a temporal window and the version retrieved is stale, (3) the auditor asks "why did the model say that?" and the answer is "because a 768-dimensional number was close to a query."
+Naive RAG ranks documents by vector similarity and returns the top *k* chunks. That works for "summarize this article" but fails in three common enterprise cases: (1) two sources say opposite things and there is no way to demote the contradicted one, (2) a fact has a temporal window and the version retrieved is stale, (3) the auditor asks "why did the model say that?" and the answer is "because a high-dimensional vector was close to a query."
 
 DASH treats the **claim** — an atomic, source-bound assertion — as the primary data primitive, with **evidence** and **citation** as first-class fields on every result. Every retrieval response is shaped `{ claim, score, supports, contradicts, citations[] }`. Each `citation` carries its `source_id`, `stance` (supports/contradicts/neutral), `source_quality`, and an optional `chunk_id` plus `span_start`/`span_end` for character-level traceability. The retrieval API exposes `stance_mode: support_only` to filter out claims that have been contradicted, and `time_range: {from_unix, to_unix}` to constrain results to a validity window.
 
@@ -33,11 +33,9 @@ That is the entire differentiator. DASH is not the fastest pure-vector index, an
 DASH stands on the shoulders of giants:
 
 - [`redb`](https://github.com/cberner/redb) — pure-Rust, ACID, embedded KV.
-- [`usearch`](https://github.com/unum-cloud/usearch) — the HNSW implementation that powers the ANN search.
 - [`jsonwebtoken`](https://github.com/Keats/jsonwebtoken), [`serde`](https://serde.rs/), [`tokio`](https://tokio.rs/) (build-time only) — the Rust crates that make the auth and the wire format tractable.
-- The OpenAI v1 embeddings spec — the wire format DASH is a drop-in for.
-- The 46 open-source contributors who have filed issues, sent PRs, and reviewed code.
+- The OpenAI v1 embeddings spec — the wire format the embeddings endpoint follows.
 
 ## Maintainers
 
-DASH is maintained by the [BHAWESHBHASKAR](https://github.com/BHAWESHBHASKAR) org and a rotating set of community maintainers. See [`AUTHORS`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/AUTHORS) for the full list.
+DASH is maintained by the [BHAWESHBHASKAR](https://github.com/BHAWESHBHASKAR) organization. There is no `AUTHORS` file; see the repository's contributors page on GitHub.

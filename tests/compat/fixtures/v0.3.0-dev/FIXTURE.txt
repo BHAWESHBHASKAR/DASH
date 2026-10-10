@@ -1,0 +1,6 @@
+label: v0.3.0-dev
+ref: HEAD
+commit: 7a780af0acf07e6d04e4b6cdea271beb246331bc
+generated: 2026-10-10
+generator: scripts/compat/generate_fixtures.sh
+dataset: tests/compat/dataset (ingest.jsonl, retrieve.jsonl, placements.csv)

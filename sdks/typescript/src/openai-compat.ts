@@ -20,6 +20,7 @@
  * This works with LangChain, LlamaIndex, the `openai` CLI, and any
  * other tool that respects the `OPENAI_BASE_URL` / `baseURL` knob.
  */
+import { trimTrailingSlashes } from './url.js';
 
 /**
  * Build the OpenAI-style base URL pointing at a DASH deployment.
@@ -29,7 +30,7 @@
  * `/v1` suffix.
  */
 export function openAIBaseURL(dashBaseUrl: string): string {
-  const trimmed = dashBaseUrl.replace(/\/+$/, '');
+  const trimmed = trimTrailingSlashes(dashBaseUrl);
   if (trimmed.endsWith('/v1')) {
     return trimmed;
   }
@@ -40,4 +41,4 @@ export function openAIBaseURL(dashBaseUrl: string): string {
  * Re-export the version string for the package so callers can
  * pin against a known SDK release.
  */
-export const DASH_TS_VERSION = '0.1.0';
+export const DASH_TS_VERSION = '0.2.0';

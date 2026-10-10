@@ -4,9 +4,11 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 
 ## Feature matrix
 
+> **Verification status.** The DASH column was checked against the code on 2026-10-09 (see [`claims-ledger.md`](claims-ledger.md)). The other columns were compiled from public documentation and have **not** been re-verified in this review; treat them as a starting point, not as fact. No head-to-head benchmark exists.
+
 | Feature | DASH | Pinecone | Weaviate | Milvus | Qdrant | Chroma |
 |---|---|---|---|---|---|---|
-| Open source | yes (see [LICENSE](../LICENSE); intended Apache-2.0) | no, proprietary | yes, BSD-3 | yes, Apache-2.0 | yes, Apache-2.0 | yes, Apache-2.0 |
+| Open source | yes (Apache-2.0, see [LICENSE](../LICENSE)) | no, proprietary | yes, BSD-3 | yes, Apache-2.0 | yes, Apache-2.0 | yes, Apache-2.0 |
 | Claim + Evidence model | first-class | no | no | no | no | no |
 | Citation provenance per result | first-class | not modeled | not modeled | not modeled | not modeled | not modeled |
 | Contradiction handling (evidence + edges) | first-class (`Stance::Contradicts`, `Relation::Contradicts`) | no | manual, via modules | no | no | no |
@@ -14,18 +16,18 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 | Temporal validity windows | first-class (`event_time_unix`, `valid_from`, `valid_to`, `time_range` filter) | metadata only | manual | manual | manual | manual |
 | OpenAI-compatible `/v1/embeddings` | yes, native | partial | yes | via proxy layer | via proxy layer | yes |
 | Swap embedding provider | trait-based (`EmbeddingProvider`) | n/a | plugin-based | n/a | n/a | function-based |
-| HNSW ANN | yes (`usearch`) | yes, proprietary | yes | yes | yes | yes |
+| HNSW-style ANN | yes (`usearch` HNSW with `i8` quantisation and exact rerank, flat scan for small tenants; recall@10 >= 0.95 on seeded clustered data; rebuilt at startup, not persisted) | yes, proprietary | yes | yes | yes | yes |
 | Graph primitives (edges, multi-hop) | first-class (`supports`, `contradicts`, `refines`, `duplicates`, `depends_on`) | no | yes, but no contradiction semantics | no | payload-based only | no |
-| Hash-chained audit log | yes, SHA-256 chain | no | no | no | no | no |
-| Tenant isolation (strict authz) | yes, allowlist + scoped keys | yes | yes (OIDC) | yes | partial | no |
-| Per-tenant rate limits | yes | yes | yes | yes | partial | no |
+| Hash-chained audit log | partial: unkeyed SHA-256 chain with a shared verifier (`tools/audit-verify`), off unless a path is configured | no | no | no | no | no |
+| Tenant isolation (strict authz) | partial: allowlist + scoped keys; one known isolation gap: the claim-id namespace is global (register SEC-18) | yes | yes (OIDC) | yes | partial | no |
+| Per-tenant rate limits | yes, per process, HTTP 429 with `Retry-After` (0.3.0) | yes | yes | yes | partial | no |
 | Scoped API keys | yes (`key:tenant[,tenant...]`) | limited | yes | yes | limited | no |
 | API key revocation (hot reload) | yes | yes | yes | yes | partial | no |
 | JWT auth (HS256) with kid rotation | yes | JWT only | yes (OIDC) | yes | partial | no |
 | Durable WAL with replay + checkpoints | yes, built-in | managed | yes | yes | yes | no |
 | Backpressure-aware HTTP transport | yes (queue + 503) | managed | yes | yes | yes | no |
 | Docker Compose / systemd units | yes | n/a | yes | yes | yes | no |
-| Benchmark suite with CI regression guard | yes | n/a | partial | yes | partial | no |
+| Benchmark suite | yes (suite exists; no published cross-system comparison) | n/a | partial | yes | partial | no |
 | Managed cloud option | no (self-hosted) | yes | yes | yes | yes | yes |
 | Backing storage | local WAL + segments | managed | pluggable (disk, S3, GCS, MinIO) | pluggable (disk, S3, GCS, MinIO) | local or S3-compatible | in-memory or local |
 
@@ -35,8 +37,8 @@ A feature-by-feature comparison focused on the dimensions that matter to RAG use
 - You need citation-grade provenance on every retrieved claim — a source, a stance, a quality score, and ideally a span.
 - You need the retrieval layer to know that a claim has been contradicted by another source and either demote or filter it (`stance_mode: support_only`).
 - You need temporal validity windows on claims (a fact is true between `valid_from` and `valid_to`; the API should be able to ask "what was true in Q3 2024?") rather than a metadata filter hack.
-- You need an audit trail that is tamper-evident: every state change is SHA-256-chained, and you can verify the chain with `scripts/verify_audit_chain.sh`.
-- You are deploying into a multi-tenant SaaS and need per-tenant rate limits, scoped API keys, key revocation, and strict tenant allowlists in the same process.
+- You want an audit trail with a hash chain (opt-in, unkeyed, so it detects accidental damage rather than a determined attacker; see the README Status section for current limits).
+- You need scoped API keys, key revocation and tenant allowlists in the same process (per-tenant rate limits are enforced as of 0.3.0).
 - You want to be able to audit the storage and retrieval path yourself — DASH's core is open source, with no managed-cloud component and no proprietary extension.
 
 ## When NOT to use DASH

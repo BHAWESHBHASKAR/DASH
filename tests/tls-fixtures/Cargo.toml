@@ -1,0 +1,11 @@
+[package]
+name = "dash-tls-fixtures"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "Test-only PKI: CAs, server and client certificates generated per test run."
+
+[dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+tempfile = "3"

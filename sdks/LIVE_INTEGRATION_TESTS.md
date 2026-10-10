@@ -14,6 +14,19 @@ running DASH instance.
 
 ## Running
 
+Retrieval and ingestion are separate services. Every SDK reads the same
+variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `DASH_LIVE_URL` | Required. Base URL of the retrieval service (also the default for the two below). |
+| `DASH_LIVE_RETRIEVAL_URL` | Retrieval service, when it differs from `DASH_LIVE_URL`. |
+| `DASH_LIVE_INGESTION_URL` | Ingestion service (`POST /v1/ingest`), e.g. `http://127.0.0.1:8081`. |
+| `DASH_LIVE_API_KEY` / `DASH_LIVE_INGEST_API_KEY` | Bearer keys for retrieval / ingestion when auth is enabled. |
+
+The ingest step posts the real ingestion body (`{claim, evidence, edges}`)
+to `DASH_LIVE_INGESTION_URL` and asserts a `200`.
+
 ### Python
 
 ```bash
@@ -27,6 +40,7 @@ cd sdks/python && pytest tests/test_live_integration.py -v
 
 ```bash
 export DASH_LIVE_URL=http://127.0.0.1:8080
+export DASH_LIVE_INGESTION_URL=http://127.0.0.1:8081
 cd sdks/go && go test -tags=integration -v ./...
 ```
 
@@ -34,6 +48,7 @@ cd sdks/go && go test -tags=integration -v ./...
 
 ```bash
 export DASH_LIVE_URL=http://127.0.0.1:8080
+export DASH_LIVE_INGESTION_URL=http://127.0.0.1:8081
 export LIVE=1
 cd sdks/typescript && npm test -- live-integration.test.ts
 ```

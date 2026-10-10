@@ -1,18 +1,22 @@
 package dev.dash.model;
 
-import java.util.List;
-
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
- * Response body for {@code POST /v1/ingest}.
+ * Response body of {@code POST /v1/ingest}.
  *
- * <p>Mirrors the per-bundle acknowledgments returned by the server.
- * The server may accept all bundles, reject some, or accept none;
- * callers should walk {@code results} and inspect {@code status}.</p>
+ * <p>Mirrors {@code IngestApiResponse} in
+ * {@code services/ingestion/src/api.rs}. {@code commitStatus} reflects
+ * replication progress ({@code ackCount} of {@code requiredAcks}).</p>
  */
 public record IngestResponse(
-        @JsonProperty("results") List<IngestClaim> results,
-        @JsonProperty("accepted") int accepted,
-        @JsonProperty("rejected") int rejected) {
+        @JsonProperty("ingested_claim_id") String ingestedClaimId,
+        @JsonProperty("claims_total") int claimsTotal,
+        @JsonProperty("commit_epoch") Long commitEpoch,
+        @JsonProperty("ack_count") int ackCount,
+        @JsonProperty("required_acks") int requiredAcks,
+        @JsonProperty("commit_status") String commitStatus,
+        @JsonProperty("checkpoint_triggered") boolean checkpointTriggered,
+        @JsonProperty("checkpoint_snapshot_records") Integer checkpointSnapshotRecords,
+        @JsonProperty("checkpoint_truncated_wal_records") Integer checkpointTruncatedWalRecords) {
 }

@@ -8,12 +8,10 @@ set -euo pipefail
 # Environment:
 #   COMPOSE_DIR            - docker compose directory (default: deploy/container)
 #   DASH_BACKUP_OUTPUT_DIR - backup destination (default: /tmp/dash-drill-backups)
-#   DASH_RESTORE_FORCE     - overwrite existing state (default: true)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_DIR="${COMPOSE_DIR:-${ROOT_DIR}/deploy/container}"
 BACKUP_DIR="${DASH_BACKUP_OUTPUT_DIR:-/tmp/dash-drill-backups}"
-FORCE="${DASH_RESTORE_FORCE:-true}"
 
 INGEST_URL="${DASH_DRILL_INGEST_URL:-http://127.0.0.1:8081}"
 RETRIEVE_URL="${DASH_DRILL_RETRIEVE_URL:-http://127.0.0.1:8080}"
@@ -122,13 +120,25 @@ docker compose up -d
 wait_ready "${INGEST_URL}"
 wait_ready "${RETRIEVE_URL}"
 
-# Restore the bundle into the ingestion container.
-docker compose cp "${BUNDLE}" "ingestion:/tmp/dash-backup.tar.gz"
-docker compose exec -T ingestion bash -c \
-  'set -e; cd /tmp; rm -rf dash-backup-drill; tar -xzf dash-backup.tar.gz; mkdir -p /var/lib/dash/wal; cp -p dash-backup-*/data/wal/* /var/lib/dash/wal/'
+# Restore the bundle into the ingestion state volume (each service has its
+# own volume; the WAL belongs to ingestion). The service containers run with
+# a read-only root filesystem (and `docker cp` cannot write into them), so
+# extract on the host and copy through a one-off container of the ingestion
+# service, which mounts that same volume.
+RESTORE_DIR="$(mktemp -d /tmp/dash-drill-restore-XXXXXX)"
+tar -xzf "${BUNDLE}" -C "${RESTORE_DIR}"
+# The one-off container runs as the unprivileged service user, and mktemp
+# creates the directory 0700 for the host user, so open it up for reading.
+chmod -R a+rX "${RESTORE_DIR}"
+docker compose stop ingestion
+docker compose run --rm --no-deps -T \
+  -v "${RESTORE_DIR}:/restore:ro" \
+  --entrypoint sh ingestion -c \
+  'set -e; mkdir -p /var/lib/dash/wal; cp /restore/dash-backup-*/data/wal/* /var/lib/dash/wal/'
+rm -rf "${RESTORE_DIR}"
 
-# Restart ingestion so it replays the restored WAL.
-docker compose restart ingestion
+# Start ingestion so it replays the restored WAL.
+docker compose start ingestion
 wait_ready "${INGEST_URL}"
 wait_ready "${RETRIEVE_URL}"
 

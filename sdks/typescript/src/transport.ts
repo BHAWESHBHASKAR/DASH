@@ -18,7 +18,7 @@ import { DashAPIError, DashConnectionError } from './errors.js';
 export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /** User agent reported to the server. */
-export const USER_AGENT = 'dash-ts/0.1.0';
+export const USER_AGENT = 'dash-ts/0.2.0';
 
 /** Default headers sent on every request. */
 export function defaultHeaders(): Record<string, string> {

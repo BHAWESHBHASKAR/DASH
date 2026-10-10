@@ -1,7 +1,8 @@
 ---
-# Voluntary disruption budgets. Either Service is allowed to lose at
-# most one replica; node drains, cluster autoscaler scale-down, and
-# version rollouts are all gated on this.
+# Voluntary disruption budget for retrieval: at most one replica may be
+# disrupted at a time. Ingestion and control-plane are single-replica
+# StatefulSets; a minAvailable budget on them would block node drains
+# forever, so they intentionally have none.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -17,19 +18,3 @@ spec:
     matchLabels:
       app.kubernetes.io/name: dash
       app.kubernetes.io/component: retrieval
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: dash-ingestion
-  namespace: dash-system
-  labels:
-    app.kubernetes.io/part-of: dash
-    app.kubernetes.io/name: dash
-    app.kubernetes.io/component: ingestion
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: dash
-      app.kubernetes.io/component: ingestion

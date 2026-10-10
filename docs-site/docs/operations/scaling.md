@@ -1,108 +1,33 @@
 # Scaling
 
-DASH is designed to scale **horizontally** — by adding more processes, not by adding concurrency inside a process. This page describes the three scaling axes: process replication, `redb` PR 3 replication (for read-after-write across data centers), and ANN index sharding (for tenants that exceed a single host).
+DASH 0.3.0 (unreleased) scales **reads** by adding polling followers and has **no built-in write sharding, consensus or automatic failover**. This page describes what exists and what does not. An earlier version of this page contained a replica-sizing table, QPS and latency figures, a description of a log-shipping "redb PR 3" protocol, a retrieval service sharing a read-only `redb` file, and ANN and ingest routers. None of those exist in the code, and no throughput or latency figure has been measured in a reproducible CI job; all were removed. For benchmark methodology see [Benchmarks](../reference/benchmarks.md).
 
-## Horizontal scaling
-
-The retrieval service is **stateless** above the persistence layer. Two replicas of the retrieval service can serve the same `redb` file (in read-only mode) and produce identical results. The recommended pattern:
+## What exists: one writer, polling read followers
 
 ```text
-       ┌──────────────────────────┐
-       │  Load balancer (L7)      │
-       └────────────┬─────────────┘
-                    │
-        ┌───────────┼───────────┐
-        │           │           │
-   ┌────▼────┐ ┌────▼────┐ ┌────▼────┐
-   │ ret-1   │ │ ret-2   │ │ ret-3   │
-   └────┬────┘ └────┬────┘ └────┬────┘
-        │           │           │
-        └───────────┼───────────┘
-                    │
-              redb file (read-only mount)
+client ── writes ──► ingestion (single writer, owns the WAL and a redb mirror)
+                          │  GET /internal/replication/wal  (token, generation-aware)
+                          ▼
+         retrieval-1   retrieval-2   retrieval-N   (each has its own in-memory store,
+                                                    optional local WAL and redb file)
+client ── reads ──► load balancer ──► any retrieval replica
 ```
 
-The ingestion service is **stateful** — it is the writer of the `redb` file. A single ingestion replica is the default; for higher ingest throughput, see the [ingest-side sharding](#ingest-side-sharding) section below.
+- **Writes** go to one ingestion process per WAL. Two writers on the same WAL or redb file are not supported (redb holds a file lock).
+- **Reads** can be spread over any number of retrieval replicas. Each replica follows the ingestion service by polling (`DASH_RETRIEVAL_REPLICATION_SOURCE_URL`, `DASH_RETRIEVAL_REPLICATION_TOKEN`), keeps its own copy of the data in memory, and, if it has a local WAL (`DASH_RETRIEVAL_WAL_PATH`), resumes from its saved `(generation, offset)` after a restart. A replica that is new, or whose state no longer matches the leader's WAL generation, resyncs from a full export. Memory use per replica grows with the data set: every replica holds every tenant's claims, evidence, vectors and ANN graph.
+- **Freshness.** A write is visible on a replica after the next poll (`DASH_RETRIEVAL_REPLICATION_POLL_INTERVAL_MS`, default 1000 ms) plus apply time.
+- **Load balancing.** Use `/ready`: a follower that has not finished its first sync, is further behind than `DASH_RETRIEVAL_REPLICATION_MAX_LAG_RECORDS` (default 100000) or has not polled successfully within `DASH_RETRIEVAL_REPLICATION_MAX_STALENESS_MS` (default 300000) answers 503 with a reason, so a load balancer can take it out of rotation. Watch `dash_retrieval_replication_lag_records` and `_last_success_age_ms` (see [Observability](observability.md)).
+- **Kubernetes and Helm.** Retrieval is a StatefulSet with one PVC per pod; scale it manually (`kubectl scale statefulset ... --replicas=N`). There is no autoscaler, because a new replica starts empty and must catch up first. Never scale ingestion or the control plane above 1. A single ingestion node bounds ingest throughput, and the ingestion runtime serializes writes.
 
-### Recommended replica counts
+## What exists: placement routing (manual, limited)
 
-| Workload                              | Ingestion replicas | Retrieval replicas |
-| ------------------------------------- | ------------------: | -----------------: |
-| Dev / staging                         |                 1   |                 1   |
-| Single-tenant small (< 1 M claims)    |                 1   |                 2   |
-| Single-tenant medium (< 100 M claims) |                 2   |                 4   |
-| Multi-tenant large (≥ 100 M claims)   |                 4   |                 8+  |
-| Multi-region                          |                 4/region | 8/region         |
+`DASH_ROUTER_PLACEMENT_FILE` (a CSV of shard placements) or `DASH_ROUTER_CONTROL_PLANE_URL` turns on placement routing in ingestion and retrieval. Each node then checks that it is the leader (writes) or an eligible replica (reads) for the tenant's shard, and refuses the request with 503 otherwise (`write_consistency` / `read_consistency` of `one`, `quorum` or `all` are checked against replica health). The control plane stores the placement, holds a file-lease leader election and can promote a replica to shard leader, but only if that replica reported zero replication lag (or the operator passes `force=1`). Placements reload on an interval (`DASH_ROUTER_PLACEMENT_RELOAD_INTERVAL_MS`); if the control plane becomes unreachable, ingestion keeps accepting writes on the last known placement only for `DASH_INGEST_PLACEMENT_STALE_GRACE_MS` (default 30 s) and then refuses them.
 
-The retrieval replicas are CPU-bound. A 4-vCPU host can serve ~1 000 QPS at p99 < 5 ms; a 16-vCPU host can serve ~4 000 QPS. The bottleneck is the lexical reranker for large `top_k` and the ANN search for large `ann_top_n`.
+What this is **not**: DASH ships no router or proxy that forwards a request to the right node. The metadata router is a library used inside the services to validate routes. Splitting tenants across several ingestion nodes means running one ingestion per placement leader and sending each tenant's writes to its node yourself. Failover is operator-driven: promote a caught-up replica through the control plane, then repoint clients. There is no consensus protocol; one lease file decides control-plane leadership.
 
-## redb PR 3 replication
+## Not implemented
 
-The current `redb` integration is **PR 1** — single-process write, single-host read. **PR 3** (on the roadmap) adds a log-based replication protocol that allows a follower `redb` to tail a leader `redb` over the network.
-
-The shape:
-
-```text
-  ┌─────────────┐
-  │  leader     │  (ingestion replica; writes to redb)
-  │  ingest-1   │
-  └──────┬──────┘
-         │  redb log (length-prefixed, CRC-32c)
-         │
-   ┌─────┴──────┬──────────────┐
-   │            │              │
-┌──▼──┐      ┌──▼──┐        ┌──▼──┐
-│ret-1│      │ret-2│        │ret-3│   (read-only followers)
-└─────┘      └─────┘        └─────┘
-```
-
-The follower's redb is read-only; it is updated by applying the leader's log records. The protocol is **at-least-once** with idempotent applies; a follower can lose its position and re-tail from the leader's last checkpoint without diverging.
-
-PR 3 is not in the current release. The design doc is at `docs/plans/2026-06-13-redb-persistence-design.md` (PR 3 section) in the source tree. Subscribe to the [issue tracker](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Aredb-pr3) for the rollout date.
-
-## ANN index sharding
-
-For tenants with more vectors than fit on a single host, the ANN index is **sharded** by claim-ID range. Each shard is a separate `usearch` HNSW graph on a separate host; the retrieval service fans out the query to all shards and merges the top-*N* results.
-
-```text
-                 ┌──────────────────────┐
-                 │  ret-router          │
-                 │  (per-tenant routing)│
-                 └──────────┬───────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-   ┌────▼─────┐        ┌────▼─────┐        ┌────▼─────┐
-   │ shard-A  │        │ shard-B  │        │ shard-C  │
-   │ c0..cN/3 │        │ cN/3..2N │        │ 2N..N    │
-   └──────────┘        └──────────┘        └──────────┘
-```
-
-The routing key is the `claim_id` modulo the shard count. The router is a thin process that holds the routing table and forwards requests; it can be co-located with any retrieval replica.
-
-The sharding is **per-tenant**. A tenant with 1 M vectors does not need sharding (it fits on one host). A tenant with 100 M vectors is sharded 4×; a tenant with 1 B vectors is sharded 16×. The shard count is fixed at tenant-provisioning time; reshard is a known gap and is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Ashard-reshard).
-
-## Ingest-side sharding
-
-The ingestion service is single-writer per `redb` file. For higher ingest throughput, the supported pattern is **shard by tenant**:
-
-```text
-  ┌──────────────────────┐
-  │  ingest-router       │
-  └──────────┬───────────┘
-             │
-   ┌─────────┼─────────┐
-   │         │         │
-┌──▼──┐   ┌──▼──┐   ┌──▼──┐
-│ i-1 │   │ i-2 │   │ i-3 │   (each owns a slice of tenants)
-│ t1..│   │ t5..│   │ t9..│
-└──┬──┘   └──┬──┘   └──┬──┘
-   │         │         │
-   ▼         ▼         ▼
- ingest    ingest    ingest
- .redb-1  .redb-2   .redb-3
-```
-
-The router is a stateless process that hashes `tenant_id` to a shard. Each ingestion replica owns a non-overlapping set of tenants and writes to its own `redb` file. The retrieval side reads from all `redb` files (mount them all, or fan out via a thin aggregator).
-
-This is a manual setup in the current release; a control-plane-managed sharding is on the [roadmap](https://github.com/BHAWESHBHASKAR/DASH/issues?q=is%3Aopen+label%3Acontrol-plane).
+- Cross-host ANN sharding or query fan-out; each retrieval process holds every tenant's ANN graph in memory.
+- Consensus replication (Raft) and automatic failover (planned P3).
+- A write-sharding router and tenant resharding.
+- Rate-limit state shared across replicas: limits are per process.

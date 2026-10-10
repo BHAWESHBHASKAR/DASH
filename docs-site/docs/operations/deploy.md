@@ -1,178 +1,80 @@
 # Deploy
 
-DASH is shipped as two Linux binaries (`dash-ingestion` and `dash-retrieval`) inside a single container image. The image is multi-arch (`linux/amd64`, `linux/arm64`) and runs as a non-root user with a healthcheck. This page describes the four supported deployment surfaces: Docker, docker-compose, Kubernetes (raw YAML), and Helm.
+DASH ships as four Linux binaries built from one workspace: `ingestion`, `retrieval`, `control-plane` and `segment-maintenance-daemon`. One container image (built from `deploy/container/Dockerfile` with a per-service `SERVICE` build argument) is produced per service, and an entrypoint script chooses which binary to run. Supported packaging in this repository: Docker Compose, systemd units, raw Kubernetes manifests and a Helm chart.
 
-## Docker
+!!! warning "Status"
+    Docker Compose is the path exercised most (a CI drill runs it). The raw Kubernetes manifests, the Helm chart and the systemd units were corrected in 0.3.0 (secret variable names, no default secrets, replication wiring, routing, state directories, sandboxing) and CI validates the artifacts (`helm lint`/`template`, `kustomize build`, `kubeconform`, `docker compose config`, a check of deploy variable names against the code), and `scripts/kind_e2e.sh` (workflow `kind-e2e.yml`) installs the Helm chart and the raw manifests on a kind cluster and exercises ingest, retrieve, delete, pod restarts, backup and restore, upgrades and native TLS ([Kubernetes operations](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/kubernetes.md)). No release images have been published yet: build from source. Upgrading from 0.2.x: see the [upgrade guide](upgrading.md).
 
-The image is published to `ghcr.io/bhaweshbhaskar/dash` with the tag of the release.
+All deployments need credentials: every service refuses to start without them. See [Configuration](../reference/configuration.md) and the [authentication guide](auth.md).
+
+## Docker Compose (recommended)
+
+The stack is `deploy/container/docker-compose.yml`. It builds the images locally, starts ingestion (`:8081`), retrieval (`:8080`) and the segment-maintenance daemon, and gives each service its own named volume (`dash-ingestion-state`, `dash-retrieval-state`, `dash-control-plane-state`); the segment-maintenance daemon mounts the ingestion volume. The control plane (`:8090`) is optional: it starts only with `--profile control-plane`.
 
 ```bash
-# Pull a specific version
-docker pull ghcr.io/bhaweshbhaskar/dash:0.1.0
-
-# Run the ingestion service
-docker run -d \
-  --name dash-ingest \
-  -p 8081:8081 \
-  -e DASH_INGEST_PORT=8081 \
-  -e DASH_INGEST_PERSISTENCE_PATH=/var/lib/dash/ingest.redb \
-  -e DASH_INGEST_WAL_PATH=/var/lib/dash/ingest.wal \
-  -v dash-data:/var/lib/dash \
-  ghcr.io/bhaweshbhaskar/dash:0.1.0 \
-  /usr/local/bin/dash-ingestion
-
-# Run the retrieval service
-docker run -d \
-  --name dash-retrieval \
-  -p 8080:8080 \
-  -e DASH_RETRIEVAL_PORT=8080 \
-  -e DASH_EMBEDDING_PROVIDER=hash \
-  -e DASH_RETRIEVAL_PERSISTENCE_PATH=/var/lib/dash/retrieval.redb \
-  -v dash-data:/var/lib/dash \
-  ghcr.io/bhaweshbhaskar/dash:0.1.0 \
-  /usr/local/bin/dash-retrieval
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh                      # writes deploy/container/.env (mode 0600, git-ignored)
+docker compose -f deploy/container/docker-compose.yml up -d --build
+# optional control plane:
+docker compose -f deploy/container/docker-compose.yml --profile control-plane up -d --build
 ```
 
-The image's default `ENTRYPOINT` is a small init script that selects the binary from the `DASH_SERVICE` env var. Setting `DASH_SERVICE=ingestion` (default) or `DASH_SERVICE=retrieval` picks the right one.
+The compose file refuses to start if the required secrets are missing: it uses `${VAR:?message}` for `DASH_INGEST_API_KEY`, `DASH_INGEST_JWT_HS256_SECRET`, `DASH_INGEST_REPLICATION_TOKEN`, `DASH_RETRIEVAL_API_KEY`, `DASH_RETRIEVAL_JWT_HS256_SECRET` and `DASH_RETRIEVAL_REPLICATION_TOKEN` (and `DASH_CONTROL_PLANE_TOKEN` for the control-plane profile), and sets `DASH_STRICT_SECRETS=1`. `scripts/generate-secrets.sh` writes all of them, with the replication and control-plane tokens shared between the two sides.
 
-## docker-compose
+Check health, then use the API with the generated keys (`x-api-key` header):
 
-The canonical compose file is at `deploy/container/docker-compose.yml`. It brings both services up on a shared bridge network, with a healthcheck-gated dependency ordering.
-
-```yaml
-# deploy/container/docker-compose.yml
-services:
-  ingestion:
-    image: ghcr.io/bhaweshbhaskar/dash:0.1.0
-    environment:
-      DASH_INGEST_PORT: 8081
-      DASH_INGEST_PERSISTENCE_PATH: /var/lib/dash/ingest.redb
-      DASH_INGEST_WAL_PATH: /var/lib/dash/ingest.wal
-    ports:
-      - "8081:8081"
-    volumes:
-      - dash-data:/var/lib/dash
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh", "ingestion"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
-  retrieval:
-    image: ghcr.io/bhaweshbhaskar/dash:0.1.0
-    depends_on:
-      ingestion:
-        condition: service_healthy
-    environment:
-      DASH_RETRIEVAL_PORT: 8080
-      DASH_EMBEDDING_PROVIDER: hash
-      DASH_RETRIEVAL_PERSISTENCE_PATH: /var/lib/dash/retrieval.redb
-    ports:
-      - "8080:8080"
-    volumes:
-      - dash-data:/var/lib/dash
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh", "retrieval"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-
-volumes:
-  dash-data:
+```bash
+curl -fsS http://localhost:8081/health
+curl -fsS http://localhost:8080/health
 ```
 
-A dev overlay with hot-reload is at `deploy/container/docker-compose.dev.yml`. Run it with:
+Notes on how the stack is wired:
+
+- **Ingestion** owns the WAL at `/var/lib/dash/wal/ingestion.wal` and the redb file at `/var/lib/dash/state/ingestion.redb`, and writes an audit log under `/var/lib/dash/audit/`.
+- **Retrieval** follows ingestion by polling `DASH_RETRIEVAL_REPLICATION_SOURCE_URL=http://ingestion:8081` every 250 ms with the replication token, and records its offset in `/var/lib/dash/state/retrieval-replication.offset`. Retrieval reads are therefore slightly behind writes.
+- All services bind `0.0.0.0:<port>` inside the container; the compose file publishes the host ports on `127.0.0.1` by default. To expose the API on other interfaces set `DASH_PUBLISH_ADDR` (for example `0.0.0.0`) and turn on TLS: add `-f deploy/container/docker-compose.tls.yml` (development certificates from `scripts/generate-dev-tls.sh`), or put a reverse proxy with TLS in front. Without the overlay the services speak plain HTTP.
+- Ports `8081` (ingestion), `8090` (control-plane) and the `/internal/replication/*` routes are not meant for the public internet.
+- The image entrypoint selects the binary from `DASH_BIN` (`ingestion`, `retrieval`, `control-plane`, `segment-maintenance-daemon`; default `retrieval`) and defaults the argument to `--serve`. There is no `DASH_SERVICE` variable. The healthcheck uses the readiness route.
+- The containers run as UID 10001 with `no-new-privileges`, all capabilities dropped, a read-only root filesystem and a small `noexec` tmpfs for `/tmp`.
+
+A development overlay with hot-reload is `deploy/container/docker-compose.dev.yml`:
 
 ```bash
 docker compose -f deploy/container/docker-compose.yml \
-               -f deploy/container/docker-compose.dev.yml \
-               up
+               -f deploy/container/docker-compose.dev.yml up
 ```
 
-## Kubernetes (raw YAML)
+To stop and delete data: `docker compose -f deploy/container/docker-compose.yml down -v`.
 
-A minimal raw-YAML deployment is at `deploy/k8s/`. The shape:
+## systemd
 
-```yaml
-# deploy/k8s/dash-ingestion.yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: dash-ingestion
-spec:
-  serviceName: dash-ingestion
-  replicas: 2
-  selector:
-    matchLabels:
-      app: dash-ingestion
-  template:
-    metadata:
-      labels:
-        app: dash-ingestion
-    spec:
-      containers:
-        - name: ingestion
-          image: ghcr.io/bhaweshbhaskar/dash:0.1.0
-          env:
-            - name: DASH_INGEST_PORT
-              value: "8081"
-            - name: DASH_INGEST_PERSISTENCE_PATH
-              value: /var/lib/dash/ingest.redb
-            - name: DASH_INGEST_WAL_PATH
-              value: /var/lib/dash/ingest.wal
-          ports:
-            - containerPort: 8081
-          readinessProbe:
-            httpGet:
-              path: /v1/health
-              port: 8081
-            initialDelaySeconds: 5
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /v1/health
-              port: 8081
-            initialDelaySeconds: 15
-            periodSeconds: 30
-          volumeMounts:
-            - name: dash-data
-              mountPath: /var/lib/dash
-  volumeClaimTemplates:
-    - metadata:
-        name: dash-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 100Gi
-```
+Unit files and example environment files are in `deploy/systemd/` (`dash-ingestion.service`, `dash-retrieval.service`, `dash-control-plane.service`, `dash-segment-maintenance.service`, and matching `*.env.example`). `scripts/deploy_systemd.sh --mode apply` installs them (`--mode plan` is the default and changes nothing): env files are written with mode 0640, every `REPLACE-ME` placeholder is replaced with a freshly generated random secret, the replication token is shared between `ingestion.env` and `retrieval.env`, and an existing env file is never overwritten. Each service has its own state directory under `/var/lib/dash/<service>` and the units are sandboxed (`ProtectSystem`, restricted write paths). Services refuse to start with placeholder or short secrets, so do not hand-edit a placeholder back in.
 
-The retrieval service is similar, with `DASH_RETRIEVAL_PORT=8080` and a `Service` of `type: LoadBalancer` (or an `Ingress` if the cluster supports it) on port 80 → 8080.
+## Kubernetes (raw manifests)
 
-A `NetworkPolicy` that allows only the retrieval service to talk to the ingestion service is recommended in multi-tenant clusters.
+`deploy/k8s/` holds a namespace, ConfigMap, retrieval and ingestion workloads, a control plane, ingress, network policy and PodDisruptionBudgets. **Secrets are not committed**: create the three Secrets (`dash-retrieval-secrets`, `dash-ingestion-secrets`, `dash-control-plane-secrets`) before applying; `deploy/k8s/11-secrets.yaml` documents the keys and has a `kubectl create secret` example (values of at least 32 random characters, the replication token identical in the retrieval and ingestion Secrets). Then apply with `kubectl apply -k deploy/k8s`. There is no HorizontalPodAutoscaler: retrieval pods own their PVCs and are scaled manually (`kubectl -n dash-system scale statefulset dash-retrieval --replicas=N`); ingestion and the control plane stay at one replica. The workloads set a read-only root filesystem, no privilege escalation and drop all capabilities, and the manifests use the variable names `DASH_INGEST_*` (not `DASH_INGESTION_*`). Health probes use `/v1/live` and `/v1/ready` (readiness is 503 if a configured redb file is unavailable or a follower is lagging); `/internal/*` and `/metrics` are not routed by the ingress.
 
 ## Helm
 
-A Helm chart is at `deploy/helm/dash/`. It is a thin wrapper over the raw YAML, parameterized for image tag, replica counts, persistence, and an `Ingress` for the retrieval service.
+The chart is at `deploy/helm/dash/` (install from the checkout; no chart repository is published). The chart ships **no default secrets**: `helm install` fails until each is supplied, and values must be at least 32 characters and not look like placeholders.
 
 ```bash
-helm repo add dash https://BHAWESHBHASKAR.github.io/dash-charts
-helm install dash dash/dash \
-  --namespace dash --create-namespace \
-  --set image.tag=0.1.0 \
-  --set retrieval.replicas=4 \
-  --set persistence.size=200Gi \
-  --set ingress.enabled=true \
-  --set ingress.host=dash.example.com
+helm install dash ./deploy/helm/dash \
+  --namespace dash-system --create-namespace \
+  --set secret.retrieval.apiKey="$(openssl rand -hex 32)" \
+  --set secret.retrieval.hs256Secret="$(openssl rand -hex 32)" \
+  --set secret.ingestion.apiKey="$(openssl rand -hex 32)" \
+  --set secret.ingestion.hs256Secret="$(openssl rand -hex 32)" \
+  --set secret.replicationToken="$(openssl rand -hex 32)" \
+  --set secret.controlPlane.token="$(openssl rand -hex 32)"
 ```
 
-The chart's `values.yaml` is the source of truth for all the knobs. The non-obvious ones:
+`deploy/helm/dash/values.yaml` and its `README.md` are the source of truth for chart values, including `secret.existingSecret.*` for GitOps and `controlPlane.enabled=false` to skip the control plane. The chart deploys retrieval, ingestion and (optionally) control-plane as StatefulSets with per-pod PVCs and no autoscaler. Images are named `<registry>/<repository>-<service>:<tag>`, matching what the release workflow publishes. Control-plane leader election is file-lease based; the chart runs one control-plane replica.
 
-- `auth.jwtPublicKey` — the PEM-encoded public key for JWT verification. Required.
-- `embedding.provider` — one of `hash`, `ollama`, `openai`. Required.
-- `embedding.ollama.baseUrl` — required if `provider=ollama`.
-- `embedding.openai.apiKey` — required if `provider=openai` (consider using a `Secret` and `valueFrom`).
-- `rateLimit.rps` and `rateLimit.burst` — per-tenant, applied to the retrieval service.
-- `audit.retentionDays` — default 2555 (7 years).
+## Operational limits to know about
 
-A `helm template` against the default `values.yaml` produces a complete set of manifests that can be `kubectl apply -f`-ed.
+- **Single writer.** Ingestion is one process per WAL. Retrieval replicas are read followers that poll; there is no consensus replication or automatic failover (planned, P3).
+- **No encryption at rest.** Nothing DASH writes (WAL, redb, segments, audit log) is encrypted by DASH. Use an encrypted volume. `pkg/encryption` is a library that no service uses yet.
+- **TLS is opt-in.** The services can serve HTTPS and mutual TLS themselves (Helm `tls.enabled`, the `deploy/k8s-tls` overlay, `docker-compose.tls.yml`; see [TLS and mutual TLS](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/operations/tls.md)). With the defaults, replication and control-plane tokens travel over plain HTTP inside the cluster; keep those routes on a private network.
+- **Backups.** See [Backup](backup.md) and `scripts/backup_state_bundle.sh`.

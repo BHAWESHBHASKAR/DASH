@@ -43,17 +43,17 @@ fn convert(value: serde_json::Value) -> JsonValue {
     }
 }
 
-pub(super) fn json_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
+pub(super) use dash_http::json_escape;
+
+#[cfg(test)]
+mod escape_tests {
+    use super::json_escape;
+
+    #[test]
+    fn json_escape_produces_valid_json_for_control_characters() {
+        let raw: String = (0u8..0x20).map(char::from).collect::<String>() + "\"\\ok";
+        let wrapped = format!("\"{}\"", json_escape(&raw));
+        let decoded: String = serde_json::from_str(&wrapped).expect("valid JSON string");
+        assert_eq!(decoded, raw);
     }
-    out
 }

@@ -1,6 +1,6 @@
 # dash-csharp
 
-A thin, idiomatic C# client for the [DASH](https://github.com/dash-retrieval/dash)
+A thin, idiomatic C# client for the [DASH](https://github.com/BHAWESHBHASKAR/DASH)
 retrieval engine. DASH serves an OpenAI-compatible `/v1/embeddings`
 endpoint and a native `/v1/retrieve` endpoint that returns
 structured **Claim + Evidence + Contradiction** results — the
@@ -92,13 +92,13 @@ var response = await client.RetrieveAsync(new RetrievalRequest
 
 // A RAG pipeline that wants "claims that are actually supported
 // and not contradicted" can filter the typed results directly:
-var cleanClaims = response.Hits
+var cleanClaims = response.Results
     .Where(r => r.Contradicts == 0 && r.Supports > 0)
     .ToList();
 
-foreach (var claim in response.Hits)
+foreach (var claim in response.Results)
 {
-    Console.WriteLine($"[{claim.Score.Overall:F2}] {claim.CanonicalText}");
+    Console.WriteLine($"[{claim.Score:F2}] {claim.CanonicalText}");
     Console.WriteLine($"   supports={claim.Supports}  contradicts={claim.Contradicts}");
     foreach (var cite in claim.Citations)
     {
@@ -165,9 +165,11 @@ talking to DASH at the HTTP layer". Network-level failures raise
 | --- | --- |
 | `DashClient(baseUrl, apiKey?, options?)` | Construct a client. |
 | `DashClient.EmbedAsync(req)` / `.Embed(req)` | `POST /v1/embeddings`, async + sync. |
-| `DashClient.IngestAsync(req)` / `.Ingest(req)` | `POST /v1/ingest`. |
+| `DashClient.IngestAsync(req[, RequestOptions])` / `.Ingest(req)` | `POST {IngestionBaseUrl}/v1/ingest` (experimental, never retried by default). |
+| `DashClient.DeleteClaimAsync(tenantId, claimId)` / `.DeleteClaim(...)` | `DELETE {IngestionBaseUrl}/v1/claims/{claim_id}?tenant_id=...` (claim, vector, evidence, edges). |
+| `DashClient.DeleteEvidenceAsync(tenantId, evidenceId)` / `.DeleteEvidence(...)` | `DELETE {IngestionBaseUrl}/v1/evidence/{evidence_id}?tenant_id=...` (evidence rows; claims stay). |
+| `DashClient.DeleteTenantAsync(tenantId)` / `.DeleteTenant(...)` | `DELETE {IngestionBaseUrl}/v1/tenants/{tenant_id}` (all of the tenant's data). |
 | `DashClient.RetrieveAsync(req)` / `.Retrieve(req)` | `POST /v1/retrieve` with `{ tenant_id, query, top_k?, stance_mode?, return_graph? }`. |
-| `DashClient.DeleteAsync(req)` / `.Delete(req)` | `POST /v1/delete`. |
 | `DashClient.HealthAsync()` / `.Health()` | `GET /health`. |
 | `DashException` and subclasses | Exception hierarchy. |
 | `DashClientOptions` | Timeout, retries, user-agent, retry delay. |
@@ -178,17 +180,76 @@ talking to DASH at the HTTP layer". Network-level failures raise
 public class DashClientOptions
 {
     public TimeSpan Timeout { get; set; }           // default 30s
-    public int MaxRetries { get; set; }             // default 3
+    public string? IngestionBaseUrl { get; set; }   // default: derived for :8080 -> :8081, else null
+    public int MaxRetries { get; set; }             // default 3 (max 10)
     public string UserAgent { get; set; }           // default "dash-csharp/0.2.0"
     public TimeSpan RetryBaseDelay { get; set; }    // default 100ms
     public HttpClient? HttpClient { get; set; }     // optional injection (testing)
 }
 ```
 
-The transport retries on transient failures (network errors,
-HTTP 5xx, HTTP 429) with exponential backoff
-(`RetryBaseDelay * 2^(N-1)`), honouring a server-supplied
-`Retry-After` header on 429 responses.
+The transport retries idempotent requests (embeddings, retrieve,
+health, deletes) on transient failures (network errors, HTTP 5xx, HTTP 429)
+with jittered exponential backoff (up to `RetryBaseDelay * 2^(N-1)`,
+capped at 5 s), honouring a server-supplied `Retry-After` header
+(up to 30 s). `POST /v1/ingest` is sent exactly once unless you pass
+`new RequestOptions { IdempotencyKey = "..." }` (or `Retry = true`).
+
+### Ingest (experimental)
+
+Ingestion is a separate service from retrieval (default ports 8081
+and 8080). Set `DashClientOptions.IngestionBaseUrl`; when omitted it
+is derived only for `http://host:8080` (becomes `:8081`), otherwise
+`IngestAsync` throws `InvalidOperationException`. The models mirror
+the server's `{ claim, evidence, edges }` body and its
+`ingested_claim_id` / `claims_total` / `commit_status` response:
+
+```csharp
+using var client = new DashClient("http://localhost:8080", apiKey: null,
+    new DashClientOptions { IngestionBaseUrl = "http://localhost:8081" });
+
+var result = await client.IngestAsync(new IngestRequest
+{
+    Claim = new IngestClaim
+    {
+        ClaimId = "c-1", TenantId = "acme",
+        CanonicalText = "Q3 revenue was $1B", Confidence = 0.9,
+    },
+});
+Console.WriteLine($"{result.IngestedClaimId} {result.CommitStatus}");
+```
+
+### Deletes
+
+Deletes are served by the ingestion service, so they use the same
+`IngestionBaseUrl` as ingest (derived only for `http://host:8080`;
+otherwise the delete methods throw `InvalidOperationException`). Ids
+are percent-encoded into the path and query. Each method has a sync
+variant without the `Async` suffix.
+
+```csharp
+using var client = new DashClient("http://localhost:8080", apiKey: "sk-ingest-...",
+    new DashClientOptions { IngestionBaseUrl = "http://localhost:8081" });
+
+await client.DeleteClaimAsync("tenant-a", "claim-1");    // claim, vector, evidence, edges
+await client.DeleteEvidenceAsync("tenant-a", "ev-1");    // every evidence row with this id
+DeleteResponse r = await client.DeleteTenantAsync("tenant-a"); // erase the tenant (admin role)
+Console.WriteLine($"{r.Deleted} {r.Scope} claims={r.ClaimsDeleted} left={r.ClaimsTotal}");
+```
+
+Every delete is idempotent and answers HTTP 200: `Deleted` is `false`
+when there was nothing to remove (an unknown id, an id already deleted,
+or a claim of another tenant). `DeleteResponse` also carries
+`EvidenceDeleted`, `EdgesDeleted`, `VectorsDeleted`,
+`CheckpointTriggered` and `CheckpointDeferred`; `ClaimId` and
+`EvidenceId` are set only for the matching scope. Deletes are retried on
+429/5xx like reads. Claim and evidence deletes need the `ingest` role; a
+tenant delete needs `admin` for that tenant. Backups and WAL archives
+taken before a delete still hold the data (see
+`docs/operations/data-deletion.md`).
+
+The generic `DeleteAsync` / `DeleteRequest` were removed in 0.2.0: the
+server has no `/v1/delete` endpoint.
 
 Cancellation uses the standard `CancellationToken` API:
 
@@ -208,7 +269,8 @@ cases that need a typed, first-class client:
   `.Supports`, etc.).
 - Native access to `/v1/retrieve` with `StanceMode` and
   `ReturnGraph` flags.
-- Native access to `/v1/ingest` for Claim + Evidence ingestion.
+- Native access to `/v1/ingest` for Claim + Evidence ingestion, and
+  to the scoped claim, evidence and tenant deletes.
 - A consistent exception hierarchy (`DashConnectionException` vs
   `DashException` subclasses) instead of inspecting
   `HttpRequestException` by hand.

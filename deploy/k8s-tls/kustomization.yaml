@@ -1,0 +1,36 @@
+---
+# Native TLS overlay for the raw manifests (docs/operations/tls.md).
+#
+#   kubectl apply -k deploy/k8s-tls
+#
+# Every listener (ingestion, retrieval, control plane) serves HTTPS from the
+# Secret `dash-internal-tls`, which must hold tls.crt, tls.key and ca.crt
+# (the shape a cert-manager Certificate produces; see certificate.example.yaml).
+# The certificate must name the service DNS names
+# (dash-ingestion.dash-system.svc.cluster.local, dash-retrieval..., and
+# dash-control-plane...) and carry both the "server auth" and "client auth"
+# usages, because retrieval also presents it as its replication client
+# certificate. Ingestion verifies client certificates against ca.crt and
+# requires one on /internal/replication/*.
+#
+# What the overlay changes on top of deploy/k8s:
+#   * dash-config: TLS file paths, https:// replication source, follower CA
+#     and client certificate; drops DASH_REPLICATION_ALLOW_INSECURE_HTTP;
+#   * StatefulSets: mount the Secret read-only at /etc/dash/tls, probes use
+#     HTTPS (the kubelet does not verify the certificate);
+#   * Services: appProtocol https; Ingress: backend-protocol HTTPS.
+# Rotation: the services re-read the files when they change (cert-manager
+# renewals need no restart).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../k8s
+patches:
+  - path: config-tls.yaml
+  - path: ingress-tls.yaml
+  - path: workload-tls.yaml
+    target:
+      kind: StatefulSet
+  - path: service-tls.yaml
+    target:
+      kind: Service

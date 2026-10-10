@@ -36,19 +36,129 @@ pub struct IngestApiRequest {
     pub edges: Vec<ClaimEdge>,
 }
 
+/// Failure to compute a claim embedding. Carries only a short machine code
+/// and the HTTP status to answer with; provider details (URLs, response
+/// bodies, key material) go to the server log, never to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedFailure {
+    pub status: u16,
+    pub code: &'static str,
+    /// `Retry-After` seconds to send with a 503.
+    pub retry_after_secs: Option<u64>,
+}
+
+impl EmbedFailure {
+    fn from_error(error: &embeddings::EmbeddingError) -> Self {
+        match error.classify() {
+            embeddings::FailureClass::Unavailable { retry_after_secs } => Self {
+                status: 503,
+                code: "embedding_unavailable",
+                retry_after_secs: Some(retry_after_secs),
+            },
+            embeddings::FailureClass::BadGateway => Self::bad_upstream_payload(),
+        }
+    }
+
+    fn bad_upstream_payload() -> Self {
+        Self {
+            status: 502,
+            code: "embedding_upstream_error",
+            retry_after_secs: None,
+        }
+    }
+}
+
+/// A claim, its optional embedding and its edges, borrowed for validation.
+pub type IngestBundleRef<'a> = (&'a Claim, Option<&'a [f32]>, &'a [ClaimEdge]);
+
+/// Ingest-side checks that need the current store state, run before anything
+/// is written (and before the WAL append) so a rejected request leaves no
+/// trace:
+///
+/// * a claim embedding must be finite and have a non-zero norm, matching the
+///   query-vector validation (a zero vector has no direction and can never
+///   match);
+/// * an edge may not point at a claim that exists under a different tenant,
+///   in the store or earlier in the same batch. A target that does not exist
+///   yet is allowed, since edges may arrive before their targets.
+///
+/// The error never names the other tenant.
+pub fn validate_ingest_bundles(
+    store: &store::InMemoryStore,
+    bundles: &[IngestBundleRef<'_>],
+) -> Result<(), store::StoreError> {
+    for (claim, embedding, edges) in bundles {
+        if let Some(vector) = embedding {
+            if vector.iter().any(|v| !v.is_finite()) {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding values must be finite".to_string(),
+                ));
+            }
+            let norm_sq: f64 = vector.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            if !vector.is_empty() && norm_sq <= 0.0 {
+                return Err(store::StoreError::InvalidVector(
+                    "claim embedding must have a non-zero norm".to_string(),
+                ));
+            }
+        }
+        for edge in *edges {
+            let target_tenant = bundles
+                .iter()
+                .find(|(other, _, _)| other.claim_id == edge.to_claim_id)
+                .map(|(other, _, _)| other.tenant_id.as_str())
+                .or_else(|| {
+                    store
+                        .claim_by_id(&edge.to_claim_id)
+                        .map(|existing| existing.tenant_id.as_str())
+                });
+            if let Some(tenant) = target_tenant
+                && tenant != claim.tenant_id
+            {
+                return Err(store::StoreError::Conflict(
+                    "edge target is not in this tenant".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+type SharedEmbeddingProvider = std::sync::Arc<dyn embeddings::EmbeddingProvider + Send + Sync>;
+
+/// Embedding provider shared by requests. It is rebuilt only when the
+/// provider-related environment changes, instead of on every request.
+fn shared_embedding_provider() -> SharedEmbeddingProvider {
+    PROVIDER_CACHE.get()
+}
+
+static PROVIDER_CACHE: embeddings::SharedProviderCache = embeddings::SharedProviderCache::new();
+
+/// How many times the ingest path has constructed an embedding provider.
+#[cfg(test)]
+pub(crate) fn embedding_provider_build_count() -> u64 {
+    PROVIDER_CACHE.build_count()
+}
+
 impl IngestApiRequest {
     /// Compute a claim embedding using the configured `DASH_EMBEDDING_PROVIDER`
     /// when the caller did not supply one. This lets clients ingest raw claim
     /// text and still get semantic retrieval without calling `/v1/embeddings`
     /// first.
-    pub fn embed_claim_if_missing(&mut self) -> Result<(), String> {
+    pub fn embed_claim_if_missing(&mut self) -> Result<(), EmbedFailure> {
         if self.claim_embedding.is_some() {
             return Ok(());
         }
-        let provider = embeddings::select_embedding_provider_from_env();
+        let provider = shared_embedding_provider();
         let vectors = provider
             .embed(std::slice::from_ref(&self.claim.canonical_text))
-            .map_err(|e| format!("embedding failed: {e}"))?;
+            .map_err(|error| {
+                eprintln!("ingestion embedding provider failed: {error}");
+                EmbedFailure::from_error(&error)
+            })?;
+        if let Err(error) = embeddings::validate_finite(&vectors) {
+            eprintln!("ingestion embedding provider failed: {error}");
+            return Err(EmbedFailure::bad_upstream_payload());
+        }
         if let Some(vector) = vectors.into_iter().next() {
             self.claim_embedding = Some(vector);
         }
@@ -138,6 +248,9 @@ impl IngestBatchApiRequestWire {
             .commit_id
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        if commit_id.as_deref().is_some_and(|id| id.starts_with('~')) {
+            return Err("commit_id must not start with '~' (reserved)".to_string());
+        }
 
         let mut items = Vec::with_capacity(self.items.len());
         let mut expected_tenant: Option<String> = None;
@@ -401,6 +514,10 @@ pub struct IngestApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,6 +525,10 @@ pub struct IngestApiResponse {
 pub struct IngestBatchApiResponse {
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub ingested_claim_ids: Vec<String>,
     pub batch_size: usize,
     pub claims_total: usize,
@@ -421,6 +542,10 @@ pub struct IngestBatchApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +554,10 @@ pub struct IngestRawApiResponse {
     pub document_id: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -446,6 +575,10 @@ pub struct IngestRawApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +589,10 @@ pub struct IngestDocumentApiResponse {
     pub parser_provider: String,
     pub commit_id: String,
     pub idempotent_replay: bool,
+    /// The commit id already existed with different content; the new
+    /// content was applied as an upsert over the previous version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updated: bool,
     pub extracted_count: usize,
     pub embedding_provider: String,
     pub embeddings_generated: usize,
@@ -473,6 +610,10 @@ pub struct IngestDocumentApiResponse {
     pub checkpoint_snapshot_records: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_truncated_wal_records: Option<usize>,
+    /// The write is committed and durable, but the post-commit checkpoint
+    /// failed and will be retried by a later write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint_deferred: bool,
 }
 
 #[cfg(test)]
@@ -534,6 +675,7 @@ mod tests {
             checkpoint_triggered: true,
             checkpoint_snapshot_records: Some(10),
             checkpoint_truncated_wal_records: Some(5),
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: IngestApiResponse = serde_json::from_str(&json).unwrap();
@@ -552,6 +694,7 @@ mod tests {
             checkpoint_triggered: false,
             checkpoint_snapshot_records: None,
             checkpoint_truncated_wal_records: None,
+            checkpoint_deferred: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("commit_epoch"));

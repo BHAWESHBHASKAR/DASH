@@ -107,10 +107,11 @@ fn build_write_route_probe_json(
             .to_string();
     };
 
+    let tenant_router_config = routing.router_config_for_tenant(tenant_id);
     match route_write_with_placement(
         tenant_id,
         entity_key,
-        &routing.router_config,
+        &tenant_router_config,
         &routing.placements,
     ) {
         Ok(routed) => {

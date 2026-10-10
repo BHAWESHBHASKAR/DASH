@@ -1,0 +1,3 @@
+{"method": "DELETE", "path": "/v1/claims/a-c06?tenant_id=tenant-a"}
+{"method": "DELETE", "path": "/v1/evidence/a-e02-2?tenant_id=tenant-a"}
+{"method": "DELETE", "path": "/v1/tenants/tenant-hash"}

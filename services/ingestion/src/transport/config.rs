@@ -7,9 +7,15 @@ use store::FileWal;
 
 static BATCH_COMMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// The environment override is resolved once per process: this runs on every
+/// batch request, and a restart is the documented way to change it.
 pub(super) fn resolve_ingest_batch_max_items(default_ingest_batch_max_items: usize) -> usize {
-    parse_env_first_usize(&["DASH_INGEST_BATCH_MAX_ITEMS", "EME_INGEST_BATCH_MAX_ITEMS"])
-        .filter(|value| *value > 0)
+    static CONFIGURED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| {
+            parse_env_first_usize(&["DASH_INGEST_BATCH_MAX_ITEMS", "EME_INGEST_BATCH_MAX_ITEMS"])
+                .filter(|value| *value > 0)
+        })
         .unwrap_or(default_ingest_batch_max_items)
 }
 
@@ -74,20 +80,6 @@ pub(super) fn resolve_wal_async_flush_interval(
             .map(|value| value.min(default_interval))
             .unwrap_or(default_interval),
     )
-}
-
-pub(super) fn sanitize_path_component(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect();
-    if out.is_empty() {
-        out.push('_');
-    }
-    out
 }
 
 pub(super) fn unix_timestamp_millis() -> u64 {

@@ -1,0 +1,28 @@
+[package]
+name = "engine-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "P2 engine spike: measurements for ADR 0003 (not part of the root workspace)"
+
+# Standalone workspace so the root build never compiles this crate.
+[workspace]
+
+[dependencies]
+store = { path = "../../pkg/store" }
+schema = { path = "../../pkg/schema" }
+usearch = "2.26"
+tantivy = "0.26"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1"
+hdrhistogram = "7"
+serde_json = "1"
+arc-swap = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+debug = 0
+strip = true
+codegen-units = 16

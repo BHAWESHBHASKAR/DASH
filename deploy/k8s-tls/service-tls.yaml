@@ -1,0 +1,4 @@
+---
+- op: add
+  path: /spec/ports/0/appProtocol
+  value: https

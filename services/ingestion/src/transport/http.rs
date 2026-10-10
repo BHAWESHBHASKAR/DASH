@@ -1,8 +1,24 @@
-use std::{collections::HashMap, io::Write, net::TcpStream, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use super::json::json_escape;
 
-const BACKPRESSURE_QUEUE_FULL_MESSAGE: &str = "service unavailable: ingestion worker queue full";
+pub(super) const SOCKET_TIMEOUT_SECS: u64 = 5;
+/// Workers reserved for health-class requests (`/health`, `/live`, ...).
+const HEALTH_WORKERS: usize = 2;
+/// Extra reserved workers for followers' WAL polls, which share the
+/// reserved lane: a caught-up follower's poll is held open (long poll), and
+/// with synchronous replication every general worker can be busy waiting
+/// for exactly those polls, so they must never queue behind writes.
+const REPLICATION_POLL_WORKERS: usize = 4;
+
+/// Reserved lane: the standard health paths plus followers' WAL polls and
+/// commit acks (a follower's poll loop waits for its acks).
+pub(super) fn reserved_lane_classifier(method: &str, path: &str) -> bool {
+    dash_http::default_health_classifier(method, path)
+        || (method == "GET" && path == "/internal/replication/wal")
+        || (method == "POST" && path == "/internal/replication/ack")
+}
+const HEALTH_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpRequest {
@@ -17,6 +33,10 @@ pub(crate) struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) content_type: &'static str,
     pub(crate) body: String,
+    /// Emitted as a `Retry-After` header (429 responses).
+    pub(crate) retry_after_secs: Option<u64>,
+    /// Extra response headers (leader hints on a non-leader's 503).
+    pub(crate) headers: Vec<(&'static str, String)>,
 }
 
 impl HttpResponse {
@@ -25,6 +45,8 @@ impl HttpResponse {
             status: 200,
             content_type: "application/json",
             body,
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -33,6 +55,8 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; version=0.0.4; charset=utf-8",
             body,
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -41,6 +65,8 @@ impl HttpResponse {
             status: 200,
             content_type: "text/plain; charset=utf-8",
             body,
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -49,6 +75,8 @@ impl HttpResponse {
             status: 400,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -57,6 +85,8 @@ impl HttpResponse {
             status: 404,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -65,6 +95,8 @@ impl HttpResponse {
             status: 403,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -73,6 +105,8 @@ impl HttpResponse {
             status: 409,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -81,6 +115,8 @@ impl HttpResponse {
             status: 405,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -89,6 +125,8 @@ impl HttpResponse {
             status: 401,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -97,6 +135,8 @@ impl HttpResponse {
             status: 500,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 
@@ -105,66 +145,81 @@ impl HttpResponse {
             status: 503,
             content_type: "application/json",
             body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
+        }
+    }
+
+    pub(crate) fn too_many_requests(message: &str, retry_after_secs: u64) -> Self {
+        Self {
+            status: 429,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: Some(retry_after_secs),
+            headers: Vec::new(),
         }
     }
 
     pub(crate) fn error_with_status(status: u16, message: &str) -> Self {
-        match status {
-            400 => Self::bad_request(message),
-            401 => Self::unauthorized(message),
-            403 => Self::forbidden(message),
-            409 => Self::conflict(message),
-            404 => Self::not_found(message),
-            405 => Self::method_not_allowed(message),
-            503 => Self::service_unavailable(message),
-            _ => Self::internal_server_error(message),
+        if status == 409 {
+            return Self::conflict(message);
+        }
+        if status == 429 {
+            return Self::too_many_requests(message, 1);
+        }
+        Self {
+            status,
+            content_type: "application/json",
+            body: format!("{{\"error\":\"{}\"}}", json_escape(message)),
+            retry_after_secs: None,
+            headers: Vec::new(),
         }
     }
 }
 
-pub(crate) fn backpressure_rejection_response() -> HttpResponse {
-    HttpResponse::service_unavailable(BACKPRESSURE_QUEUE_FULL_MESSAGE)
+impl From<dash_http::Request> for HttpRequest {
+    fn from(request: dash_http::Request) -> Self {
+        let mut headers = request.headers;
+        // Only the TLS layer may vouch for a client certificate.
+        dash_common::tls::stamp_client_cert_header(&mut headers, request.tls.as_ref());
+        Self {
+            method: request.method,
+            target: request.target,
+            headers,
+            body: request.body,
+        }
+    }
 }
 
-pub(crate) fn write_backpressure_response(
-    mut stream: TcpStream,
-    socket_timeout_secs: u64,
-) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(Duration::from_secs(socket_timeout_secs)))?;
-    let response = backpressure_rejection_response();
-    let response = format!(
-        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-        response.content_type,
-        response.body.len(),
-        response.body
-    );
-    stream.write_all(response.as_bytes())
+impl From<HttpResponse> for dash_http::Response {
+    fn from(response: HttpResponse) -> Self {
+        let mut out =
+            dash_http::Response::new(response.status, response.content_type, response.body);
+        if let Some(secs) = response.retry_after_secs {
+            out = out.with_header("Retry-After", secs.to_string());
+        }
+        for (name, value) in response.headers {
+            out = out.with_header(name, value);
+        }
+        out
+    }
 }
 
-pub(crate) fn write_response(
-    stream: &mut TcpStream,
-    response: HttpResponse,
-) -> std::io::Result<()> {
-    stream.write_all(render_response_text(&response).as_bytes())?;
-    stream.flush()
+/// Server settings for ingestion: the shared defaults plus the
+/// `DASH_HTTP_*` environment overrides.
+pub(super) fn server_config(worker_count: usize, queue_capacity: usize) -> dash_http::ServerConfig {
+    let env = dash_common::conn::ConnConfig::from_env();
+    let mut config = dash_http::ServerConfig::new("ingestion", worker_count, queue_capacity);
+    config.health_workers = HEALTH_WORKERS + REPLICATION_POLL_WORKERS;
+    config.health_queue_capacity = HEALTH_QUEUE_CAPACITY;
+    config.write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
+    config.reject_write_timeout = Duration::from_secs(SOCKET_TIMEOUT_SECS);
+    config.request_deadline = env.request_timeout;
+    config.first_byte_timeout = env.first_byte_timeout;
+    config.max_conns_per_ip = env.max_per_ip;
+    config
 }
 
-pub(crate) fn render_response_text(response: &HttpResponse) -> String {
-    let status_text = match response.status {
-        200 => "200 OK",
-        400 => "400 Bad Request",
-        401 => "401 Unauthorized",
-        403 => "403 Forbidden",
-        409 => "409 Conflict",
-        404 => "404 Not Found",
-        405 => "405 Method Not Allowed",
-        503 => "503 Service Unavailable",
-        500 => "500 Internal Server Error",
-        _ => "500 Internal Server Error",
-    };
-    let body_len = response.body.len();
-    format!(
-        "HTTP/1.1 {status_text}\r\nContent-Type: {}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n{}",
-        response.content_type, response.body
-    )
+pub(super) fn render_response_text(response: &HttpResponse) -> String {
+    dash_http::render_response(&response.clone().into())
 }

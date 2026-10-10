@@ -59,7 +59,10 @@ fn end_to_end_retrieval_returns_citations_and_support_counts() {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].claim_id, "claim-acq");
-    assert_eq!(results[0].supports, 2);
+    // One supporting evidence row. The outgoing edge to the (nonexistent)
+    // `claim-related` supports its target, not `claim-acq`, and a dangling
+    // target is ignored, so it adds nothing here.
+    assert_eq!(results[0].supports, 1);
     assert_eq!(results[0].citations.len(), 1);
     assert_eq!(results[0].citations[0].source_id, "source://press-release");
     assert_eq!(

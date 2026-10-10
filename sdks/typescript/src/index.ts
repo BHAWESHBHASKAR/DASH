@@ -23,6 +23,15 @@
 export { DashClient, createClient, DEFAULT_TIMEOUT_MS } from './client.js';
 export type { ClientOptions } from './client.js';
 
+export {
+  claimDeletePath,
+  deriveIngestionUrl,
+  evidenceDeletePath,
+  parseDeleteResponse,
+  tenantDeletePath,
+} from './deletes.js';
+export type { DeleteOptions, DeleteResponse } from './deletes.js';
+
 export { EmbeddingsService } from './embeddings.js';
 export type { CreateEmbeddingsOptions } from './embeddings.js';
 
@@ -58,4 +67,4 @@ export type { RequestOptions } from './transport.js';
 export { openAIBaseURL, DASH_TS_VERSION } from './openai-compat.js';
 
 /** The package version. */
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';

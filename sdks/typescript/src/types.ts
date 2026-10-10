@@ -35,6 +35,11 @@ export interface EmbeddingRequest {
   model?: string;
   encoding_format?: EncodingFormat;
   user?: string;
+  /**
+   * Expected embedding size. The server rejects values that differ from
+   * its provider's dimensionality.
+   */
+  dimensions?: number;
 }
 
 /**
@@ -87,27 +92,43 @@ export type StanceMode = 'balanced' | 'support_only';
 /** Stance recorded for a single citation. */
 export type Stance = 'supports' | 'contradicts' | 'neutral';
 
+/** How many replicas must answer a read. Server default is `"one"`. */
+export type ReadConsistency = 'one' | 'quorum' | 'all';
+
+/** Inclusive unix-second window; either bound may be omitted. */
+export interface TimeRange {
+  from_unix?: number | null;
+  to_unix?: number | null;
+}
+
 /**
  * Request body for `POST /v1/retrieve`.
  *
- * Mirrors `schema::RetrievalRequest` and the test JSON in
- * `services/retrieval/tests/transport_http.rs`:
- *
- *     {"tenant_id": "...", "query": "...",
- *      "top_k": 10, "stance_mode": "balanced",
- *      "return_graph": false}
+ * Mirrors the JSON accepted by `build_retrieve_transport_request_from_json`
+ * in `services/retrieval/src/transport/payload.rs`. Only `tenant_id` and
+ * `query` are required.
  */
 export interface RetrieveRequest {
   /** Tenant namespace to search within. */
   tenant_id: string;
   /** Free-text query. */
   query: string;
-  /** Maximum number of claims to return. Defaults to `10`. */
+  /** Maximum number of claims to return. Defaults to `5` (the server default). */
   top_k?: number;
   /** Defaults to `"balanced"`. */
   stance_mode?: StanceMode;
   /** Optional flag to also return the claim graph. */
   return_graph?: boolean;
+  /** Pre-computed query vector (skips server-side embedding). */
+  query_embedding?: number[];
+  /** Restrict results to claims mentioning these entities. */
+  entity_filters?: string[];
+  /** Restrict results to these embedding ids. */
+  embedding_id_filters?: string[];
+  /** Restrict results by event time. */
+  time_range?: TimeRange;
+  /** Read consistency policy (server default `"one"`). */
+  read_consistency?: ReadConsistency;
 }
 
 /**
@@ -129,12 +150,13 @@ export interface Citation {
 }
 
 /**
- * A single claim returned by `/v1/retrieve`.
+ * A single claim returned by `/v1/retrieve`
+ * (`render_evidence_node_json` in the retrieval service).
  *
- * Mirrors `schema::RetrievalResult`. The **Claim + Evidence +
- * Contradiction** differentiator lives here: `supports` and
- * `contradicts` give the caller the stance tally for the claim
- * without having to walk citations manually.
+ * The **Claim + Evidence + Contradiction** differentiator lives here:
+ * `supports` and `contradicts` give the caller the stance tally for the
+ * claim without having to walk citations manually. Fields after
+ * `citations` are optional and `null` when the server omits them.
  */
 export interface RetrieveResult {
   claim_id: string;
@@ -143,15 +165,50 @@ export interface RetrieveResult {
   supports: number;
   contradicts: number;
   citations: Citation[];
+  claim_confidence?: number | null;
+  confidence_band?: string | null;
+  dominant_stance?: string | null;
+  contradiction_risk?: number | null;
+  graph_score?: number | null;
+  support_path_count?: number | null;
+  contradiction_chain_depth?: number | null;
+  event_time_unix?: number | null;
+  temporal_match_mode?: string | null;
+  temporal_in_range?: boolean | null;
+  claim_type?: string | null;
+  valid_from?: number | null;
+  valid_to?: number | null;
+  created_at?: number | null;
+  updated_at?: number | null;
+}
+
+/** An edge of the evidence graph (`return_graph: true`). */
+export interface GraphEdge {
+  from_claim_id: string;
+  to_claim_id: string;
+  relation: string;
+  strength: number;
+}
+
+/** Evidence graph returned when `return_graph` is true. */
+export interface RetrieveGraph {
+  nodes: RetrieveResult[];
+  edges: GraphEdge[];
 }
 
 /**
  * Response body for `POST /v1/retrieve`.
  *
- * Wire format is `{"results": [...]}`.
+ * Wire format is `{"results": [...], "graph": ..., "read_policy": ...,
+ * "read_quorum_met": ..., "serving_replica": ...}`; everything except
+ * `results` is optional.
  */
 export interface RetrieveResponse {
   results: RetrieveResult[];
+  graph?: RetrieveGraph | null;
+  read_policy?: string | null;
+  read_quorum_met?: boolean | null;
+  serving_replica?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +232,40 @@ export function embeddingRequestToBody(req: EmbeddingRequest): Record<string, un
   if (req.user !== undefined) {
     body.user = req.user;
   }
+  if (req.dimensions !== undefined) {
+    body.dimensions = req.dimensions;
+  }
   return body;
+}
+
+/**
+ * Decode the server's `encoding_format: "base64"` embedding: float32
+ * components packed little-endian, standard base64 alphabet.
+ *
+ * @throws TypeError when the input is not valid base64 or not a whole
+ *   number of float32 values.
+ */
+export function decodeBase64Embedding(encoded: string): number[] {
+  let binary: string;
+  try {
+    binary = atob(encoded);
+  } catch {
+    throw new TypeError('embedding is not valid base64');
+  }
+  if (binary.length % 4 !== 0) {
+    throw new TypeError(
+      `base64 embedding has ${binary.length} bytes, not a multiple of 4`,
+    );
+  }
+  const view = new DataView(new ArrayBuffer(binary.length));
+  for (let i = 0; i < binary.length; i++) {
+    view.setUint8(i, binary.charCodeAt(i));
+  }
+  const out: number[] = [];
+  for (let offset = 0; offset < binary.length; offset += 4) {
+    out.push(view.getFloat32(offset, true));
+  }
+  return out;
 }
 
 /**
@@ -185,11 +275,29 @@ export function retrieveRequestToBody(req: RetrieveRequest): Record<string, unkn
   const body: Record<string, unknown> = {
     tenant_id: req.tenant_id,
     query: req.query,
-    top_k: req.top_k ?? 10,
+    top_k: req.top_k ?? 5,
     stance_mode: req.stance_mode ?? 'balanced',
   };
   if (req.return_graph !== undefined) {
     body.return_graph = req.return_graph;
+  }
+  if (req.query_embedding !== undefined) {
+    body.query_embedding = req.query_embedding;
+  }
+  if (req.entity_filters !== undefined) {
+    body.entity_filters = req.entity_filters;
+  }
+  if (req.embedding_id_filters !== undefined) {
+    body.embedding_id_filters = req.embedding_id_filters;
+  }
+  if (req.time_range !== undefined) {
+    const tr: Record<string, number> = {};
+    if (req.time_range.from_unix != null) tr.from_unix = req.time_range.from_unix;
+    if (req.time_range.to_unix != null) tr.to_unix = req.time_range.to_unix;
+    body.time_range = tr;
+  }
+  if (req.read_consistency !== undefined) {
+    body.read_consistency = req.read_consistency;
   }
   return body;
 }
@@ -210,10 +318,13 @@ export function parseEmbeddingResponse(raw: unknown): EmbeddingResponse {
   const dataRaw = Array.isArray(body.data) ? body.data : [];
   const data: EmbeddingData[] = dataRaw.map((d, fallbackIndex) => {
     const item = d as Record<string, unknown>;
-    const embeddingRaw = Array.isArray(item.embedding) ? item.embedding : [];
-    const embedding: number[] = embeddingRaw.map((v) =>
-      typeof v === 'number' ? v : Number(v),
-    );
+    // `encoding_format: "base64"` makes the server return a string.
+    const embedding: number[] =
+      typeof item.embedding === 'string'
+        ? decodeBase64Embedding(item.embedding)
+        : (Array.isArray(item.embedding) ? item.embedding : []).map((v) =>
+            typeof v === 'number' ? v : Number(v),
+          );
     return {
       object: 'embedding',
       embedding,
@@ -248,43 +359,77 @@ export function parseRetrieveResponse(raw: unknown): RetrieveResponse {
   const body = raw as Record<string, unknown>;
   const resultsRaw = Array.isArray(body.results) ? body.results : [];
 
-  const results: RetrieveResult[] = resultsRaw.map((r) => {
-    const item = r as Record<string, unknown>;
-    const citationsRaw = Array.isArray(item.citations) ? item.citations : [];
-    const citations: Citation[] = citationsRaw.map((c) => {
-      const ci = c as Record<string, unknown>;
+  const results: RetrieveResult[] = resultsRaw.map((r) => parseRetrieveResult(r));
+
+  const out: RetrieveResponse = { results };
+  if (typeof body.graph === 'object' && body.graph !== null) {
+    const g = body.graph as Record<string, unknown>;
+    const nodes = Array.isArray(g.nodes) ? g.nodes.map((n) => parseRetrieveResult(n)) : [];
+    const edges: GraphEdge[] = (Array.isArray(g.edges) ? g.edges : []).map((e) => {
+      const ei = e as Record<string, unknown>;
       return {
-        evidence_id: String(ci.evidence_id ?? ''),
-        source_id: String(ci.source_id ?? ''),
-        stance: (ci.stance as Stance) ?? 'neutral',
-        source_quality: Number(ci.source_quality ?? 0),
-        chunk_id: (ci.chunk_id as string | null | undefined) ?? null,
-        span_start:
-          ci.span_start === null || ci.span_start === undefined
-            ? null
-            : Number(ci.span_start),
-        span_end:
-          ci.span_end === null || ci.span_end === undefined
-            ? null
-            : Number(ci.span_end),
-        doc_id: (ci.doc_id as string | null | undefined) ?? null,
-        extraction_model: (ci.extraction_model as string | null | undefined) ?? null,
-        ingested_at:
-          ci.ingested_at === null || ci.ingested_at === undefined
-            ? null
-            : Number(ci.ingested_at),
+        from_claim_id: String(ei.from_claim_id ?? ''),
+        to_claim_id: String(ei.to_claim_id ?? ''),
+        relation: String(ei.relation ?? ''),
+        strength: Number(ei.strength ?? 0),
       };
     });
+    out.graph = { nodes, edges };
+  }
+  if (typeof body.read_policy === 'string') out.read_policy = body.read_policy;
+  if (typeof body.read_quorum_met === 'boolean') out.read_quorum_met = body.read_quorum_met;
+  if (typeof body.serving_replica === 'string') out.serving_replica = body.serving_replica;
+  return out;
+}
 
+function optNumber(v: unknown): number | null {
+  return v === null || v === undefined ? null : Number(v);
+}
+
+function optString(v: unknown): string | null {
+  return typeof v === 'string' ? v : null;
+}
+
+function parseRetrieveResult(r: unknown): RetrieveResult {
+  const item = (r ?? {}) as Record<string, unknown>;
+  const citationsRaw = Array.isArray(item.citations) ? item.citations : [];
+  const citations: Citation[] = citationsRaw.map((c) => {
+    const ci = c as Record<string, unknown>;
     return {
-      claim_id: String(item.claim_id ?? ''),
-      canonical_text: String(item.canonical_text ?? ''),
-      score: Number(item.score ?? 0),
-      supports: Number(item.supports ?? 0),
-      contradicts: Number(item.contradicts ?? 0),
-      citations,
+      evidence_id: String(ci.evidence_id ?? ''),
+      source_id: String(ci.source_id ?? ''),
+      stance: (ci.stance as Stance) ?? 'neutral',
+      source_quality: Number(ci.source_quality ?? 0),
+      chunk_id: (ci.chunk_id as string | null | undefined) ?? null,
+      span_start: optNumber(ci.span_start),
+      span_end: optNumber(ci.span_end),
+      doc_id: (ci.doc_id as string | null | undefined) ?? null,
+      extraction_model: (ci.extraction_model as string | null | undefined) ?? null,
+      ingested_at: optNumber(ci.ingested_at),
     };
   });
 
-  return { results };
+  return {
+    claim_id: String(item.claim_id ?? ''),
+    canonical_text: String(item.canonical_text ?? ''),
+    score: Number(item.score ?? 0),
+    supports: Number(item.supports ?? 0),
+    contradicts: Number(item.contradicts ?? 0),
+    citations,
+    claim_confidence: optNumber(item.claim_confidence),
+    confidence_band: optString(item.confidence_band),
+    dominant_stance: optString(item.dominant_stance),
+    contradiction_risk: optNumber(item.contradiction_risk),
+    graph_score: optNumber(item.graph_score),
+    support_path_count: optNumber(item.support_path_count),
+    contradiction_chain_depth: optNumber(item.contradiction_chain_depth),
+    event_time_unix: optNumber(item.event_time_unix),
+    temporal_match_mode: optString(item.temporal_match_mode),
+    temporal_in_range: typeof item.temporal_in_range === 'boolean' ? item.temporal_in_range : null,
+    claim_type: optString(item.claim_type),
+    valid_from: optNumber(item.valid_from),
+    valid_to: optNumber(item.valid_to),
+    created_at: optNumber(item.created_at),
+    updated_at: optNumber(item.updated_at),
+  };
 }

@@ -14,7 +14,7 @@ import {
 import { createClient } from '../src/client.js';
 
 describe('RetrieveService.query', () => {
-  it('uses the default top_k=10 and stance_mode=balanced', async () => {
+  it('uses the default top_k=5 and stance_mode=balanced', async () => {
     const { fetch: f, calls } = makeFetchMock(200, SAMPLE_RETRIEVE_RESPONSE);
     const client = createClient({ baseUrl: BASE_URL, fetch: f });
     const response = await client.retrieve.query({
@@ -28,7 +28,7 @@ describe('RetrieveService.query', () => {
     expect(calls[0]!.body).toEqual({
       tenant_id: 'tenant-a',
       query: 'company x',
-      top_k: 10,
+      top_k: 5,
       stance_mode: 'balanced',
     });
     expect(response.results).toHaveLength(1);
@@ -168,5 +168,94 @@ describe('RetrieveService error mapping', () => {
     await expect(
       client.retrieve.query({ tenant_id: 't', query: 'q' }),
     ).rejects.toBeInstanceOf(DashConnectionError);
+  });
+});
+
+describe('RetrieveService.query server-contract fields', () => {
+  it('sends optional payload.rs fields when provided', async () => {
+    const { fetch: f, calls } = makeFetchMock(200, SAMPLE_RETRIEVE_RESPONSE);
+    const client = createClient({ baseUrl: BASE_URL, fetch: f });
+    await client.retrieve.query({
+      tenant_id: 't',
+      query: 'q',
+      top_k: 3,
+      return_graph: true,
+      query_embedding: [0.5, 0.25],
+      entity_filters: ['acme'],
+      embedding_id_filters: ['emb-1'],
+      time_range: { from_unix: 10, to_unix: 20 },
+      read_consistency: 'quorum',
+    });
+    expect(calls[0]!.body).toEqual({
+      tenant_id: 't',
+      query: 'q',
+      top_k: 3,
+      stance_mode: 'balanced',
+      return_graph: true,
+      query_embedding: [0.5, 0.25],
+      entity_filters: ['acme'],
+      embedding_id_filters: ['emb-1'],
+      time_range: { from_unix: 10, to_unix: 20 },
+      read_consistency: 'quorum',
+    });
+  });
+
+  it('omits unset optional fields and half-open time ranges', async () => {
+    const { fetch: f, calls } = makeFetchMock(200, SAMPLE_RETRIEVE_RESPONSE);
+    const client = createClient({ baseUrl: BASE_URL, fetch: f });
+    await client.retrieve.query({ tenant_id: 't', query: 'q', time_range: { from_unix: 5 } });
+    const body = calls[0]!.body as Record<string, unknown>;
+    expect(body.time_range).toEqual({ from_unix: 5 });
+    for (const key of ['query_embedding', 'entity_filters', 'embedding_id_filters', 'read_consistency']) {
+      expect(key in body).toBe(false);
+    }
+  });
+
+  it('decodes graph, read policy and extra node fields', async () => {
+    const serverBody = {
+      results: [
+        {
+          claim_id: 'c-1',
+          canonical_text: 'x',
+          score: 0.5,
+          claim_confidence: 0.8,
+          confidence_band: 'high',
+          dominant_stance: 'supports',
+          contradiction_risk: null,
+          graph_score: 0.25,
+          support_path_count: 2,
+          contradiction_chain_depth: null,
+          supports: 1,
+          contradicts: 0,
+          citations: [],
+          event_time_unix: 1700000000,
+          temporal_in_range: true,
+          claim_type: 'factual',
+          future_field: { ignored: true },
+        },
+      ],
+      graph: {
+        nodes: [],
+        edges: [{ from_claim_id: 'c-1', to_claim_id: 'c-2', relation: 'supports', strength: 0.5 }],
+      },
+      read_policy: 'one',
+      read_quorum_met: true,
+      serving_replica: null,
+    };
+    const { fetch: f } = makeFetchMock(200, serverBody);
+    const client = createClient({ baseUrl: BASE_URL, fetch: f });
+    const response = await client.retrieve.query({ tenant_id: 't', query: 'q' });
+
+    const hit = response.results[0]!;
+    expect(hit.claim_confidence).toBe(0.8);
+    expect(hit.confidence_band).toBe('high');
+    expect(hit.contradiction_risk).toBeNull();
+    expect(hit.support_path_count).toBe(2);
+    expect(hit.temporal_in_range).toBe(true);
+    expect(hit.event_time_unix).toBe(1700000000);
+    expect(response.graph?.edges[0]?.relation).toBe('supports');
+    expect(response.read_policy).toBe('one');
+    expect(response.read_quorum_met).toBe(true);
+    expect(response.serving_replica).toBeUndefined();
   });
 });

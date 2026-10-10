@@ -1,133 +1,89 @@
 # Architecture
 
-DASH is two HTTP services backed by a shared library crate (`pkg/store`) and a shared type crate (`pkg/schema`). This page describes the topology, the responsibilities of each component, the data flow, and the persistence stack.
+DASH is a Rust workspace of shared library crates, four service binaries and two offline tools (`wal-inspect`, `audit-verify`). This page describes the topology as the code implements it in 0.3.0 (unreleased), the data flow, and the concurrency model. Planned designs (consensus replication, sharded clusters) are described in the [master plan](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/plans/2026-10-09-production-readiness-master-plan.md) and are not available yet.
 
-## The two services
-
-```text
-                        ┌───────────────────────┐
-                        │      Client(s)        │
-                        │  SDKs / curl / OpenAI │
-                        └───────────┬───────────┘
-                                    │
-                ┌───────────────────┴───────────────────┐
-                │                                       │
-        POST /v1/ingest                        POST /v1/retrieve
-        POST /v1/embeddings                    POST /v1/embeddings
-                │                                       │
-        ┌───────▼────────┐                    ┌────────▼────────┐
-        │   ingestion    │                    │    retrieval    │
-        │  (port 8081)   │                    │   (port 8080)   │
-        │                │                    │                 │
-        │ • validate     │                    │ • embed query   │
-        │ • write WAL    │                    │ • ANN search    │
-        │ • append redb  │                    │ • lexical rerank│
-        │ • audit log    │                    │ • stance filter │
-        │ • emit metrics │                    │ • emit metrics  │
-        └───────┬────────┘                    └────────┬────────┘
-                │                                      │
-                │         ┌────────────────┐           │
-                └────────►│   pkg/store    │◄──────────┘
-                          │                │
-                          │ • InMemoryStore│
-                          │ • DiskBackedStore
-                          │ • ANN (usearch)│
-                          │ • redb tables  │
-                          │ • WAL          │
-                          └────────┬───────┘
-                                   │
-                          ┌────────▼───────┐
-                          │   Persistence  │
-                          │  redb + WAL    │
-                          │  (per-tenant   │
-                          │   key spaces)  │
-                          └────────────────┘
-```
-
-The two services are intentionally independent. They share the type system (`pkg/schema`) and the store implementation (`pkg/store`), but they do not share a process or a network port. A deployment can scale ingestion replicas separately from retrieval replicas; the only thing they have to agree on is the shape of the `redb` files and the wire format on disk.
-
-## Component responsibilities
-
-### `services/ingestion`
-
-- Accepts `POST /v1/ingest` with a `Claim`, an evidence `Vec`, and an edges `Vec`.
-- Validates the bundle against the schema (`claim_id` uniqueness, `tenant_id` consistency, `confidence ∈ [0, 1]`, etc.).
-- Appends a record to the **write-ahead log** (WAL).
-- If `DASH_INGEST_PERSISTENCE_PATH` is set, appends the bundle to the **redb** file via `DiskBackedStore::insert`.
-- Emits an `AuditEvent` (hash-chained) recording the operator, the tenant, the bundle IDs, and the SHA-256 of the canonical form.
-- Emits Prometheus metrics: `dash_ingest_requests_total`, `dash_ingest_latency_seconds`, `dash_ingest_bundle_size`.
-
-### `services/retrieval`
-
-- Accepts `POST /v1/retrieve` with a `tenant_id`, a `query`, an optional `query_vector`, a `top_k`, an optional `time_range`, and a `stance_mode`.
-- Computes the query embedding via the configured `EmbeddingProvider` (default: `HashEmbeddingProvider`; alternatives: `ollama`, `openai`, custom).
-- Performs a per-tenant **ANN search** (`usearch`) to get the top-*N* candidate claims.
-- **Reranks** the candidates with the lexical/BM25 score, applies the `time_range` filter, and the `stance_mode` filter.
-- Returns `{ claim, score, supports, contradicts, citations[] }` for each surviving result.
-
-The retrieval service also serves:
-
-- `POST /v1/embeddings` — OpenAI v1 wire-compatible.
-- `GET /v1/health` — liveness/readiness.
-- `GET /metrics` — Prometheus exposition.
-
-### `pkg/store`
-
-The shared store. Exposes:
-
-- `InMemoryStore` — `HashMap`-backed, in-process. Fast, volatile, the default for tests and small deployments.
-- `DiskBackedStore` — `redb`-backed, durable, opt-in via `DASH_*_PERSISTENCE_PATH`. Wraps `InMemoryStore`; the in-memory layer is the source of truth during a process's lifetime, and redb is the snapshot.
-- `IndexBuilder` — pluggable ANN index. The default implementation is `usearch` (HNSW).
-- `FileWal` — the append-only write-ahead log with replay.
-- `audit::hash_chain` — the SHA-256-chained `AuditEvent` recorder.
-
-### `pkg/schema`
-
-The wire-level types. Every HTTP request body, every redb record, and every JSON line in the audit log deserializes to a type defined here. The types are `Serialize`/`Deserialize`-derived; the optional fields are `#[serde(default)]` so old payloads stay forward-compatible.
-
-## Data flow: ingest → store → retrieve
+## Topology
 
 ```text
-client
-  │
-  │  POST /v1/ingest
-  ▼
-ingestion service
-  │
-  │ 1. validate
-  │ 2. write WAL (fsync, durability guard on)
-  │ 3. if redb path set: DiskBackedStore::insert
-  │ 4. AuditEvent::record (hash chain)
-  │ 5. respond 202 Accepted
-  ▼
-redb + WAL on disk
-  │
-  │  (on retrieval, or on restart during WAL replay)
-  ▼
-InMemoryStore rebuilt in the retrieval service
-  │
-  │  POST /v1/retrieve
-  │      → EmbeddingProvider::embed(query)
-  │      → ANN top-N candidates
-  │      → lexical rerank
-  │      → stance + time_range filter
-  │      → response
-  ▼
-client
+                  clients (SDKs, curl, OpenAI clients)
+                       │                     │
+            POST /v1/ingest*          POST /v1/retrieve
+                       │              POST /v1/embeddings
+                       ▼                     ▼
+              ┌────────────────┐     ┌────────────────┐
+              │   ingestion    │     │   retrieval    │
+              │  :8081         │     │  :8080         │
+              │  owns the WAL  │────►│  read replica  │
+              │  redb mirror   │ HTTP│  in-memory     │
+              │  /internal/    │ poll│  store + ANN   │
+              │   replication  │     │  redb mirror   │
+              └───────┬────────┘     └────────────────┘
+                      │ segments
+              ┌───────▼────────┐     ┌────────────────┐
+              │ segment-       │     │ control-plane  │
+              │ maintenance    │     │ :8090          │
+              │ daemon         │     │ placement,     │
+              └────────────────┘     │ file lease     │
+                                     └────────────────┘
 ```
 
-## Persistence architecture (redb + WAL)
+- **ingestion** (`services/ingestion`) validates writes, appends them to the WAL, updates its in-memory store, mirrors to redb, optionally publishes index segments, and serves the WAL to followers over `/internal/replication/*`.
+- **retrieval** (`services/retrieval`) answers `/v1/retrieve` and `/v1/embeddings`. It does not accept writes; it follows the ingestion service by polling its replication endpoint (`DASH_RETRIEVAL_REPLICATION_SOURCE_URL`) and applying WAL deltas into its own in-memory store.
+- **control-plane** (`services/control-plane`) holds shard placement state (CSV, optionally persisted with a SHA-256 checksum), runs a durable, fenced file-lease leader election, and exposes token-authenticated placement and failover-promotion endpoints (promotion is refused unless the replica reported zero lag). Ingestion and retrieval can consult it via `DASH_ROUTER_CONTROL_PLANE_URL` or read a placement file directly.
+- **metadata-router** (`services/metadata-router`) is a library, not a process: shard placement types, consistent-hash routing, and read/write route resolution used by the services.
+- **indexer** (`services/indexer`) is a library plus the `segment-maintenance-daemon` binary: it builds immutable segments with manifests and checksums, plans and applies compactions, and garbage-collects unreferenced files.
 
-DASH has a **two-layer persistence story**:
+There is no consensus protocol. Writes go to a single ingestion process per WAL; failover is an operator-driven placement change.
 
-1. **WAL** — the append-only write-ahead log. Every mutation is recorded as a length-prefixed, CRC-32c-checked record. The WAL is the *first* thing that gets written; the in-memory state and the redb snapshot are *consequences* of the WAL. Replay reconstructs the in-memory state on restart.
+## Library crates
 
-2. **redb** — the on-disk snapshot. `redb` is a pure-Rust, ACID, single-file embedded database built on top of B-trees. DASH uses redb PR 1: a single `redb` file per service (one for ingestion, one for retrieval), with per-tenant key spaces. The `DiskBackedStore` is additive; if `DASH_*_PERSISTENCE_PATH` is unset, DASH runs in WAL-only mode and the pre-redb behavior is preserved bit-for-bit.
+| Crate | Responsibility |
+|---|---|
+| `pkg/schema` | Claim, Evidence, ClaimEdge, Citation types; validation; tokenization helpers |
+| `pkg/store` | `InMemoryStore`, `FileWal` (checksummed records, commit groups, generations), `DiskBackedStore` (redb), the ANN graph, metrics, GPU placeholder |
+| `pkg/ranking` | Score computation: confidence, stance, source quality, contradiction penalty |
+| `pkg/graph` | Graph expansion over claim edges; support-path and contradiction-depth reasoning |
+| `pkg/auth` | HS256 JWT, OIDC/JWKS validation, roles, SHA-256 helper |
+| `pkg/embeddings` | `EmbeddingProvider` trait; hash, Ollama, OpenAI providers; circuit breaker |
+| `pkg/encryption` | AES-256-GCM envelope library; **not used by any service** |
+| `services/common` | Deny-by-default auth policy and rate limiter (`policy`), audit chain writer and verifier (`audit`), secret validation, shutdown signaling, logging init |
 
-The reasons for choosing redb are documented in [ADR-001: Why redb over sled/rocksdb](../reference/architecture-decisions.md#adr-001-why-redb-over-sledrocksdb). The full 3-PR persistence plan is in `docs/plans/2026-06-13-redb-persistence-design.md` in the source tree.
+### Storage inside `pkg/store`
+
+- `InMemoryStore`: hash-map based, holds claims, evidence, edges, vectors and lexical, entity, embedding-id and temporal indexes. It is the source of truth while a process runs.
+- `FileWal`: the append-only line-oriented log with snapshot checkpoints. See [Persistence](persistence.md).
+- `DiskBackedStore`: a redb mirror, on by default when a WAL path is set.
+- Vector index: one `TenantVectorIndex` per tenant (`pkg/store/src/vector_index.rs`). It starts as an exact **flat** index (contiguous normalised `f32` rows, SIMD-friendly dot product) and converts itself to a [`usearch`](https://github.com/unum-cloud/usearch) **HNSW** (cosine metric, `i8` scalar quantisation) once the tenant holds more than `DASH_*_VECTOR_FLAT_THRESHOLD` vectors (default 8192). The HNSW returns about 50 candidates (`DASH_*_VECTOR_RERANK`) that are re-scored with exact `f32` cosine against the full-precision vectors in `claim_vectors`, so the quantised index costs roughly a third of an `f32` HNSW and recall does not pay for it. Claim ids are interned to dense `u64` keys per tenant; removing or replacing a vector is a usearch soft delete whose slot is reused (memory does not shrink after deletes).
+- Filtered vector search: time-range and allowed-claim-id filters are passed to the index as a predicate. When the allowed set is no larger than the flat threshold it is scanned exactly instead (measured faster and exact, ADR 0003); a larger set goes through the HNSW with the predicate. Every search stays inside the tenant's own index.
+- Cold start: the vector index is **not persisted**. WAL replay and the redb bulk load collect the vectors and then build each tenant's index once, multi-threaded. The cost grows with the vector count (see [Persistence](persistence.md) for measured numbers); persisting or memory-mapping the index is a follow-up.
+- The `gpu-backend` feature is a placeholder that never produces a GPU engine; scoring runs on the CPU.
+
+## Data flow
+
+```text
+client ── POST /v1/ingest ──► ingestion
+                               1. read request (bounded), parse JSON, authorize (tenant + role, rate limit)
+                               2. embed the claim if no vector was given
+                               3. validate bundle (pkg/schema, store)
+                               4. append one WAL commit group (claim, evidence, edges, vector)
+                               5. mirror to redb, update in-memory indexes and ANN
+                               6. optional checkpoint; optional audit line
+                               7. respond 200 with ingested_claim_id and commit fields
+retrieval ◄── poll /internal/replication/wal ── ingestion
+   │  apply delta (or full export when behind)
+   ▼
+client ── POST /v1/retrieve ─► retrieval
+                               authorize, then embed query (unless query_embedding given)
+                               candidates: lexical + entity + temporal + ANN
+                               filter by tenant, time_range, stance_mode
+                               rank, attach citations, optional graph expansion
+                               respond 200
+```
+
+Because retrieval is a polling follower, a write is visible on retrieval only after the next poll (250 ms in the compose file, 1000 ms default). Authentication and authorization run before any embedding provider call (register SEC-09, fixed in 0.3.0). When the leader checkpoints, its WAL generation changes and followers resync from a full export.
 
 ## Concurrency model
 
-Both services are single-threaded at the request-handling level. They use `std::net::TcpListener` and a thread-per-connection model with a configurable worker count (`DASH_*_WORKERS`). The reasoning for staying on `std::net::TcpServer` rather than reaching for `axum` / `tokio` is in [ADR-003](../reference/architecture-decisions.md#adr-003-why-stdnettcpstream-over-axumreqwest).
+All three services use one shared server implementation, the `dash-http` crate (`pkg/http`): a strict request parser, response renderer and `std::thread` server. Each service passes it a handler closure; the server accepts connections on a `std::net::TcpListener` and hands them to a bounded queue served by a fixed pool of worker threads (`DASH_INGEST_HTTP_WORKERS` / `DASH_RETRIEVAL_HTTP_WORKERS`, queue `workers * 64` by default; a full queue answers 503). Requests are HTTP/1.1 with `Connection: close`. The ingestion runtime is protected by one mutex, so writes are serialized. The retrieval store is behind a read-write lock. See [ADR-003](../reference/architecture-decisions.md#adr-003-why-stdnettcpstream-over-axumreqwest) for the rationale and the [issue register](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/plans/2026-10-09-issue-register.md) (ROB-* items) for remaining robustness gaps in this hand-written transport (now a single module, so a later move to hyper/axum replaces one crate). Since 0.3.0 requests have a whole-request deadline (`DASH_HTTP_REQUEST_TIMEOUT_MS`), bounded headers and bodies, and a depth-limited JSON parser.
 
-This is a deliberate constraint, not an oversight: DASH is built so that horizontal scale comes from **more processes**, not more concurrency inside a process. The redb file lock guarantees that only one writer is ever active per file, and the WAL replay is single-pass, so a single process can saturate a single NVMe drive. To go faster, run more processes (with a load balancer in front), and let redb's cross-process primitives coordinate.
+Horizontal scaling today means adding retrieval followers that poll one ingestion process. Multiple writers over the same WAL or redb file are not supported (redb holds a file lock).

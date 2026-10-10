@@ -60,8 +60,53 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: "maven"
+    directory: "/sdks/java"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps(java)"
+    labels:
+      - "dependencies"
+    groups:
+      java-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gradle"
+    directory: "/sdks/kotlin"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps(kotlin)"
+    labels:
+      - "dependencies"
+    groups:
+      kotlin-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "nuget"
+    directory: "/sdks/csharp"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps(csharp)"
+    labels:
+      - "dependencies"
+    groups:
+      csharp-dependencies:
+        patterns:
+          - "*"
+
+  # Actions are pinned to commit SHAs with a `# vX.Y.Z` comment; Dependabot
+  # updates the SHA and the comment together. "/" makes it scan
+  # .github/workflows.
   - package-ecosystem: "github-actions"
-    directory: "/.github/workflows"
+    directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -74,6 +119,8 @@ updates:
         patterns:
           - "*"
 
+  # Base images in the Dockerfile are pinned by digest (tag@sha256:...);
+  # Dependabot bumps both.
   - package-ecosystem: "docker"
     directory: "/deploy/container"
     schedule:

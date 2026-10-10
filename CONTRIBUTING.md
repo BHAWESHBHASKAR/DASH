@@ -103,6 +103,22 @@ Open a pull request on GitHub. Reference any related issues (e.g., `Closes #42`)
 - Make requested changes in new commits (don't force-push during review)
 - Once approved, a maintainer will merge your PR
 
+### 6. Closing Issues and Status Claims
+
+**An issue is closed only when the fix is merged with a regression test that fails on the old code; plan status lines must link to evidence.**
+
+In practice:
+
+- A pull request that closes an issue (including a row in `docs/plans/2026-10-09-issue-register.md`) must add or change a test that fails without the fix, and the PR description names that test and the CI run that executed it.
+- A plan, roadmap or changelog line may say "done" or "fixed" only if it links to evidence: the test (`path::name`), a CI job, or a drill record. No link means not done.
+- Capability claims in `README.md` are listed in `docs/claims-ledger.md` with the test that proves them. Run `scripts/check_claims_ledger.sh` after changing either file; it fails if a referenced test or file does not exist, or if the README test count is stale.
+- Changes to security, storage format or replication need a second reviewer and an update to `docs/threat-model.md` (or an ADR line) when behavior changes.
+- Configuration and API reference pages must list only what the code reads and serves. When you add an environment variable or a route, update `docs-site/docs/reference/configuration.md` or `api.md` in the same PR.
+- `scripts/check_config_docs.sh` fails if an environment variable read by the Rust code (`DASH_*` or `EME_*` string literals in `services/*/src`, `pkg/*/src`, `tools/*/src`, plus the per-service auth and audit names built at runtime) is not mentioned in `docs-site/docs/reference/configuration.md`. Run it whenever you add or rename an environment variable.
+- The Rust toolchain is pinned in `rust-toolchain.toml` (and the digest-pinned `rust:` base image in `deploy/container/Dockerfile`) so local builds, CI and the image use the same compiler and the same lints. To upgrade, change both together and fix any new warnings in the same change.
+- `scripts/check_sdk_surface.sh` fails if the Java, Kotlin or C# SDK exposes the removed generic delete API (a `/v1/delete` route, a `DeleteRequest` model or a bare `delete(` / `Delete(` / `DeleteAsync(` method; the scoped `deleteClaim` / `deleteEvidence` / `deleteTenant` methods are fine, and "removed" notes in CHANGELOGs and READMEs are allowed), or if any `sdks/*/README.md` or SDK source names an endpoint that is not in the route tables of `docs-site/docs/reference/api.md`. Run it after changing an SDK or its README; `--self-test` plants violations in a temporary copy and checks that each is caught. CI runs both in the `surface-check` job of `.github/workflows/sdks.yml`.
+- Every environment setting is a row in the typed registry `pkg/config/src/registry.rs`; the configuration reference page is generated from it. When you add or rename an environment variable, add or change its row, then run `cargo run -p dash-config -- docs` to regenerate `docs-site/docs/reference/configuration.md`. The test `registry_covers_every_env_var_read_by_code` fails if the code reads a `DASH_*` / `EME_*` name (string literals in `services/*/src`, `pkg/*/src`, `tools/*/src`, plus the per-service auth and audit names built at runtime) that the registry lacks, and `scripts/check_config_docs.sh` (a wrapper around `dash-config docs --check`) fails if the page is stale.
+
 ---
 
 ## Project Structure
@@ -150,7 +166,7 @@ Looking for a place to start? Check out issues labeled `good-first-issue`:
 - Write tutorial: \"Ingest and retrieve your first claims\"
 
 ### High Complexity (but high impact!)
-- Integrate ANN vector index (HNSW via `usearch` or `hora`)
+- Persist or memory-map the vector index (HNSW via `usearch` is integrated; it is rebuilt at startup today)
 - Build pluggable embedding model API
 - Implement multi-hop graph traversal
 - Design segment storage with object store backend (S3)
@@ -266,7 +282,7 @@ pub fn ingest_bundle(
 
 ### Architecture Docs
 
-- For architectural decisions, update `EME_ARCHITECTURE.md`
+- For architectural decisions, update `docs/architecture/eme-architecture.md`
 - For execution details, add to `docs/execution/`
 
 ---
@@ -317,7 +333,7 @@ Contributors are recognized in:
 
 ## Questions?
 
-- Check [`EME_ARCHITECTURE.md`](EME_ARCHITECTURE.md) for system design
+- Check [`docs/architecture/eme-architecture.md`](docs/architecture/eme-architecture.md) for system design
 - Check [`feasibility.md`](feasibility.md) for roadmap and priorities
 - Open a [GitHub Discussion](https://github.com/your-org/dash/discussions) for questions
 - Tag maintainers in issues if blocked

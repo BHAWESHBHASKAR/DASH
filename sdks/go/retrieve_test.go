@@ -12,7 +12,7 @@ import (
 )
 
 // TestRetrieveDefaultStanceModeAndTopK verifies that a Query call
-// with zero values uses the documented defaults (top_k=10,
+// with zero values uses the documented defaults (top_k=5,
 // stance_mode="balanced") on the wire and that the typed response is
 // populated.
 func TestRetrieveDefaultStanceModeAndTopK(t *testing.T) {
@@ -34,7 +34,7 @@ func TestRetrieveDefaultStanceModeAndTopK(t *testing.T) {
 	require.NoError(t, json.Unmarshal(got.Body, &body))
 	assert.Equal(t, "tenant-a", body["tenant_id"])
 	assert.Equal(t, "company x", body["query"])
-	assert.EqualValues(t, 10, body["top_k"])
+	assert.EqualValues(t, 5, body["top_k"])
 	assert.Equal(t, "balanced", body["stance_mode"])
 
 	require.Len(t, resp.Results, 1)
@@ -314,4 +314,101 @@ func TestRetrieveMultipleResults(t *testing.T) {
 	assert.Equal(t, 0, resp.Results[0].Contradicts)
 	assert.Equal(t, 5, resp.Results[0].Supports)
 	assert.Equal(t, 3, resp.Results[1].Contradicts)
+}
+
+// TestRetrieveSendsOptionalServerFields verifies that the payload.rs
+// fields are emitted on the wire when set.
+func TestRetrieveSendsOptionalServerFields(t *testing.T) {
+	h := &recordingHandler{status: 200, body: sampleRetrieveResponse}
+	srv := newTestServer(t, h)
+
+	from, to := int64(10), int64(20)
+	c := New(srv.URL)
+	_, err := c.Retrieve().Query(context.Background(), RetrieveRequest{
+		TenantID:           "t",
+		Query:              "q",
+		QueryEmbedding:     []float32{0.5, 0.25},
+		EntityFilters:      []string{"acme"},
+		EmbeddingIDFilters: []string{"emb-1"},
+		TimeRange:          &TimeRange{FromUnix: &from, ToUnix: &to},
+		ReadConsistency:    "quorum",
+		ReturnGraph:        true,
+	})
+	require.NoError(t, err)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(h.lastRequest(t).Body, &body))
+	assert.Equal(t, []any{0.5, 0.25}, body["query_embedding"])
+	assert.Equal(t, []any{"acme"}, body["entity_filters"])
+	assert.Equal(t, []any{"emb-1"}, body["embedding_id_filters"])
+	assert.Equal(t, map[string]any{"from_unix": float64(10), "to_unix": float64(20)}, body["time_range"])
+	assert.Equal(t, "quorum", body["read_consistency"])
+	assert.Equal(t, true, body["return_graph"])
+}
+
+// TestRetrieveOmitsUnsetOptionalFields verifies that zero-valued optional
+// fields do not appear on the wire.
+func TestRetrieveOmitsUnsetOptionalFields(t *testing.T) {
+	h := &recordingHandler{status: 200, body: sampleRetrieveResponse}
+	srv := newTestServer(t, h)
+
+	c := New(srv.URL)
+	_, err := c.Retrieve().Query(context.Background(), RetrieveRequest{TenantID: "t", Query: "q", TimeRange: &TimeRange{}})
+	require.NoError(t, err)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(h.lastRequest(t).Body, &body))
+	for _, key := range []string{"query_embedding", "entity_filters", "embedding_id_filters", "time_range", "read_consistency", "return_graph"} {
+		_, present := body[key]
+		assert.False(t, present, key)
+	}
+	assert.EqualValues(t, 5, body["top_k"])
+}
+
+// TestRetrieveDecodesExtraResponseFields verifies the optional response
+// fields emitted by render_retrieve_response_json.
+func TestRetrieveDecodesExtraResponseFields(t *testing.T) {
+	h := &recordingHandler{status: 200, body: json.RawMessage(`{
+	  "results": [{
+	    "claim_id": "c-1", "canonical_text": "x", "score": 0.5,
+	    "claim_confidence": 0.8, "confidence_band": "high",
+	    "dominant_stance": "supports", "contradiction_risk": null,
+	    "graph_score": 0.25, "support_path_count": 2,
+	    "contradiction_chain_depth": null, "supports": 1, "contradicts": 0,
+	    "citations": [], "event_time_unix": 1700000000,
+	    "temporal_match_mode": null, "temporal_in_range": true,
+	    "claim_type": "factual", "valid_from": null, "valid_to": null,
+	    "created_at": 1, "updated_at": null, "future_field": {"x": 1}
+	  }],
+	  "graph": {"nodes": [], "edges": [{"from_claim_id": "c-1", "to_claim_id": "c-2", "relation": "supports", "strength": 0.5}]},
+	  "read_policy": "one", "read_quorum_met": true, "serving_replica": null
+	}`)}
+	srv := newTestServer(t, h)
+
+	c := New(srv.URL)
+	resp, err := c.Retrieve().Query(context.Background(), RetrieveRequest{TenantID: "t", Query: "q"})
+	require.NoError(t, err)
+
+	require.Len(t, resp.Results, 1)
+	r := resp.Results[0]
+	require.NotNil(t, r.ClaimConfidence)
+	assert.InDelta(t, 0.8, *r.ClaimConfidence, 0.0001)
+	require.NotNil(t, r.ConfidenceBand)
+	assert.Equal(t, "high", *r.ConfidenceBand)
+	assert.Nil(t, r.ContradictionRisk)
+	require.NotNil(t, r.SupportPathCount)
+	assert.Equal(t, 2, *r.SupportPathCount)
+	assert.Nil(t, r.ContradictionChainDepth)
+	require.NotNil(t, r.TemporalInRange)
+	assert.True(t, *r.TemporalInRange)
+	require.NotNil(t, r.EventTimeUnix)
+	assert.EqualValues(t, 1700000000, *r.EventTimeUnix)
+	require.NotNil(t, resp.Graph)
+	require.Len(t, resp.Graph.Edges, 1)
+	assert.Equal(t, "supports", resp.Graph.Edges[0].Relation)
+	require.NotNil(t, resp.ReadPolicy)
+	assert.Equal(t, "one", *resp.ReadPolicy)
+	require.NotNil(t, resp.ReadQuorumMet)
+	assert.True(t, *resp.ReadQuorumMet)
+	assert.Nil(t, resp.ServingReplica)
 }

@@ -181,11 +181,7 @@ def test_retrieve_after_direct_ingest_returns_results() -> None:
         headers=headers,
         timeout=5.0,
     )
-    # Soft check: 200, 202, or 4xx-with-warning are all acceptable
-    # outcomes for a non-existent tenant. The point is to exercise
-    # the wire format end-to-end.
-    if r.status_code >= 500:
-        pytest.fail(f"ingest 5xx: {r.status_code} {r.text}")
+    assert r.status_code == 200, f"ingest failed: {r.status_code} {r.text}"
 
     deadline = time.time() + 5.0
     client = Client(base_url=retrieval, api_key=_api_key())

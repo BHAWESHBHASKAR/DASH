@@ -1,0 +1,122 @@
+# kind-e2e.yml
+# Kubernetes end-to-end test: scripts/kind_e2e.sh on a kind cluster.
+#   * builds the image from deploy/container/Dockerfile (GitHub Actions cache,
+#     shared with the docker-build job in rust.yml) and loads it into kind;
+#   * Helm chart: install -> ingest -> retrieve -> delete -> kill ingestion
+#     and retrieval pods -> backup -> restore -> helm upgrade, with Pod
+#     Security "restricted" and NetworkPolicy enforced;
+#   * upgrade from the chart at the PR base commit (pull requests) or at the
+#     commit before the last chart change (nightly);
+#   * the raw manifests (kubectl apply -k deploy/k8s): ingest -> retrieve;
+#   * native TLS (tls.enabled, self-signed CA): ingest -> retrieve.
+# kind, helm and kubectl are downloaded by the script at pinned versions and
+# verified against their published sha256 files; the kind node image is
+# pinned by digest. Pod logs, `kubectl describe` output, events and the kind
+# node logs are uploaded when the job fails.
+# Runs on pull requests that touch the deployment or the services, nightly
+# at 03:23 UTC, and on manual dispatch.
+# Expected runtime: ~15 min with a cold image cache, ~8 min with a warm one.
+name: Kubernetes e2e (kind)
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "services/**"
+      - "pkg/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/kind_e2e.sh"
+      - "scripts/k8s_backup_restore.sh"
+      - "scripts/backup_state_bundle.sh"
+      - "scripts/restore_state_bundle.sh"
+      - "scripts/generate-secrets.sh"
+      - ".github/workflows/kind-e2e.yml"
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: kind-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kind-e2e:
+    name: Helm chart on kind (install, failover, backup/restore, upgrade, TLS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The upgrade phase extracts the chart from an older commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build the DASH image from deploy/container/Dockerfile
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: deploy/container/Dockerfile
+          target: runtime
+          build-args: |
+            SERVICE=retrieval
+          load: true
+          push: false
+          tags: dash.local/dash-e2e:e2e
+          cache-from: |
+            type=gha,scope=dash-image
+            type=gha,scope=kind-e2e
+          cache-to: type=gha,mode=max,scope=kind-e2e
+
+      - name: Choose the chart to upgrade from
+        id: upgrade-from
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            ref="${PR_BASE_SHA}"
+          else
+            # The chart as it was before its most recent change.
+            last="$(git log -n 1 --format=%H -- deploy/helm/dash)"
+            ref="$(git rev-parse --verify --quiet "${last}^" || true)"
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "upgrade-from ref: ${ref:-<none>}"
+
+      - name: Run scripts/kind_e2e.sh
+        env:
+          DASH_E2E_SKIP_BUILD: "1"
+          DASH_E2E_IMAGE: dash.local/dash-e2e:e2e
+          DASH_E2E_WORK_DIR: ${{ runner.temp }}/kind-e2e
+          DASH_E2E_ARTIFACT_DIR: ${{ runner.temp }}/kind-e2e-artifacts
+          DASH_E2E_UPGRADE_FROM_REF: ${{ steps.upgrade-from.outputs.ref }}
+          DASH_E2E_UPGRADE_FROM_OPTIONAL: "1"
+          DASH_E2E_TIMEOUT: "300"
+          # Fail instead of warning when NetworkPolicy is not enforced.
+          DASH_E2E_REQUIRE_NETPOL: "1"
+        run: scripts/kind_e2e.sh
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kind-e2e-diagnostics
+          path: ${{ runner.temp }}/kind-e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 14

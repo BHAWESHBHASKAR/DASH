@@ -1,5 +1,13 @@
 package dash
 
+import (
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+)
+
 // EmbeddingRequest is the request body for POST /v1/embeddings.
 //
 // Mirrors services/retrieval/src/openai_embeddings.rs.
@@ -15,12 +23,17 @@ type EmbeddingRequest struct {
 	// in the response. Defaults to "text-embedding-3-small" to
 	// match OpenAI's own default.
 	Model string
-	// EncodingFormat is "float" only; other values are rejected by
-	// the server. Omit for the default behaviour.
+	// EncodingFormat is "float" (default) or "base64". Base64 payloads
+	// are decoded for you, so EmbeddingData.Embedding is always a
+	// []float32.
 	EncodingFormat string
 	// User is an opaque OpenAI-style user identifier. Omit for the
 	// default behaviour.
 	User string
+	// Dimensions is the expected embedding size. The server rejects
+	// values that differ from its provider's dimensionality. Zero omits
+	// the parameter.
+	Dimensions int
 }
 
 // EmbeddingData is one embedding vector in a response.
@@ -28,6 +41,54 @@ type EmbeddingData struct {
 	Object    string    `json:"object"`
 	Embedding []float32 `json:"embedding"`
 	Index     int       `json:"index"`
+}
+
+// UnmarshalJSON accepts both wire forms of the embedding: a JSON array of
+// floats (encoding_format "float") and a base64 string (encoding_format
+// "base64"; float32 values packed little-endian).
+func (d *EmbeddingData) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		Object    string          `json:"object"`
+		Embedding json.RawMessage `json:"embedding"`
+		Index     int             `json:"index"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	d.Object = wire.Object
+	d.Index = wire.Index
+	d.Embedding = nil
+	if len(wire.Embedding) == 0 || string(wire.Embedding) == "null" {
+		return nil
+	}
+	if wire.Embedding[0] == '"' {
+		var encoded string
+		if err := json.Unmarshal(wire.Embedding, &encoded); err != nil {
+			return err
+		}
+		floats, err := decodeBase64Embedding(encoded)
+		if err != nil {
+			return err
+		}
+		d.Embedding = floats
+		return nil
+	}
+	return json.Unmarshal(wire.Embedding, &d.Embedding)
+}
+
+func decodeBase64Embedding(encoded string) ([]float32, error) {
+	bytes, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("dash: embedding is not valid base64: %w", err)
+	}
+	if len(bytes)%4 != 0 {
+		return nil, fmt.Errorf("dash: base64 embedding has %d bytes, not a multiple of 4", len(bytes))
+	}
+	out := make([]float32, len(bytes)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(bytes[i*4:]))
+	}
+	return out, nil
 }
 
 // EmbeddingUsage is the token usage block returned alongside the
@@ -45,28 +106,41 @@ type EmbeddingResponse struct {
 	Usage  EmbeddingUsage  `json:"usage"`
 }
 
+// TimeRange is an inclusive unix-second window for RetrieveRequest.
+// Either bound may be nil (open-ended).
+type TimeRange struct {
+	FromUnix *int64 `json:"from_unix,omitempty"`
+	ToUnix   *int64 `json:"to_unix,omitempty"`
+}
+
 // RetrieveRequest is the request body for POST /v1/retrieve.
 //
-// Mirrors schema::RetrievalRequest and the test JSON in
-// services/retrieval/tests/transport_http.rs:
-//
-//	{"tenant_id": "...", "query": "...",
-//	 "top_k": 10, "stance_mode": "balanced",
-//	 "return_graph": false}
+// Mirrors the JSON accepted by build_retrieve_transport_request_from_json
+// in services/retrieval/src/transport/payload.rs. Only TenantID and Query
+// are required; zero-valued optional fields are omitted from the wire body.
 type RetrieveRequest struct {
 	// TenantID is the tenant namespace to search within.
 	TenantID string
 	// Query is the free-text query.
 	Query string
-	// TopK is the maximum number of claims to return. Defaults to
-	// 10 on the server when zero.
+	// TopK is the maximum number of claims to return. Defaults to 5
+	// (the server default) when zero.
 	TopK int
 	// StanceMode is "balanced" (default) or "support_only".
 	StanceMode string
 	// ReturnGraph optionally asks the server to also return the
-	// claim graph. Servers that do not implement it silently ignore
-	// the flag.
+	// claim graph.
 	ReturnGraph bool
+	// QueryEmbedding is an optional pre-computed query vector.
+	QueryEmbedding []float32
+	// EntityFilters restricts results to claims mentioning these entities.
+	EntityFilters []string
+	// EmbeddingIDFilters restricts results to these embedding ids.
+	EmbeddingIDFilters []string
+	// TimeRange optionally restricts results by event time.
+	TimeRange *TimeRange
+	// ReadConsistency is "one" (server default), "quorum" or "all".
+	ReadConsistency string
 }
 
 // Citation is a single evidence citation attached to a retrieval
@@ -88,12 +162,13 @@ type Citation struct {
 	IngestedAt      *int64  `json:"ingested_at,omitempty"`
 }
 
-// RetrieveResult is a single claim returned by /v1/retrieve.
+// RetrieveResult is a single claim returned by /v1/retrieve
+// (render_evidence_node_json in the retrieval service).
 //
-// Mirrors schema::RetrievalResult. The Claim + Evidence +
-// Contradiction differentiator lives in the Supports and
-// Contradicts fields: callers can filter on them without walking
-// the Citations list.
+// The Claim + Evidence + Contradiction differentiator lives in the
+// Supports and Contradicts fields: callers can filter on them without
+// walking the Citations list. Fields after Citations are optional and
+// nil when the server omits them or sends null.
 type RetrieveResult struct {
 	ClaimID       string     `json:"claim_id"`
 	CanonicalText string     `json:"canonical_text"`
@@ -101,10 +176,47 @@ type RetrieveResult struct {
 	Supports      int        `json:"supports"`
 	Contradicts   int        `json:"contradicts"`
 	Citations     []Citation `json:"citations"`
+
+	ClaimConfidence         *float32 `json:"claim_confidence,omitempty"`
+	ConfidenceBand          *string  `json:"confidence_band,omitempty"`
+	DominantStance          *string  `json:"dominant_stance,omitempty"`
+	ContradictionRisk       *float32 `json:"contradiction_risk,omitempty"`
+	GraphScore              *float32 `json:"graph_score,omitempty"`
+	SupportPathCount        *int     `json:"support_path_count,omitempty"`
+	ContradictionChainDepth *int     `json:"contradiction_chain_depth,omitempty"`
+	EventTimeUnix           *int64   `json:"event_time_unix,omitempty"`
+	TemporalMatchMode       *string  `json:"temporal_match_mode,omitempty"`
+	TemporalInRange         *bool    `json:"temporal_in_range,omitempty"`
+	ClaimType               *string  `json:"claim_type,omitempty"`
+	ValidFrom               *int64   `json:"valid_from,omitempty"`
+	ValidTo                 *int64   `json:"valid_to,omitempty"`
+	CreatedAt               *int64   `json:"created_at,omitempty"`
+	UpdatedAt               *int64   `json:"updated_at,omitempty"`
+}
+
+// GraphEdge is an edge of the evidence graph returned when
+// RetrieveRequest.ReturnGraph is set.
+type GraphEdge struct {
+	FromClaimID string  `json:"from_claim_id"`
+	ToClaimID   string  `json:"to_claim_id"`
+	Relation    string  `json:"relation"`
+	Strength    float32 `json:"strength"`
+}
+
+// RetrieveGraph is the evidence graph of a retrieve response.
+type RetrieveGraph struct {
+	Nodes []RetrieveResult `json:"nodes"`
+	Edges []GraphEdge      `json:"edges"`
 }
 
 // RetrieveResponse is the response body for POST /v1/retrieve.
-// The wire format is {"results": [...]}.
+// The wire format is {"results": [...], "graph": ..., "read_policy": ...,
+// "read_quorum_met": ..., "serving_replica": ...}; everything except
+// Results is optional.
 type RetrieveResponse struct {
-	Results []RetrieveResult `json:"results"`
+	Results        []RetrieveResult `json:"results"`
+	Graph          *RetrieveGraph   `json:"graph,omitempty"`
+	ReadPolicy     *string          `json:"read_policy,omitempty"`
+	ReadQuorumMet  *bool            `json:"read_quorum_met,omitempty"`
+	ServingReplica *string          `json:"serving_replica,omitempty"`
 }

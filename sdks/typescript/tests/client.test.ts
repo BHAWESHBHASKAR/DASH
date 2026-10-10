@@ -102,7 +102,7 @@ describe('DashClient auth + headers', () => {
     const { fetch: f, calls } = makeFetchMock(200, SAMPLE_EMBEDDING_RESPONSE);
     const client = new DashClient({ baseUrl: BASE_URL, fetch: f });
     await client.embeddings.create('hi');
-    expect(calls[0]!.headers['User-Agent']).toBe('dash-ts/0.1.0');
+    expect(calls[0]!.headers['User-Agent']).toBe('dash-ts/0.2.0');
   });
 });
 

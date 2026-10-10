@@ -1,0 +1,49 @@
+# Distributed tracing overlay for the Compose stack
+# (docs/operations/tracing.md). Off unless this file is added.
+#
+#   # export to a collector you already run (OTLP/HTTP, port 4318):
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.internal:4318 \
+#   docker compose -f deploy/container/docker-compose.yml \
+#                  -f deploy/container/docker-compose.tracing.yml up -d
+#
+#   # or start a local Jaeger (UI on http://127.0.0.1:16686) with the stack:
+#   docker compose -f deploy/container/docker-compose.yml \
+#                  -f deploy/container/docker-compose.tracing.yml \
+#                  --profile tracing-backend up -d
+#
+# Only OTLP over HTTP/protobuf is supported (not gRPC on 4317). Collector
+# credentials, if any, go in OTEL_EXPORTER_OTLP_HEADERS (name=value pairs,
+# comma-separated); keep them in .env, not in this file.
+
+x-tracing-env: &tracing-env
+  DASH_OTEL_ENABLED: "1"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+  OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_always_on}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1}
+  DASH_OTEL_BACKGROUND_SAMPLE_RATIO: ${DASH_OTEL_BACKGROUND_SAMPLE_RATIO:-0.1}
+  OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment=compose}
+
+services:
+  ingestion:
+    environment:
+      <<: *tracing-env
+
+  retrieval:
+    environment:
+      <<: *tracing-env
+
+  control-plane:
+    environment:
+      <<: *tracing-env
+
+  # Local trace backend for development (profile `tracing-backend`). Receives
+  # OTLP/HTTP on 4318 inside the Compose network; the UI is published on
+  # loopback only.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["tracing-backend"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686"

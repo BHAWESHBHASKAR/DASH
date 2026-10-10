@@ -11,7 +11,7 @@
 
     <name>dash-java</name>
     <description>Idiomatic Java client for the DASH retrieval engine</description>
-    <url>https://github.com/dash-retrieval/dash</url>
+    <url>https://github.com/BHAWESHBHASKAR/DASH</url>
 
     <licenses>
         <license>
@@ -28,9 +28,9 @@
     </developers>
 
     <scm>
-        <connection>scm:git:git://github.com/dash-retrieval/dash.git</connection>
-        <developerConnection>scm:git:ssh://git@github.com/dash-retrieval/dash.git</developerConnection>
-        <url>https://github.com/dash-retrieval/dash</url>
+        <connection>scm:git:git://github.com/BHAWESHBHASKAR/DASH.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/BHAWESHBHASKAR/DASH.git</developerConnection>
+        <url>https://github.com/BHAWESHBHASKAR/DASH</url>
     </scm>
 
     <properties>
@@ -38,7 +38,7 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <okhttp.version>4.12.0</okhttp.version>
-        <jackson.version>2.18.9</jackson.version>
+        <jackson.version>2.18.11</jackson.version>
         <junit.version>5.10.2</junit.version>
         <assertj.version>3.25.3</assertj.version>
     </properties>

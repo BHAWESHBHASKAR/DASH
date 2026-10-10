@@ -1,0 +1,212 @@
+# durability-nightly.yml
+# Nightly durability and performance evidence for the DASH services:
+#   * crash: 1000 randomized kill -9 cycles of the ingestion service
+#     (tools/crash-test), a checkpoint-pressure run, and a self-check that
+#     the harness does catch lost writes when WAL durability is disabled;
+#   * disk-full: the RLIMIT_FSIZE scenarios (tests/e2e s10_disk_full) and the
+#     e2e crash scenario with 500 cycles;
+#   * soak: a 30-minute bounded-data soak with interval stats and a server
+#     RSS growth gate, then a 2-minute load report (tools/loadgen).
+# JSON summaries and logs are uploaded as artifacts.
+# Runs daily at 02:30 UTC and on manual dispatch.
+# Expected runtime: crash ~25 min, disk-full ~10 min, soak ~45 min (parallel).
+name: Durability Nightly
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      crash_cycles:
+        description: "kill -9 cycles for the long crash run"
+        required: false
+        default: "1000"
+      soak_minutes:
+        description: "soak duration in minutes"
+        required: false
+        default: "30"
+
+concurrency:
+  group: durability-nightly-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Explicit bash enables pipefail, so a failing tool fails its `| tee` step.
+    shell: bash
+
+jobs:
+  crash:
+    name: Crash consistency (long)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      DASH_E2E_BIN_DIR: ${{ github.workspace }}/target/release
+      CRASH_CYCLES: ${{ github.event.inputs.crash_cycles || '1000' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Release build of the services and tools
+        run: cargo build --release -p ingestion -p retrieval -p control-plane -p wal-inspect -p crash-test
+
+      - name: Long kill -9 run
+        # A fresh state directory every 250 cycles keeps restart replay time
+        # bounded; within a directory the oracle covers every earlier cycle.
+        run: |
+          mkdir -p reports
+          target/release/crash-test --cycles "${CRASH_CYCLES}" --writers 6 --fresh-every 250 \
+            --json-out reports/crash-long.json 2>&1 | tee reports/crash-long.log
+
+      - name: Kill -9 under checkpoint pressure
+        run: |
+          target/release/crash-test --cycles 200 --writers 6 --checkpoint-every 100 \
+            --json-out reports/crash-checkpoint.json 2>&1 | tee reports/crash-checkpoint.log
+
+      - name: Kill -9 with encryption at rest
+        # Same oracle with DASH_ENCRYPTION_KEY_FILE set; the offline checks
+        # also require every WAL and snapshot on disk to be encrypted.
+        run: |
+          target/release/crash-test --cycles 200 --writers 6 --checkpoint-every 100 --encryption \
+            --json-out reports/crash-encryption.json 2>&1 | tee reports/crash-encryption.log
+
+      - name: Harness self-check (must detect lost writes)
+        # With the in-process append buffer and no flush, acknowledged writes
+        # die with the process; the harness has to report that and fail.
+        run: |
+          set +e
+          target/release/crash-test --cycles 20 --writers 4 \
+            --env DASH_INGEST_WAL_BACKGROUND_FLUSH_ONLY=true \
+            --env DASH_INGEST_WAL_ASYNC_FLUSH_INTERVAL_MS=60000 \
+            --env DASH_INGEST_WAL_SYNC_EVERY_RECORDS=100000 \
+            --env DASH_INGEST_WAL_APPEND_BUFFER_RECORDS=100000 \
+            --env DASH_INGEST_ALLOW_UNSAFE_WAL_DURABILITY=true \
+            --json-out reports/crash-selfcheck.json > reports/crash-selfcheck.log 2>&1
+          status=$?
+          set -e
+          tail -n 5 reports/crash-selfcheck.log
+          if [ "${status}" -ne 1 ] || ! grep -q "missing after kill -9" reports/crash-selfcheck.log; then
+            echo "crash-test did not detect lost writes with WAL durability disabled (exit ${status})" >&2
+            exit 1
+          fi
+
+      - name: Upload crash reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crash-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  disk-full:
+    name: Disk full and e2e crash scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build service binaries
+        run: cargo build -p ingestion -p retrieval -p control-plane -p wal-inspect
+
+      - name: Disk-full scenarios (RLIMIT_FSIZE)
+        run: cargo test -p dash-e2e --test s10_disk_full -- --nocapture
+
+      - name: e2e crash scenario, 500 cycles
+        env:
+          E2E_CRASH_CYCLES: "500"
+        run: cargo test -p dash-e2e --test s4_crash_consistency -- --nocapture
+
+  soak:
+    name: Soak and load report
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      DASH_E2E_BIN_DIR: ${{ github.workspace }}/target/release
+      SOAK_MINUTES: ${{ github.event.inputs.soak_minutes || '30' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master (no release tags)
+        with:
+          toolchain: stable
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Release build of the services and loadgen
+        run: cargo build --release -p ingestion -p retrieval -p control-plane -p wal-inspect -p loadgen
+
+      - name: Soak (bounded data set, RSS growth gate)
+        # Ingests update a fixed set of 20,000 claims, so the data size is
+        # constant after the preload and server memory should plateau.
+        run: |
+          mkdir -p reports
+          target/release/loadgen --duration-secs "$((SOAK_MINUTES * 60))" --warmup-secs 30 \
+            --concurrency 8 --ingest-percent 30 --dim 384 \
+            --preload 20000 --id-space 20000 --checkpoint-every 20000 \
+            --report-every-secs 60 --max-rss-growth-mib 256 --max-error-rate 0 \
+            --json-out reports/soak.json 2>&1 | grep -v ' INFO \| WARN ' | tee reports/soak.log
+
+      - name: Load report (2 minutes, 50/50 mix)
+        run: |
+          target/release/loadgen --duration-secs 120 --warmup-secs 10 \
+            --concurrency 16 --ingest-percent 50 --dim 384 --preload 5000 \
+            --json-out reports/load.json 2>&1 | grep -v ' INFO \| WARN ' | tee reports/load.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Soak and load"
+            echo '```'
+            sed -n '/loadgen report/,$p' reports/soak.log 2>/dev/null || true
+            sed -n '/loadgen report/,$p' reports/load.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload soak and load reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: soak-load-reports
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 30

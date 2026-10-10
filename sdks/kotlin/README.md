@@ -1,7 +1,7 @@
 # dash-kotlin
 
 Kotlin coroutine wrappers around [`dash-java`](../java/), the
-[OpenAI-compatible](https://github.com/dash-retrieval/dash) DASH
+[OpenAI-compatible](https://github.com/BHAWESHBHASKAR/DASH) DASH
 retrieval engine. Every blocking call is wrapped in a `suspend fun`
 that hops to `Dispatchers.IO` before delegating to the synchronous
 Java client, so you can `await` results from any coroutine context.
@@ -111,26 +111,38 @@ println(resp.data().first().embedding())
 This is the same path LangChain, LlamaIndex, and the OpenAI CLI
 use, so they all work too.
 
-### 4. Ingest and delete
+### 4. Ingest (experimental)
+
+Ingestion is a separate service from retrieval (default ports 8081
+and 8080). Configure it on the wrapped Java client:
 
 ```kotlin
-import dev.dash.model.*
-
-val bundle = IngestBundle(
-    claim = IngestClaim("c-1", "acme", "Q3 revenue was $1B", 0.9, null),
-    evidence = listOf(
-        IngestEvidence("e-1", "src-1", "supports", 0.8,
-            chunkId = null, spanStart = null, spanEnd = null,
-            docId = null, extractionModel = null, rawText = "raw chunk")
-    )
+val client = DashClientAsync(
+    DashClient("http://localhost:8080", "http://localhost:8081", "sk-live-...")
 )
 
-val ingest = client.ingest(IngestRequest("acme", bundle))
-println("accepted=${ingest.accepted} rejected=${ingest.rejected}")
-
-val deleted = client.delete(DeleteRequest("acme", listOf("c-1"), deleteEvidence = true))
-println("deleted=${deleted.deleted} missing=${deleted.missing}")
+val claim = IngestClaim("c-1", "acme", "Q3 revenue was $1B", 0.9)
+val evidence = listOf(IngestEvidence("e-1", "c-1", "src-1", "supports", 0.8))
+val ingest = client.ingest(IngestRequest(claim, evidence))
+println("${ingest.ingestedClaimId} ${ingest.commitStatus}")
 ```
+
+The ingest API is experimental and is sent exactly once (no
+automatic retries); pass
+`RequestOptions.withIdempotencyKey("...")` as the second argument to
+allow retries. `delete` was removed in 0.2.0 because the server has
+no `/v1/delete` endpoint.
+
+### Deletes (0.3.0)
+
+```kotlin
+val client = DashClientAsync(DashClient("http://localhost:8080", "http://localhost:8081", "sk-live-..."))
+client.deleteClaim("tenant-a", "claim-1")     // claim, vector, evidence, edges
+client.deleteEvidence("tenant-a", "ev-1")     // every evidence row with this id
+val r = client.deleteTenant("tenant-a")       // erase the tenant (admin role)
+```
+
+Deletes are served by the ingestion service (default port 8081). Its URL is derived only when the retrieval URL uses port 8080; otherwise configure it. Every delete is idempotent: `deleted` is false when the target did not exist. Claim and evidence deletes need the `ingest` role; a tenant delete needs `admin` for that tenant. Backups and WAL archives taken before a delete still hold the data (see `docs/operations/data-deletion.md`).
 
 ### 5. Error handling
 
@@ -184,9 +196,8 @@ escaping back to the blocking API when needed (e.g. inside a
 | --- | --- |
 | `DashClientAsync(delegate)` | Construct an async wrapper. |
 | `suspend fun embed(req)` | `POST /v1/embeddings`. |
-| `suspend fun ingest(req)` | `POST /v1/ingest`. |
+| `suspend fun ingest(req, options)` | `POST /v1/ingest` on the ingestion service (experimental). |
 | `suspend fun retrieve(req)` | `POST /v1/retrieve`. |
-| `suspend fun delete(req)` | `POST /v1/delete`. |
 | `suspend fun health()` | `GET /health`. |
 | `fun sync(): DashClient` | Escape hatch to the blocking Java client. |
 

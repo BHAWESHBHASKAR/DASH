@@ -24,12 +24,12 @@ public sealed record EmbeddingRequest
     public required object Input { get; init; }
 
     /// <summary>
-    /// Model name. Defaults to <c>"text-embedding-3-small"</c> when
-    /// <c>null</c>. DASH uses its configured embedding provider for
+    /// Model name. Defaults to <c>"text-embedding-3-small"</c>; set to
+    /// <c>null</c> to omit. DASH uses its configured embedding provider for
     /// the actual vector; the value is echoed back in the response.
     /// </summary>
     [JsonPropertyName("model")]
-    public string? Model { get; init; }
+    public string? Model { get; init; } = "text-embedding-3-small";
 
     /// <summary>
     /// Encoding format for the returned vectors. DASH currently only

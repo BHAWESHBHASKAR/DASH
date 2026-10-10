@@ -42,6 +42,11 @@ internal sealed class FakeHttpMessageHandler : HttpMessageHandler
             {
                 response.Content = new StringContent(rawText, Encoding.UTF8, "text/plain");
             }
+            else if (jsonBody is string rawJson)
+            {
+                // A string body is already-serialised JSON.
+                response.Content = new StringContent(rawJson, Encoding.UTF8, "application/json");
+            }
             else if (jsonBody is not null)
             {
                 var json = System.Text.Json.JsonSerializer.Serialize(jsonBody);

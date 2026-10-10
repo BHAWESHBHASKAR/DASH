@@ -1,64 +1,38 @@
 # Quickstart
 
-The five-minute path from `git clone` to a first retrieval query.
+From `git clone` to a first retrieval query, with authentication on. DASH is pre-1.0; no release images are published yet, so the Docker path builds from source. The full walkthrough, including the contradiction example and the build-from-source path, is in [`docs/quickstart.md`](https://github.com/BHAWESHBHASKAR/DASH/blob/main/docs/quickstart.md).
 
-## 1. Install
-
-=== "Docker"
-
-    The fastest path. Multi-arch images (`linux/amd64`, `linux/arm64`),
-    non-root runtime, healthcheck, dependency ordering, and a dev overlay
-    with hot-reload.
-
-    ```bash
-    git clone https://github.com/BHAWESHBHASKAR/DASH.git
-    cd DASH
-    docker compose -f deploy/container/docker-compose.yml up -d
-    ```
-
-    Both services come up on a shared `dash-net` bridge network:
-
-    | Service       | Port  | Purpose                          |
-    | ------------- | ----- | -------------------------------- |
-    | `dash-ingest` | 8081  | `/v1/ingest`, `/v1/health`       |
-    | `dash-retrieval` | 8080 | `/v1/retrieve`, `/v1/embeddings` |
-
-=== "From source"
-
-    Requires **Rust 1.83+** and `cargo`.
-
-    ```bash
-    git clone https://github.com/BHAWESHBHASKAR/DASH.git
-    cd DASH
-    cargo build --workspace --release
-
-    # Two terminals
-    DASH_INGEST_PORT=8081 \
-      cargo run --release -p services-ingestion
-    DASH_RETRIEVAL_PORT=8080 \
-      DASH_EMBEDDING_PROVIDER=hash \
-      cargo run --release -p services-retrieval
-    ```
-
-## 2. Run
-
-Confirm both services are healthy:
+## 1. Install and run
 
 ```bash
-curl -s http://localhost:8081/v1/health
-# {"status":"ok","service":"ingestion"}
-
-curl -s http://localhost:8080/v1/health
-# {"status":"ok","service":"retrieval"}
+git clone https://github.com/BHAWESHBHASKAR/DASH.git
+cd DASH
+./scripts/generate-secrets.sh                     # writes deploy/container/.env (git-ignored)
+set -a; source deploy/container/.env; set +a      # makes the keys available to curl below
+docker compose -f deploy/container/docker-compose.yml up -d --build
 ```
 
-## 3. Query
-
-Ingest a claim with its supporting evidence:
+| Service | Port | Purpose |
+| --- | --- | --- |
+| ingestion | 8081 | `/v1/ingest`, `/v1/ingest/batch`, `/v1/ingest/raw`, `/v1/ingest/document`, health |
+| retrieval | 8080 | `/v1/retrieve`, `/v1/embeddings`, health |
+| control-plane | 8090 | placement and leader state (internal); optional, start it with `--profile control-plane` |
 
 ```bash
-curl -X POST http://localhost:8081/v1/ingest \
+curl -fsS http://localhost:8081/health     # {"status":"ok"}
+curl -fsS http://localhost:8080/health
+```
+
+Building from source instead: use `cargo build --release -p ingestion -p retrieval` and the variables in [Configuration](reference/configuration.md). Ingestion binds `127.0.0.1:8081` and retrieval `127.0.0.1:8080` by default. Each service exits unless a credential is configured (an API key of at least 16 characters, or for a throwaway local run `DASH_INSECURE_DEV_MODE=1`); retrieval needs `DASH_RETRIEVAL_REPLICATION_SOURCE_URL` and a replication token (`DASH_INGEST_REPLICATION_TOKEN` on ingestion, the same value as `DASH_RETRIEVAL_REPLICATION_TOKEN` on retrieval) to see ingestion's data. The Rust toolchain must support edition 2024 (1.85 or newer).
+
+## 2. Ingest
+
+Use the ingestion key in the `x-api-key` header (or `Authorization: Bearer <key>`):
+
+```bash
+curl -fsS -X POST http://localhost:8081/v1/ingest \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $DASH_INGEST_API_KEY" \
   -d '{
     "claim": {
       "claim_id": "c1",
@@ -77,11 +51,17 @@ curl -X POST http://localhost:8081/v1/ingest \
   }'
 ```
 
-Retrieve with citations, dropping any claim that has been contradicted:
+The response is HTTP 200 with `ingested_claim_id` and commit fields. Since 0.3.0, retries are safe: evidence is upserted by `evidence_id`, so re-sending the same bundle leaves one copy.
+
+## 3. Retrieve
+
+Retrieval follows ingestion by polling, so allow a moment for the write to appear. Use the retrieval key:
 
 ```bash
-curl -X POST http://localhost:8080/v1/retrieve \
+sleep 2
+curl -fsS -X POST http://localhost:8080/v1/retrieve \
   -H "Content-Type: application/json" \
+  -H "x-api-key: $DASH_RETRIEVAL_API_KEY" \
   -d '{
     "tenant_id": "t1",
     "query": "Company X acquired Company Y",
@@ -90,75 +70,29 @@ curl -X POST http://localhost:8080/v1/retrieve \
   }'
 ```
 
-The response is the canonical DASH retrieval shape:
+The response is an object with a `results` array. Each result is flat: `claim_id`, `canonical_text`, `score`, `supports`, `contradicts`, `citations[]` and the claim's temporal fields. See the [HTTP API reference](reference/api.md#retrieval-service) for the full shape. `support_only` drops claims that have more contradicting than supporting evidence.
 
-```json
-{
-  "results": [
-    {
-      "claim": {
-        "claim_id": "c1",
-        "tenant_id": "t1",
-        "canonical_text": "Company X acquired Company Y",
-        "confidence": 0.95
-      },
-      "score": 1.0,
-      "supports": 1,
-      "contradicts": 0,
-      "citations": [
-        {
-          "source_id": "news://nyt",
-          "stance": "supports",
-          "source_quality": 0.95,
-          "chunk_id": null,
-          "span_start": null,
-          "span_end": null
-        }
-      ]
-    }
-  ]
-}
-```
-
-## 4. Embeddings (OpenAI drop-in)
-
-Point any OpenAI client at DASH:
-
-```bash
-export OPENAI_API_BASE=http://localhost:8080/v1
-```
+## 4. Embeddings (OpenAI-compatible)
 
 ```python
+import os
 import openai
-client = openai.OpenAI(base_url="http://localhost:8080/v1", api_key="not_needed")
-resp = client.embeddings.create(
-    input="hello world",
-    model="text-embedding-3-small",
-)
+
+client = openai.OpenAI(base_url="http://localhost:8080/v1", api_key=os.environ["DASH_RETRIEVAL_API_KEY"])
+resp = client.embeddings.create(input="hello world", model="text-embedding-3-small")
 print(resp.data[0].embedding[:5])
 ```
 
-## 5. Scale
+`/v1/embeddings` requires a credential with the `retrieve` role (it was open before 0.3.0). The default provider is a deterministic hash embedder for development. See the [Embeddings guide](guides/embeddings.md).
 
-Turn on durable storage and a real embedding model:
+## 5. Persistence and real embeddings
 
-```bash
-# Persistence: claims survive a process restart
-DASH_INGEST_PERSISTENCE_PATH=/var/lib/dash/ingest.redb \
-DASH_RETRIEVAL_PERSISTENCE_PATH=/var/lib/dash/retrieval.redb \
-  docker compose -f deploy/container/docker-compose.yml up -d
+With a WAL path configured, ingestion keeps data across restarts (the compose file already sets one under the `dash-ingestion-state` volume) and mirrors it into a redb file by default. For semantic embeddings, set `DASH_EMBEDDING_PROVIDER=ollama`, `DASH_OLLAMA_ENDPOINT` and `DASH_OLLAMA_MODEL` on the retrieval service (add them to its `environment` block in the compose file). The OpenAI provider (`DASH_EMBEDDING_PROVIDER=openai`, `DASH_OPENAI_API_KEY`) uses HTTPS.
 
-# Real embeddings
-DASH_EMBEDDING_PROVIDER=ollama \
-DASH_OLLAMA_BASE_URL=http://ollama:11434 \
-DASH_EMBEDDING_MODEL=nomic-embed-text \
-  docker compose -f deploy/container/docker-compose.yml up -d
-```
-
-To run more replicas of the retrieval service, see [Scaling](operations/scaling.md). To ship to production on Kubernetes, see [Deploy](operations/deploy.md).
+To deploy beyond a single host, read [Deploy](operations/deploy.md) and [Scaling](operations/scaling.md). Upgrading from 0.2.x: see the [upgrade guide](operations/upgrading.md).
 
 ## Next steps
 
-- Read [Why DASH](concepts/why-dash.md) for the design rationale.
-- Browse the [HTTP API reference](reference/api.md) for the full request/response shapes.
-- Pick an SDK: [Python](guides/sdks.md#python-dash-py), [Go](guides/sdks.md#go-dash-go), [TypeScript](guides/sdks.md#typescript-dash-ts).
+- [Why DASH](concepts/why-dash.md)
+- [HTTP API reference](reference/api.md)
+- SDKs: [overview](guides/sdks.md). Python, Go and TypeScript cover embeddings and retrieve only; Java, Kotlin and C# also cover ingest.

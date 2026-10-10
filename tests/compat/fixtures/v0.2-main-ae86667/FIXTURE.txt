@@ -1,0 +1,6 @@
+label: v0.2-main-ae86667
+ref: origin/main
+commit: ae866672c8a2af01941c8e8d4bea124217cc5927
+generated: 2026-10-10
+generator: scripts/compat/generate_fixtures.sh
+dataset: tests/compat/dataset (ingest.jsonl, retrieve.jsonl, placements.csv)

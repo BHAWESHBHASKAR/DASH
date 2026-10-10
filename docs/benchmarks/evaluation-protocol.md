@@ -184,11 +184,11 @@ Optional overrides:
 - `--max-dash-latency-regression-pct <N>` to cap allowed DASH avg-latency growth vs prior run (`--max-eme-latency-regression-pct` alias is still accepted)
 - `--scorecard-out <PATH>` to emit a markdown benchmark scorecard (latency + quality probes)
 - ANN tuning controls:
-  - `--ann-max-neighbors-base <N>`
-  - `--ann-max-neighbors-upper <N>`
-  - `--ann-search-expansion-factor <N>`
-  - `--ann-search-expansion-min <N>`
-  - `--ann-search-expansion-max <N>`
+  - `--ann-max-neighbors-base <N>` (HNSW connectivity)
+  - `--ann-expansion-add <N>` (HNSW construction beam)
+  - `--ann-search-expansion-min <N>` (HNSW search beam floor)
+  - `--vector-flat-threshold <N>` (exact scan up to this many vectors per tenant)
+  - `--vector-rerank <N>` (exact rerank width, `0` disables)
 - large-profile gates:
   - `--large-min-candidate-reduction-pct <N>` (default `95`)
   - `--large-max-dash-latency-ms <N>` (default `120`)
@@ -200,10 +200,10 @@ Optional overrides:
   - `--min-segment-cache-hits <N>` (default `0`)
 - env equivalents for benchmark runtime:
   - `DASH_BENCH_ANN_MAX_NEIGHBORS_BASE`
-  - `DASH_BENCH_ANN_MAX_NEIGHBORS_UPPER`
-  - `DASH_BENCH_ANN_SEARCH_EXPANSION_FACTOR`
+  - `DASH_BENCH_ANN_EXPANSION_ADD`
   - `DASH_BENCH_ANN_SEARCH_EXPANSION_MIN`
-  - `DASH_BENCH_ANN_SEARCH_EXPANSION_MAX`
+  - `DASH_BENCH_VECTOR_FLAT_THRESHOLD`
+  - `DASH_BENCH_VECTOR_RERANK`
   - `DASH_BENCH_LARGE_MIN_CANDIDATE_REDUCTION_PCT`
   - `DASH_BENCH_LARGE_MAX_DASH_LATENCY_MS`
   - `DASH_BENCH_XLARGE_MIN_CANDIDATE_REDUCTION_PCT`

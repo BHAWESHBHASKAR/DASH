@@ -20,12 +20,14 @@ import okhttp3.ResponseBody;
 
 import dev.dash.DashConnectionException;
 import dev.dash.DashException;
+import dev.dash.RequestOptions;
 
 /**
  * Low-level HTTP transport used by the public {@code DashClient}.
  *
  * <p>Wraps an {@link OkHttpClient} with a bearer-token auth interceptor,
- * exponential-backoff retry (3 attempts, 100ms base, jittered), and
+ * exponential-backoff retry (3 attempts, 100ms base, jittered and capped; only for
+ * idempotent requests; honours Retry-After), and
  * configurable timeouts. The transport is safe for concurrent use; the
  * underlying {@code OkHttpClient} is shared across calls.</p>
  *
@@ -46,6 +48,12 @@ public class HttpTransport {
     public static final int DEFAULT_MAX_ATTEMPTS = 3;
     /** Base backoff between retries, in milliseconds. */
     public static final long DEFAULT_BACKOFF_MS = 100L;
+    /** Upper bound for the jittered exponential backoff, in milliseconds. */
+    public static final long MAX_BACKOFF_MS = 5_000L;
+    /** Upper bound honoured for a server-sent Retry-After, in milliseconds. */
+    public static final long MAX_RETRY_AFTER_MS = 30_000L;
+    /** Hard cap on attempts regardless of configuration. */
+    public static final int MAX_ATTEMPTS_LIMIT = 10;
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
     private static final String USER_AGENT = "dash-java/0.2.0";
@@ -70,7 +78,7 @@ public class HttpTransport {
             int maxAttempts,
             long backoffMs) {
         this.baseUrl = Objects.requireNonNull(baseUrl, "baseUrl").replaceAll("/+$", "");
-        this.maxAttempts = Math.max(1, maxAttempts);
+        this.maxAttempts = Math.min(MAX_ATTEMPTS_LIMIT, Math.max(1, maxAttempts));
         this.backoffMs = Math.max(0L, backoffMs);
         this.mapper = new ObjectMapper()
                 .registerModule(new JavaTimeModule())
@@ -87,17 +95,17 @@ public class HttpTransport {
 
     /**
      * POST a JSON-serialisable body to {@code path} and return the
-     * deserialised response of type {@code responseType}.
+     * deserialised response of type {@code responseType}. The request is
+     * sent once (no retries); use the overload taking {@link RequestOptions}
+     * to allow retries.
      */
     public <T> T post(String path, Object body, Class<T> responseType) {
-        String json;
-        try {
-            json = mapper.writeValueAsString(body);
-        } catch (IOException e) {
-            throw new DashException("failed to serialise request body: " + e.getMessage(), e);
-        }
-        Response response = executeWithRetry("/" + path.replaceFirst("^/+", ""), json);
-        return decode(response, responseType);
+        return post(path, body, responseType, RequestOptions.NONE);
+    }
+
+    public <T> T post(String path, Object body, Class<T> responseType, RequestOptions options) {
+        RawResponse raw = execute(path, serialise(body), options);
+        return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
     }
 
     /**
@@ -105,22 +113,31 @@ public class HttpTransport {
      * against a {@link TypeReference} (e.g. {@code List<Foo>}).
      */
     public <T> T post(String path, Object body, TypeReference<T> typeRef) {
-        String json;
-        try {
-            json = mapper.writeValueAsString(body);
-        } catch (IOException e) {
-            throw new DashException("failed to serialise request body: " + e.getMessage(), e);
-        }
-        Response response = executeWithRetry("/" + path.replaceFirst("^/+", ""), json);
-        return decode(response, typeRef);
+        return post(path, body, typeRef, RequestOptions.NONE);
+    }
+
+    public <T> T post(String path, Object body, TypeReference<T> typeRef, RequestOptions options) {
+        RawResponse raw = execute(path, serialise(body), options);
+        return decode(raw, mapper -> mapper.readValue(raw.body, typeRef));
     }
 
     /**
-     * GET {@code path} and return the deserialised response.
+     * GET {@code path} and return the deserialised response. GET is
+     * idempotent so it is retried on 429/5xx and I/O errors.
      */
     public <T> T get(String path, Class<T> responseType) {
-        Response response = executeWithRetry("/" + path.replaceFirst("^/+", ""), null);
-        return decode(response, responseType);
+        RawResponse raw = execute(path, null, RequestOptions.IDEMPOTENT);
+        return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
+    }
+
+    /**
+     * DELETE {@code path} (no body) and return the deserialised response.
+     * The DASH delete routes are idempotent, so the request is retried on
+     * 429/5xx and I/O errors like a GET.
+     */
+    public <T> T httpDelete(String path, Class<T> responseType) {
+        RawResponse raw = execute("DELETE", path, null, RequestOptions.IDEMPOTENT);
+        return decode(raw, mapper -> mapper.readValue(raw.body, responseType));
     }
 
     public ObjectMapper mapper() {
@@ -135,50 +152,88 @@ public class HttpTransport {
     // Internals
     // ------------------------------------------------------------------
 
-    private Response executeWithRetry(String path, String jsonBody) {
+    /** Fully-read response: the body is consumed exactly once and closed. */
+    private static final class RawResponse {
+        final int status;
+        final String body;
+        final String requestId;
+        final String retryAfter;
+
+        RawResponse(int status, String body, String requestId, String retryAfter) {
+            this.status = status;
+            this.body = body;
+            this.requestId = requestId;
+            this.retryAfter = retryAfter;
+        }
+    }
+
+    private String serialise(Object body) {
+        try {
+            return mapper.writeValueAsString(body);
+        } catch (IOException e) {
+            throw new DashException("failed to serialise request body: " + e.getMessage(), e);
+        }
+    }
+
+    private RawResponse execute(String rawPath, String jsonBody, RequestOptions options) {
+        return execute(jsonBody != null ? "POST" : "GET", rawPath, jsonBody, options);
+    }
+
+    private RawResponse execute(String method, String rawPath, String jsonBody,
+                                RequestOptions options) {
+        String path = "/" + rawPath.replaceFirst("^/+", "");
         String url = baseUrl + path;
-        IOException last = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        int attempts = options.canRetry() ? maxAttempts : 1;
+        for (int attempt = 1; ; attempt++) {
             Request.Builder builder = new Request.Builder().url(url);
             if (jsonBody != null) {
                 builder.post(RequestBody.create(jsonBody, JSON));
+            } else if ("DELETE".equals(method)) {
+                builder.delete();
             } else {
                 builder.get();
             }
-            Request request = builder.build();
-            try {
-                Response response = client.newCall(request).execute();
-                if (!shouldRetry(response.code()) || attempt == maxAttempts) {
-                    return response;
-                }
-                response.close();
-                sleepBackoff(attempt);
+            if (options.idempotencyKey() != null && !options.idempotencyKey().isBlank()) {
+                builder.header("Idempotency-Key", options.idempotencyKey());
+            }
+            RawResponse raw;
+            try (Response response = client.newCall(builder.build()).execute()) {
+                ResponseBody body = response.body();
+                raw = new RawResponse(
+                        response.code(),
+                        body == null ? "" : body.string(),
+                        response.header("X-Request-Id"),
+                        response.header("Retry-After"));
             } catch (IOException e) {
-                last = e;
-                if (attempt == maxAttempts) {
+                if (attempt >= attempts) {
                     throw new DashConnectionException(
                             "failed to reach DASH at " + baseUrl + ": " + e.getMessage(), e);
                 }
-                sleepBackoff(attempt);
+                sleepBackoff(attempt, null);
+                continue;
             }
+            if (!shouldRetry(raw.status) || attempt >= attempts) {
+                return raw;
+            }
+            sleepBackoff(attempt, raw.retryAfter);
         }
-        // Unreachable, but keep the compiler happy.
-        throw new DashConnectionException(
-                "failed to reach DASH at " + baseUrl
-                        + (last != null ? ": " + last.getMessage() : ""));
     }
 
     private static boolean shouldRetry(int code) {
         return code == 429 || (code >= 500 && code < 600);
     }
 
-    private void sleepBackoff(int attempt) {
-        if (backoffMs <= 0) {
+    private void sleepBackoff(int attempt, String retryAfter) {
+        // Exponential backoff with full jitter, capped at MAX_BACKOFF_MS.
+        long cap = Math.min(MAX_BACKOFF_MS, backoffMs * (1L << Math.min(attempt - 1, 20)));
+        long delay = cap <= 0 ? 0 : ThreadLocalRandom.current().nextLong(0, cap + 1);
+        long serverDelay = parseRetryAfterMs(retryAfter);
+        if (serverDelay >= 0) {
+            delay = Math.max(delay, Math.min(serverDelay, MAX_RETRY_AFTER_MS));
+        }
+        if (delay <= 0) {
             return;
         }
-        // Exponential backoff with full jitter: 0..(base * 2^(attempt-1))
-        long cap = backoffMs * (1L << (attempt - 1));
-        long delay = ThreadLocalRandom.current().nextLong(0, cap + 1);
         try {
             Thread.sleep(delay);
         } catch (InterruptedException e) {
@@ -187,42 +242,45 @@ public class HttpTransport {
         }
     }
 
-    private <T> T decode(Response response, Class<T> type) {
-        return decodeInternal(response, mapper -> mapper.readValue(mapper.createParser(responseBody(response)), type));
-    }
-
-    private <T> T decode(Response response, TypeReference<T> typeRef) {
-        return decodeInternal(response, mapper -> mapper.readValue(mapper.createParser(responseBody(response)), typeRef));
-    }
-
-    @FunctionalInterface
-    private interface Decoder<T> {
-        T apply(ObjectMapper mapper) throws IOException;
-    }
-
-    private <T> T decodeInternal(Response response, Decoder<T> decoder) {
-        int status = response.code();
-        String rawBody = responseBody(response);
+    /** Parse a Retry-After header (delta-seconds or HTTP-date); -1 if absent or invalid. */
+    public static long parseRetryAfterMs(String value) {
+        if (value == null || value.isBlank()) {
+            return -1;
+        }
+        String v = value.trim();
         try {
-            if (status >= 200 && status < 300) {
-                if (rawBody == null || rawBody.isEmpty()) {
+            long seconds = Long.parseLong(v);
+            return seconds < 0 ? -1 : seconds * 1000L;
+        } catch (NumberFormatException ignore) {
+            // fall through to HTTP-date
+        }
+        try {
+            var when = java.time.ZonedDateTime.parse(v, java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME);
+            long ms = java.time.Duration.between(java.time.ZonedDateTime.now(), when).toMillis();
+            return Math.max(0L, ms);
+        } catch (java.time.format.DateTimeParseException e) {
+            return -1;
+        }
+    }
+
+    private <T> T decode(RawResponse raw, Decoder<T> decoder) {
+        try {
+            if (raw.status >= 200 && raw.status < 300) {
+                if (raw.body == null || raw.body.isEmpty()) {
                     return null;
                 }
                 return decoder.apply(mapper);
             }
-            throw buildError(status, rawBody, response.header("X-Request-Id"));
+            throw buildError(raw.status, raw.body, raw.requestId);
         } catch (IOException e) {
             throw new DashException(
                     "failed to decode DASH response: " + e.getMessage(), e);
         }
     }
 
-    private static String responseBody(Response response) {
-        try (ResponseBody body = response.body()) {
-            return body == null ? "" : body.string();
-        } catch (IOException e) {
-            throw new DashException("failed to read DASH response body: " + e.getMessage(), e);
-        }
+    @FunctionalInterface
+    private interface Decoder<T> {
+        T apply(ObjectMapper mapper) throws IOException;
     }
 
     private DashException buildError(int status, String rawBody, String requestId) {

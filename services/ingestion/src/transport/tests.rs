@@ -1,13 +1,21 @@
+use super::authz::policy_from_parts as test_auth_policy;
 use super::*;
+
+mod authz_matrix;
+mod delete;
+mod group_commit;
+mod provider_cache;
+mod ready;
+mod review_fixes;
+mod write_path;
 use indexer::{CompactionSchedulerConfig, Segment, Tier, persist_segments_atomic};
 use metadata_router::{ReplicaHealth, ReplicaPlacement, ReplicaRole, promote_replica_to_leader};
-use std::io::Read;
-use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn sample_runtime() -> SharedRuntime {
+pub(super) fn sample_runtime() -> SharedRuntime {
+    ensure_dev_mode_env();
     Arc::new(Mutex::new(
         IngestionRuntime::in_memory(InMemoryStore::new()),
     ))
@@ -27,9 +35,23 @@ fn temp_wal_path() -> PathBuf {
     wal_path
 }
 
-fn env_lock() -> &'static Mutex<()> {
+/// Tests that exercise handlers without configuring credentials run in
+/// explicit dev mode (the only way to get an unauthenticated service).
+#[allow(unused_unsafe)]
+fn ensure_dev_mode_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var("DASH_INSECURE_DEV_MODE", "1");
+        std::env::set_var("DASH_STRICT_SECRETS", "0");
+    });
+}
+
+pub(super) fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| {
+        ensure_dev_mode_env();
+        Mutex::new(())
+    })
 }
 
 #[allow(unused_unsafe)]
@@ -715,7 +737,7 @@ fn handle_request_post_batch_replays_idempotently_for_same_commit_id() {
 }
 
 #[test]
-fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
+fn handle_request_post_batch_commit_id_reuse_with_changed_content_is_an_update() {
     let runtime = sample_runtime();
     let first_request = HttpRequest {
         method: "POST".to_string(),
@@ -760,10 +782,14 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
         .to_vec(),
     };
     let second = handle_request(&runtime, &second_request);
-    assert_eq!(second.status, 409);
-    assert!(second.body.contains("state conflict"));
-    assert!(second.body.contains("existing_fingerprint="));
-    assert!(second.body.contains("incoming_fingerprint="));
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert!(second.body.contains("\"idempotent_replay\":false"));
+    assert!(second.body.contains("\"updated\":true"));
+    // The identical request afterwards is a plain replay.
+    let third = handle_request(&runtime, &second_request);
+    assert_eq!(third.status, 200);
+    assert!(third.body.contains("\"idempotent_replay\":true"));
+    assert!(!third.body.contains("\"updated\""));
 
     let metrics_request = HttpRequest {
         method: "GET".to_string(),
@@ -776,12 +802,12 @@ fn handle_request_post_batch_rejects_commit_id_reuse_with_different_payload() {
     assert!(
         metrics_response
             .body
-            .contains("dash_ingest_batch_failed_total 1")
+            .contains("dash_ingest_batch_failed_total 0")
     );
     assert!(
         metrics_response
             .body
-            .contains("dash_ingest_batch_idempotent_hit_total 0")
+            .contains("dash_ingest_batch_idempotent_hit_total 1")
     );
 }
 
@@ -831,12 +857,12 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
         target: "/v1/ingest/batch".to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         body: br#"{
-                "commit_id": "commit-audit-conflict-1",
+                "commit_id": "commit-audit-conflict-2",
                 "items": [
                     {
                         "claim": {
-                            "claim_id": "c-audit-conflict-2",
-                            "tenant_id": "tenant-a",
+                            "claim_id": "c-audit-conflict-1",
+                            "tenant_id": "tenant-b",
                             "canonical_text": "Commit conflict two",
                             "confidence": 0.89
                         }
@@ -864,7 +890,7 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
     assert!(matches!(last_obj.get("status"), Some(JsonValue::Number(raw)) if raw == "409"));
     assert!(matches!(last_obj.get("outcome"), Some(JsonValue::String(raw)) if raw == "denied"));
     assert!(
-        matches!(last_obj.get("reason"), Some(JsonValue::String(raw)) if raw.contains("existing_fingerprint="))
+        matches!(last_obj.get("reason"), Some(JsonValue::String(raw)) if raw.contains("claim_id already exists"))
     );
 
     restore_env_var_for_tests("DASH_INGEST_AUDIT_LOG_PATH", previous_audit_path.as_deref());
@@ -873,6 +899,7 @@ fn handle_request_post_batch_conflict_marks_audit_outcome_denied() {
 
 #[test]
 fn handle_request_post_batch_is_atomic_on_validation_failure() {
+    ensure_dev_mode_env();
     let wal_path = temp_wal_path();
     let wal = FileWal::open(&wal_path).expect("wal should open");
     let runtime = Arc::new(Mutex::new(IngestionRuntime::persistent(
@@ -919,6 +946,7 @@ fn handle_request_post_batch_is_atomic_on_validation_failure() {
     let wal_records = guard
         .wal
         .as_ref()
+        .map(lock_wal)
         .expect("persistent runtime should have wal")
         .wal_record_count()
         .expect("wal record count should be readable");
@@ -964,14 +992,16 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
     let pull_response = handle_request(&runtime, &pull_request);
     assert_eq!(pull_response.status, 200);
     assert!(pull_response.body.contains("status=ok"));
-    assert!(pull_response.body.contains("records=2"));
-    assert!(pull_response.body.contains("next_offset=2"));
+    // begin marker + claim + vector + commit marker
+    assert!(pull_response.body.contains("records=4"));
+    assert!(pull_response.body.contains("next_offset=4"));
 
     let guard = runtime.lock().expect("runtime lock should be available");
     let _ = std::fs::remove_file(
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .path(),
     );
@@ -979,6 +1009,7 @@ fn handle_request_internal_replication_wal_returns_delta_payload() {
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .snapshot_path(),
     );
@@ -1030,6 +1061,7 @@ fn handle_request_internal_replication_endpoints_require_token_when_configured()
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .path(),
     );
@@ -1037,6 +1069,7 @@ fn handle_request_internal_replication_endpoints_require_token_when_configured()
         guard
             .wal
             .as_ref()
+            .map(lock_wal)
             .expect("persistent runtime should have wal")
             .snapshot_path(),
     );
@@ -1065,7 +1098,7 @@ fn auth_policy_scoped_key_allows_configured_tenant() {
         headers: HashMap::from([("x-api-key".to_string(), "scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         None,
@@ -1086,7 +1119,7 @@ fn auth_policy_scoped_key_rejects_other_tenants() {
         headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(None, None, None, None, Some("scope-a:tenant-a".to_string()));
+    let policy = test_auth_policy(None, None, None, None, Some("scope-a:tenant-a".to_string()));
     assert_eq!(
         authorize_request_for_tenant(&request, "tenant-z", &policy, Role::Ingest),
         AuthDecision::Forbidden("tenant is not allowed for this API key")
@@ -1101,7 +1134,7 @@ fn auth_policy_scoped_key_rejects_unknown_key_when_required_keys_are_unset() {
         headers: HashMap::from([("x-api-key".to_string(), "unknown-key".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         None,
@@ -1122,7 +1155,7 @@ fn auth_policy_required_key_rejects_missing_key() {
         headers: HashMap::new(),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(Some("secret".to_string()), None, None, None, None);
+    let policy = test_auth_policy(Some("secret".to_string()), None, None, None, None);
     assert_eq!(
         authorize_request_for_tenant(&request, "tenant-a", &policy, Role::Ingest),
         AuthDecision::Unauthorized("missing or invalid API key")
@@ -1137,7 +1170,7 @@ fn auth_policy_required_key_set_supports_rotation() {
         headers: HashMap::from([("x-api-key".to_string(), "new-key".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         Some("old-key".to_string()),
         Some("new-key,old-key-2".to_string()),
         None,
@@ -1158,7 +1191,7 @@ fn auth_policy_revoked_key_is_denied() {
         headers: HashMap::from([("authorization".to_string(), "Bearer scope-a".to_string())]),
         body: Vec::new(),
     };
-    let policy = AuthPolicy::from_env(
+    let policy = test_auth_policy(
         None,
         None,
         Some("scope-a".to_string()),
@@ -1251,6 +1284,7 @@ fn metrics_endpoint_reports_backpressure_queue_values() {
         queue_depth: AtomicUsize::new(3),
         queue_capacity: 8,
         queue_full_reject_total: AtomicU64::new(11),
+        ..TransportBackpressureMetrics::default()
     });
     {
         let mut guard = runtime.lock().expect("runtime lock should be available");
@@ -1305,24 +1339,15 @@ fn resolve_http_queue_capacity_prefers_env_override() {
 }
 
 #[test]
-fn write_backpressure_response_returns_http_503_payload() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener bind should succeed");
-    let addr = listener.local_addr().expect("local addr should resolve");
-    let client = std::thread::spawn(move || {
-        let mut stream = TcpStream::connect(addr).expect("client connect should succeed");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("client should read response");
-        response
-    });
-
-    let (server_stream, _) = listener.accept().expect("accept should succeed");
-    write_backpressure_response(server_stream, SOCKET_TIMEOUT_SECS)
-        .expect("response write should succeed");
-    let response = client.join().expect("client thread should join");
+fn overload_response_is_the_http_503_payload() {
+    let config = server_config(1, 1);
+    let response = dash_http::render_response(&config.overload_response);
     assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
-    assert!(response.contains("content-type: application/json"));
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: application/json")
+    );
     assert!(response.contains("ingestion worker queue full"));
 }
 
@@ -1401,14 +1426,14 @@ fn background_only_mode_skips_request_thread_interval_flush() {
     std::thread::sleep(Duration::from_millis(2));
     runtime.flush_wal_if_due();
     let metrics = runtime.metrics_text();
-    assert!(metrics.contains("dash_ingest_wal_unsynced_records 1"));
+    assert!(metrics.contains("dash_ingest_wal_unsynced_records 3"));
     assert!(metrics.contains("dash_ingest_wal_background_flush_only 1"));
 
     runtime.flush_wal_for_async_tick();
     let flushed = runtime.metrics_text();
     assert!(flushed.contains("dash_ingest_wal_unsynced_records 0"));
-    assert!(flushed.contains("dash_ingest_wal_flush_synced_records_total 1"));
-    assert!(flushed.contains("dash_ingest_wal_flush_last_synced_records 1"));
+    assert!(flushed.contains("dash_ingest_wal_flush_synced_records_total 3"));
+    assert!(flushed.contains("dash_ingest_wal_flush_last_synced_records 3"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);
@@ -1438,16 +1463,16 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
         .expect("request should parse");
     runtime.ingest(request).expect("ingest should succeed");
     let before = runtime.metrics_text();
-    assert!(before.contains("dash_ingest_wal_unsynced_records 1"));
-    assert!(before.contains("dash_ingest_wal_buffered_records 1"));
+    assert!(before.contains("dash_ingest_wal_unsynced_records 3"));
+    assert!(before.contains("dash_ingest_wal_buffered_records 3"));
 
     runtime.flush_wal_for_async_tick();
     let after = runtime.metrics_text();
     assert!(after.contains("dash_ingest_wal_unsynced_records 0"));
     assert!(after.contains("dash_ingest_wal_buffered_records 0"));
     assert!(after.contains("dash_ingest_wal_async_flush_tick_total 1"));
-    assert!(after.contains("dash_ingest_wal_flush_synced_records_total 1"));
-    assert!(after.contains("dash_ingest_wal_flush_last_synced_records 1"));
+    assert!(after.contains("dash_ingest_wal_flush_synced_records_total 3"));
+    assert!(after.contains("dash_ingest_wal_flush_last_synced_records 3"));
 
     drop(runtime);
     let _ = std::fs::remove_file(&wal_path);
@@ -1458,6 +1483,7 @@ fn async_flush_tick_forces_sync_of_unsynced_wal_records() {
 
 #[test]
 fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1529,6 +1555,7 @@ fn handle_request_post_rejects_when_local_node_is_not_write_leader() {
 
 #[test]
 fn handle_request_write_route_reresolves_after_leader_promotion() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1622,6 +1649,8 @@ fn handle_request_write_route_reresolves_after_leader_promotion() {
 
 #[test]
 fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack() {
+    // Replication endpoints read the token env var; serialize with tests that set it.
+    let _guard = env_lock().lock().unwrap_or_else(|p| p.into_inner());
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1712,6 +1741,7 @@ fn handle_request_write_consistency_quorum_starts_pending_until_replication_ack(
 
 #[test]
 fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insufficient() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1763,6 +1793,7 @@ fn handle_request_write_consistency_all_rejects_when_healthy_replicas_are_insuff
 
 #[test]
 fn debug_placement_endpoint_returns_structured_route_probe() {
+    ensure_dev_mode_env();
     let placement = ShardPlacement {
         tenant_id: "tenant-a".to_string(),
         shard_id: 0,
@@ -1908,6 +1939,7 @@ fn debug_document_parser_endpoint_reports_adapter_configuration() {
 
 #[test]
 fn segment_publish_writes_manifest_and_metrics() {
+    ensure_dev_mode_env();
     let mut root_dir = std::env::temp_dir();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2087,4 +2119,50 @@ fn append_audit_record_writes_chained_hash_and_seq() {
     assert_eq!(second_prev, first_hash);
 
     let _ = std::fs::remove_file(audit_path);
+}
+
+fn ingest_json(runtime: &mut IngestionRuntime, body: &str) -> Result<(), StoreError> {
+    let request = build_ingest_request_from_json(body).expect("request should parse");
+    runtime.ingest(request).map(|_| ())
+}
+
+#[test]
+fn ingest_rejects_edges_into_another_tenants_claim() {
+    let mut runtime = IngestionRuntime::in_memory(InMemoryStore::new());
+    ingest_json(
+        &mut runtime,
+        r#"{"claim":{"claim_id":"victim-claim","tenant_id":"tenant-b","canonical_text":"b claim","confidence":0.9}}"#,
+    )
+    .expect("tenant-b claim ingests");
+
+    let cross = r#"{"claim":{"claim_id":"a1","tenant_id":"tenant-a","canonical_text":"a claim","confidence":0.9},
+        "edges":[{"edge_id":"e1","from_claim_id":"a1","to_claim_id":"victim-claim","relation":"supports","strength":0.5}]}"#;
+    let err = ingest_json(&mut runtime, cross).expect_err("cross-tenant edge must be rejected");
+    assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    assert!(
+        runtime.store.claim_by_id("a1").is_none(),
+        "a rejected bundle must not be applied"
+    );
+    // The other tenant's claim never gains an inbound edge.
+    assert!(runtime.store.edges_for_claim("victim-claim").is_empty());
+
+    // Edges whose target does not exist yet stay allowed (edges may arrive
+    // before their targets), as do edges within the tenant.
+    let dangling = r#"{"claim":{"claim_id":"a2","tenant_id":"tenant-a","canonical_text":"a2 claim","confidence":0.9},
+        "edges":[{"edge_id":"e2","from_claim_id":"a2","to_claim_id":"not-yet","relation":"supports","strength":0.5}]}"#;
+    ingest_json(&mut runtime, dangling).expect("dangling target is allowed");
+    let same_tenant = r#"{"claim":{"claim_id":"a3","tenant_id":"tenant-a","canonical_text":"a3 claim","confidence":0.9},
+        "edges":[{"edge_id":"e3","from_claim_id":"a3","to_claim_id":"a2","relation":"supports","strength":0.5}]}"#;
+    ingest_json(&mut runtime, same_tenant).expect("same-tenant edge is allowed");
+}
+
+#[test]
+fn ingest_rejects_all_zero_claim_embedding() {
+    let mut runtime = IngestionRuntime::in_memory(InMemoryStore::new());
+    let zero = r#"{"claim":{"claim_id":"z1","tenant_id":"tenant-a","canonical_text":"zero","confidence":0.9,"embedding_vector":[0.0,0.0,0.0]}}"#;
+    let err = ingest_json(&mut runtime, zero).expect_err("zero vector must be rejected");
+    assert!(matches!(err, StoreError::InvalidVector(_)), "{err:?}");
+    assert!(runtime.store.claim_by_id("z1").is_none());
+    let ok = r#"{"claim":{"claim_id":"z2","tenant_id":"tenant-a","canonical_text":"nonzero","confidence":0.9,"embedding_vector":[0.0,0.5,0.0]}}"#;
+    ingest_json(&mut runtime, ok).expect("non-zero vector is accepted");
 }

@@ -1,6 +1,5 @@
 package dev.dash
 
-import dev.dash.model.DeleteRequest
 import dev.dash.model.DeleteResponse
 import dev.dash.model.EmbedRequest
 import dev.dash.model.EmbeddingResponse
@@ -22,7 +21,7 @@ import kotlinx.coroutines.withContext
  *
  * Example:
  * ```
- * val client = DashClientAsync(DashClient("http://localhost:8080", "sk-live-..."))
+ * val client = DashClientAsync(DashClient("http://localhost:8080", "http://localhost:8081", "sk-live-..."))
  * val resp = client.embed(EmbedRequest.of("hello world"))
  * println(resp.data.first().embedding.take(5))
  * ```
@@ -41,10 +40,37 @@ class DashClientAsync(
         withContext(Dispatchers.IO) { delegate.embed(req) }
 
     /**
-     * Call `POST /v1/ingest` and return the per-bundle response.
+     * EXPERIMENTAL. Call `POST /v1/ingest` on the ingestion service
+     * (configure its URL on the wrapped [DashClient]). The request is sent
+     * exactly once unless [options] enables retries, for example
+     * [RequestOptions.withIdempotencyKey].
      */
-    suspend fun ingest(req: IngestRequest): IngestResponse =
-        withContext(Dispatchers.IO) { delegate.ingest(req) }
+    suspend fun ingest(
+        req: IngestRequest,
+        options: RequestOptions = RequestOptions.NONE,
+    ): IngestResponse =
+        withContext(Dispatchers.IO) { delegate.ingest(req, options) }
+
+    /**
+     * Call `DELETE /v1/claims/{claimId}?tenant_id=...` on the ingestion
+     * service (see [DashClient.deleteClaim]). Idempotent.
+     */
+    suspend fun deleteClaim(tenantId: String, claimId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteClaim(tenantId, claimId) }
+
+    /**
+     * Call `DELETE /v1/evidence/{evidenceId}?tenant_id=...` on the ingestion
+     * service (see [DashClient.deleteEvidence]).
+     */
+    suspend fun deleteEvidence(tenantId: String, evidenceId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteEvidence(tenantId, evidenceId) }
+
+    /**
+     * Call `DELETE /v1/tenants/{tenantId}` on the ingestion service: erase
+     * all of the tenant's data (admin role). See [DashClient.deleteTenant].
+     */
+    suspend fun deleteTenant(tenantId: String): DeleteResponse =
+        withContext(Dispatchers.IO) { delegate.deleteTenant(tenantId) }
 
     /**
      * Call `POST /v1/retrieve` and return the structured
@@ -52,13 +78,6 @@ class DashClientAsync(
      */
     suspend fun retrieve(req: RetrievalRequest): RetrievalResponse =
         withContext(Dispatchers.IO) { delegate.retrieve(req) }
-
-    /**
-     * Call `POST /v1/delete` and return the per-claim delete
-     * acknowledgment.
-     */
-    suspend fun delete(req: DeleteRequest): DeleteResponse =
-        withContext(Dispatchers.IO) { delegate.delete(req) }
 
     /**
      * Call `GET /health` and return the liveness response.
